@@ -1,0 +1,30 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "W3ChampionsChatService", "W3ChampionsChatService\W3ChampionsChatService.csproj", "{E92F0AB0-E244-40C6-9622-D2D1D7C30FF1}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionItems", "SolutionItems", "{A83B7482-C4C3-49A5-BCBA-FAF90FF5E48C}"
+ProjectSection(SolutionItems) = preProject
+	azure-pipelines.yml = azure-pipelines.yml
+	Dockerfile = Dockerfile
+	README.md = README.md
+	.gitignore = .gitignore
+EndProjectSection
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "W3ChampionsChatService.Tests", "W3ChampionsChatService.Tests\W3ChampionsChatService.Tests.csproj", "{E0E22C94-BFAC-4B97-A47B-663F04E11050}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E92F0AB0-E244-40C6-9622-D2D1D7C30FF1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E92F0AB0-E244-40C6-9622-D2D1D7C30FF1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E92F0AB0-E244-40C6-9622-D2D1D7C30FF1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E92F0AB0-E244-40C6-9622-D2D1D7C30FF1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E0E22C94-BFAC-4B97-A47B-663F04E11050}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E0E22C94-BFAC-4B97-A47B-663F04E11050}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E0E22C94-BFAC-4B97-A47B-663F04E11050}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E0E22C94-BFAC-4B97-A47B-663F04E11050}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
