@@ -7,18 +7,18 @@ namespace W3ChampionsChatService.Settings
     [Route("api/chat-settings")]
     public class ChatSettingsController : ControllerBase
     {
-        private readonly ChatSettingsRepository _chatSettingsRepository;
+        private readonly SettingsRepository _settingsRepository;
 
         public ChatSettingsController(
-            ChatSettingsRepository chatSettingsRepository)
+            SettingsRepository settingsRepository)
         {
-            _chatSettingsRepository = chatSettingsRepository;
+            _settingsRepository = settingsRepository;
         }
 
         [HttpGet("{battleTag}")]
         public async Task<IActionResult> GetMembership(string battleTag)
         {
-            var memberShip = await _chatSettingsRepository.Load(battleTag) ?? new ChatSettings(battleTag)
+            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag)
             {
                 DefaultChat = "W3C Lounge",
                 HideChat = false
@@ -27,12 +27,11 @@ namespace W3ChampionsChatService.Settings
         }
 
         [HttpPut("{battleTag}")]
-        // Todo Authorize with chat key
         public async Task<IActionResult> UpdateSettings(string battleTag, [FromBody] ChatSettingsDto settings)
         {
-            var memberShip = await _chatSettingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
+            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
             memberShip.Update(settings.DefaultChat, settings.HideChat);
-            await _chatSettingsRepository.Save(memberShip);
+            await _settingsRepository.Save(memberShip);
             return Ok(memberShip);
         }
     }

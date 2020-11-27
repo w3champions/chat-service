@@ -3,9 +3,9 @@ using MongoDB.Driver;
 
 namespace W3ChampionsChatService.Settings
 {
-    public class ChatSettingsRepository : MongoDbRepositoryBase
+    public class SettingsRepository : MongoDbRepositoryBase
     {
-        public ChatSettingsRepository(MongoClient mongoClient) : base(mongoClient)
+        public SettingsRepository(MongoClient mongoClient) : base(mongoClient)
         {
         }
 
