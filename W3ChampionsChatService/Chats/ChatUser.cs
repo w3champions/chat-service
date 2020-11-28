@@ -36,10 +36,4 @@ namespace W3ChampionsChatService.Chats
         Total = 16,
         Special = 32
     }
-
-    public class ChatDetailsDto
-    {
-        public string ClanId { get; set; }
-        public ProfilePicture ProfilePicture { get; set;}
-    }
 }

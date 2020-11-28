@@ -23,4 +23,10 @@ namespace W3ChampionsChatService.Chats
             return new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
         }
     }
+
+    public class ChatDetailsDto
+    {
+        public string ClanId { get; set; }
+        public ProfilePicture ProfilePicture { get; set;}
+    }
 }
