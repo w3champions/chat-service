@@ -120,7 +120,7 @@ namespace W3ChampionsChatService.Chats
 
                 await Clients.Caller.SendAsync("StartChat", new List<ChatUser>(), new List<ChatMessage>
                 {
-                    new ChatMessage(new ChatUser("error#123", "clanerror", new ProfilePicture()), e.Message)
+                    new ChatMessage(new ChatUser("error#123", "clanerror", new ProfilePicture()), $"{e.Message} STACK: {e.StackTrace}")
                 }, "error");
             }
 
