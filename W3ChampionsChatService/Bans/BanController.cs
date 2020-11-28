@@ -1,5 +1,6 @@
 ﻿using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
+using W3ChampionsChatService.Authentication;
 
 namespace W3ChampionsChatService.Bans
 {
@@ -15,14 +16,15 @@ namespace W3ChampionsChatService.Bans
             _banRepository = banRepository;
         }
 
-        [HttpGet("{battleTag}")]
-        public async Task<IActionResult> GetBan(string battleTag)
+        [HttpGet]
+        public async Task<IActionResult> GetBans()
         {
-            var ban = await _banRepository.Load(battleTag);
+            var ban = await _banRepository.LoadAll();
             return Ok(ban);
         }
 
         [HttpPut]
+        [CheckIfBattleTagIsAdmin]
         public async Task<IActionResult> SetBan([FromBody] ChatBan ban)
         {
             await _banRepository.Upsert(ban);
@@ -30,6 +32,7 @@ namespace W3ChampionsChatService.Bans
         }
 
         [HttpDelete("{battleTag}")]
+        [CheckIfBattleTagIsAdmin]
         public async Task<IActionResult> UpdateSettings(string battleTag)
         {
             await _banRepository.Delete(battleTag);
