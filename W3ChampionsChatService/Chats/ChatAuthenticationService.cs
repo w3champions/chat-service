@@ -8,7 +8,8 @@ namespace W3ChampionsChatService.Chats
 {
     public class ChatAuthenticationService : MongoDbRepositoryBase
     {
-        private static readonly string StatisticServiceApiUrl = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_URI") ?? "https://statistic-service.test.w3champions.com";
+        private static readonly string StatisticServiceApiUrl = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_URI") ?? "https://statistic-service-test.w3champions.com";
+
         public ChatAuthenticationService(MongoClient mongoClient) : base(mongoClient)
         {
         }
@@ -17,7 +18,8 @@ namespace W3ChampionsChatService.Chats
         {
             var httpClient = new HttpClient();
             httpClient.BaseAddress = new Uri(StatisticServiceApiUrl);
-            var result = await httpClient.GetAsync($"/api/player/{battleTag}/clan-and-picture");
+            var escapeDataString = Uri.EscapeDataString(battleTag);
+            var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
             var content = await result.Content.ReadAsStringAsync();
             var userDetails = JsonConvert.DeserializeObject<ChatDetailsDto>(content);
             return new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);

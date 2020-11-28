@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Bans;
+using W3ChampionsChatService.Settings;
 
 namespace W3ChampionsChatService.Chats
 {
@@ -9,17 +10,20 @@ namespace W3ChampionsChatService.Chats
     {
         private readonly ChatAuthenticationService _authenticationService;
         private readonly BanRepository _banRepository;
+        private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
 
         public ChatHub(
             ChatAuthenticationService authenticationService,
             BanRepository banRepository,
+            SettingsRepository settingsRepository,
             ConnectionMapping connections,
             ChatHistory chatHistory)
         {
             _authenticationService = authenticationService;
             _banRepository = banRepository;
+            _settingsRepository = settingsRepository;
             _connections = connections;
             _chatHistory = chatHistory;
         }
@@ -65,6 +69,10 @@ namespace W3ChampionsChatService.Chats
             await Clients.Group(oldRoom).SendAsync("UserLeft", user);
             await Clients.Group(chatRoom).SendAsync("UserEntered", user);
             await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom));
+
+            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
+            memberShip.Update(chatRoom);
+            await _settingsRepository.Save(memberShip);
         }
 
         public async Task LoginAs(string chatKey, string battleTag, string chatRoom)

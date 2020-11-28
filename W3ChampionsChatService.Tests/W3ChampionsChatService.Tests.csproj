@@ -16,7 +16,6 @@
 
     <ItemGroup>
         <ProjectReference Include="..\W3ChampionsChatService\W3ChampionsChatService.csproj" />
-        <ProjectReference Include="..\W3ChampionsStatisticService\W3ChampionsChatService.csproj" />
     </ItemGroup>
 
 </Project>

@@ -20,25 +20,9 @@ namespace W3ChampionsChatService.Settings
         {
             var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag)
             {
-                DefaultChat = "W3C Lounge",
-                HideChat = false
+                DefaultChat = "W3C Lounge"
             };
             return Ok(memberShip);
         }
-
-        [HttpPut("{battleTag}")]
-        public async Task<IActionResult> UpdateSettings(string battleTag, [FromBody] ChatSettingsDto settings)
-        {
-            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
-            memberShip.Update(settings.DefaultChat, settings.HideChat);
-            await _settingsRepository.Save(memberShip);
-            return Ok(memberShip);
-        }
-    }
-
-    public class ChatSettingsDto
-    {
-        public string DefaultChat { get; set; }
-        public bool? HideChat { get; set; }
     }
 }

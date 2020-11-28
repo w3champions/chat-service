@@ -11,12 +11,10 @@
 
         public string BattleTag { get; set; }
         public string DefaultChat { get; set; }
-        public bool? HideChat { get; set; }
 
-        public void Update(string defaultChat, bool? hideChat)
+        public void Update(string defaultChat)
         {
-            if (hideChat != null) HideChat = hideChat;
-            if (defaultChat != null) DefaultChat = defaultChat;
+            DefaultChat = defaultChat;
         }
     }
 }
