@@ -5,6 +5,7 @@
         public ChatSettings(string battleTag)
         {
             BattleTag = battleTag;
+            DefaultChat = "W3C Lounge";
         }
 
         public string Id => BattleTag;

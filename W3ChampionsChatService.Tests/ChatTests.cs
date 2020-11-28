@@ -41,9 +41,9 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task Login()
         {
-            await _chatHub.LoginAs("", "peter#123", "clan rbtv");
+            await _chatHub.LoginAs("", "peter#123");
 
-            var usersOfRoom = _connectionMapping.GetUsersOfRoom("clan rbtv");
+            var usersOfRoom = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             Assert.AreEqual(1, usersOfRoom.Count);
             Assert.AreEqual("peter", usersOfRoom[0].Name);
             Assert.AreEqual("peter#123", usersOfRoom[0].BattleTag);
@@ -52,11 +52,11 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task SwitchRoom()
         {
-            await _chatHub.LoginAs("", "peter#123", "clan rbtv");
+            await _chatHub.LoginAs("", "peter#123");
 
             await _chatHub.SwitchRoom("", "peter#123", "w3c");
 
-            var usersOfRoom1 = _connectionMapping.GetUsersOfRoom("clan rbtv");
+            var usersOfRoom1 = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             var usersOfRoom2 = _connectionMapping.GetUsersOfRoom("w3c");
             Assert.AreEqual(0, usersOfRoom1.Count);
             Assert.AreEqual(1, usersOfRoom2.Count);

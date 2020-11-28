@@ -68,16 +68,17 @@ namespace W3ChampionsChatService.Chats
             var usersOfRoom = _connections.GetUsersOfRoom(chatRoom);
             await Clients.Group(oldRoom).SendAsync("UserLeft", user);
             await Clients.Group(chatRoom).SendAsync("UserEntered", user);
-            await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom));
+            await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom), chatRoom);
 
             var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
             memberShip.Update(chatRoom);
             await _settingsRepository.Save(memberShip);
         }
 
-        public async Task LoginAs(string chatKey, string battleTag, string chatRoom)
+        public async Task LoginAs(string chatKey, string battleTag)
         {
             var user = await _authenticationService.GetUser(battleTag);
+            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
             var ban = await _banRepository.Load(battleTag.ToLower());
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
@@ -87,13 +88,13 @@ namespace W3ChampionsChatService.Chats
             }
             else
             {
-                _connections.Add(Context.ConnectionId, chatRoom, user);
-                await Groups.AddToGroupAsync(Context.ConnectionId, chatRoom);
+                _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
+                await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
 
-                var usersOfRoom = _connections.GetUsersOfRoom(chatRoom);
+                var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
 
-                await Clients.Group(chatRoom).SendAsync("UserEntered", user);
-                await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom));
+                await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
+                await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat);
             }
         }
     }
