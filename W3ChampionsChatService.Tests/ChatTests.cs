@@ -1,5 +1,6 @@
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Bans;
@@ -25,7 +26,8 @@ namespace W3ChampionsChatService.Tests
             _connectionMapping = new ConnectionMapping();
             _chatHistory = new ChatHistory();
             _settingsRepository = new SettingsRepository(MongoClient);
-            _chatHub = new ChatHub(_chatAuthenticationService, _banRepository, _settingsRepository,  _connectionMapping, _chatHistory);
+            _chatHub = new ChatHub(_chatAuthenticationService, _banRepository, _settingsRepository,
+            _connectionMapping, _chatHistory, NullLogger<ChatHub>.Instance);
 
             var clients = new Mock<IHubCallerClients>();
             clients.Setup(c => c.Group(It.IsAny<string>())).Returns(new Mock<IClientProxy>().Object);

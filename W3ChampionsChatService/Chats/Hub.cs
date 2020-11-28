@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Logging;
 using W3ChampionsChatService.Bans;
 using W3ChampionsChatService.Settings;
 
@@ -13,19 +14,22 @@ namespace W3ChampionsChatService.Chats
         private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
+        private readonly ILogger<ChatHub> _logger;
 
         public ChatHub(
             ChatAuthenticationService authenticationService,
             BanRepository banRepository,
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
-            ChatHistory chatHistory)
+            ChatHistory chatHistory,
+            ILogger<ChatHub> logger)
         {
             _authenticationService = authenticationService;
             _banRepository = banRepository;
             _settingsRepository = settingsRepository;
             _connections = connections;
             _chatHistory = chatHistory;
+            _logger = logger;
         }
 
         public async Task SendMessage(string chatKey, string battleTag, string message)
@@ -77,9 +81,17 @@ namespace W3ChampionsChatService.Chats
 
         public async Task LoginAs(string chatKey, string battleTag)
         {
+            _logger.LogInformation("login started");
             var user = await _authenticationService.GetUser(battleTag);
+            _logger.LogInformation("BT" + user.BattleTag);
+            _logger.LogInformation("CT" + user.ClanTag);
             var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
+            _logger.LogInformation("MBT" + memberShip.BattleTag);
+            _logger.LogInformation("DC" + memberShip.DefaultChat);
+
             var ban = await _banRepository.Load(battleTag.ToLower());
+            _logger.LogInformation("BT" + ban?.BattleTag);
+
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
             if (ban != null && string.Compare(ban.EndDate, nowDate, StringComparison.Ordinal) > 0)
@@ -88,12 +100,15 @@ namespace W3ChampionsChatService.Chats
             }
             else
             {
+                _logger.LogInformation("1");
                 _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
+                _logger.LogInformation("2");
                 await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
-
+                _logger.LogInformation("3");
                 var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
-
+                _logger.LogInformation("4");
                 await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
+                _logger.LogInformation("5");
                 await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat);
             }
         }
