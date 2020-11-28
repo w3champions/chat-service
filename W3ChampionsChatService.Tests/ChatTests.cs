@@ -27,7 +27,7 @@ namespace W3ChampionsChatService.Tests
             _chatHistory = new ChatHistory();
             _settingsRepository = new SettingsRepository(MongoClient);
             _chatHub = new ChatHub(_chatAuthenticationService, _banRepository, _settingsRepository,
-            _connectionMapping, _chatHistory, NullLogger<ChatHub>.Instance);
+            _connectionMapping, _chatHistory);
 
             var clients = new Mock<IHubCallerClients>();
             clients.Setup(c => c.Group(It.IsAny<string>())).Returns(new Mock<IClientProxy>().Object);

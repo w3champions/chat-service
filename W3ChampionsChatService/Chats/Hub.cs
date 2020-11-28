@@ -14,22 +14,18 @@ namespace W3ChampionsChatService.Chats
         private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
-        private readonly ILogger<ChatHub> _logger;
 
-        public ChatHub(
-            ChatAuthenticationService authenticationService,
+        public ChatHub(ChatAuthenticationService authenticationService,
             BanRepository banRepository,
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
-            ChatHistory chatHistory,
-            ILogger<ChatHub> logger)
+            ChatHistory chatHistory)
         {
             _authenticationService = authenticationService;
             _banRepository = banRepository;
             _settingsRepository = settingsRepository;
             _connections = connections;
             _chatHistory = chatHistory;
-            _logger = logger;
         }
 
         public async Task SendMessage(string chatKey, string battleTag, string message)
@@ -81,16 +77,16 @@ namespace W3ChampionsChatService.Chats
 
         public async Task LoginAs(string chatKey, string battleTag)
         {
-            _logger.LogInformation("login started");
+            Console.WriteLine("login started");
             var user = await _authenticationService.GetUser(battleTag);
-            _logger.LogInformation("BT" + user.BattleTag);
-            _logger.LogInformation("CT" + user.ClanTag);
+            Console.WriteLine("BT" + user.BattleTag);
+            Console.WriteLine("CT" + user.ClanTag);
             var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
-            _logger.LogInformation("MBT" + memberShip.BattleTag);
-            _logger.LogInformation("DC" + memberShip.DefaultChat);
+            Console.WriteLine("MBT" + memberShip.BattleTag);
+            Console.WriteLine("DC" + memberShip.DefaultChat);
 
             var ban = await _banRepository.Load(battleTag.ToLower());
-            _logger.LogInformation("BT" + ban?.BattleTag);
+            Console.WriteLine("BT" + ban?.BattleTag);
 
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
@@ -100,15 +96,15 @@ namespace W3ChampionsChatService.Chats
             }
             else
             {
-                _logger.LogInformation("1");
+                Console.WriteLine("1");
                 _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
-                _logger.LogInformation("2");
+                Console.WriteLine("2");
                 await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
-                _logger.LogInformation("3");
+                Console.WriteLine("3");
                 var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
-                _logger.LogInformation("4");
+                Console.WriteLine("4");
                 await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
-                _logger.LogInformation("5");
+                Console.WriteLine("5");
                 await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat);
             }
         }
