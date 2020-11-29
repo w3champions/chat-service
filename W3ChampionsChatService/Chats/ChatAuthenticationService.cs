@@ -16,13 +16,20 @@ namespace W3ChampionsChatService.Chats
 
         public async Task<ChatUser> GetUser(string battleTag)
         {
-            var httpClient = new HttpClient();
-            httpClient.BaseAddress = new Uri(StatisticServiceApiUrl);
-            var escapeDataString = Uri.EscapeDataString(battleTag);
-            var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
-            var content = await result.Content.ReadAsStringAsync();
-            var userDetails = JsonConvert.DeserializeObject<ChatDetailsDto>(content);
-            return new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
+            try
+            {
+                var httpClient = new HttpClient();
+                httpClient.BaseAddress = new Uri(StatisticServiceApiUrl);
+                var escapeDataString = Uri.EscapeDataString(battleTag);
+                var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
+                var content = await result.Content.ReadAsStringAsync();
+                var userDetails = JsonConvert.DeserializeObject<ChatDetailsDto>(content);
+                return new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
+            }
+            catch (Exception e)
+            {
+                return new ChatUser(battleTag, e.Message, null);
+            }
         }
     }
 

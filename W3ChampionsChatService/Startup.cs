@@ -31,11 +31,11 @@ namespace W3ChampionsChatService
 
             services.AddSingleton<ConnectionMapping>();
             services.AddSingleton<ChatHistory>();
-
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
         {
+            // without that, nginx forwarding in docker wont work
             app.UseForwardedHeaders(new ForwardedHeadersOptions
             {
                 ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto

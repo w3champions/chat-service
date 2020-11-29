@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using W3ChampionsChatService.Bans;
 using W3ChampionsChatService.Settings;
 
@@ -77,17 +79,10 @@ namespace W3ChampionsChatService.Chats
 
         public async Task LoginAs(string chatKey, string battleTag)
         {
-            Console.WriteLine("login started");
             var user = await _authenticationService.GetUser(battleTag);
-            Console.WriteLine("BT" + user.BattleTag);
-            Console.WriteLine("CT" + user.ClanTag);
             var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
-            Console.WriteLine("MBT" + memberShip.BattleTag);
-            Console.WriteLine("DC" + memberShip.DefaultChat);
 
             var ban = await _banRepository.Load(battleTag.ToLower());
-            Console.WriteLine("BT" + ban?.BattleTag);
-
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
             if (ban != null && string.Compare(ban.EndDate, nowDate, StringComparison.Ordinal) > 0)
@@ -96,15 +91,10 @@ namespace W3ChampionsChatService.Chats
             }
             else
             {
-                Console.WriteLine("1");
                 _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
-                Console.WriteLine("2");
                 await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
-                Console.WriteLine("3");
                 var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
-                Console.WriteLine("4");
                 await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
-                Console.WriteLine("5");
                 await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat);
             }
         }
