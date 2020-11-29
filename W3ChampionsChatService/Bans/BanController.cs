@@ -1,4 +1,5 @@
-﻿using System.Threading.Tasks;
+﻿using System.Collections.Generic;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using W3ChampionsChatService.Authentication;
 
@@ -20,7 +21,7 @@ namespace W3ChampionsChatService.Bans
         public async Task<IActionResult> GetBans()
         {
             var ban = await _banRepository.LoadAll();
-            return Ok(ban);
+            return Ok(new BanResponse(ban));
         }
 
         [HttpPut]
@@ -37,6 +38,17 @@ namespace W3ChampionsChatService.Bans
         {
             await _banRepository.Delete(battleTag);
             return Ok();
+        }
+    }
+
+    public class BanResponse
+    {
+        public List<ChatBan> Players { get; }
+        public int total => Players.Count;
+
+        public BanResponse(List<ChatBan> players)
+        {
+            Players = players;
         }
     }
 }
