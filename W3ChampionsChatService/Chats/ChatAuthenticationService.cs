@@ -26,9 +26,9 @@ namespace W3ChampionsChatService.Chats
                 var userDetails = JsonConvert.DeserializeObject<ChatDetailsDto>(content);
                 return new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
             }
-            catch (Exception e)
+            catch (Exception)
             {
-                return new ChatUser(battleTag, e.Message, null);
+                return new ChatUser(battleTag, null, null);
             }
         }
     }
