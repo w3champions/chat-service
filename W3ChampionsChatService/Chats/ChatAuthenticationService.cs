@@ -28,7 +28,7 @@ namespace W3ChampionsChatService.Chats
             }
             catch (Exception)
             {
-                return new ChatUser(battleTag, null, null);
+                return new ChatUser(battleTag, null, new ProfilePicture());
             }
         }
     }
