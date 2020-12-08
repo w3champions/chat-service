@@ -1,9 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using W3ChampionsChatService.Bans;
 using W3ChampionsChatService.Settings;
 
@@ -11,13 +8,14 @@ namespace W3ChampionsChatService.Chats
 {
     public class ChatHub : Hub
     {
-        private readonly ChatAuthenticationService _authenticationService;
+        private readonly IChatAuthenticationService _authenticationService;
         private readonly BanRepository _banRepository;
         private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
 
-        public ChatHub(ChatAuthenticationService authenticationService,
+        public ChatHub(
+            IChatAuthenticationService authenticationService,
             BanRepository banRepository,
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
@@ -30,10 +28,10 @@ namespace W3ChampionsChatService.Chats
             _chatHistory = chatHistory;
         }
 
-        public async Task SendMessage(string chatKey, string battleTag, string message)
+        public async Task SendMessage(string chatKey, string message)
         {
             var trimmedMessage = message.Trim();
-            var user = await _authenticationService.GetUser(battleTag);
+            var user = await _authenticationService.GetUser(chatKey);
             if (!string.IsNullOrEmpty(trimmedMessage))
             {
                 var chatRoom = _connections.GetRoom(Context.ConnectionId);
@@ -56,9 +54,9 @@ namespace W3ChampionsChatService.Chats
             await base.OnDisconnectedAsync(exception);
         }
 
-        public async Task SwitchRoom(string chatKey, string battleTag, string chatRoom)
+        public async Task SwitchRoom(string chatKey, string chatRoom)
         {
-            var user = await _authenticationService.GetUser(battleTag);
+            var user = await _authenticationService.GetUser(chatKey);
 
             var oldRoom = _connections.GetRoom(Context.ConnectionId);
             _connections.Remove(Context.ConnectionId);
@@ -72,17 +70,17 @@ namespace W3ChampionsChatService.Chats
             await Clients.Group(chatRoom).SendAsync("UserEntered", user);
             await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom), chatRoom);
 
-            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
+            var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
             memberShip.Update(chatRoom);
             await _settingsRepository.Save(memberShip);
         }
 
-        public async Task LoginAs(string chatKey, string battleTag)
+        public async Task LoginAs(string chatKey)
         {
-            var user = await _authenticationService.GetUser(battleTag);
-            var memberShip = await _settingsRepository.Load(battleTag) ?? new ChatSettings(battleTag);
+            var user = await _authenticationService.GetUser(chatKey);
+            var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
 
-            var ban = await _banRepository.Load(battleTag.ToLower());
+            var ban = await _banRepository.Load(user.BattleTag.ToLower());
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
             if (ban != null && string.Compare(ban.EndDate, nowDate, StringComparison.Ordinal) > 0)

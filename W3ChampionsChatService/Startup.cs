@@ -24,13 +24,14 @@ namespace W3ChampionsChatService
             services.AddSignalR();
 
             services.AddTransient<SettingsRepository>();
-            services.AddTransient<ChatAuthenticationService>();
+            services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
             services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
             services.AddTransient<BanRepository>();
             services.AddTransient<CheckIfBattleTagIsAdminFilter>();
 
             services.AddSingleton<ConnectionMapping>();
             services.AddSingleton<ChatHistory>();
+            services.AddSingleton<TokenCache>();
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
