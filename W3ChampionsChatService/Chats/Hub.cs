@@ -80,7 +80,7 @@ namespace W3ChampionsChatService.Chats
             var user = await _authenticationService.GetUser(chatKey);
             var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
 
-            var ban = await _banRepository.Load(user.BattleTag.ToLower());
+            var ban = await _banRepository.Load(user.BattleTag);
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
             if (ban != null && string.Compare(ban.EndDate, nowDate, StringComparison.Ordinal) > 0)
