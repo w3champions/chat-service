@@ -1,41 +1,44 @@
 ﻿using System;
-using System.Net.Http;
 using System.Threading.Tasks;
 using MongoDB.Driver;
-using Newtonsoft.Json;
+using W3ChampionsChatService.Authentication;
 
 namespace W3ChampionsChatService.Chats
 {
-    public class ChatAuthenticationService : MongoDbRepositoryBase
+    public interface IChatAuthenticationService
     {
-        private static readonly string StatisticServiceApiUrl = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_URI") ?? "https://statistic-service-test.w3champions.com";
+        Task<ChatUser> GetUser(string chatKey);
+    }
 
-        public ChatAuthenticationService(MongoClient mongoClient) : base(mongoClient)
+    public class ChatAuthenticationService : MongoDbRepositoryBase, IChatAuthenticationService
+    {
+        private readonly IW3CAuthenticationService _authenticationService;
+        private readonly IWebsiteBackendRepository _websiteBackendRepository;
+
+        public ChatAuthenticationService(
+            MongoClient mongoClient,
+            IW3CAuthenticationService authenticationService,
+            IWebsiteBackendRepository websiteBackendRepository
+            ) : base(mongoClient)
         {
+            _authenticationService = authenticationService;
+            _websiteBackendRepository = websiteBackendRepository;
         }
 
-        public async Task<ChatUser> GetUser(string battleTag)
+        public async Task<ChatUser> GetUser(string chatKey)
         {
             try
             {
-                var httpClient = new HttpClient();
-                httpClient.BaseAddress = new Uri(StatisticServiceApiUrl);
-                var escapeDataString = Uri.EscapeDataString(battleTag);
-                var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
-                var content = await result.Content.ReadAsStringAsync();
-                var userDetails = JsonConvert.DeserializeObject<ChatDetailsDto>(content);
-                return new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
+                var user = await _authenticationService.GetUserByToken(chatKey);
+                if (user == null) return null;
+                var userDetails = await _websiteBackendRepository.GetChatDetails(user.BattleTag);
+                return new ChatUser(user.BattleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
             }
             catch (Exception)
             {
-                return new ChatUser(battleTag, null, new ProfilePicture());
+                return null;
             }
         }
-    }
 
-    public class ChatDetailsDto
-    {
-        public string ClanId { get; set; }
-        public ProfilePicture ProfilePicture { get; set;}
     }
 }

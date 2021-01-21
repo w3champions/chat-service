@@ -17,20 +17,22 @@ namespace W3ChampionsChatService
         {
             services.AddControllers();
 
-            var mongoConnectionString = Environment.GetEnvironmentVariable("MONGO_CONNECTION_STRING") ?? "mongodb://176.28.16.249:3513";
+            var mongoConnectionString = Environment.GetEnvironmentVariable("MONGO_CONNECTION_STRING") ?? "mongodb://157.90.1.251:3513";
             var mongoClient = new MongoClient(mongoConnectionString.Replace("'", ""));
             services.AddSingleton(mongoClient);
 
             services.AddSignalR();
 
             services.AddTransient<SettingsRepository>();
-            services.AddTransient<ChatAuthenticationService>();
+            services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
             services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
+            services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
             services.AddTransient<BanRepository>();
             services.AddTransient<CheckIfBattleTagIsAdminFilter>();
 
             services.AddSingleton<ConnectionMapping>();
             services.AddSingleton<ChatHistory>();
+            services.AddSingleton<TokenCache>();
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)

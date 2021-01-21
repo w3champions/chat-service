@@ -1,6 +1,5 @@
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
-using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Bans;
@@ -12,7 +11,7 @@ namespace W3ChampionsChatService.Tests
     public class ChatTests : IntegrationTestBase
     {
         private ChatHub _chatHub;
-        private ChatAuthenticationService _chatAuthenticationService;
+        private IChatAuthenticationService _chatAuthenticationService;
         private BanRepository _banRepository;
         private ConnectionMapping _connectionMapping;
         private ChatHistory _chatHistory;
@@ -21,7 +20,10 @@ namespace W3ChampionsChatService.Tests
         [SetUp]
         public void SetupHere()
         {
-            _chatAuthenticationService = new ChatAuthenticationService(MongoClient);
+            var chatAuthenticationService = new Mock<IChatAuthenticationService>();
+            chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
+                .ReturnsAsync(new ChatUser("peter#123", "AB", new ProfilePicture()));
+            _chatAuthenticationService = chatAuthenticationService.Object;
             _banRepository = new BanRepository(MongoClient);
             _connectionMapping = new ConnectionMapping();
             _chatHistory = new ChatHistory();
@@ -43,7 +45,7 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task Login()
         {
-            await _chatHub.LoginAs("", "peter#123");
+            await _chatHub.LoginAs("key");
 
             var usersOfRoom = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             Assert.AreEqual(1, usersOfRoom.Count);
@@ -54,9 +56,9 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task SwitchRoom()
         {
-            await _chatHub.LoginAs("", "peter#123");
+            await _chatHub.LoginAs("key");
 
-            await _chatHub.SwitchRoom("", "peter#123", "w3c");
+            await _chatHub.SwitchRoom("peter#123", "w3c");
 
             var usersOfRoom1 = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             var usersOfRoom2 = _connectionMapping.GetUsersOfRoom("w3c");
