@@ -16,7 +16,7 @@ namespace W3ChampionsChatService.Chats
     {
         private readonly IW3CAuthenticationService _authenticationService;
 
-        private static readonly string StatisticServiceApiUrl = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_URI") ?? "https://statistic-service-test.w3champions.com";
+        private static readonly string StatisticServiceApiUrl = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_URI") ?? "https://statistic-service.test.w3champions.com";
 
         public ChatAuthenticationService(MongoClient mongoClient, IW3CAuthenticationService authenticationService) : base(mongoClient)
         {
