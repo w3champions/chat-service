@@ -31,9 +31,9 @@ namespace W3ChampionsChatService.Chats
         public async Task SendMessage(string chatKey, string message)
         {
             var trimmedMessage = message.Trim();
-            var user = await _authenticationService.GetUser(chatKey);
             if (!string.IsNullOrEmpty(trimmedMessage))
             {
+                var user = await _authenticationService.GetUser(chatKey);
                 var chatRoom = _connections.GetRoom(Context.ConnectionId);
                 var chatMessage = new ChatMessage(user, trimmedMessage);
                 _chatHistory.AddMessage(chatRoom, chatMessage);
