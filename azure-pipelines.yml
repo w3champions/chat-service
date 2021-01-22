@@ -34,4 +34,3 @@ steps:
     buildContext: '.'
     tags: |
       $(Build.BuildID)
-      latest
