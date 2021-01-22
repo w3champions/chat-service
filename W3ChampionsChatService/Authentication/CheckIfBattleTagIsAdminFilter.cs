@@ -24,7 +24,7 @@ namespace W3ChampionsChatService.Authentication
                 if (
                     res != null
                     && !string.IsNullOrEmpty(res.BattleTag)
-                    && res.isAdmin)
+                    && res.IsAdmin)
                 {
                     context.ActionArguments["battleTag"] = res.BattleTag;
                     await next.Invoke();

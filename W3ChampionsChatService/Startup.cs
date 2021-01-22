@@ -33,7 +33,6 @@ namespace W3ChampionsChatService
 
             services.AddSingleton<ConnectionMapping>();
             services.AddSingleton<ChatHistory>();
-            services.AddSingleton<TokenCache>();
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
