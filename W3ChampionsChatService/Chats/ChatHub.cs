@@ -55,6 +55,7 @@ namespace W3ChampionsChatService.Chats
             if (user == null)
             {
                 await Clients.Caller.SendAsync("AuthorizationFailed");
+                Context.Abort();
                 return;
             }
 
@@ -106,6 +107,7 @@ namespace W3ChampionsChatService.Chats
             if (ban != null && string.Compare(ban.EndDate, nowDate, StringComparison.Ordinal) > 0)
             {
                 await Clients.Caller.SendAsync("PlayerBannedFromChat", ban);
+                Context.Abort();
             }
             else
             {
