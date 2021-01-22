@@ -1,9 +1,12 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Bans;
 using W3ChampionsChatService.Settings;
 
+[assembly:InternalsVisibleTo("W3ChampionsChatService.Tests")]
 namespace W3ChampionsChatService.Chats
 {
     public class ChatHub : Hub
@@ -13,32 +16,50 @@ namespace W3ChampionsChatService.Chats
         private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
+        private readonly IHttpContextAccessor _contextAccessor;
 
         public ChatHub(
             IChatAuthenticationService authenticationService,
             BanRepository banRepository,
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
-            ChatHistory chatHistory)
+            ChatHistory chatHistory,
+            IHttpContextAccessor contextAccessor)
         {
             _authenticationService = authenticationService;
             _banRepository = banRepository;
             _settingsRepository = settingsRepository;
             _connections = connections;
             _chatHistory = chatHistory;
+            _contextAccessor = contextAccessor;
         }
 
-        public async Task SendMessage(string chatKey, string message)
+        public async Task SendMessage(string message)
         {
             var trimmedMessage = message.Trim();
             if (!string.IsNullOrEmpty(trimmedMessage))
             {
-                var user = await _authenticationService.GetUser(chatKey);
                 var chatRoom = _connections.GetRoom(Context.ConnectionId);
+                var user = _connections.GetUser(Context.ConnectionId);
+
                 var chatMessage = new ChatMessage(user, trimmedMessage);
                 _chatHistory.AddMessage(chatRoom, chatMessage);
                 await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
             }
+        }
+
+        public override async Task OnConnectedAsync()
+        {
+            var accesToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
+            var user = await _authenticationService.GetUser(accesToken);
+            if (user == null)
+            {
+                await Clients.Caller.SendAsync("AuthorizationFailed");
+                return;
+            }
+
+            await LoginAs(user);
+            await base.OnConnectedAsync();
         }
 
         public override async Task OnDisconnectedAsync(Exception exception)
@@ -54,11 +75,11 @@ namespace W3ChampionsChatService.Chats
             await base.OnDisconnectedAsync(exception);
         }
 
-        public async Task SwitchRoom(string chatKey, string chatRoom)
+        public async Task SwitchRoom(string chatRoom)
         {
-            var user = await _authenticationService.GetUser(chatKey);
-
             var oldRoom = _connections.GetRoom(Context.ConnectionId);
+            var user = _connections.GetUser(Context.ConnectionId);
+
             _connections.Remove(Context.ConnectionId);
             _connections.Add(Context.ConnectionId, chatRoom, user);
 
@@ -75,9 +96,8 @@ namespace W3ChampionsChatService.Chats
             await _settingsRepository.Save(memberShip);
         }
 
-        public async Task LoginAs(string chatKey)
+        internal async Task LoginAs(ChatUser user)
         {
-            var user = await _authenticationService.GetUser(chatKey);
             var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
 
             var ban = await _banRepository.Load(user.BattleTag);

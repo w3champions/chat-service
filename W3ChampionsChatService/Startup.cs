@@ -29,6 +29,7 @@ namespace W3ChampionsChatService
             services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
             services.AddTransient<BanRepository>();
             services.AddTransient<CheckIfBattleTagIsAdminFilter>();
+            services.AddHttpContextAccessor();
 
             services.AddSingleton<ConnectionMapping>();
             services.AddSingleton<ChatHistory>();

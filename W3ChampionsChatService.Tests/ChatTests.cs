@@ -29,7 +29,7 @@ namespace W3ChampionsChatService.Tests
             _chatHistory = new ChatHistory();
             _settingsRepository = new SettingsRepository(MongoClient);
             _chatHub = new ChatHub(_chatAuthenticationService, _banRepository, _settingsRepository,
-            _connectionMapping, _chatHistory);
+            _connectionMapping, _chatHistory, null);
 
             var clients = new Mock<IHubCallerClients>();
             clients.Setup(c => c.Group(It.IsAny<string>())).Returns(new Mock<IClientProxy>().Object);
@@ -45,7 +45,7 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task Login()
         {
-            await _chatHub.LoginAs("key");
+            await _chatHub.LoginAs(new ChatUser("peter#123", "[123]", new ProfilePicture()));
 
             var usersOfRoom = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             Assert.AreEqual(1, usersOfRoom.Count);
@@ -56,9 +56,9 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task SwitchRoom()
         {
-            await _chatHub.LoginAs("key");
+            await _chatHub.LoginAs(new ChatUser("peter#123", "[123]", new ProfilePicture()));
 
-            await _chatHub.SwitchRoom("peter#123", "w3c");
+            await _chatHub.SwitchRoom("w3c");
 
             var usersOfRoom1 = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             var usersOfRoom2 = _connectionMapping.GetUsersOfRoom("w3c");
