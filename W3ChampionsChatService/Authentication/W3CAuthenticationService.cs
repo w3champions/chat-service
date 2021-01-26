@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -8,19 +9,32 @@ namespace W3ChampionsChatService.Authentication
 {
     public class W3CAuthenticationService : IW3CAuthenticationService
     {
+        private readonly TokenCache _tokenCache;
+
+        public W3CAuthenticationService(TokenCache tokenCache)
+        {
+            _tokenCache = tokenCache;
+        }
+
         private static readonly string IdentificationApiUrl = Environment.GetEnvironmentVariable("IDENTIFICATION_SERVICE_URI") ?? "https://identification-service.test.w3champions.com";
 
-        public async Task<W3CUserAuthenticationDto> GetUserByToken(string bearer)
+        public async Task<W3CUserAuthenticationDto> GetUserByToken(string jwt)
         {
             try
             {
+                if (_tokenCache.TryGetValue(jwt, out var user))
+                {
+                    return user;
+                }
+
                 var httpClient = new HttpClient();
                 httpClient.BaseAddress = new Uri(IdentificationApiUrl);
-                var result = await httpClient.GetAsync($"/api/oauth/user-info?jwt={bearer}");
+                var result = await httpClient.GetAsync($"/api/oauth/user-info?jwt={jwt}");
                 if (result.IsSuccessStatusCode)
                 {
                     var content = await result.Content.ReadAsStringAsync();
                     var deserializeObject = JsonConvert.DeserializeObject<W3CUserAuthenticationDto>(content);
+                    _tokenCache.AddOrUpdate(jwt, deserializeObject, (s, dto) => dto);
                     return deserializeObject;
                 }
 
@@ -33,9 +47,13 @@ namespace W3ChampionsChatService.Authentication
         }
     }
 
+    public class TokenCache : ConcurrentDictionary<string, W3CUserAuthenticationDto>
+    {
+    }
+
     public interface IW3CAuthenticationService
     {
-        Task<W3CUserAuthenticationDto> GetUserByToken(string bearer);
+        Task<W3CUserAuthenticationDto> GetUserByToken(string jwt);
     }
 
     public class W3CUserAuthenticationDto

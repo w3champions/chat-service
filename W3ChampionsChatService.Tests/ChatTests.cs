@@ -2,6 +2,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Bans;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Settings;
@@ -69,6 +70,24 @@ namespace W3ChampionsChatService.Tests
 
             var setting = await _settingsRepository.Load("peter#123");
             Assert.AreEqual(setting.DefaultChat, "w3c");
+        }
+
+        [Test]
+        public async Task GetTokenWithCache()
+        {
+            var tokenCache = new TokenCache();
+
+            var w3CAuthenticationService = new W3CAuthenticationService(tokenCache);
+            var userByToken1 = await w3CAuthenticationService.GetUserByToken("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJOYW1lIjoibW9kbW90byIsIklzQWRtaW4iOnRydWV9.YcBM_2081QPZYlVzD72rqZdX4bqxkl8TlFnpRFPbUvo");
+
+            Assert.AreEqual(1, tokenCache.Keys.Count);
+
+            var userByToken2 = await w3CAuthenticationService.GetUserByToken("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJOYW1lIjoibW9kbW90byIsIklzQWRtaW4iOnRydWV9.YcBM_2081QPZYlVzD72rqZdX4bqxkl8TlFnpRFPbUvo");
+
+            Assert.AreEqual(1, tokenCache.Keys.Count);
+
+            Assert.AreEqual("modmoto#2809", userByToken1.BattleTag);
+            Assert.AreEqual("modmoto#2809", userByToken2.BattleTag);
         }
     }
 }

@@ -26,6 +26,7 @@ namespace W3ChampionsChatService
             services.AddTransient<SettingsRepository>();
             services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
             services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
+            services.AddSingleton<TokenCache>();
             services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
             services.AddTransient<BanRepository>();
             services.AddTransient<CheckIfBattleTagIsAdminFilter>();
