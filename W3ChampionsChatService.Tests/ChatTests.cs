@@ -17,6 +17,7 @@ namespace W3ChampionsChatService.Tests
         private ConnectionMapping _connectionMapping;
         private ChatHistory _chatHistory;
         private SettingsRepository _settingsRepository;
+        private string _jwt = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJOYW1lIjoibW9kbW90byIsIklzQWRtaW4iOnRydWV9.C8mPpDK2sNIO8tUQJ1rOAYnDgG-Ydmrv60-5t4gZrgYFnJ7Qaivu6_SjulpJAU8wFQ5sGkrkvQTUs9S7wJmJelY75rB2bnxYdw-_4N9IZe_gOwLtaAsjB4Ix4xvf1hO-EHSrnh3X3aiywJd1N8reS2MIsj7ceMtuaB0moOsP11qSIwHKPVmaWPwVLcgeyuBUI5Q8Ui0Ot-EPt8Z7jJis-GOWGXzllosaxcYF5rW2IhTNTq8XLVjN48LLEqhjZDuAWs9ju76kYpVMq83XvgFi9VOwfPPCXNiHBleWrrYEj2fS654uCYI9P1lmeyPzIPj9XUKuWq3MAbZ4HiB8KPi5sQ";
 
         [SetUp]
         public void SetupHere()
@@ -78,11 +79,11 @@ namespace W3ChampionsChatService.Tests
             var tokenCache = new TokenCache();
 
             var w3CAuthenticationService = new W3CAuthenticationService(tokenCache);
-            var userByToken1 = await w3CAuthenticationService.GetUserByToken("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJOYW1lIjoibW9kbW90byIsIklzQWRtaW4iOnRydWV9.YcBM_2081QPZYlVzD72rqZdX4bqxkl8TlFnpRFPbUvo");
+            var userByToken1 = await w3CAuthenticationService.GetUserByToken(_jwt);
 
             Assert.AreEqual(1, tokenCache.Keys.Count);
 
-            var userByToken2 = await w3CAuthenticationService.GetUserByToken("eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJOYW1lIjoibW9kbW90byIsIklzQWRtaW4iOnRydWV9.YcBM_2081QPZYlVzD72rqZdX4bqxkl8TlFnpRFPbUvo");
+            var userByToken2 = await w3CAuthenticationService.GetUserByToken(_jwt);
 
             Assert.AreEqual(1, tokenCache.Keys.Count);
 
