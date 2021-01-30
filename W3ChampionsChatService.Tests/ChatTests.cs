@@ -17,7 +17,7 @@ namespace W3ChampionsChatService.Tests
         private ConnectionMapping _connectionMapping;
         private ChatHistory _chatHistory;
         private SettingsRepository _settingsRepository;
-        private string _jwt = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJOYW1lIjoibW9kbW90byIsIklzQWRtaW4iOnRydWV9.C8mPpDK2sNIO8tUQJ1rOAYnDgG-Ydmrv60-5t4gZrgYFnJ7Qaivu6_SjulpJAU8wFQ5sGkrkvQTUs9S7wJmJelY75rB2bnxYdw-_4N9IZe_gOwLtaAsjB4Ix4xvf1hO-EHSrnh3X3aiywJd1N8reS2MIsj7ceMtuaB0moOsP11qSIwHKPVmaWPwVLcgeyuBUI5Q8Ui0Ot-EPt8Z7jJis-GOWGXzllosaxcYF5rW2IhTNTq8XLVjN48LLEqhjZDuAWs9ju76kYpVMq83XvgFi9VOwfPPCXNiHBleWrrYEj2fS654uCYI9P1lmeyPzIPj9XUKuWq3MAbZ4HiB8KPi5sQ";
+        private string _jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJCYXR0bGVUYWciOiJtb2Rtb3RvIzI4MDkiLCJJc0FkbWluIjoiVHJ1ZSIsIk5hbWUiOiJtb2Rtb3RvIn0.Y4xe1wqRceSdJW2evar5LFVsWfixZUUQtWWckehnkNwVpGiNIzQb90GP30fzOFt9GKUXO7ADNuy4ss8tTNxlvSiYmkT9Ulx1-ve64WO8SYJUBwFVqPorBrunz628tFyf4t1YMt_q_lfbVuQc1WdJiNVqFy1FNzkWENW-GsZbJB-shrCIVj9qp_MtP7MC0Bata7XCjTszlZnVAJUh7-iBPlUhSg8405U5aHkGpPzjLRgQtlGm6s8F1lYOyIzT-rCCvAI_dVI3F4ee6cjS0MbY9m8KPjloOx2NJGKvbwE0dAKBszKbQ7Ic3zr6yCvj-FBt82VmAaDan7pzXJLyZcSnFbikhsKSjLzcAXw1fP_I-FhEIvS-9vysWmXx9uNF91cDlXvdZZo57gV7o6vS4CgXscvpwiPQ9KnKsQA3Ezn61snZoXjGKspiTI_yblC4zLPHm-s40RmPOI_9TwxaiOurl6GjZk1uNY5dm7cGQjh4QWbha8CkllAmgknKOfQw9Mj7TvEKukkFetKF96jOjnqBFQUVXM8YL8K9rzATEy45vkPbfTs7MP9dHUVyEUYfD-HoYMpexEkPRwpCsLty2VfDmIV9Jkj3yOh3ybeKgv7N3Dh8ROx2lxSnqZhyc5HfE_AsnjaLTq2SvEqJ4ndYtYH9rVIARx0p_gPBZF9kAl-Nb2M";
 
         [SetUp]
         public void SetupHere()
@@ -74,21 +74,12 @@ namespace W3ChampionsChatService.Tests
         }
 
         [Test]
-        public async Task GetTokenWithCache()
+        public void GetToken()
         {
-            var tokenCache = new TokenCache();
-
-            var w3CAuthenticationService = new W3CAuthenticationService(tokenCache);
-            var userByToken1 = await w3CAuthenticationService.GetUserByToken(_jwt);
-
-            Assert.AreEqual(1, tokenCache.Keys.Count);
-
-            var userByToken2 = await w3CAuthenticationService.GetUserByToken(_jwt);
-
-            Assert.AreEqual(1, tokenCache.Keys.Count);
+            var w3CAuthenticationService = new W3CAuthenticationService();
+            var userByToken1 = w3CAuthenticationService.GetUserByToken(_jwt);
 
             Assert.AreEqual("modmoto#2809", userByToken1.BattleTag);
-            Assert.AreEqual("modmoto#2809", userByToken2.BattleTag);
         }
     }
 }

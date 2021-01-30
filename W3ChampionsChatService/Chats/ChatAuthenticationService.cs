@@ -29,7 +29,7 @@ namespace W3ChampionsChatService.Chats
         {
             try
             {
-                var user = await _authenticationService.GetUserByToken(chatKey);
+                var user = _authenticationService.GetUserByToken(chatKey);
                 if (user == null) return null;
                 var userDetails = await _websiteBackendRepository.GetChatDetails(user.BattleTag);
                 return new ChatUser(user.BattleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
