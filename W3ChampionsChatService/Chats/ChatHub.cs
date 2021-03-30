@@ -17,6 +17,7 @@ namespace W3ChampionsChatService.Chats
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
         private readonly IHttpContextAccessor _contextAccessor;
+        private readonly IWebsiteBackendRepository _websiteBackendRepository;
 
         public ChatHub(
             IChatAuthenticationService authenticationService,
@@ -24,7 +25,8 @@ namespace W3ChampionsChatService.Chats
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
             ChatHistory chatHistory,
-            IHttpContextAccessor contextAccessor)
+            IHttpContextAccessor contextAccessor,
+            IWebsiteBackendRepository websiteBackendRepository)
         {
             _authenticationService = authenticationService;
             _banRepository = banRepository;
@@ -32,6 +34,7 @@ namespace W3ChampionsChatService.Chats
             _connections = connections;
             _chatHistory = chatHistory;
             _contextAccessor = contextAccessor;
+            _websiteBackendRepository = websiteBackendRepository;
         }
 
         public async Task SendMessage(string message)
@@ -98,7 +101,15 @@ namespace W3ChampionsChatService.Chats
             await _settingsRepository.Save(memberShip);
         }
 
-        internal async Task LoginAs(ChatUser user)
+        // this is the workaround without key, remove when authentication is released
+        public async Task LoginAs(string nada, string battleTag)
+        {
+            var userDetails = await _websiteBackendRepository.GetChatDetails(battleTag);
+            var chatUser = new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
+            await LoginAsAuthenticated(chatUser);
+        }
+
+        internal async Task LoginAsAuthenticated(ChatUser user)
         {
             var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
 
