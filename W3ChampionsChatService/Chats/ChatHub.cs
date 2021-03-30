@@ -37,7 +37,9 @@ namespace W3ChampionsChatService.Chats
             _websiteBackendRepository = websiteBackendRepository;
         }
 
-        public async Task SendMessage(string message)
+        // use this signature for auth solution
+        // public async Task SendMessage(string message)
+        public async Task SendMessage(string chatKey, string battleTag, string message)
         {
             var trimmedMessage = message.Trim();
             if (!string.IsNullOrEmpty(trimmedMessage))
@@ -80,7 +82,9 @@ namespace W3ChampionsChatService.Chats
             await base.OnDisconnectedAsync(exception);
         }
 
-        public async Task SwitchRoom(string chatRoom)
+        // use this signature for auth solution
+        // public async Task SwitchRoom(string chatRoom)
+        public async Task SwitchRoom(string chatKey, string battleTag, string chatRoom)
         {
             var oldRoom = _connections.GetRoom(Context.ConnectionId);
             var user = _connections.GetUser(Context.ConnectionId);
@@ -102,7 +106,7 @@ namespace W3ChampionsChatService.Chats
         }
 
         // this is the workaround without key, remove when authentication is released
-        public async Task LoginAs(string nada, string battleTag)
+        public async Task LoginAs(string deprecatedKey, string battleTag)
         {
             var userDetails = await _websiteBackendRepository.GetChatDetails(battleTag);
             var chatUser = new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
