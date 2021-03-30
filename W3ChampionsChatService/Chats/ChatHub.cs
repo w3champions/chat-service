@@ -12,7 +12,7 @@ namespace W3ChampionsChatService.Chats
     public class ChatHub : Hub
     {
         private readonly IChatAuthenticationService _authenticationService;
-        private readonly BanRepository _banRepository;
+        private readonly IBanRepository _banRepository;
         private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
@@ -20,7 +20,7 @@ namespace W3ChampionsChatService.Chats
 
         public ChatHub(
             IChatAuthenticationService authenticationService,
-            BanRepository banRepository,
+            IBanRepository banRepository,
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
             ChatHistory chatHistory,
@@ -48,20 +48,21 @@ namespace W3ChampionsChatService.Chats
             }
         }
 
-        public override async Task OnConnectedAsync()
-        {
-            var accesToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
-            var user = await _authenticationService.GetUser(accesToken);
-            if (user == null)
-            {
-                await Clients.Caller.SendAsync("AuthorizationFailed");
-                Context.Abort();
-                return;
-            }
-
-            await LoginAs(user);
-            await base.OnConnectedAsync();
-        }
+        // add this back, wenn the client send the jwt to login
+        // public override async Task OnConnectedAsync()
+        // {
+        //     var accesToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
+        //     var user = await _authenticationService.GetUser(accesToken);
+        //     if (user == null)
+        //     {
+        //         await Clients.Caller.SendAsync("AuthorizationFailed");
+        //         Context.Abort();
+        //         return;
+        //     }
+        //
+        //     await LoginAs(user);
+        //     await base.OnConnectedAsync();
+        // }
 
         public override async Task OnDisconnectedAsync(Exception exception)
         {
@@ -101,7 +102,7 @@ namespace W3ChampionsChatService.Chats
         {
             var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
 
-            var ban = await _banRepository.Load(user.BattleTag);
+            var ban = await _banRepository.GetBannedPlayer(user.BattleTag);
 
             var nowDate = DateTime.Now.ToString("yyyy-MM-dd");
             if (ban != null && string.Compare(ban.EndDate, nowDate, StringComparison.Ordinal) > 0)

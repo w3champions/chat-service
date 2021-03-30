@@ -13,7 +13,7 @@ namespace W3ChampionsChatService.Tests
     {
         private ChatHub _chatHub;
         private IChatAuthenticationService _chatAuthenticationService;
-        private BanRepository _banRepository;
+        private IBanRepository _banRepository;
         private ConnectionMapping _connectionMapping;
         private ChatHistory _chatHistory;
         private SettingsRepository _settingsRepository;
@@ -26,7 +26,7 @@ namespace W3ChampionsChatService.Tests
             chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
                 .ReturnsAsync(new ChatUser("peter#123", "AB", new ProfilePicture()));
             _chatAuthenticationService = chatAuthenticationService.Object;
-            _banRepository = new BanRepository(MongoClient);
+            _banRepository = new Mock<IBanRepository>().Object;
             _connectionMapping = new ConnectionMapping();
             _chatHistory = new ChatHistory();
             _settingsRepository = new SettingsRepository(MongoClient);

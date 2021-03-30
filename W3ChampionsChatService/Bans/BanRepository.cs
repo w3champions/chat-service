@@ -1,28 +1,64 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
 using System.Threading.Tasks;
-using MongoDB.Driver;
+using Newtonsoft.Json;
 
 namespace W3ChampionsChatService.Bans
 {
-    public class BanRepository : MongoDbRepositoryBase
+    public interface IBanRepository
     {
-        public BanRepository(MongoClient mongoClient) : base(mongoClient)
+        Task<BannedPlayer> GetBannedPlayer(string userBattleTag);
+    }
+
+    public class BanRepository : IBanRepository
+    {
+        private readonly BanCache _banCache;
+        private static readonly string MatchmakingApiUrl = Environment.GetEnvironmentVariable("MATCHMAKING_API") ?? "https://matchmaking-service.test.w3champions.com";
+        private static readonly string MatchmakingAdminSecret = Environment.GetEnvironmentVariable("ADMIN_SECRET") ?? "300C018C-6321-4BAB-B289-9CB3DB760CBB";
+
+        public BanRepository(BanCache banCache)
         {
+            _banCache = banCache;
         }
 
-        public Task<ChatBan> Load(string battleTag)
+        public async Task<BannedPlayer> GetBannedPlayer(string userBattleTag)
         {
-            return LoadFirst<ChatBan>(battleTag);
-        }
+            if (_banCache.HasValue)
+            {
+                return _banCache.Cache.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
+            }
 
-        public Task<List<ChatBan>> LoadAll()
-        {
-            return LoadAll<ChatBan>();
-        }
+            try
+            {
+                var httpClient = new HttpClient();
+                var result = await httpClient.GetAsync($"{MatchmakingApiUrl}/admin/bannedPlayers?secret={MatchmakingAdminSecret}");
+                var content = await result.Content.ReadAsStringAsync();
+                if (string.IsNullOrEmpty(content)) return null;
+                var deserializeObject = JsonConvert.DeserializeObject<BannedPlayerResponse>(content);
 
-        public Task Delete(string battleTag)
-        {
-            return Delete<ChatBan>(battleTag);
+                _banCache.SetCache(deserializeObject);
+                return deserializeObject.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
+            }
+            catch (Exception)
+            {
+                return _banCache.Cache.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
+            }
+
         }
+    }
+
+    public class BannedPlayerResponse
+    {
+        public int Total { get; set; }
+        public List<BannedPlayer> Players { get; set; }
+    }
+
+    public class BannedPlayer
+    {
+        public string BattleTag { get; set; }
+
+        public string EndDate { get; set; }
     }
 }
