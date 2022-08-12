@@ -60,7 +60,7 @@ namespace W3ChampionsChatService.Tests
         {
             await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", "[123]", new ProfilePicture()));
 
-            await _chatHub.SwitchRoom(null, "peter#123", "w3c");
+            await _chatHub.SwitchRoom("w3c");
 
             var usersOfRoom1 = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             var usersOfRoom2 = _connectionMapping.GetUsersOfRoom("w3c");
