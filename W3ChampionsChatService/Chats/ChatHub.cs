@@ -37,9 +37,7 @@ namespace W3ChampionsChatService.Chats
             _websiteBackendRepository = websiteBackendRepository;
         }
 
-        // use this signature for auth solution
-        // public async Task SendMessage(string message)
-        public async Task SendMessage(string chatKey, string battleTag, string message)
+        public async Task SendMessage(string message)
         {
             var trimmedMessage = message.Trim();
             if (!string.IsNullOrEmpty(trimmedMessage))
@@ -53,21 +51,23 @@ namespace W3ChampionsChatService.Chats
             }
         }
 
-        // add this back, wenn the client send the jwt to login
-        // public override async Task OnConnectedAsync()
-        // {
-        //     var accesToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
-        //     var user = await _authenticationService.GetUser(accesToken);
-        //     if (user == null)
-        //     {
-        //         await Clients.Caller.SendAsync("AuthorizationFailed");
-        //         Context.Abort();
-        //         return;
-        //     }
-        //
-        //     await LoginAs(user);
-        //     await base.OnConnectedAsync();
-        // }
+        public override async Task OnConnectedAsync()
+        {
+            bool oauth = Environment.GetEnvironmentVariable("BNET_OAUTH") == "true";
+            if (oauth)
+            {
+                var accessToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
+                var user = await _authenticationService.GetUser(accessToken);
+                if (user == null)
+                {
+                    await Clients.Caller.SendAsync("AuthorizationFailed");
+                    Context.Abort();
+                    return;
+                }
+                await LoginAsAuthenticated(user);
+            }
+            await base.OnConnectedAsync();
+        }
 
         public override async Task OnDisconnectedAsync(Exception exception)
         {
@@ -82,9 +82,7 @@ namespace W3ChampionsChatService.Chats
             await base.OnDisconnectedAsync(exception);
         }
 
-        // use this signature for auth solution
-        // public async Task SwitchRoom(string chatRoom)
-        public async Task SwitchRoom(string chatKey, string battleTag, string chatRoom)
+        public async Task SwitchRoom(string chatRoom)
         {
             var oldRoom = _connections.GetRoom(Context.ConnectionId);
             var user = _connections.GetUser(Context.ConnectionId);
@@ -105,8 +103,8 @@ namespace W3ChampionsChatService.Chats
             await _settingsRepository.Save(memberShip);
         }
 
-        // this is the workaround without key, remove when authentication is released
-        public async Task LoginAs(string deprecatedKey, string battleTag)
+        // used when OAuth is off, invoked from ingame-client
+        public async Task LoginAs(string battleTag)
         {
             var userDetails = await _websiteBackendRepository.GetChatDetails(battleTag);
             var chatUser = new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
