@@ -4,9 +4,10 @@ namespace W3ChampionsChatService.Chats
 {
     public class ChatUser
     {
-        public ChatUser(string battleTag, string clanTag, ProfilePicture profilePicture)
+        public ChatUser(string battleTag, bool isAdmin, string clanTag, ProfilePicture profilePicture)
         {
             BattleTag = battleTag;
+            IsAdmin = isAdmin;
             ClanTag = clanTag;
             ProfilePicture = profilePicture;
             Name = battleTag.Split("#")[0];
@@ -14,6 +15,7 @@ namespace W3ChampionsChatService.Chats
 
         [BsonId]
         public string BattleTag { get; set; }
+        public bool IsAdmin { get; set; }
         public string Name { get; set; }
         public string ClanTag { get; set; }
         public ProfilePicture ProfilePicture { get; set; }

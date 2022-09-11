@@ -24,7 +24,7 @@ namespace W3ChampionsChatService.Tests
         {
             var chatAuthenticationService = new Mock<IChatAuthenticationService>();
             chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
-                .ReturnsAsync(new ChatUser("peter#123", "AB", new ProfilePicture()));
+                .ReturnsAsync(new ChatUser("peter#123", false, "AB", new ProfilePicture()));
             _chatAuthenticationService = chatAuthenticationService.Object;
             _banRepository = new Mock<IBanRepository>().Object;
             _connectionMapping = new ConnectionMapping();
@@ -47,7 +47,7 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task Login()
         {
-            await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", "[123]", new ProfilePicture()));
+            await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture()));
 
             var usersOfRoom = _connectionMapping.GetUsersOfRoom("W3C Lounge");
             Assert.AreEqual(1, usersOfRoom.Count);
@@ -58,7 +58,7 @@ namespace W3ChampionsChatService.Tests
         [Test]
         public async Task SwitchRoom()
         {
-            await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", "[123]", new ProfilePicture()));
+            await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture()));
 
             await _chatHub.SwitchRoom("w3c");
 
