@@ -104,10 +104,10 @@ namespace W3ChampionsChatService.Chats
         }
 
         // used when OAuth is off, invoked from ingame-client
-        public async Task LoginAs(string battleTag)
+        public async Task LoginAs(string battleTag, bool isAdmin)
         {
             var userDetails = await _websiteBackendRepository.GetChatDetails(battleTag);
-            var chatUser = new ChatUser(battleTag, userDetails?.ClanId, userDetails?.ProfilePicture);
+            var chatUser = new ChatUser(battleTag, isAdmin, userDetails?.ClanId, userDetails?.ProfilePicture);
             await LoginAsAuthenticated(chatUser);
         }
 

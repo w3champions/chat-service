@@ -331,3 +331,8 @@ ASALocalRun/
 
 .fake
 .ionide
+
+.vscode
+
+# direnv file
+.envrc
