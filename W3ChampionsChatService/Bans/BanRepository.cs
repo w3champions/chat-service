@@ -14,22 +14,11 @@ namespace W3ChampionsChatService.Bans
 
     public class BanRepository : IBanRepository
     {
-        private readonly BanCache _banCache;
         private static readonly string MatchmakingApiUrl = Environment.GetEnvironmentVariable("MATCHMAKING_API") ?? "https://matchmaking-service.test.w3champions.com";
         private static readonly string MatchmakingAdminSecret = Environment.GetEnvironmentVariable("ADMIN_SECRET") ?? "300C018C-6321-4BAB-B289-9CB3DB760CBB";
 
-        public BanRepository(BanCache banCache)
-        {
-            _banCache = banCache;
-        }
-
         public async Task<BannedPlayer> GetBannedPlayer(string userBattleTag)
         {
-            if (_banCache.HasValue)
-            {
-                return _banCache.Cache.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
-            }
-
             try
             {
                 var httpClient = new HttpClient();
@@ -38,12 +27,11 @@ namespace W3ChampionsChatService.Bans
                 if (string.IsNullOrEmpty(content)) return null;
                 var deserializeObject = JsonConvert.DeserializeObject<BannedPlayerResponse>(content);
 
-                _banCache.SetCache(deserializeObject);
                 return deserializeObject.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
             }
             catch (Exception)
             {
-                return _banCache.Cache.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
+                return null;
             }
 
         }
