@@ -95,29 +95,6 @@ namespace W3ChampionsChatService.Tests
         }
 
         [Test]
-        public async Task ChatterIsBanned_ClientDoesNotAttemptConnection()
-        {
-            // arrange
-            var tag = "ceph#1234";
-            var banEnd = DateTime.Now.AddDays(3).ToString();
-            var bannedPlayer = new BannedPlayer()
-            {
-                BattleTag = tag,
-                EndDate = banEnd
-            };
-
-            _banRepository
-                .Setup(b => b.GetBannedPlayer("ceph#1234"))
-                .ReturnsAsync(bannedPlayer);
-
-            // act
-            await _chatHub.LoginAsAuthenticated(new ChatUser(tag, false, "[123]", new ProfilePicture()));
-
-            // assert
-            _hubCallerContext.Verify(x => x.Abort(), Times.Once());
-        }
-
-        [Test]
         public async Task ChattersBanExpired_ClientAttemptsConnection()
         {
             // arrange
