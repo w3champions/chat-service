@@ -26,8 +26,9 @@ namespace W3ChampionsChatService.Bans
                 var content = await result.Content.ReadAsStringAsync();
                 if (string.IsNullOrEmpty(content)) return null;
                 var deserializeObject = JsonConvert.DeserializeObject<BannedPlayerResponse>(content);
+                var bTagLower = userBattleTag.ToLower();
 
-                return deserializeObject.Players.FirstOrDefault(p => p.BattleTag == userBattleTag);
+                return deserializeObject.Players.FirstOrDefault(p => p.BattleTag == bTagLower);
             }
             catch (Exception)
             {
