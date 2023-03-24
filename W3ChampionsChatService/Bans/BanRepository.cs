@@ -21,7 +21,7 @@ namespace W3ChampionsChatService.Bans
             try
             {
                 var httpClient = new HttpClient();
-                var result = await httpClient.GetAsync($"{MatchmakingApiUrl}//admin/loungeMutes?secret={MatchmakingAdminSecret}");
+                var result = await httpClient.GetAsync($"{MatchmakingApiUrl}/admin/loungeMutes?secret={MatchmakingAdminSecret}");
                 var content = await result.Content.ReadAsStringAsync();
                 if (string.IsNullOrEmpty(content)) return null;
                 var deserializeObject = JsonConvert.DeserializeObject<LoungeMute[]>(content);
