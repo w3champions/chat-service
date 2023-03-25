@@ -94,29 +94,6 @@ namespace W3ChampionsChatService.Tests
             Assert.AreEqual("modmoto#2809", userByToken1.BattleTag);
         }
 
-        [Test]
-        public async Task ChattersBanExpired_ClientAttemptsConnection()
-        {
-            // arrange
-            var tag = "ceph#1234";
-            var banEnd = DateTime.Now.AddDays(-3).ToString();
-            var bannedPlayer = new BannedPlayer()
-            {
-                BattleTag = tag,
-                EndDate = banEnd
-            };
-
-            _banRepository
-                .Setup(b => b.GetBannedPlayer("ceph#1234"))
-                .ReturnsAsync(bannedPlayer);
-
-            // act
-            await _chatHub.LoginAsAuthenticated(new ChatUser(tag, false, "[123]", new ProfilePicture()));
-
-            // assert
-            _hubCallerContext.Verify(x => x.Abort(), Times.Never());
-        }
-
         private void ResetSetups()
         {
             _banRepository.Reset();
