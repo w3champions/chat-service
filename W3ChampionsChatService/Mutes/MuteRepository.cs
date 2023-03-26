@@ -23,7 +23,7 @@ namespace W3ChampionsChatService.Mutes
 
         public Task<LoungeMute> GetMutedPlayer(string battleTag)
         {
-            return LoadFirst<LoungeMute>(battleTag);
+            return LoadFirst<LoungeMute>(battleTag.ToLower());
         }
 
         public Task<List<LoungeMute>> GetLoungeMutes()
