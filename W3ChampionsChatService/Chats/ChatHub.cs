@@ -3,7 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
-using W3ChampionsChatService.Bans;
+using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Settings;
 
 [assembly:InternalsVisibleTo("W3ChampionsChatService.Tests")]
@@ -12,7 +12,7 @@ namespace W3ChampionsChatService.Chats
     public class ChatHub : Hub
     {
         private readonly IChatAuthenticationService _authenticationService;
-        private readonly IBanRepository _banRepository;
+        private readonly MuteRepository _muteRepository;
         private readonly SettingsRepository _settingsRepository;
         private readonly ConnectionMapping _connections;
         private readonly ChatHistory _chatHistory;
@@ -21,7 +21,7 @@ namespace W3ChampionsChatService.Chats
 
         public ChatHub(
             IChatAuthenticationService authenticationService,
-            IBanRepository banRepository,
+            MuteRepository muteRepository,
             SettingsRepository settingsRepository,
             ConnectionMapping connections,
             ChatHistory chatHistory,
@@ -29,7 +29,7 @@ namespace W3ChampionsChatService.Chats
             IWebsiteBackendRepository websiteBackendRepository)
         {
             _authenticationService = authenticationService;
-            _banRepository = banRepository;
+            _muteRepository = muteRepository;
             _settingsRepository = settingsRepository;
             _connections = connections;
             _chatHistory = chatHistory;
@@ -115,12 +115,12 @@ namespace W3ChampionsChatService.Chats
         {
             var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
 
-            var ban = await _banRepository.GetBannedPlayer(user.BattleTag);
+            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
 
-            var utcNow = DateTime.UtcNow.ToString("s") + "Z";
-            if (ban != null && string.Compare(ban.endDate, utcNow, StringComparison.Ordinal) > 0)
+            var utcNow = DateTime.UtcNow;
+            if (mute != null && DateTime.Compare(mute.endDate, utcNow) > 0)
             {
-                await Clients.Caller.SendAsync("PlayerBannedFromChat", ban);
+                await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
                 Context.Abort();
             }
             else

@@ -5,7 +5,7 @@ using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.DependencyInjection;
 using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
-using W3ChampionsChatService.Bans;
+using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Settings;
 
@@ -27,7 +27,7 @@ namespace W3ChampionsChatService
             services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
             services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
             services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
-            services.AddTransient<IBanRepository, BanRepository>();
+            services.AddTransient<MuteRepository>();
             services.AddHttpContextAccessor();
 
             services.AddSingleton<ConnectionMapping>();
