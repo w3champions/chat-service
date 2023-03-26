@@ -45,9 +45,16 @@ namespace W3ChampionsChatService.Chats
                 var chatRoom = _connections.GetRoom(Context.ConnectionId);
                 var user = _connections.GetUser(Context.ConnectionId);
 
-                var chatMessage = new ChatMessage(user, trimmedMessage);
-                _chatHistory.AddMessage(chatRoom, chatMessage);
-                await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
+                // Check if player is on Lounge Mute list. If yes, disconnect. If no, send chat message.
+                var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
+                if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0) {
+                    await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
+                    Context.Abort();
+                } else {
+                    var chatMessage = new ChatMessage(user, trimmedMessage);
+                    _chatHistory.AddMessage(chatRoom, chatMessage);
+                    await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
+                }
             }
         }
 
@@ -117,8 +124,7 @@ namespace W3ChampionsChatService.Chats
 
             var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
 
-            var utcNow = DateTime.UtcNow;
-            if (mute != null && DateTime.Compare(mute.endDate, utcNow) > 0)
+            if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0)
             {
                 await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
                 Context.Abort();
