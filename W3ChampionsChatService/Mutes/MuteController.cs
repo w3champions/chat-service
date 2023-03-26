@@ -14,7 +14,7 @@ namespace W3ChampionsChatService.Mutes
         }
 
         [HttpGet("")]
-        // [CheckIfBattleTagIsAdmin]
+        [CheckIfBattleTagIsAdmin]
         public async Task<IActionResult> GetLoungeMutes()
         {
             var loungeMutes = await _muteRepository.GetLoungeMutes();
@@ -22,7 +22,7 @@ namespace W3ChampionsChatService.Mutes
         }
 
         [HttpPost("")]
-        // [CheckIfBattleTagIsAdmin]
+        [CheckIfBattleTagIsAdmin]
         public async Task<IActionResult> AddLoungeMute([FromBody] LoungeMuteRequest loungeMuteRequest)
         {
             if (loungeMuteRequest.battleTag == "") {
@@ -38,7 +38,7 @@ namespace W3ChampionsChatService.Mutes
         }
 
         [HttpDelete("{bTag}")]
-        // [CheckIfBattleTagIsAdmin]
+        [CheckIfBattleTagIsAdmin]
         public async Task<IActionResult> DeleteLoungeMute([FromRoute] string bTag)
         {
             if (bTag == "") {
