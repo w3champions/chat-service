@@ -4,7 +4,7 @@ using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
-using W3ChampionsChatService.Bans;
+using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Settings;
 
@@ -14,7 +14,7 @@ namespace W3ChampionsChatService.Tests
     {
         private ChatHub _chatHub;
         private IChatAuthenticationService _chatAuthenticationService;
-        private Mock<IBanRepository> _banRepository;
+        private Mock<MuteRepository> _muteRepository;
         private Mock<IHubCallerClients> _clients;
         private Mock<HubCallerContext> _hubCallerContext;
         private ConnectionMapping _connectionMapping;
@@ -25,7 +25,7 @@ namespace W3ChampionsChatService.Tests
         [SetUp]
         public void SetupBeforeEach()
         {
-            _banRepository = new Mock<IBanRepository>();
+            _muteRepository = new Mock<MuteRepository>(MongoClient);
             _clients = new Mock<IHubCallerClients>();
             _hubCallerContext = new Mock<HubCallerContext>();
             ResetSetups();
@@ -40,7 +40,7 @@ namespace W3ChampionsChatService.Tests
             
             _chatHub = new ChatHub(
                 _chatAuthenticationService, 
-                _banRepository.Object, 
+                _muteRepository.Object, 
                 _settingsRepository,
                 _connectionMapping, 
                 _chatHistory, 
@@ -96,7 +96,7 @@ namespace W3ChampionsChatService.Tests
 
         private void ResetSetups()
         {
-            _banRepository.Reset();
+            _muteRepository.Reset();
             _clients.Reset();
             _hubCallerContext.Reset();
         }
