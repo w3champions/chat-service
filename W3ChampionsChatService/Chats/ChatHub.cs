@@ -138,5 +138,12 @@ namespace W3ChampionsChatService.Chats
                 await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat);
             }
         }
+
+        public async Task UpdateUserProfilePicture(string chatRoom, ProfilePicture profilePicture)
+        {
+            var user = _connections.GetUser(Context.ConnectionId);
+            user.ProfilePicture = profilePicture;
+            await Clients.Group(chatRoom).SendAsync("UserUpdated", user);
+        }
     }
 }
