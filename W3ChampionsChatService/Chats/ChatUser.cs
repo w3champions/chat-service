@@ -19,6 +19,23 @@ namespace W3ChampionsChatService.Chats
         public string Name { get; set; }
         public string ClanTag { get; set; }
         public ProfilePicture ProfilePicture { get; set; }
+
+        /// <summary>
+        /// Generates a fake user with the name "SYSTEM" that is based on this user.
+        /// This approach is necessary in order to ensure that we do not break backwards compatibility
+        /// with the old launcher. This way, a user can click on the "SYSTEM" user and won't get a 404
+        /// because the Battle Tag has not been found.
+        /// </summary>
+        /// <returns>A ChatUser object representing the derived fake system user.</returns>
+        public ChatUser GenerateFakeSystemUser()
+        {
+            var systemUser = new ChatUser(this.BattleTag, this.IsAdmin, this.ClanTag, this.ProfilePicture);
+            // Manually set the name to "SYSTEM" because the constructor does not set it.
+            // This will allow BattleTag to be the same as the original user to allow clicking it while
+            // showing [SYSTEM] as the name in the chat.
+            systemUser.Name = "[SYSTEM]";
+            return systemUser;
+        }
     }
 
     public class ProfilePicture
