@@ -52,7 +52,7 @@ namespace W3ChampionsChatService.Chats
                     Context.Abort();
                 } else {
                     var chatMessage = new ChatMessage(user, trimmedMessage);
-                    if (!await processChatCommand(chatMessage))
+                    if (!await ProcessChatCommand(chatMessage))
                     {
                         _chatHistory.AddMessage(chatRoom, chatMessage);
                         await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
@@ -67,7 +67,7 @@ namespace W3ChampionsChatService.Chats
         /// </summary>
         /// <param name="message">The chat message to process.</param>
         /// <returns>True if a command was processed, false otherwise.</returns>
-        private async Task<bool> processChatCommand(ChatMessage message)
+        private async Task<bool> ProcessChatCommand(ChatMessage message)
         {
             if (!message.Message.StartsWith("/"))
             {
@@ -77,7 +77,7 @@ namespace W3ChampionsChatService.Chats
             var fakeSystemUser = message.User.GenerateFakeSystemUser();
             string messageToSend;
 
-            if (message.Message.StartsWith("/w") || message.Message.StartsWith("/whisper") || message.Message.StartsWith("/r"))
+            if (message.Message.StartsWith("/w ") || message.Message.StartsWith("/whisper ") || message.Message.StartsWith("/r ")  || message.Message.StartsWith("/reply "))
             {
                 messageToSend = "Private messages to other players are currently not supported!";
             }

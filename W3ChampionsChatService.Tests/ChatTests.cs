@@ -205,7 +205,8 @@ namespace W3ChampionsChatService.Tests
         [Test]
         [TestCase("/w john#456 Hello there", "Private messages to other players are currently not supported!", Description = "Short whisper command")]
         [TestCase("/whisper john#456 Hello there", "Private messages to other players are currently not supported!", Description = "Full whisper command")]
-        [TestCase("/r Hello there again", "Private messages to other players are currently not supported!", Description = "Reply command")]
+        [TestCase("/r Hello there again", "Private messages to other players are currently not supported!", Description = "Short reply command")]
+        [TestCase("/reply Hello there again", "Private messages to other players are currently not supported!", Description = "Full reply command")]
         [TestCase("/help", "Chat commands are currently not supported!", Description = "Other command")]
         public async Task ChatCommands_Not_Supported(string command, string expectedResponse)
         {
