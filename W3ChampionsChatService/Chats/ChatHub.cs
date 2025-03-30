@@ -52,10 +52,42 @@ namespace W3ChampionsChatService.Chats
                     Context.Abort();
                 } else {
                     var chatMessage = new ChatMessage(user, trimmedMessage);
-                    _chatHistory.AddMessage(chatRoom, chatMessage);
-                    await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
+                    if (!await ProcessChatCommand(chatMessage))
+                    {
+                        _chatHistory.AddMessage(chatRoom, chatMessage);
+                        await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
+                    }
                 }
             }
+        }
+
+        /// <summary>
+        /// Processes chat commands and returns a boolean indicating whether a command was processed 
+        /// or the message should be sent as a normal message.
+        /// </summary>
+        /// <param name="message">The chat message to process.</param>
+        /// <returns>True if a command was processed, false otherwise.</returns>
+        private async Task<bool> ProcessChatCommand(ChatMessage message)
+        {
+            if (!message.Message.StartsWith("/"))
+            {
+                return false;
+            }
+            
+            var fakeSystemUser = message.User.GenerateFakeSystemUser();
+            string messageToSend;
+
+            if (message.Message.StartsWith("/w ") || message.Message.StartsWith("/whisper ") || message.Message.StartsWith("/r ")  || message.Message.StartsWith("/reply "))
+            {
+                messageToSend = "Private messages to other players are currently not supported!";
+            }
+            else
+            {
+                messageToSend = "Chat commands are currently not supported!";
+            }
+
+            await Clients.Caller.SendAsync("ReceiveMessage", new ChatMessage(fakeSystemUser, messageToSend));
+            return true;
         }
 
         public override async Task OnConnectedAsync()
