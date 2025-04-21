@@ -1,6 +1,8 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build-env
 
 WORKDIR /app
+COPY Directory.Build.props .
+COPY Directory.Packages.props .
 COPY ./W3ChampionsChatService.sln ./
 
 COPY ./W3ChampionsChatService/W3ChampionsChatService.csproj ./W3ChampionsChatService/W3ChampionsChatService.csproj

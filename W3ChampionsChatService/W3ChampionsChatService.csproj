@@ -1,14 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
-    <PropertyGroup>
-        <TargetFramework>net8.0</TargetFramework>
-    </PropertyGroup>
-
     <ItemGroup>
-        <PackageReference Include="Microsoft.ApplicationInsights.AspNetCore" Version="2.14.0" />
-        <PackageReference Include="Microsoft.AspNetCore.SignalR" Version="1.1.0" />
-        <PackageReference Include="MongoDB.Driver" Version="2.30.0" />
-        <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="6.8.0" />
+        <PackageReference Include="Microsoft.ApplicationInsights.AspNetCore" />
+        <PackageReference Include="Microsoft.AspNetCore.SignalR" />
+        <PackageReference Include="MongoDB.Driver" />
+        <PackageReference Include="System.IdentityModel.Tokens.Jwt" />
     </ItemGroup>
 
 </Project>
