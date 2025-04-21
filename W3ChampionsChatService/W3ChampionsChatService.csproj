@@ -2,7 +2,6 @@
 
     <ItemGroup>
         <PackageReference Include="Microsoft.ApplicationInsights.AspNetCore" />
-        <PackageReference Include="Microsoft.AspNetCore.SignalR" />
         <PackageReference Include="MongoDB.Driver" />
         <PackageReference Include="System.IdentityModel.Tokens.Jwt" />
     </ItemGroup>
