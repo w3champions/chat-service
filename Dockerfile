@@ -1,6 +1,8 @@
-FROM mcr.microsoft.com/dotnet/sdk:6.0 AS build-env
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build-env
 
 WORKDIR /app
+COPY Directory.Build.props .
+COPY Directory.Packages.props .
 COPY ./W3ChampionsChatService.sln ./
 
 COPY ./W3ChampionsChatService/W3ChampionsChatService.csproj ./W3ChampionsChatService/W3ChampionsChatService.csproj
@@ -11,7 +13,7 @@ RUN dotnet build ./W3ChampionsChatService/W3ChampionsChatService.csproj -c Relea
 
 RUN dotnet publish "./W3ChampionsChatService/W3ChampionsChatService.csproj" -c Release -o "../../app/out"
 
-FROM mcr.microsoft.com/dotnet/aspnet:6.0
+FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app
 COPY --from=build-env /app/out .
 

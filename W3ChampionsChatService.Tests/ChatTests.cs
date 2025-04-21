@@ -27,7 +27,7 @@ namespace W3ChampionsChatService.Tests
         private ChatMessage _capturedCallerMessage;
         private ChatMessage _capturedGroupMessage;
         private bool _groupMessageSent;
-        private Mock<IClientProxy> _callerProxy;
+        private Mock<ISingleClientProxy> _callerProxy;
         private Mock<IClientProxy> _groupProxy;
 
         [SetUp]
@@ -60,7 +60,7 @@ namespace W3ChampionsChatService.Tests
             _capturedGroupMessage = null;
             _groupMessageSent = false;
             
-            _callerProxy = new Mock<IClientProxy>();
+            _callerProxy = new Mock<ISingleClientProxy>();
             _callerProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
                 .Callback<string, object[], CancellationToken>((method, args, token) => 
                 {
