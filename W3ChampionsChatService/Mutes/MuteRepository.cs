@@ -18,6 +18,7 @@ namespace W3ChampionsChatService.Mutes
             loungeMute.author = loungeMuteRequest.author;
             loungeMute.insertDate = DateTime.UtcNow;
             loungeMute.endDate = DateTime.Parse(loungeMuteRequest.endDate);
+            loungeMute.MuteType = loungeMuteRequest.MuteType;
             return Upsert(loungeMute);
         }
 

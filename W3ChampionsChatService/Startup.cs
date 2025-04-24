@@ -8,6 +8,7 @@ using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Settings;
+using Microsoft.Extensions.Caching.Memory;
 
 namespace W3ChampionsChatService
 {
@@ -22,17 +23,21 @@ namespace W3ChampionsChatService
             services.AddSingleton(mongoClient);
 
             services.AddSignalR();
+            services.AddMemoryCache();
 
             services.AddTransient<SettingsRepository>();
             services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
             services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
             services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
             services.AddTransient<MuteRepository>();
+            services.AddTransient<BlockRepository>();
             services.AddTransient<CheckIfBattleTagIsAdminFilter>();
             services.AddHttpContextAccessor();
+            services.AddHttpClient();
 
             services.AddSingleton<ConnectionMapping>();
             services.AddSingleton<ChatHistory>();
+            services.AddSingleton<IPrivateMessageHistoryService, InMemoryPrivateMessageHistoryService>();
         }
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
