@@ -1,12 +1,6 @@
-namespace W3ChampionsChatService.Authentication
-{
-    public class ErrorResult
-    {
-        public string Error { get; }
+namespace W3ChampionsChatService.Authentication;
 
-        public ErrorResult(string error)
-        {
-            Error = error;
-        }
-    }
+public class ErrorResult(string error)
+{
+    public string Error { get; } = error;
 }

@@ -1,20 +1,12 @@
 ﻿using System;
 
-namespace W3ChampionsChatService.Chats
+namespace W3ChampionsChatService.Chats;
+
+public class ChatMessage(ChatUser user, string message)
 {
-    public class ChatMessage
-    {
-        private readonly DateTimeOffset _time;
-        public ChatUser User { get; }
-        public string Message { get; }
+    private readonly DateTimeOffset _time = DateTimeOffset.UtcNow;
+    public ChatUser User { get; } = user;
+    public string Message { get; } = message;
 
-        public string Time => _time.ToString();
-
-        public ChatMessage(ChatUser user, string message)
-        {
-            User = user;
-            Message = message;
-            _time = DateTimeOffset.UtcNow;
-        }
-    }
+    public string Time => _time.ToString();
 }

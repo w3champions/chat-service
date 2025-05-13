@@ -1,22 +1,17 @@
 using System.Threading.Tasks;
 using MongoDB.Driver;
 
-namespace W3ChampionsChatService.Settings
+namespace W3ChampionsChatService.Settings;
+
+public class SettingsRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
 {
-    public class SettingsRepository : MongoDbRepositoryBase
+    public Task Save(ChatSettings chatSettings)
     {
-        public SettingsRepository(MongoClient mongoClient) : base(mongoClient)
-        {
-        }
+        return Upsert(chatSettings);
+    }
 
-        public Task Save(ChatSettings chatSettings)
-        {
-            return Upsert(chatSettings);
-        }
-
-        public Task<ChatSettings> Load(string id)
-        {
-            return LoadFirst<ChatSettings>(id);
-        }
+    public Task<ChatSettings> Load(string id)
+    {
+        return LoadFirst<ChatSettings>(id);
     }
 }
