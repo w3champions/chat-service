@@ -1,21 +1,14 @@
-﻿namespace W3ChampionsChatService.Settings
+﻿namespace W3ChampionsChatService.Settings;
+
+public class ChatSettings(string battleTag) : IIdentifiable
 {
-    public class ChatSettings : IIdentifiable
+    public string Id => BattleTag;
+
+    public string BattleTag { get; set; } = battleTag;
+    public string DefaultChat { get; set; } = "W3C Lounge";
+
+    public void Update(string defaultChat)
     {
-        public ChatSettings(string battleTag)
-        {
-            BattleTag = battleTag;
-            DefaultChat = "W3C Lounge";
-        }
-
-        public string Id => BattleTag;
-
-        public string BattleTag { get; set; }
-        public string DefaultChat { get; set; }
-
-        public void Update(string defaultChat)
-        {
-            DefaultChat = defaultChat;
-        }
+        DefaultChat = defaultChat;
     }
 }

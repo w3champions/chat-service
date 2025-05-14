@@ -3,42 +3,34 @@ using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
 
-namespace W3ChampionsChatService.Chats
+namespace W3ChampionsChatService.Chats;
+
+public interface IChatAuthenticationService
 {
-    public interface IChatAuthenticationService
+    Task<ChatUser> GetUser(string chatKey);
+}
+
+public class ChatAuthenticationService(
+    MongoClient mongoClient,
+    IW3CAuthenticationService authenticationService,
+    IWebsiteBackendRepository websiteBackendRepository
+) : MongoDbRepositoryBase(mongoClient), IChatAuthenticationService
+{
+    private readonly IW3CAuthenticationService _authenticationService = authenticationService;
+    private readonly IWebsiteBackendRepository _websiteBackendRepository = websiteBackendRepository;
+
+    public async Task<ChatUser> GetUser(string chatKey)
     {
-        Task<ChatUser> GetUser(string chatKey);
-    }
-
-    public class ChatAuthenticationService : MongoDbRepositoryBase, IChatAuthenticationService
-    {
-        private readonly IW3CAuthenticationService _authenticationService;
-        private readonly IWebsiteBackendRepository _websiteBackendRepository;
-
-        public ChatAuthenticationService(
-            MongoClient mongoClient,
-            IW3CAuthenticationService authenticationService,
-            IWebsiteBackendRepository websiteBackendRepository
-            ) : base(mongoClient)
+        try
         {
-            _authenticationService = authenticationService;
-            _websiteBackendRepository = websiteBackendRepository;
+            var user = _authenticationService.GetUserByToken(chatKey);
+            if (user == null) return null;
+            var userDetails = await _websiteBackendRepository.GetChatDetails(user.BattleTag);
+            return new ChatUser(user.BattleTag, user.IsAdmin, userDetails?.ClanId, userDetails?.ProfilePicture);
         }
-
-        public async Task<ChatUser> GetUser(string chatKey)
+        catch (Exception)
         {
-            try
-            {
-                var user = _authenticationService.GetUserByToken(chatKey);
-                if (user == null) return null;
-                var userDetails = await _websiteBackendRepository.GetChatDetails(user.BattleTag);
-                return new ChatUser(user.BattleTag, user.IsAdmin, userDetails?.ClanId, userDetails?.ProfilePicture);
-            }
-            catch (Exception)
-            {
-                return null;
-            }
+            return null;
         }
-
     }
 }
