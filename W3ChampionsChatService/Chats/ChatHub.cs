@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Settings;
+using Serilog;
 
 [assembly: InternalsVisibleTo("W3ChampionsChatService.Tests")]
 namespace W3ChampionsChatService.Chats;
@@ -91,6 +92,7 @@ public class ChatHub(
             var user = await _authenticationService.GetUser(accessToken);
             if (user == null)
             {
+                Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
                 await Clients.Caller.SendAsync("AuthorizationFailed");
                 Context.Abort();
                 return;
@@ -150,11 +152,13 @@ public class ChatHub(
 
         if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0)
         {
+            Log.Information("Declining connection for {BattleTag} because they are banned until {EndDate}", user.BattleTag, mute.endDate);
             await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
             Context.Abort();
         }
         else
         {
+            Log.Information("Accepting connection for {BattleTag} and adding to room {Room}", user.BattleTag, memberShip.DefaultChat);
             _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
             var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
