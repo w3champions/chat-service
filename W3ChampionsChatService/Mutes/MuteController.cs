@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using W3ChampionsChatService.Authentication;
+using Serilog;
 
 namespace W3ChampionsChatService.Mutes;
 
@@ -41,6 +42,7 @@ public class MuteController(MuteRepository muteRepository) : ControllerBase
             return BadRequest("Ban End Date must be set.");
         }
 
+        Log.Information("Adding lounge mute for {BattleTag} until {EndDate} by {Author}", loungeMuteRequest.battleTag, loungeMuteRequest.endDate, loungeMuteRequest.author);
         await _muteRepository.AddLoungeMute(loungeMuteRequest);
         return Ok();
     }
@@ -53,6 +55,7 @@ public class MuteController(MuteRepository muteRepository) : ControllerBase
         {
             return StatusCode(403);
         }
+        Log.Information("Deleting lounge mute for {BattleTag}", bTag);
         await _muteRepository.DeleteLoungeMute(bTag);
         return Ok();
     }

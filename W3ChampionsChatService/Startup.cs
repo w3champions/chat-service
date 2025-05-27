@@ -1,4 +1,6 @@
 using System;
+using Serilog;
+
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.DependencyInjection;
@@ -14,6 +16,7 @@ public class Startup
 {
     public void ConfigureServices(IServiceCollection services)
     {
+        Log.Information("Adding services");
         services.AddControllers();
 
         var mongoConnectionString = Environment.GetEnvironmentVariable("MONGO_CONNECTION_STRING") ?? "mongodb://157.90.1.251:3513";
@@ -32,10 +35,12 @@ public class Startup
 
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();
+        Log.Information("Services added");
     }
 
     public void Configure(IApplicationBuilder app)
     {
+        Log.Information("Configuring service");
         // without that, nginx forwarding in docker wont work
         app.UseForwardedHeaders(new ForwardedHeadersOptions
         {
@@ -54,5 +59,6 @@ public class Startup
             endpoints.MapControllers();
             endpoints.MapHub<ChatHub>("/chatHub");
         });
+        Log.Information("Chat Service started");
     }
 }

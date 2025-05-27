@@ -2,6 +2,7 @@
 using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
+using Serilog;
 
 namespace W3ChampionsChatService.Chats;
 
@@ -28,8 +29,9 @@ public class ChatAuthenticationService(
             var userDetails = await _websiteBackendRepository.GetChatDetails(user.BattleTag);
             return new ChatUser(user.BattleTag, user.IsAdmin, userDetails?.ClanId, userDetails?.ProfilePicture);
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            Log.Error(ex, "Error getting user by token");
             return null;
         }
     }
