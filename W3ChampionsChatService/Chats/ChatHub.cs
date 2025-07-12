@@ -16,8 +16,7 @@ public class ChatHub(
     SettingsRepository settingsRepository,
     ConnectionMapping connections,
     ChatHistory chatHistory,
-    IHttpContextAccessor contextAccessor,
-    IWebsiteBackendRepository websiteBackendRepository) : Hub
+    IHttpContextAccessor contextAccessor) : Hub
 {
     private readonly IChatAuthenticationService _authenticationService = authenticationService;
     private readonly MuteRepository _muteRepository = muteRepository;
@@ -25,7 +24,6 @@ public class ChatHub(
     private readonly ConnectionMapping _connections = connections;
     private readonly ChatHistory _chatHistory = chatHistory;
     private readonly IHttpContextAccessor _contextAccessor = contextAccessor;
-    private readonly IWebsiteBackendRepository _websiteBackendRepository = websiteBackendRepository;
 
     public async Task SendMessage(string message)
     {
@@ -85,21 +83,16 @@ public class ChatHub(
 
     public override async Task OnConnectedAsync()
     {
-        bool oauth = Environment.GetEnvironmentVariable("BNET_OAUTH") == "true";
-        if (oauth)
+        var accessToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
+        var user = await _authenticationService.GetUser(accessToken);
+        if (user == null)
         {
-            var accessToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
-            var user = await _authenticationService.GetUser(accessToken);
-            if (user == null)
-            {
-                Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
-                await Clients.Caller.SendAsync("AuthorizationFailed");
-                Context.Abort();
-                return;
-            }
-            await LoginAsAuthenticated(user);
+            Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
+            await Clients.Caller.SendAsync("AuthorizationFailed");
+            Context.Abort();
+            return;
         }
-        await base.OnConnectedAsync();
+        await LoginAsAuthenticated(user);
     }
 
     public override async Task OnDisconnectedAsync(Exception exception)
@@ -134,14 +127,6 @@ public class ChatHub(
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
         memberShip.Update(chatRoom);
         await _settingsRepository.Save(memberShip);
-    }
-
-    // used when OAuth is off, invoked from ingame-client
-    public async Task LoginAs(string battleTag, bool isAdmin)
-    {
-        var userDetails = await _websiteBackendRepository.GetChatDetails(battleTag);
-        var chatUser = new ChatUser(battleTag, isAdmin, userDetails?.ClanId, userDetails?.ProfilePicture);
-        await LoginAsAuthenticated(chatUser);
     }
 
     internal async Task LoginAsAuthenticated(ChatUser user)
