@@ -52,7 +52,6 @@ public class ChatTests : IntegrationTestBase
             _settingsRepository,
             _connectionMapping,
             _chatHistory,
-            null,
             null);
 
         // Setup message capturing proxies
