@@ -42,7 +42,7 @@ public class MuteController(MuteRepository muteRepository) : ControllerBase
             return BadRequest("Ban End Date must be set.");
         }
 
-        Log.Information("Adding lounge mute for {BattleTag} until {EndDate} by {Author}", loungeMuteRequest.battleTag, loungeMuteRequest.endDate, loungeMuteRequest.author);
+        Log.Information("Adding lounge mute shadowBan={IsShadowBan} for {BattleTag} until {EndDate} by {Author}", loungeMuteRequest.isShadowBan, loungeMuteRequest.battleTag, loungeMuteRequest.endDate, loungeMuteRequest.author);
         await _muteRepository.AddLoungeMute(loungeMuteRequest);
         return Ok();
     }
