@@ -33,10 +33,16 @@ public class ChatHub(
             var chatRoom = _connections.GetRoom(Context.ConnectionId);
             var user = _connections.GetUser(Context.ConnectionId);
 
-            // Check if player is on Lounge Mute list. If yes, disconnect. If no, send chat message.
+            // Check if player is on Lounge Mute list. If yes, handle accordingly.
             var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0)
+            if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) <= 0)
             {
+                mute = null;
+            }
+
+            if (mute != null && !mute.isShadowBan)
+            {
+                // Regular mute: disconnect
                 await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
                 Context.Abort();
             }
@@ -45,8 +51,16 @@ public class ChatHub(
                 var chatMessage = new ChatMessage(user, trimmedMessage);
                 if (!await ProcessChatCommand(chatMessage))
                 {
-                    _chatHistory.AddMessage(chatRoom, chatMessage);
-                    await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
+                    if (mute != null && mute.isShadowBan)
+                    {
+                        // Only send to caller to make them think it was sent
+                        await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
+                    }
+                    else
+                    {
+                        _chatHistory.AddMessage(chatRoom, chatMessage);
+                        await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
+                    }
                 }
             }
         }
@@ -135,7 +149,7 @@ public class ChatHub(
 
         var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
 
-        if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0)
+        if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0 && !mute.isShadowBan)
         {
             Log.Information("Declining connection for {BattleTag} because they are banned until {EndDate}", user.BattleTag, mute.endDate);
             await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
