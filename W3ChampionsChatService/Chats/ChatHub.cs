@@ -54,6 +54,7 @@ public class ChatHub(
                     if (mute != null && mute.isShadowBan)
                     {
                         // Only send to caller to make them think it was sent
+                        Log.Information("Shadow banned user {BattleTag} sent message {Message}", user.BattleTag, trimmedMessage);
                         await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
                     }
                     else
