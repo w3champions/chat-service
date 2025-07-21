@@ -31,7 +31,7 @@ public class ChatHistory : Dictionary<string, List<ChatMessage>>
         return this[chatRoom];
     }
 
-    public bool DeleteMessage(string messageId)
+    public ChatMessage DeleteMessage(string messageId)
     {
         foreach (var chatRoom in Keys)
         {
@@ -40,10 +40,10 @@ public class ChatHistory : Dictionary<string, List<ChatMessage>>
             if (messageToDelete != null)
             {
                 messages.Remove(messageToDelete);
-                return true;
+                return messageToDelete;
             }
         }
-        return false;
+        return null;
     }
 
     public List<ChatMessage> DeleteMessagesFromUser(string battleTag)

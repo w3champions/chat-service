@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
@@ -6,6 +7,7 @@ using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Settings;
 using Serilog;
+using W3ChampionsChatService.Authentication;
 
 [assembly: InternalsVisibleTo("W3ChampionsChatService.Tests")]
 namespace W3ChampionsChatService.Chats;
@@ -142,6 +144,55 @@ public class ChatHub(
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
         memberShip.Update(chatRoom);
         await _settingsRepository.Save(memberShip);
+    }
+
+    [UserHasPermission(EPermission.Moderation)]
+    public async Task DeleteMessage(string messageId)
+    {
+        var deletedMessage = _chatHistory.DeleteMessage(messageId);
+        if (deletedMessage != null)
+        {
+            var adminUser = _connections.GetUser(Context.ConnectionId);
+            Log.Information("Deleted message '{MessageContent}' from {MessageSender} by request of {AdminUserName}", deletedMessage.Message, deletedMessage.User.BattleTag, adminUser.BattleTag);
+
+            await Clients.All.SendAsync("MessageDeleted", deletedMessage.Id);
+        }
+    }
+
+    [UserHasPermission(EPermission.Moderation)]
+    public async Task PurgeMessagesFromUser(string battleTag)
+    {
+        var deletedMessages = _chatHistory.DeleteMessagesFromUser(battleTag);
+        if (deletedMessages.Count > 0)
+        {
+            var adminUser = _connections.GetUser(Context.ConnectionId);
+            Log.Information("Purging {Count} messages from user {BattleTag} on request of {AdminUserName}", deletedMessages.Count, battleTag, adminUser.BattleTag);
+            await Clients.All.SendAsync("BulkMessageDeleted", deletedMessages.Select(m => m.Id).ToList());
+        }
+        else
+        {
+            var adminUser = _connections.GetUser(Context.ConnectionId);
+            Log.Information("Purging messages from user {BattleTag} by request of {AdminUserName} failed: No messages found", battleTag, adminUser.BattleTag);
+        }
+    }
+
+    [UserHasPermission(EPermission.Moderation)]
+    public async Task BanUser(string battleTag, string reason, bool isShadowBan, string endDate)
+    {
+        var adminUser = _connections.GetUser(Context.ConnectionId);
+        Log.Information("Banning user {BattleTag} until {EndDate} by {AdminUser}. Reason: {Reason}, ShadowBan: {IsShadowBan}",
+            battleTag, endDate, adminUser.BattleTag, reason, isShadowBan);
+
+        var loungeMuteRequest = new LoungeMuteRequest
+        {
+            battleTag = battleTag,
+            endDate = endDate,
+            isShadowBan = isShadowBan,
+            author = adminUser.BattleTag,
+            reason = reason
+        };
+
+        await _muteRepository.AddLoungeMute(loungeMuteRequest);
     }
 
     internal async Task LoginAsAuthenticated(ChatUser user)

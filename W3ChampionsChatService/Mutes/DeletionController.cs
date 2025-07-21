@@ -26,9 +26,9 @@ public class DeletionController(ChatHistory chatHistory, IHubContext<ChatHub> hu
         }
 
         Log.Information("Deleting message with ID {MessageId}", messageId);
-        var wasDeleted = _chatHistory.DeleteMessage(messageId);
+        var deletedMessage = _chatHistory.DeleteMessage(messageId);
 
-        if (wasDeleted)
+        if (deletedMessage != null)
         {
             await _hubContext.Clients.All.SendAsync("MessageDeleted", messageId);
             return Ok();
