@@ -12,8 +12,9 @@ public class MuteRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mon
         LoungeMute loungeMute = new LoungeMute();
         loungeMute.battleTag = loungeMuteRequest.battleTag.ToLower();
         loungeMute.author = loungeMuteRequest.author;
+        loungeMute.reason = loungeMuteRequest.reason;
         loungeMute.insertDate = DateTime.UtcNow;
-        loungeMute.endDate = DateTime.Parse(loungeMuteRequest.endDate);
+        loungeMute.endDate = DateTime.Parse(loungeMuteRequest.endDate, null, System.Globalization.DateTimeStyles.AdjustToUniversal);
         loungeMute.isShadowBan = loungeMuteRequest.isShadowBan;
         return Upsert(loungeMute);
     }

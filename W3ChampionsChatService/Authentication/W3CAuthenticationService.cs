@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Security.Cryptography;
@@ -47,12 +48,16 @@ public class W3CUserAuthentication
             var btag = claims.Claims.First(c => c.Type == "battleTag").Value;
             var isAdmin = Boolean.Parse(claims.Claims.First(c => c.Type == "isAdmin").Value);
             var name = claims.Claims.First(c => c.Type == "name").Value;
-
+            var permissions = claims.Claims
+                    .Where(claim => claim.Type == "permissions")
+                    .Select(x => Enum.Parse<EPermission>(x.Value))
+                    .ToHashSet();
             return new W3CUserAuthentication
             {
                 Name = name,
                 BattleTag = btag,
-                IsAdmin = isAdmin
+                IsAdmin = isAdmin,
+                Permissions = permissions
             };
         }
         catch (Exception)
@@ -64,4 +69,5 @@ public class W3CUserAuthentication
     public string BattleTag { get; set; }
     public string Name { get; set; }
     public bool IsAdmin { get; set; }
+    public HashSet<EPermission> Permissions { get; set; } = new HashSet<EPermission>();
 }
