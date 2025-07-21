@@ -155,7 +155,8 @@ public class ChatHub(
             var adminUser = _connections.GetUser(Context.ConnectionId);
             Log.Information("Deleted message '{MessageContent}' from {MessageSender} by request of {AdminUserName}", deletedMessage.Message, deletedMessage.User.BattleTag, adminUser.BattleTag);
 
-            await Clients.All.SendAsync("MessageDeleted", deletedMessage.Id);
+            var authorConnectionIds = _connections.GetConnectionIdsForUser(deletedMessage.User.BattleTag);
+            await Clients.AllExcept(authorConnectionIds).SendAsync("MessageDeleted", deletedMessage.Id);
         }
     }
 
@@ -167,7 +168,9 @@ public class ChatHub(
         {
             var adminUser = _connections.GetUser(Context.ConnectionId);
             Log.Information("Purging {Count} messages from user {BattleTag} on request of {AdminUserName}", deletedMessages.Count, battleTag, adminUser.BattleTag);
-            await Clients.All.SendAsync("BulkMessageDeleted", deletedMessages.Select(m => m.Id).ToList());
+
+            var authorConnectionIds = _connections.GetConnectionIdsForUser(battleTag);
+            await Clients.AllExcept(authorConnectionIds).SendAsync("BulkMessageDeleted", deletedMessages.Select(m => m.Id).ToList());
         }
         else
         {

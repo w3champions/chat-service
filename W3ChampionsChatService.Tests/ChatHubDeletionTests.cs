@@ -21,6 +21,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
     private ChatHistory _chatHistory;
     private SettingsRepository _settingsRepository;
     private Mock<IClientProxy> _mockAllProxy;
+    private Mock<IClientProxy> _mockAllExceptProxy;
 
     [SetUp]
     public void SetupBeforeEach()
@@ -29,6 +30,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
         _clients = new Mock<IHubCallerClients>();
         _hubCallerContext = new Mock<HubCallerContext>();
         _mockAllProxy = new Mock<IClientProxy>();
+        _mockAllExceptProxy = new Mock<IClientProxy>();
 
         var chatAuthenticationService = new Mock<IChatAuthenticationService>();
         chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
@@ -48,6 +50,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             null);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
+        _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);
         _chatHub.Clients = _clients.Object;
 
         _hubCallerContext.Setup(c => c.ConnectionId).Returns("AdminConnectionId");
@@ -60,12 +63,19 @@ public class ChatHubDeletionTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task DeleteMessage_ValidMessage_DeletesAndNotifiesClients()
+    [TestCase(true, Description = "Author is connected - should exclude them from notification")]
+    [TestCase(false, Description = "Author is not connected - should send to all")]
+    public async Task DeleteMessage_ValidMessage_DeletesAndNotifiesCorrectClients(bool authorIsConnected)
     {
         // Arrange
         var user = new ChatUser("sender#123", false, "Sender", new ProfilePicture());
         var message = new ChatMessage(user, "Message to delete");
         _chatHistory.AddMessage("W3C Lounge", message);
+
+        if (authorIsConnected)
+        {
+            _connectionMapping.Add("SenderConnectionId", "W3C Lounge", user);
+        }
 
         // Act
         await _chatHub.DeleteMessage(message.Id);
@@ -74,9 +84,21 @@ public class ChatHubDeletionTests : IntegrationTestBase
         var messages = _chatHistory.GetMessages("W3C Lounge");
         Assert.AreEqual(0, messages.Count, "Message should be deleted from history");
 
-        _mockAllProxy.Verify(p => p.SendCoreAsync("MessageDeleted",
+        // Verify AllExcept was called with correct exclusion list
+        var expectedExcludedIds = authorIsConnected ? new[] { "SenderConnectionId" } : new string[0];
+        _clients.Verify(c => c.AllExcept(
+            It.Is<System.Collections.Generic.IReadOnlyList<string>>(list =>
+                list.Count == expectedExcludedIds.Length &&
+                expectedExcludedIds.All(id => list.Contains(id)))),
+            Times.Once);
+
+        _mockAllExceptProxy.Verify(p => p.SendCoreAsync("MessageDeleted",
             It.Is<object[]>(args => args.Length == 1 && args[0].Equals(message.Id)),
             default), Times.Once);
+
+        // Verify All proxy was NOT called (since we now always use AllExcept)
+        _mockAllProxy.Verify(p => p.SendCoreAsync("MessageDeleted", It.IsAny<object[]>(), default),
+            Times.Never);
     }
 
     [Test]
@@ -91,7 +113,9 @@ public class ChatHubDeletionTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task PurgeMessagesFromUser_ExistingUser_DeletesAllMessagesAndNotifies()
+    [TestCase(true, Description = "Target user is connected - should exclude them from notification")]
+    [TestCase(false, Description = "Target user is not connected - should send to all")]
+    public async Task PurgeMessagesFromUser_ExistingUser_DeletesAllMessagesAndNotifiesCorrectClients(bool targetUserIsConnected)
     {
         // Arrange
         var targetUser = new ChatUser("target#123", false, "Target", new ProfilePicture());
@@ -105,6 +129,11 @@ public class ChatHubDeletionTests : IntegrationTestBase
         _chatHistory.AddMessage("W3C Lounge", message2);
         _chatHistory.AddMessage("room2", message3);
 
+        if (targetUserIsConnected)
+        {
+            _connectionMapping.Add("TargetConnectionId", "W3C Lounge", targetUser);
+        }
+
         // Act
         await _chatHub.PurgeMessagesFromUser("target#123");
 
@@ -116,11 +145,23 @@ public class ChatHubDeletionTests : IntegrationTestBase
         Assert.AreEqual("other#456", loungeMessages[0].User.BattleTag);
         Assert.AreEqual(0, room2Messages.Count, "Target user's message should be deleted from room2");
 
-        _mockAllProxy.Verify(p => p.SendCoreAsync("BulkMessageDeleted",
+        // Verify AllExcept was called with correct exclusion list
+        var expectedExcludedIds = targetUserIsConnected ? new[] { "TargetConnectionId" } : new string[0];
+        _clients.Verify(c => c.AllExcept(
+            It.Is<System.Collections.Generic.IReadOnlyList<string>>(list =>
+                list.Count == expectedExcludedIds.Length &&
+                expectedExcludedIds.All(id => list.Contains(id)))),
+            Times.Once);
+
+        _mockAllExceptProxy.Verify(p => p.SendCoreAsync("BulkMessageDeleted",
             It.Is<object[]>(args => args.Length == 1 &&
                 args[0] != null &&
                 args[0].GetType() == typeof(System.Collections.Generic.List<string>)),
             default), Times.Once);
+
+        // Verify All proxy was NOT called (since we now always use AllExcept)
+        _mockAllProxy.Verify(p => p.SendCoreAsync("BulkMessageDeleted", It.IsAny<object[]>(), default),
+            Times.Never);
     }
 
     [Test]
@@ -229,4 +270,5 @@ public class ChatHubDeletionTests : IntegrationTestBase
         Assert.AreEqual("other#456", _chatHistory.GetMessages("room1")[0].User.BattleTag);
         Assert.AreEqual(0, _chatHistory.GetMessages("room2").Count);
     }
+
 }
