@@ -67,4 +67,23 @@ public class ConnectionMapping
             return null;
         }
     }
+
+    public List<string> GetConnectionIdsForUser(string battleTag)
+    {
+        lock (_connections)
+        {
+            var connectionIds = new List<string>();
+            foreach (var chatRoomConnections in _connections.Values)
+            {
+                foreach (var connection in chatRoomConnections)
+                {
+                    if (connection.Value.BattleTag == battleTag)
+                    {
+                        connectionIds.Add(connection.Key);
+                    }
+                }
+            }
+            return connectionIds;
+        }
+    }
 }
