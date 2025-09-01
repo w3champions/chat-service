@@ -34,7 +34,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
 
         var chatAuthenticationService = new Mock<IChatAuthenticationService>();
         chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
-            .ReturnsAsync(new ChatUser("admin#123", true, "Admin", new ProfilePicture()));
+            .ReturnsAsync(new ChatUser("admin#123", true, "Admin", new ProfilePicture(), null, null));
         _chatAuthenticationService = chatAuthenticationService.Object;
 
         _connectionMapping = new ConnectionMapping();
@@ -58,7 +58,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
         _chatHub.Groups = new Mock<IGroupManager>().Object;
 
         // Add admin user to connections
-        var adminUser = new ChatUser("admin#123", true, "Admin", new ProfilePicture());
+        var adminUser = new ChatUser("admin#123", true, "Admin", new ProfilePicture(), null, null);
         _connectionMapping.Add("AdminConnectionId", "W3C Lounge", adminUser);
     }
 
@@ -68,7 +68,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
     public async Task DeleteMessage_ValidMessage_DeletesAndNotifiesCorrectClients(bool authorIsConnected)
     {
         // Arrange
-        var user = new ChatUser("sender#123", false, "Sender", new ProfilePicture());
+        var user = new ChatUser("sender#123", false, "Sender", new ProfilePicture(), null, null);
         var message = new ChatMessage(user, "Message to delete");
         _chatHistory.AddMessage("W3C Lounge", message);
 
@@ -118,8 +118,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
     public async Task PurgeMessagesFromUser_ExistingUser_DeletesAllMessagesAndNotifiesCorrectClients(bool targetUserIsConnected)
     {
         // Arrange
-        var targetUser = new ChatUser("target#123", false, "Target", new ProfilePicture());
-        var otherUser = new ChatUser("other#456", false, "Other", new ProfilePicture());
+        var targetUser = new ChatUser("target#123", false, "Target", new ProfilePicture(), null, null);
+        var otherUser = new ChatUser("other#456", false, "Other", new ProfilePicture(), null, null);
 
         var message1 = new ChatMessage(targetUser, "Message 1");
         var message2 = new ChatMessage(otherUser, "Message 2");
@@ -168,7 +168,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
     public async Task PurgeMessagesFromUser_UserWithNoMessages_DoesNotNotifyClients()
     {
         // Arrange
-        var user = new ChatUser("other#456", false, "Other", new ProfilePicture());
+        var user = new ChatUser("other#456", false, "Other", new ProfilePicture(), null, null);
         var message = new ChatMessage(user, "Message");
         _chatHistory.AddMessage("W3C Lounge", message);
 
@@ -217,7 +217,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
     public void ChatHistory_DeleteMessage_ReturnsDeletedMessage(string battleTag, string messageText, string room)
     {
         // Arrange
-        var user = new ChatUser(battleTag, false, "Test", new ProfilePicture());
+        var user = new ChatUser(battleTag, false, "Test", new ProfilePicture(), null, null);
         var message = new ChatMessage(user, messageText);
         _chatHistory.AddMessage(room, message);
 
@@ -249,8 +249,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
     public void ChatHistory_DeleteMessagesFromUser_ReturnsDeletedMessagesList()
     {
         // Arrange
-        var user1 = new ChatUser("test#123", false, "Test1", new ProfilePicture());
-        var user2 = new ChatUser("other#456", false, "Test2", new ProfilePicture());
+        var user1 = new ChatUser("test#123", false, "Test1", new ProfilePicture(), null, null);
+        var user2 = new ChatUser("other#456", false, "Test2", new ProfilePicture(), null, null);
         var message1 = new ChatMessage(user1, "Message 1");
         var message2 = new ChatMessage(user2, "Message 2");
         var message3 = new ChatMessage(user1, "Message 3");
