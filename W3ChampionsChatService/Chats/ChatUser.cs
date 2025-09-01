@@ -2,7 +2,7 @@ using MongoDB.Bson.Serialization.Attributes;
 
 namespace W3ChampionsChatService.Chats;
 
-public class ChatUser(string battleTag, bool isAdmin, string clanTag, ProfilePicture profilePicture)
+public class ChatUser(string battleTag, bool isAdmin, string clanTag, ProfilePicture profilePicture, ChatColor chatColor, ChatIcon[] chatIcons)
 {
     [BsonId]
     public string BattleTag { get; set; } = battleTag;
@@ -10,6 +10,8 @@ public class ChatUser(string battleTag, bool isAdmin, string clanTag, ProfilePic
     public string Name { get; set; } = battleTag.Split("#")[0];
     public string ClanTag { get; set; } = clanTag;
     public ProfilePicture ProfilePicture { get; set; } = profilePicture;
+    public ChatColor ChatColor { get; set; } = chatColor;
+    public ChatIcon[] ChatIcons { get; set; } = chatIcons;
 
     /// <summary>
     /// Generates a fake user with the name "SYSTEM" that is based on this user.
@@ -20,7 +22,7 @@ public class ChatUser(string battleTag, bool isAdmin, string clanTag, ProfilePic
     /// <returns>A ChatUser object representing the derived fake system user.</returns>
     public ChatUser GenerateFakeSystemUser()
     {
-        var systemUser = new ChatUser(this.BattleTag, this.IsAdmin, this.ClanTag, this.ProfilePicture);
+        var systemUser = new ChatUser(this.BattleTag, this.IsAdmin, this.ClanTag, this.ProfilePicture, null, null);
         // Manually set the name to "SYSTEM" because the constructor does not set it.
         // This will allow BattleTag to be the same as the original user to allow clicking it while
         // showing [SYSTEM] as the name in the chat.

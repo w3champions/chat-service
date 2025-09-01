@@ -26,8 +26,22 @@ public class WebsiteBackendRepository : IWebsiteBackendRepository
     }
 }
 
-public class ChatDetailsDto
+public class ChatDetailsDto(string clanId, ProfilePicture profilePicture, ChatColor chatColor, ChatIcon[] chatIcons)
 {
-    public string ClanId { get; set; }
-    public ProfilePicture ProfilePicture { get; set; }
+    public string ClanId { get; } = clanId;
+    public ProfilePicture ProfilePicture { get; } = profilePicture;
+
+    public ChatColor ChatColor { get; } = chatColor;
+    public ChatIcon[] ChatIcons { get; } = chatIcons;
+}
+
+
+public class ChatColor(string colorId)
+{
+    public string ColorId { get; } = colorId;
+}
+
+public class ChatIcon(string iconId)
+{
+    public string IconId { get; } = iconId;
 }
