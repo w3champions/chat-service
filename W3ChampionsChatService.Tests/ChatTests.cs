@@ -40,7 +40,7 @@ public class ChatTests : IntegrationTestBase
 
         var chatAuthenticationService = new Mock<IChatAuthenticationService>();
         chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
-            .ReturnsAsync(new ChatUser("peter#123", false, "AB", new ProfilePicture()));
+            .ReturnsAsync(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
         _chatAuthenticationService = chatAuthenticationService.Object;
         _connectionMapping = new ConnectionMapping();
         _chatHistory = new ChatHistory();
@@ -97,7 +97,7 @@ public class ChatTests : IntegrationTestBase
     // Helper method to authenticate a user and prepare for tests
     private async Task LoginUser()
     {
-        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture()));
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture(), null, null));
     }
 
     // Helper method to verify message was sent only to caller and not to group
@@ -116,7 +116,7 @@ public class ChatTests : IntegrationTestBase
     [Test]
     public async Task Login()
     {
-        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture()));
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture(), null, null));
 
         var usersOfRoom = _connectionMapping.GetUsersOfRoom("W3C Lounge");
         Assert.AreEqual(1, usersOfRoom.Count);
@@ -127,7 +127,7 @@ public class ChatTests : IntegrationTestBase
     [Test]
     public async Task SwitchRoom()
     {
-        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture()));
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture(), null, null));
 
         await _chatHub.SwitchRoom("w3c");
 
@@ -233,7 +233,7 @@ public class ChatTests : IntegrationTestBase
         await _muteRepository.AddLoungeMute(mute);
 
         // Login should succeed
-        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture()));
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "[123]", new ProfilePicture(), null, null));
 
         var usersOfRoom = _connectionMapping.GetUsersOfRoom("W3C Lounge");
         Assert.AreEqual(1, usersOfRoom.Count);
@@ -304,7 +304,7 @@ public class ChatTests : IntegrationTestBase
     {
         // Arrange
         await LoginUser();
-        var user = new ChatUser("other#456", false, "Other", new ProfilePicture());
+        var user = new ChatUser("other#456", false, "Other", new ProfilePicture(), null, null);
         var message = new ChatMessage(user, "Message");
         _chatHistory.AddMessage("W3C Lounge", message);
 
