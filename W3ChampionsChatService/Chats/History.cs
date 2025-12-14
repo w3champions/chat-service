@@ -5,6 +5,9 @@ namespace W3ChampionsChatService.Chats;
 
 public class ChatHistory : Dictionary<string, List<ChatMessage>>
 {
+    private readonly int VisibleMessages = 100;
+    private readonly int MaxMessages = 1000;
+
     public void AddMessage(string chatRoom, ChatMessage message)
     {
         if (!ContainsKey(chatRoom))
@@ -14,7 +17,7 @@ public class ChatHistory : Dictionary<string, List<ChatMessage>>
         else
         {
             this[chatRoom].Add(message);
-            if (this[chatRoom].Count > 50)
+            if (this[chatRoom].Count > MaxMessages)
             {
                 this[chatRoom].RemoveAt(0);
             }
@@ -25,7 +28,17 @@ public class ChatHistory : Dictionary<string, List<ChatMessage>>
     {
         if (!ContainsKey(chatRoom))
         {
-            return new List<ChatMessage>();
+            return [];
+        }
+
+        return [.. this[chatRoom].TakeLast(VisibleMessages)];
+    }
+
+    public List<ChatMessage> GetAllMessages(string chatRoom)
+    {
+        if (!ContainsKey(chatRoom))
+        {
+            return [];
         }
 
         return this[chatRoom];
