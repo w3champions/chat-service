@@ -29,7 +29,7 @@ public class MuteRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mon
         return LoadAll<LoungeMute>();
     }
 
-    public Task DeleteLoungeMute(string battleTag)
+    public Task<DeleteResult> DeleteLoungeMute(string battleTag)
     {
         return Delete<LoungeMute>(c => c.battleTag == battleTag);
     }

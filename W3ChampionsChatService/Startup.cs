@@ -30,7 +30,7 @@ public class Startup
         services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
         services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
         services.AddTransient<MuteRepository>();
-        services.AddTransient<CheckIfBattleTagIsAdminFilter>();
+        services.AddTransient<UserHasPermissionFilter>();
         services.AddHttpContextAccessor();
 
         services.AddSingleton<ConnectionMapping>();

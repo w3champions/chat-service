@@ -80,11 +80,11 @@ public class MongoDbRepositoryBase(MongoClient mongoClient)
         return collection.BulkWriteAsync(bulkOps);
     }
 
-    protected async Task Delete<T>(Expression<Func<T, bool>> deleteQuery)
+    protected async Task<DeleteResult> Delete<T>(Expression<Func<T, bool>> deleteQuery)
     {
         var mongoDatabase = CreateClient();
         var mongoCollection = mongoDatabase.GetCollection<T>(typeof(T).Name);
-        await mongoCollection.DeleteOneAsync<T>(deleteQuery);
+        return await mongoCollection.DeleteOneAsync<T>(deleteQuery);
     }
 
     protected Task Delete<T>(string id) where T : IIdentifiable
