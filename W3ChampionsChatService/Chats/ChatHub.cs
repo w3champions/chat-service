@@ -217,7 +217,7 @@ public class ChatHub(
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
             var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
             await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
-            await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat);
+            await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat, DefaultChatRooms.Rooms);
         }
     }
 
