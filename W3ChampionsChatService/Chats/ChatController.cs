@@ -1,21 +1,20 @@
 using Microsoft.AspNetCore.Mvc;
-using System.Threading.Tasks;
 using System.Collections.Generic;
 using W3ChampionsChatService.Authentication;
 
 namespace W3ChampionsChatService.Chats;
 
 [ApiController]
-[Route("api/chats")]
+[Route("api/chat")]
 public class ChatController(ChatHistory chatHistory) : ControllerBase
 {
     private readonly ChatHistory _chatHistory = chatHistory;
 
     [HttpGet("{chatroom}")]
     [UserHasPermission(EPermission.Moderation)]
-    public async Task<IActionResult> GetChatRoomMessages([FromRoute] string chatroom)
+    public List<ChatMessage> GetChatRoomMessages([FromRoute] string chatroom)
     {
         List<ChatMessage> messages = _chatHistory.GetAllMessages(chatroom);
-        return Ok(messages);
+        return messages;
     }
 }
