@@ -7,7 +7,7 @@ namespace W3ChampionsChatService.Chats;
 public class ChatHistory : Dictionary<string, List<ChatMessage>>
 {
     private readonly int VisibleMessages = 100;
-    private readonly int MaxMessages = 1000;
+    private readonly int MaxMessages = 2000;
 
     public void AddMessage(string chatRoom, ChatMessage message)
     {
