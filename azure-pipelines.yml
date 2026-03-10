@@ -1,3 +1,6 @@
+trigger:
+- master
+
 name: $(Build.BuildID)
 
 pool:
