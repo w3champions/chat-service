@@ -1456,6 +1456,66 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _chatHub.BanUser("offline#999", "reason", false, endDate));
     }
 
+    // ── Task 8 tests ────────────────────────────────────────────────────────────
+
+    [Test]
+    public async Task OnDisconnectedAsync_ShadowBan_InBannedRoom_NoUserLeftBroadcast()
+    {
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        int userLeftCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.OnDisconnectedAsync(null);
+
+        Assert.AreEqual(0, userLeftCount,
+            "Shadow-banned user leaving a banned room must NOT broadcast UserLeft");
+    }
+
+    [Test]
+    public async Task OnDisconnectedAsync_ShadowBan_InExemptRoom_UserLeftBroadcast()
+    {
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        int userLeftCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.OnDisconnectedAsync(null);
+
+        Assert.AreEqual(1, userLeftCount,
+            "Shadow-banned user leaving an exempt room must broadcast UserLeft normally");
+    }
+
+    [Test]
+    public async Task OnDisconnectedAsync_NormalUser_BroadcastsUserLeft()
+    {
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
+
+        int userLeftCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.OnDisconnectedAsync(null);
+
+        Assert.AreEqual(1, userLeftCount, "Normal user disconnect must broadcast UserLeft");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]

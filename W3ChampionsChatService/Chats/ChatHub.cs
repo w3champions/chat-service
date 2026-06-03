@@ -170,9 +170,23 @@ public class ChatHub(
         var user = _connections.GetUser(Context.ConnectionId);
         if (user != null)
         {
+            // Capture room and mute status BEFORE Remove (which clears the cache entry).
             var chatRoom = _connections.GetRoom(Context.ConnectionId);
+            var muteStatus = _connections.GetEffectiveMuteStatus(Context.ConnectionId, DateTime.UtcNow);
             _connections.Remove(Context.ConnectionId);
-            await Clients.Group(chatRoom).SendAsync("UserLeft", user);
+
+            // Guard against null room (full-ban no-clan user has no room — G3/G2: no crash).
+            // Suppress UserLeft for shadow-banned users in banned rooms: they were never announced
+            // as present (ghost-join), so broadcasting UserLeft would break the illusion (spec §6).
+            // Shadow users in exempt rooms (clan/lobby) were announced normally — broadcast as usual.
+            var suppressUserLeft = muteStatus == MuteStatus.Shadow
+                && chatRoom != null
+                && DefaultChatRooms.IsBannedRoom(chatRoom);
+
+            if (!suppressUserLeft && chatRoom != null)
+            {
+                await Clients.Group(chatRoom).SendAsync("UserLeft", user);
+            }
         }
 
         await base.OnDisconnectedAsync(exception);
