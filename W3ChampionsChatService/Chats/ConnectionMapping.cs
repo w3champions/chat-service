@@ -15,7 +15,18 @@ public enum MuteStatus
 /// Per-connection mute state cached at login. Carries both the resolved status and
 /// the expiry so the hub can enforce expiry from the cache alone — no per-message DB read.
 /// </summary>
-public readonly record struct CachedMute(MuteStatus Status, DateTime EndDate);
+public readonly record struct CachedMute(MuteStatus Status, DateTime EndDate)
+{
+    /// <summary>
+    /// The single source of truth for the cache-expiry rule (this is a SECURITY rule —
+    /// it gates ban enforcement, so it must never be re-derived in divergent copies).
+    /// <c>None</c> never expires (an unbanned connection stays unbanned); any other status
+    /// is effective only while <see cref="EndDate"/> is still in the future. Once the ban
+    /// has expired it returns <c>None</c>.
+    /// </summary>
+    public MuteStatus EffectiveStatus(DateTime now) =>
+        (Status == MuteStatus.None || EndDate > now) ? Status : MuteStatus.None;
+}
 
 public class ConnectionMapping
 {
@@ -98,7 +109,10 @@ public class ConnectionMapping
             {
                 foreach (var connection in chatRoomConnections)
                 {
-                    if (connection.Value.BattleTag == battleTag)
+                    // Case-insensitive match: the DB lowercases battleTags (see MuteRepository),
+                    // while connection-stored tags keep their original casing — so an exact (==)
+                    // compare would silently miss a casing mismatch (e.g. live-ban reconcile).
+                    if (string.Equals(connection.Value.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase))
                     {
                         connectionIds.Add(connection.Key);
                     }
@@ -142,9 +156,10 @@ public class ConnectionMapping
     /// first to decide whether a lazy resolve is needed.
     /// </summary>
     /// <remarks>
-    /// The expiry rule lives in a single place: <see cref="GetEffectiveMuteStatusNoLock"/>.
-    /// This method just acquires the lock and delegates. <see cref="GetUsersOfRoomForViewer"/>
-    /// calls the no-lock helper directly because it already holds <c>lock(_connections)</c>.
+    /// The expiry rule itself lives on <see cref="CachedMute.EffectiveStatus"/> (single source).
+    /// This method just acquires the lock and delegates to <see cref="GetEffectiveMuteStatusNoLock"/>.
+    /// <see cref="GetUsersOfRoomForViewer"/> calls the no-lock helper directly because it already
+    /// holds <c>lock(_connections)</c>.
     /// </remarks>
     public MuteStatus GetEffectiveMuteStatus(string connectionId, DateTime now)
     {
@@ -155,21 +170,16 @@ public class ConnectionMapping
     }
 
     /// <summary>
-    /// Single source of truth for the cache expiry rule. The caller MUST already hold
-    /// <c>lock(_connections)</c>. A cache MISS returns <c>None</c>; a HIT returns its status
-    /// while still effective (<c>None</c> never expires; other statuses expire once
-    /// <c>EndDate</c> has passed).
+    /// Resolves the effective mute status from the cache. The caller MUST already hold
+    /// <c>lock(_connections)</c>. A cache MISS returns <c>None</c>; a HIT delegates to
+    /// <see cref="CachedMute.EffectiveStatus"/> (the single expiry rule).
     /// </summary>
     private MuteStatus GetEffectiveMuteStatusNoLock(string connectionId, DateTime now)
     {
-        if (!_mutes.TryGetValue(connectionId, out var cached))
-            return MuteStatus.None;
-
-        // None is always effective (unbanned); other statuses expire when EndDate passes.
-        if (cached.Status == MuteStatus.None || cached.EndDate > now)
-            return cached.Status;
-
-        return MuteStatus.None;
+        // Cache MISS → None; otherwise the single expiry rule lives on CachedMute.EffectiveStatus.
+        return _mutes.TryGetValue(connectionId, out var cached)
+            ? cached.EffectiveStatus(now)
+            : MuteStatus.None;
     }
 
     /// <summary>

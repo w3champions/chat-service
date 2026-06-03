@@ -1326,6 +1326,67 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task BanUser_LiveUser_MultipleConnections_AllReconciled()
+    {
+        // A user can be connected from multiple clients (multiple connection ids). A full ban
+        // must reconcile EVERY live connection: each cache flips to Full AND each receives
+        // PlayerBannedFromChat. No Context.Abort() on any of them.
+        var conn1User = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        var conn2User = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn1", "W3C Lounge", conn1User);
+        _connectionMapping.SetMute("VictimConn1", MuteStatus.None, DateTime.MinValue);
+        _connectionMapping.Add("VictimConn2", "1 vs 1", conn2User);
+        _connectionMapping.SetMute("VictimConn2", MuteStatus.None, DateTime.MinValue);
+
+        var victim1Signals = 0;
+        var victim1Proxy = new Mock<ISingleClientProxy>();
+        victim1Proxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, _, _) =>
+            {
+                if (method == "PlayerBannedFromChat") victim1Signals++;
+            })
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn1")).Returns(victim1Proxy.Object);
+
+        var victim2Signals = 0;
+        var victim2Proxy = new Mock<ISingleClientProxy>();
+        victim2Proxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, _, _) =>
+            {
+                if (method == "PlayerBannedFromChat") victim2Signals++;
+            })
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn2")).Returns(victim2Proxy.Object);
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        // Both caches updated to Full
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn1", out var cached1));
+        Assert.AreEqual(MuteStatus.Full, cached1.Status,
+            "First connection's cache must be reconciled to Full");
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn2", out var cached2));
+        Assert.AreEqual(MuteStatus.Full, cached2.Status,
+            "Second connection's cache must be reconciled to Full");
+
+        // Both connections received exactly one PlayerBannedFromChat
+        Assert.AreEqual(1, victim1Signals,
+            "First connection must receive PlayerBannedFromChat");
+        Assert.AreEqual(1, victim2Signals,
+            "Second connection must receive PlayerBannedFromChat");
+
+        Assert.IsFalse(abortCalled, "Context.Abort() must NOT be called on any connection (G1)");
+    }
+
+    [Test]
     public async Task BanUser_LiveUser_ShadowBan_SendsNoSignalToTarget()
     {
         // Shadow ban: illusion preserved — no PlayerBannedFromChat sent to target

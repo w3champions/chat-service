@@ -58,7 +58,8 @@ public class ChatHub(
             {
                 // Cache HIT with an active ban — honor cached status + expiry. ZERO DB reads.
                 // This is the primary §7 win: a cached-banned user does NOT hit the DB on every send.
-                muteStatus = cached.EndDate > DateTime.UtcNow ? cached.Status : MuteStatus.None;
+                // EffectiveStatus is the single expiry rule (expired ban → None).
+                muteStatus = cached.EffectiveStatus(DateTime.UtcNow);
 
                 if (muteStatus == MuteStatus.None)
                 {
@@ -215,9 +216,8 @@ public class ChatHub(
                 if (hasCachedEntry && preSwitchCached.Status != MuteStatus.None)
                 {
                     // Fast path: cached active ban — honor cached status + expiry, no DB read.
-                    muteStatus = preSwitchCached.EndDate > DateTime.UtcNow
-                        ? preSwitchCached.Status
-                        : MuteStatus.None;
+                    // EffectiveStatus is the single expiry rule (expired ban → None).
+                    muteStatus = preSwitchCached.EffectiveStatus(DateTime.UtcNow);
                     cachedEndDate = preSwitchCached.EndDate;
                 }
                 else
@@ -239,9 +239,8 @@ public class ChatHub(
             else if (hasCachedEntry)
             {
                 // Exempt target — cache HIT drives the shadow presence gates below; no DB read.
-                muteStatus = (preSwitchCached.Status == MuteStatus.None || preSwitchCached.EndDate > DateTime.UtcNow)
-                    ? preSwitchCached.Status
-                    : MuteStatus.None;
+                // EffectiveStatus is the single expiry rule (expired ban → None).
+                muteStatus = preSwitchCached.EffectiveStatus(DateTime.UtcNow);
             }
             // Exempt target + cache MISS: muteStatus stays None; no DB read needed.
         }
@@ -352,10 +351,24 @@ public class ChatHub(
 
         // Spec §12: Reconcile any live connections for this user so enforcement is instant.
         // Parse the endDate once — used for both the cache and the PlayerBannedFromChat payload.
-        var parsedEndDate = DateTime.Parse(endDate, null, System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime();
+        // Use the SAME DateTimeStyles the repository uses (AdjustToUniversal) so the CACHED expiry
+        // can never disagree with the PERSISTED expiry for an offset-less endDate.
+        // Guard a malformed/empty endDate: the ban is already persisted, so on a parse failure
+        // skip the live reconcile gracefully (the safety-net re-resolve enforces on next send/join)
+        // rather than throwing a hub exception after the write.
+        if (!DateTime.TryParse(endDate, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsedEndDate))
+        {
+            Log.Warning("BanUser: could not parse endDate '{EndDate}' for {BattleTag} — ban persisted, skipping live cache reconcile (safety-net re-resolve will enforce)",
+                endDate, battleTag);
+            return;
+        }
+
         var newStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
 
-        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag);
+        // Match the DB convention (GetMutedPlayer/AddLoungeMute lowercase the battleTag) by lowercasing
+        // the lookup arg too. GetConnectionIdsForUser also compares case-insensitively, so the instant
+        // reconcile works on a casing mismatch (not just via the safety-net self-heal).
+        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag.ToLower());
         foreach (var connId in liveConnectionIds)
         {
             // Update the cache so the next SendMessage/SwitchRoom enforces from the cache (no DB read).
