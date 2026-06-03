@@ -154,6 +154,173 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         Assert.AreEqual(MuteStatus.None, mapping.GetMuteStatus("conn1"));
     }
 
+    // ── Task 3 helper methods ─────────────────────────────────────────────────
+
+    private async Task AddFullBan(string battleTag, int daysFromNow = 1)
+    {
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = battleTag,
+            endDate = DateTime.UtcNow.AddDays(daysFromNow).ToString("O"),
+            author = "admin#1",
+            reason = "test ban",
+            isShadowBan = false
+        });
+    }
+
+    private async Task AddShadowBan(string battleTag, int daysFromNow = 1)
+    {
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = battleTag,
+            endDate = DateTime.UtcNow.AddDays(daysFromNow).ToString("O"),
+            author = "admin#1",
+            reason = "test shadow ban",
+            isShadowBan = true
+        });
+    }
+
+    // ── Task 3 tests ────────────────────────────────────────────────────────────
+
+    [Test]
+    public async Task Login_FullBan_DoesNotAbortConnection()
+    {
+        await AddFullBan("peter#123");
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.IsFalse(abortCalled, "Context.Abort() must NOT be called for full-banned users");
+    }
+
+    [Test]
+    public async Task Login_FullBan_SendsPlayerBannedFromChat()
+    {
+        await AddFullBan("peter#123");
+
+        string callerMethodReceived = null;
+        LoungeMute muteReceived = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "PlayerBannedFromChat")
+                {
+                    callerMethodReceived = method;
+                    muteReceived = args[0] as LoungeMute;
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.AreEqual("PlayerBannedFromChat", callerMethodReceived);
+        Assert.IsNotNull(muteReceived);
+        Assert.AreEqual("peter#123", muteReceived.battleTag);
+    }
+
+    [Test]
+    public async Task Login_FullBan_StartChatExcludesBannedRooms()
+    {
+        await AddFullBan("peter#123");
+
+        List<string> roomListReceived = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "StartChat" && args.Length >= 4)
+                {
+                    roomListReceived = args[3] as List<string>;
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.IsNotNull(roomListReceived, "StartChat must still be sent");
+        foreach (var bannedRoom in DefaultChatRooms.Rooms)
+        {
+            Assert.IsFalse(roomListReceived.Contains(bannedRoom),
+                $"Banned room '{bannedRoom}' must not appear in full-banned user's channel list");
+        }
+    }
+
+    [Test]
+    public async Task Login_FullBan_WithClanTag_SeatedInClanRoom()
+    {
+        await AddFullBan("peter#123");
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+
+        // Must be in "clan AB", not in any banned room
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan AB", room);
+        Assert.IsFalse(DefaultChatRooms.IsBannedRoom(room));
+    }
+
+    [Test]
+    public async Task Login_FullBan_NoClan_NotSeatedInAnyRoom()
+    {
+        await AddFullBan("peter#123");
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        // No clan → not added to any room
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.IsNull(room, "Full-banned user with no clan must not be seated in any room");
+    }
+
+    [Test]
+    public async Task Login_FullBan_NoClan_StillEmitsStartChat()
+    {
+        // G3: even a full-banned user with no clan/no room must receive a StartChat so legacy
+        // clients can initialize. The payload is an empty-room payload (null room).
+        await AddFullBan("peter#123");
+
+        bool startChatSent = false;
+        string roomArg = "unset";
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "StartChat")
+                {
+                    startChatSent = true;
+                    roomArg = args.Length >= 3 ? args[2] as string : "missing";
+                }
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.IsTrue(startChatSent, "Full-banned user with no clan must still receive a StartChat (G3)");
+        Assert.IsNull(roomArg, "Empty-room StartChat payload must use a null room");
+    }
+
+    [Test]
+    public async Task Login_FullBan_NoBannedUserEntered_Broadcast()
+    {
+        // A second user (normal) is already in W3C Lounge; full-banned user should NOT trigger UserEntered there
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("OtherConn", "W3C Lounge", normalUser);
+
+        var groupUserEnteredCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserEntered", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => groupUserEnteredCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await AddFullBan("peter#123");
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.AreEqual(0, groupUserEnteredCount,
+            "UserEntered must not be broadcast for full-banned user with no clan");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]

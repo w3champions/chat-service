@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
@@ -44,9 +45,11 @@ public class ChatHub(
 
             if (mute != null && !mute.isShadowBan)
             {
-                // Regular mute: disconnect
-                await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
-                Context.Abort();
+                // G1: Full ban — silently drop the message (no Context.Abort(), no teardown).
+                // The PlayerBannedFromChat notice was already sent at connect time (LoginAsAuthenticated).
+                Log.Information("Full-banned user {BattleTag} attempted to send message in room {Room} — dropped silently",
+                    user?.BattleTag, chatRoom);
+                return;
             }
             else
             {
@@ -201,19 +204,59 @@ public class ChatHub(
     internal async Task LoginAsAuthenticated(ChatUser user)
     {
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
-
         var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
 
-        if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0 && !mute.isShadowBan)
+        // Treat expired mutes as no mute
+        if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) <= 0)
         {
-            Log.Information("Declining connection for {BattleTag} because they are banned until {EndDate}", user.BattleTag, mute.endDate);
+            mute = null;
+        }
+
+        var isFullBan = mute != null && !mute.isShadowBan;
+        var isShadowBan = mute != null && mute.isShadowBan;
+
+        if (isFullBan)
+        {
+            // G1: do NOT abort — connect the user. G5: still send legacy PlayerBannedFromChat.
+            Log.Information("Full-banned user {BattleTag} connecting — sending ban notice, filtering rooms", user.BattleTag);
+
+            // G5: legacy ban notice so old clients render their notice.
             await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
-            Context.Abort();
+
+            // Filtered channel list excludes all lounge/ladder banned rooms (spec §5.1).
+            var availableRooms = new List<string>();
+
+            // Seat in clan room if available, else no room (spec D2 — empty state).
+            var safeRoom = string.IsNullOrWhiteSpace(user.ClanTag) ? null : $"clan {user.ClanTag}";
+
+            if (safeRoom != null)
+            {
+                _connections.Add(Context.ConnectionId, safeRoom, user);
+                _connections.SetMuteStatus(Context.ConnectionId, MuteStatus.Full);
+                await Groups.AddToGroupAsync(Context.ConnectionId, safeRoom);
+                var usersOfRoom = _connections.GetUsersOfRoom(safeRoom);
+                await Clients.Group(safeRoom).SendAsync("UserEntered", user);
+                // G3: StartChat with the seated room's payload.
+                await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(safeRoom), safeRoom, availableRooms);
+            }
+            else
+            {
+                // No clan: not seated in any room (spec D2).
+                // Note: SetMuteStatus is not called here because the connection is not in the mapping yet.
+                // SwitchRoom enforcement (Task 4) lazily re-resolves the mute from MongoDB for this edge case.
+                // G3: STILL emit a StartChat — an empty-room payload — so legacy clients can initialize.
+                await Clients.Caller.SendAsync("StartChat", new List<ChatUser>(), new List<ChatMessage>(), (string)null, availableRooms);
+            }
         }
         else
         {
-            Log.Information("Accepting connection for {BattleTag} and adding to room {Room}", user.BattleTag, memberShip.DefaultChat);
+            // Shadow ban or no ban: connect as normal (G1 — never abort).
+            var muteStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.None;
+            Log.Information("Accepting connection for {BattleTag}, mute={MuteStatus}, room={Room}",
+                user.BattleTag, muteStatus, memberShip.DefaultChat);
+
             _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
+            _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
             var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
             await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);

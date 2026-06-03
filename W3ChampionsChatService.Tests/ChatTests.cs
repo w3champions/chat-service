@@ -152,34 +152,30 @@ public class ChatTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task BannedUser_CannotSendMessage()
+    public async Task BannedUser_SendMessageInBannedRoom_IsRejectedSilently()
     {
-        // Login before ban
+        // Login first (not yet banned)
         await LoginUser();
 
-        // Reset the group message flag after login
+        // Reset group flag after login
         _groupMessageSent = false;
 
-        // Setup muted player
-        var mute = new LoungeMuteRequest
+        // Ban the user
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
             battleTag = "peter#123",
             endDate = DateTime.UtcNow.AddDays(1).ToString(),
             author = "modmoto#2809"
-        };
+        });
 
-        await _muteRepository.AddLoungeMute(mute);
-
-        // Set up tracking for Context.Abort()
+        // Ensure Abort is NOT called (new behavior)
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
-        // Send message
         await _chatHub.SendMessage("Hello world");
 
-        // Verify connection aborted and message not sent
-        Assert.IsTrue(abortCalled);
-        Assert.IsFalse(_groupMessageSent, "No message should be sent to the group for banned users");
+        Assert.IsFalse(abortCalled, "Context.Abort() must not be called from SendMessage");
+        Assert.IsFalse(_groupMessageSent, "No message should be broadcast to the group");
         Assert.AreEqual(0, _chatHistory.GetMessages("W3C Lounge").Count);
     }
 
@@ -271,30 +267,29 @@ public class ChatTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task BackwardsCompatibility_RegularMuteStillWorks()
+    public async Task BackwardsCompatibility_RegularMuteStillBlocks()
     {
         // Login before ban
         await LoginUser();
 
-        // Setup regular mute (without isShadowBan property)
-        var mute = new LoungeMuteRequest
+        _groupMessageSent = false;
+
+        // Regular mute (isShadowBan defaults to false)
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
             battleTag = "peter#123",
             endDate = DateTime.UtcNow.AddDays(1).ToString(),
             author = "modmoto#2809"
             // isShadowBan defaults to false
-        };
+        });
 
-        await _muteRepository.AddLoungeMute(mute);
-
-        // Set up tracking for Context.Abort()
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
-        // Send message should result in abort
         await _chatHub.SendMessage("Hello world");
 
-        Assert.IsTrue(abortCalled);
+        // No abort from SendMessage in the new design — full-ban enforces by dropping message
+        Assert.IsFalse(abortCalled, "Context.Abort() must not be called from SendMessage");
         Assert.IsFalse(_groupMessageSent);
         Assert.AreEqual(0, _chatHistory.GetMessages("W3C Lounge").Count);
     }
