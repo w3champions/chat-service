@@ -141,6 +141,13 @@ public class ConnectionMapping
     /// <c>MuteStatus.None</c>. Does NOT trigger a DB read — call <see cref="TryGetMute"/>
     /// first to decide whether a lazy resolve is needed.
     /// </summary>
+    /// <remarks>
+    /// <see cref="GetUsersOfRoomForViewer"/> intentionally inlines this same expiry logic
+    /// rather than calling this method. C#'s <c>lock</c> is reentrant so calling here while
+    /// already holding <c>lock(_connections)</c> would not deadlock, but inlining keeps the
+    /// single-lock discipline explicit while iterating the room. Keep the inlined copy in
+    /// <see cref="GetUsersOfRoomForViewer"/> in sync with the expiry rule below.
+    /// </remarks>
     public MuteStatus GetEffectiveMuteStatus(string connectionId, DateTime now)
     {
         lock (_connections)

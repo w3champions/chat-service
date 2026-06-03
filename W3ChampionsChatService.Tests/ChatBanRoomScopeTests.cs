@@ -949,10 +949,17 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
         Assert.AreEqual(1, visibleToNormal.Count);
         Assert.AreEqual("normal#1", visibleToNormal[0].BattleTag);
+        var tagsVisibleToNormal = visibleToNormal.Select(u => u.BattleTag).ToList();
+        Assert.IsFalse(tagsVisibleToNormal.Contains("shadow#2"),
+            "Non-viewer must NOT see the shadow-banned user's battleTag");
+        Assert.IsTrue(tagsVisibleToNormal.Contains("normal#1"),
+            "Non-viewer must see the normal user's battleTag");
 
         // Shadow user viewing themselves — they see both
         var visibleToShadow = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-shadow");
         Assert.AreEqual(2, visibleToShadow.Count);
+        Assert.IsTrue(visibleToShadow.Any(u => u.BattleTag == "shadow#2"),
+            "Shadow-banned viewer must see their own battleTag");
     }
 
     [Test]
