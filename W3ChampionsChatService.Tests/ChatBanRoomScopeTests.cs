@@ -500,6 +500,36 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task SwitchRoom_FullBan_NoClan_ExemptThenBanned_StillRejected()
+    {
+        // SECURITY regression (full-ban bypass): a no-clan full-banned connection starts as a
+        // cache MISS. A FIRST switch into an EXEMPT room ("clan AB") is allowed and would write a
+        // cache-None entry. A SECOND switch into a BANNED room must STILL re-resolve the DB and
+        // reject — it must not trust the cache-None written by the exempt switch.
+        await AddFullBan("peter#123");
+        // Seated in a room but with NO cached mute (cache MISS), reproducing the no-clan login path.
+        _connectionMapping.Add("TestId", "clan SEED", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        // First switch: into an EXEMPT room — allowed, and (pre-fix) caches None.
+        await _chatHub.SwitchRoom("clan AB");
+        Assert.AreEqual("clan AB", _connectionMapping.GetRoom("TestId"),
+            "Switch into an exempt room must be allowed");
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        // Second switch: into a BANNED room — must re-resolve the ban and reject.
+        await _chatHub.SwitchRoom("W3C Lounge");
+
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan AB", room,
+            "Full-banned user must NOT enter a banned room after a prior exempt switch (cache-None must not bypass the ban)");
+        Assert.IsFalse(_connectionMapping.GetUsersOfRoom("clan AB").Count == 0,
+            "User must remain seated in the exempt room");
+        Assert.IsFalse(abortCalled, "Rejected SwitchRoom must not call Context.Abort() (G1)");
+    }
+
+    [Test]
     public async Task SwitchRoom_ShadowBan_IntoBannedRoom_GhostJoin_NoUserEnteredBroadcast()
     {
         await AddShadowBan("peter#123");

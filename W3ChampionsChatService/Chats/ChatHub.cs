@@ -187,41 +187,60 @@ public class ChatHub(
         // Capture the full cached entry BEFORE Remove so we can re-populate it afterwards.
         var hasCachedEntry = _connections.TryGetMute(Context.ConnectionId, out var preSwitchCached);
         var cachedEndDate = hasCachedEntry ? preSwitchCached.EndDate : DateTime.MinValue;
+        var targetIsBanned = DefaultChatRooms.IsBannedRoom(chatRoom);
 
         if (user != null)
         {
-            if (hasCachedEntry)
+            if (targetIsBanned)
             {
-                // Cache HIT — use the cached status with expiry; no DB read needed for any room.
+                // SECURITY: for a BANNED target, only trust the cache on a HIT with a real ban
+                // (Status != None). A cache MISS *or* a HIT-None must lazy-resolve from the DB —
+                // otherwise a no-clan full-banned user who first switched into an exempt room
+                // (which writes a cache-None) would bypass the ban on a later switch into a
+                // banned room. This mirrors SendMessage's HIT-None re-resolve path.
+                if (hasCachedEntry && preSwitchCached.Status != MuteStatus.None)
+                {
+                    // Fast path: cached active ban — honor cached status + expiry, no DB read.
+                    muteStatus = preSwitchCached.EndDate > DateTime.UtcNow
+                        ? preSwitchCached.Status
+                        : MuteStatus.None;
+                    cachedEndDate = preSwitchCached.EndDate;
+                }
+                else
+                {
+                    // Cache MISS or HIT-None — lazy-resolve the mute for the banned target.
+                    var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
+                    if (mute != null && mute.IsActive(DateTime.UtcNow))
+                    {
+                        muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+                        cachedEndDate = mute.endDate;
+                    }
+                    else
+                    {
+                        muteStatus = MuteStatus.None;
+                        cachedEndDate = DateTime.MinValue;
+                    }
+                }
+            }
+            else if (hasCachedEntry)
+            {
+                // Exempt target — cache HIT drives the shadow presence gates below; no DB read.
                 muteStatus = (preSwitchCached.Status == MuteStatus.None || preSwitchCached.EndDate > DateTime.UtcNow)
                     ? preSwitchCached.Status
                     : MuteStatus.None;
             }
-            else if (DefaultChatRooms.IsBannedRoom(chatRoom))
-            {
-                // Cache MISS + target is banned — lazy resolve (no-clan full-ban edge case at login).
-                var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-                if (mute != null && mute.IsActive(DateTime.UtcNow))
-                {
-                    muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
-                    cachedEndDate = mute.endDate;
-                }
-                else
-                {
-                    cachedEndDate = DateTime.MinValue;
-                }
-                // We will cache the resolved result after Remove+Add below.
-                hasCachedEntry = false; // treat as "needs to be written after Remove+Add"
-            }
-            // Cache MISS + exempt room: muteStatus stays None; no DB read needed.
+            // Exempt target + cache MISS: muteStatus stays None; no DB read needed.
         }
 
         // G1/G2: Full-ban → graceful reject BEFORE any Remove/Add. User stays in their current room.
         // No Context.Abort(), no throw, no connection teardown.
-        if (DefaultChatRooms.IsBannedRoom(chatRoom) && muteStatus == MuteStatus.Full)
+        if (targetIsBanned && muteStatus == MuteStatus.Full)
         {
+            // S3: cache the resolved full ban before returning so subsequent SwitchRoom/SendMessage
+            // enforce from the cache instead of re-reading the DB.
+            _connections.SetMute(Context.ConnectionId, MuteStatus.Full, cachedEndDate);
             Log.Information("Full-banned user {BattleTag} rejected from joining banned room {Room} — staying in {OldRoom}",
-                user?.BattleTag, chatRoom, oldRoom);
+                user.BattleTag, chatRoom, oldRoom);
             return;
         }
 
@@ -233,11 +252,12 @@ public class ChatHub(
         // Using a single target-based flag for both would leak/strand presence on cross-category
         // shadow transitions (exempt→banned must still broadcast UserLeft; banned→exempt must not).
         var suppressLeave = oldRoom != null && DefaultChatRooms.IsBannedRoom(oldRoom) && muteStatus == MuteStatus.Shadow;
-        var suppressEnter = DefaultChatRooms.IsBannedRoom(chatRoom) && muteStatus == MuteStatus.Shadow;
+        var suppressEnter = targetIsBanned && muteStatus == MuteStatus.Shadow;
 
         _connections.Remove(Context.ConnectionId);
         _connections.Add(Context.ConnectionId, chatRoom, user);
         // Re-cache the mute status + endDate after Remove (which clears it) + Add.
+        // S3: this also caches a freshly lazy-resolved shadow ban on the ghost-join path.
         _connections.SetMute(Context.ConnectionId, muteStatus, cachedEndDate);
 
         if (oldRoom != null)
