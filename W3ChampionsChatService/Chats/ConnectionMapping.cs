@@ -3,10 +3,21 @@ using System.Linq;
 
 namespace W3ChampionsChatService.Chats;
 
+public enum MuteStatus
+{
+    None,
+    Shadow,
+    Full
+}
+
 public class ConnectionMapping
 {
     private readonly Dictionary<string, Dictionary<string, ChatUser>> _connections =
         new Dictionary<string, Dictionary<string, ChatUser>>();
+
+    // Per-connection mute status cache. Keyed by connectionId.
+    private readonly Dictionary<string, MuteStatus> _muteStatuses =
+        new Dictionary<string, MuteStatus>();
 
     public List<ChatUser> GetUsersOfRoom(string chatRoom)
     {
@@ -52,6 +63,10 @@ public class ConnectionMapping
             var connection = _connections.Values.SingleOrDefault(r => r.ContainsKey(connectionId));
             connection?.Remove(connectionId);
         }
+        lock (_muteStatuses)
+        {
+            _muteStatuses.Remove(connectionId);
+        }
     }
 
     public string GetRoom(string connectionId)
@@ -84,6 +99,22 @@ public class ConnectionMapping
                 }
             }
             return connectionIds;
+        }
+    }
+
+    public void SetMuteStatus(string connectionId, MuteStatus status)
+    {
+        lock (_muteStatuses)
+        {
+            _muteStatuses[connectionId] = status;
+        }
+    }
+
+    public MuteStatus GetMuteStatus(string connectionId)
+    {
+        lock (_muteStatuses)
+        {
+            return _muteStatuses.TryGetValue(connectionId, out var status) ? status : MuteStatus.None;
         }
     }
 }
