@@ -1,4 +1,6 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace W3ChampionsChatService.Chats;
 
@@ -20,8 +22,8 @@ public class DefaultChatRooms()
     ];
 
     /// <summary>
-    /// Returns true if <paramref name="room"/> is a lounge/ladder channel
-    /// where chat mutes apply. Clan and custom-game-lobby rooms return false.
+    /// True only for the official lounge/ladder rooms in <see cref="Rooms"/> (case-insensitive).
+    /// Any other room — clan rooms, game-lobby rooms, or any dynamic room — returns false.
     /// </summary>
-    public static bool IsBannedRoom(string room) => Rooms.Contains(room);
+    public static bool IsBannedRoom(string room) => Rooms.Contains(room, StringComparer.OrdinalIgnoreCase);
 }

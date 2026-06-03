@@ -168,11 +168,16 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     [TestCase("Castle Fight",    ExpectedResult = true)]
     [TestCase("Risk Europe",     ExpectedResult = true)]
     [TestCase("Mini Dota",       ExpectedResult = true)]
+    // Mixed-case variants of banned rooms must still be caught (case-insensitive ban check)
+    [TestCase("w3c lounge",      ExpectedResult = true)]
+    [TestCase("1 VS 1",          ExpectedResult = true)]
+    [TestCase("LEGION TD",       ExpectedResult = true)]
     [TestCase("clan AB",         ExpectedResult = false)]
     [TestCase("clan XYZ",        ExpectedResult = false)]
     [TestCase("game-lobby-42",   ExpectedResult = false)]
     [TestCase("custom_lobby",    ExpectedResult = false)]
     [TestCase("",                ExpectedResult = false)]
+    [TestCase(null,              ExpectedResult = false)]
     public bool IsBannedRoom_ClassifiesCorrectly(string room)
     {
         return DefaultChatRooms.IsBannedRoom(room);
