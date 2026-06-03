@@ -321,6 +321,29 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "UserEntered must not be broadcast for full-banned user with no clan");
     }
 
+    [Test]
+    public async Task OnDisconnected_FullBanNoClan_NoThrow()
+    {
+        // Lifecycle regression: a full-banned, no-clan user is connected but seated in NO room.
+        // Disconnecting must not throw (no NRE on a null room) and must not broadcast UserLeft,
+        // since there is no room/group to notify.
+        await AddFullBan("peter#123");
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        // Track any group send after login (StartChat goes to caller, not group).
+        var groupSendsAfterLogin = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => groupSendsAfterLogin++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        Assert.DoesNotThrowAsync(async () => await _chatHub.OnDisconnectedAsync(null),
+            "Disconnecting a full-banned no-clan user (no room) must not throw");
+        Assert.AreEqual(0, groupSendsAfterLogin,
+            "No group broadcast (UserLeft) must fire for a user seated in no room");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]

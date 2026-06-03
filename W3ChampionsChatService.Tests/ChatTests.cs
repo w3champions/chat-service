@@ -152,7 +152,7 @@ public class ChatTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task BannedUser_SendMessageInBannedRoom_IsRejectedSilently()
+    public async Task BannedUser_SendMessage_IsRejectedSilently()
     {
         // Login first (not yet banned)
         await LoginUser();

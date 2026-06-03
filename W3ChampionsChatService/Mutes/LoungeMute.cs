@@ -20,4 +20,10 @@ public class LoungeMute : IIdentifiable
     public string author { get; set; }
     public string reason { get; set; }
     public bool isShadowBan { get; set; } = false;
+
+    /// <summary>
+    /// Returns true if this mute is still active at <paramref name="now"/>
+    /// (i.e. its end date is in the future). An expired mute is treated as no mute.
+    /// </summary>
+    public bool IsActive(DateTime now) => DateTime.Compare(endDate, now) > 0;
 }

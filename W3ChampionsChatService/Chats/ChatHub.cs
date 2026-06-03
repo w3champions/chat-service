@@ -36,19 +36,28 @@ public class ChatHub(
             var chatRoom = _connections.GetRoom(Context.ConnectionId);
             var user = _connections.GetUser(Context.ConnectionId);
 
+            // R6 (membership-before-send, start): a connected user may be seated in NO room
+            // (e.g. full-banned with no clan). Without a room/user there is nothing to send.
+            // Guard before dereferencing user/chatRoom to avoid an NRE. Task 5 completes room-scoping.
+            if (user == null || chatRoom == null)
+            {
+                return;
+            }
+
             // Check if player is on Lounge Mute list. If yes, handle accordingly.
             var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) <= 0)
+            if (mute != null && !mute.IsActive(DateTime.UtcNow))
             {
                 mute = null;
             }
 
+            // TODO (Task 5): room-scope via DefaultChatRooms.IsBannedRoom + cached GetMuteStatus; currently room-blind.
             if (mute != null && !mute.isShadowBan)
             {
                 // G1: Full ban — silently drop the message (no Context.Abort(), no teardown).
                 // The PlayerBannedFromChat notice was already sent at connect time (LoginAsAuthenticated).
                 Log.Information("Full-banned user {BattleTag} attempted to send message in room {Room} — dropped silently",
-                    user?.BattleTag, chatRoom);
+                    user.BattleTag, chatRoom);
                 return;
             }
             else
@@ -207,7 +216,7 @@ public class ChatHub(
         var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
 
         // Treat expired mutes as no mute
-        if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) <= 0)
+        if (mute != null && !mute.IsActive(DateTime.UtcNow))
         {
             mute = null;
         }
