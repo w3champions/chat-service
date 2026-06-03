@@ -932,6 +932,179 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "Dropped message must not enter history");
     }
 
+    // ── Task 6 tests ────────────────────────────────────────────────────────────
+
+    [Test]
+    public void ConnectionMapping_GetUsersOfRoomForViewer_ShadowBanInBannedRoom_HiddenFromOthers()
+    {
+        var mapping = new ConnectionMapping();
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        var shadowUser = new ChatUser("shadow#2", false, null, new ProfilePicture(), null, null);
+
+        mapping.Add("conn-normal", "W3C Lounge", normalUser);
+        mapping.Add("conn-shadow", "W3C Lounge", shadowUser);
+        mapping.SetMute("conn-shadow", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        // Normal user viewing — shadow user must be hidden
+        var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
+        Assert.AreEqual(1, visibleToNormal.Count);
+        Assert.AreEqual("normal#1", visibleToNormal[0].BattleTag);
+
+        // Shadow user viewing themselves — they see both
+        var visibleToShadow = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-shadow");
+        Assert.AreEqual(2, visibleToShadow.Count);
+    }
+
+    [Test]
+    public void ConnectionMapping_GetUsersOfRoomForViewer_ShadowBanInExemptRoom_Visible()
+    {
+        var mapping = new ConnectionMapping();
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        var shadowUser = new ChatUser("shadow#2", false, null, new ProfilePicture(), null, null);
+
+        mapping.Add("conn-normal", "clan AB", normalUser);
+        mapping.Add("conn-shadow", "clan AB", shadowUser);
+        mapping.SetMute("conn-shadow", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        // In exempt room, shadow user is fully visible to normal viewer
+        var visibleToNormal = mapping.GetUsersOfRoomForViewer("clan AB", "conn-normal");
+        Assert.AreEqual(2, visibleToNormal.Count);
+    }
+
+    [Test]
+    public void ConnectionMapping_GetUsersOfRoomForViewer_FullBan_NotShadowHidden()
+    {
+        var mapping = new ConnectionMapping();
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        var fullBanUser = new ChatUser("banned#3", false, null, new ProfilePicture(), null, null);
+
+        // Full-banned users should never be in a banned room (rejected at SwitchRoom),
+        // but if they somehow are, they appear as-is — only Shadow status is presence-hidden.
+        mapping.Add("conn-normal", "W3C Lounge", normalUser);
+        mapping.Add("conn-banned", "W3C Lounge", fullBanUser);
+        mapping.SetMute("conn-banned", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
+
+        // Full-banned user is NOT shadow-hidden; they simply shouldn't be here.
+        var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
+        Assert.AreEqual(2, visibleToNormal.Count);
+    }
+
+    [Test]
+    public void ConnectionMapping_GetUsersOfRoomForViewer_ExpiredShadowBan_NotHidden()
+    {
+        // An EXPIRED shadow ban must NOT cause hiding — expiry-aware via GetEffectiveMuteStatus.
+        var mapping = new ConnectionMapping();
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        var expiredShadowUser = new ChatUser("expired#4", false, null, new ProfilePicture(), null, null);
+
+        mapping.Add("conn-normal", "W3C Lounge", normalUser);
+        mapping.Add("conn-expired", "W3C Lounge", expiredShadowUser);
+        // Shadow ban that ended in the past
+        mapping.SetMute("conn-expired", MuteStatus.Shadow, DateTime.UtcNow.AddDays(-1));
+
+        // Expired shadow ban → user IS visible to others (ban has expired)
+        var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
+        Assert.AreEqual(2, visibleToNormal.Count,
+            "User with EXPIRED shadow ban must not be hidden — expiry-aware filtering");
+    }
+
+    [Test]
+    public void ConnectionMapping_GetUsersOfRoomForViewer_NoBan_AllVisible()
+    {
+        var mapping = new ConnectionMapping();
+        var user1 = new ChatUser("user#1", false, null, new ProfilePicture(), null, null);
+        var user2 = new ChatUser("user#2", false, null, new ProfilePicture(), null, null);
+
+        mapping.Add("conn-1", "W3C Lounge", user1);
+        mapping.Add("conn-2", "W3C Lounge", user2);
+        // No SetMute calls — both are cache misses (treated as None)
+
+        var visibleToUser1 = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-1");
+        Assert.AreEqual(2, visibleToUser1.Count,
+            "Normal (unbanned) users must never be excluded from the user list");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_CallerReceivesStartChat_SeesSelf_OthersExcluded()
+    {
+        // Full integration: when a shadow-banned user ghost-joins a banned room,
+        // the StartChat sent to them (the viewer) must include themselves but not other shadow users.
+        await AddShadowBan("peter#123");
+
+        // Add another shadow-banned user already in "1 vs 1"
+        var otherShadowUser = new ChatUser("shadow-other#5", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("OtherShadowConn", "1 vs 1", otherShadowUser);
+        _connectionMapping.SetMute("OtherShadowConn", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        // A normal user also in "1 vs 1"
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("NormalConn", "1 vs 1", normalUser);
+
+        // Shadow-banned user starts in W3C Lounge, switches to "1 vs 1"
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        List<ChatUser> startChatUsers = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "StartChat" && args.Length >= 1)
+                    startChatUsers = args[0] as List<ChatUser>;
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive StartChat on ghost-join");
+        // peter#123 (the viewer) must see themselves
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "peter#123"),
+            "Shadow-banned viewer must see themselves in usersOfRoom");
+        // normal#1 must be visible (not shadow-banned)
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "normal#1"),
+            "Normal user must be visible to the shadow-banned viewer");
+        // shadow-other#5 must be hidden from peter (also shadow-banned, not the viewer)
+        Assert.IsFalse(startChatUsers.Any(u => u.BattleTag == "shadow-other#5"),
+            "Other shadow-banned users must be hidden from the shadow-banned viewer");
+    }
+
+    [Test]
+    public async Task Login_ShadowBan_StartChat_FiltersOtherShadowUsers()
+    {
+        // Integration: on login, shadow-banned user's StartChat (in the default room, a banned room)
+        // must hide other shadow users but show themselves and normal users.
+        await AddShadowBan("peter#123");
+
+        // Another shadow user already in W3C Lounge
+        var otherShadow = new ChatUser("other-shadow#9", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("OtherShadowConn", "W3C Lounge", otherShadow);
+        _connectionMapping.SetMute("OtherShadowConn", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        // A normal user also in W3C Lounge
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("NormalConn", "W3C Lounge", normalUser);
+
+        List<ChatUser> startChatUsers = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "StartChat" && args.Length >= 1)
+                    startChatUsers = args[0] as List<ChatUser>;
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive StartChat on login");
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "peter#123"),
+            "Shadow-banned viewer must see themselves");
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "normal#1"),
+            "Normal user must be visible to shadow-banned viewer");
+        Assert.IsFalse(startChatUsers.Any(u => u.BattleTag == "other-shadow#9"),
+            "Other shadow-banned users must be hidden");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]

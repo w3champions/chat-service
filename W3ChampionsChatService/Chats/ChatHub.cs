@@ -271,12 +271,13 @@ public class ChatHub(
 
         await Groups.AddToGroupAsync(Context.ConnectionId, chatRoom);
 
-        var usersOfRoom = _connections.GetUsersOfRoom(chatRoom);
+        var usersOfRoom = _connections.GetUsersOfRoomForViewer(chatRoom, Context.ConnectionId);
         if (!suppressEnter)
         {
             await Clients.Group(chatRoom).SendAsync("UserEntered", user);
         }
-        // Caller always receives StartChat (their own view — unfiltered for now; Task 6 adds viewer-aware filtering).
+        // Caller receives their viewer-filtered user list: they always see themselves;
+        // other shadow-banned users are hidden from them in banned rooms (spec §6).
         await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom), chatRoom);
 
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
@@ -370,7 +371,7 @@ public class ChatHub(
                 // Cache full-ban status + endDate so SwitchRoom/SendMessage never need a DB read.
                 _connections.SetMute(Context.ConnectionId, MuteStatus.Full, mute.endDate);
                 await Groups.AddToGroupAsync(Context.ConnectionId, safeRoom);
-                var usersOfRoom = _connections.GetUsersOfRoom(safeRoom);
+                var usersOfRoom = _connections.GetUsersOfRoomForViewer(safeRoom, Context.ConnectionId);
                 await Clients.Group(safeRoom).SendAsync("UserEntered", user);
                 // G3: StartChat with the seated room's payload.
                 await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(safeRoom), safeRoom, availableRooms);
@@ -398,7 +399,7 @@ public class ChatHub(
             // Cache status + endDate at login so every subsequent send/join works from the cache.
             _connections.SetMute(Context.ConnectionId, muteStatus, muteEndDate);
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
-            var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
+            var usersOfRoom = _connections.GetUsersOfRoomForViewer(memberShip.DefaultChat, Context.ConnectionId);
             await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
             await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat, DefaultChatRooms.Rooms);
         }

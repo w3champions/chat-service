@@ -155,4 +155,46 @@ public class ConnectionMapping
             return MuteStatus.None;
         }
     }
+
+    /// <summary>
+    /// Returns the users of <paramref name="chatRoom"/> as seen by <paramref name="viewerConnectionId"/>.
+    /// In banned rooms (see <see cref="DefaultChatRooms.IsBannedRoom"/>), shadow-banned users whose ban
+    /// has not yet expired are hidden from all viewers except themselves (a shadow user always sees themselves).
+    /// In exempt rooms (clan, lobby) the filter is a no-op — all users are visible.
+    /// Uses per-connection cached expiry so the check is EXPIRY-AWARE without a DB read.
+    /// All access is under the single <c>_connections</c> lock for consistency.
+    /// </summary>
+    public List<ChatUser> GetUsersOfRoomForViewer(string chatRoom, string viewerConnectionId)
+    {
+        lock (_connections)
+        {
+            if (!_connections.TryGetValue(chatRoom, out var roomConnections))
+                return [];
+
+            var isBannedRoom = DefaultChatRooms.IsBannedRoom(chatRoom);
+            var now = DateTime.UtcNow;
+
+            return roomConnections
+                .Where(kvp =>
+                {
+                    // Always include the viewer themselves — shadow users see themselves.
+                    if (kvp.Key == viewerConnectionId) return true;
+
+                    // In banned rooms, exclude users whose effective mute status is Shadow.
+                    // GetEffectiveMuteStatus is expiry-aware: an expired shadow ban returns None.
+                    if (isBannedRoom && _mutes.TryGetValue(kvp.Key, out var cached))
+                    {
+                        var effectiveStatus = (cached.Status == MuteStatus.None || cached.EndDate > now)
+                            ? cached.Status
+                            : MuteStatus.None;
+                        if (effectiveStatus == MuteStatus.Shadow) return false;
+                    }
+
+                    return true;
+                })
+                .Select(kvp => kvp.Value)
+                .OrderBy(u => u.BattleTag)
+                .ToList();
+        }
+    }
 }
