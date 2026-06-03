@@ -142,15 +142,56 @@ public class ChatHub(
         var oldRoom = _connections.GetRoom(Context.ConnectionId);
         var user = _connections.GetUser(Context.ConnectionId);
 
+        // Resolve the cached mute status for this connection.
+        var muteStatus = _connections.GetMuteStatus(Context.ConnectionId);
+
+        // Lazy re-resolve: if cache shows None but target is a banned room, check DB in case
+        // this connection was never cached (e.g. full-banned user with no clan at login).
+        if (muteStatus == MuteStatus.None && user != null && DefaultChatRooms.IsBannedRoom(chatRoom))
+        {
+            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
+            if (mute != null && mute.IsActive(DateTime.UtcNow))
+            {
+                muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+                _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
+            }
+        }
+
+        // G1/G2: Full-ban → graceful reject BEFORE any Remove/Add. User stays in their current room.
+        // No Context.Abort(), no throw, no connection teardown.
+        if (DefaultChatRooms.IsBannedRoom(chatRoom) && muteStatus == MuteStatus.Full)
+        {
+            Log.Information("Full-banned user {BattleTag} rejected from joining banned room {Room} — staying in {OldRoom}",
+                user?.BattleTag, chatRoom, oldRoom);
+            return;
+        }
+
+        // Ghost-join flag: shadow-banned user entering a banned room receives messages
+        // but their presence is hidden from others (no UserEntered / UserLeft broadcasts).
+        var ghostJoin = DefaultChatRooms.IsBannedRoom(chatRoom) && muteStatus == MuteStatus.Shadow;
+
         _connections.Remove(Context.ConnectionId);
         _connections.Add(Context.ConnectionId, chatRoom, user);
+        // Re-cache the mute status after Remove (which clears it) + Add.
+        _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
 
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldRoom);
+        if (oldRoom != null)
+        {
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldRoom);
+            if (!ghostJoin)
+            {
+                await Clients.Group(oldRoom).SendAsync("UserLeft", user);
+            }
+        }
+
         await Groups.AddToGroupAsync(Context.ConnectionId, chatRoom);
 
         var usersOfRoom = _connections.GetUsersOfRoom(chatRoom);
-        await Clients.Group(oldRoom).SendAsync("UserLeft", user);
-        await Clients.Group(chatRoom).SendAsync("UserEntered", user);
+        if (!ghostJoin)
+        {
+            await Clients.Group(chatRoom).SendAsync("UserEntered", user);
+        }
+        // Caller always receives StartChat (their own view — unfiltered for now; Task 6 adds viewer-aware filtering).
         await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom), chatRoom);
 
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);

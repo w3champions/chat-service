@@ -1,6 +1,7 @@
 // W3ChampionsChatService.Tests/ChatBanRoomScopeTests.cs
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
@@ -342,6 +343,242 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "Disconnecting a full-banned no-clan user (no room) must not throw");
         Assert.AreEqual(0, groupSendsAfterLogin,
             "No group broadcast (UserLeft) must fire for a user seated in no room");
+    }
+
+    // ── Task 4 tests ────────────────────────────────────────────────────────────
+
+    private void LoginNormal(string battleTag = "peter#123", string clanTag = null)
+    {
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser(battleTag, false, clanTag, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+    }
+
+    [Test]
+    public async Task SwitchRoom_FullBan_IntoBannedRoom_IsRejected()
+    {
+        await AddFullBan("peter#123");
+        // Seat user in a non-banned room as if they connected with a clan
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        await _chatHub.SwitchRoom("W3C Lounge");
+
+        // Still in clan AB, not moved to W3C Lounge
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan AB", room, "Full-banned user must not be moved into a banned room");
+    }
+
+    [TestCase("W3C Lounge")]
+    [TestCase("1 vs 1")]
+    [TestCase("2 vs 2")]
+    [TestCase("FFA")]
+    [TestCase("Legion TD")]
+    public async Task SwitchRoom_FullBan_IntoEachBannedRoom_IsRejected(string bannedRoom)
+    {
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        await _chatHub.SwitchRoom(bannedRoom);
+
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan AB", room, $"Full-banned user must not join banned room '{bannedRoom}'");
+    }
+
+    [Test]
+    public async Task SwitchRoom_FullBan_IntoClanRoom_IsAllowed()
+    {
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        await _chatHub.SwitchRoom("clan XYZ");
+
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan XYZ", room, "Full-banned user must be allowed to join a clan room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_FullBan_IntoLobbyRoom_IsAllowed()
+    {
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        await _chatHub.SwitchRoom("game-lobby-9999");
+
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("game-lobby-9999", room, "Full-banned user must be allowed to join a lobby room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_FullBan_IntoBannedRoom_NoContextAbort()
+    {
+        // G1: rejected SwitchRoom must NEVER call Context.Abort()
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        await _chatHub.SwitchRoom("W3C Lounge");
+
+        Assert.IsFalse(abortCalled, "Context.Abort() must NOT be called on a rejected SwitchRoom (G1)");
+    }
+
+    [Test]
+    public async Task SwitchRoom_FullBan_NoClanInMapping_LazilReresolvesFromDB_IsRejected()
+    {
+        // Edge case: full-banned user with no clan was NOT in the ConnectionMapping at login
+        // (because they had no clan), so their MuteStatus is None in cache.
+        // SwitchRoom must lazily resolve from DB and still reject the move into a banned room.
+        await AddFullBan("peter#123");
+        // NOT calling _connectionMapping.SetMuteStatus — simulating the "no clan at login" path.
+        // The user is seated nowhere yet (simulating them calling SwitchRoom to try to join W3C Lounge).
+        // We DON'T add them to the mapping at all — GetUser returns null, lazy resolution must still work.
+        // Actually: the user must be seated somewhere for SwitchRoom to have a user object.
+        // Simulate: user connected but is in the mapping with None mute status (cache miss).
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        // MuteStatus is None (default — cache miss, as if they came via the no-clan full-ban login path)
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        // Should be rejected: lazy re-resolve hits DB, finds full ban, and returns early
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("W3C Lounge", room,
+            "Full-banned user (lazy resolved) must not be moved into a banned room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_GhostJoin_NoUserEnteredBroadcast()
+    {
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        int userEnteredCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserEntered", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userEnteredCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        Assert.AreEqual(0, userEnteredCount, "Shadow-banned user must NOT trigger UserEntered in a banned room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_UserIsMovedIntoGroup()
+    {
+        // Ghost-join: shadow-banned user IS added to the group (can receive messages)
+        // even though UserEntered is suppressed.
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        // Connection mapping must reflect the new room
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("1 vs 1", room, "Shadow-banned user must be physically added to the room in the mapping");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_CallerReceivesStartChat()
+    {
+        await AddShadowBan("peter#123");
+
+        // Add a normal user to "1 vs 1" first
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("OtherConn", "1 vs 1", normalUser);
+
+        // Shadow-banned user joins from "W3C Lounge"
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        List<ChatUser> startChatUsers = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "StartChat" && args.Length >= 1)
+                    startChatUsers = args[0] as List<ChatUser>;
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        // Shadow-banned user sees themselves in the list (their own view is unfiltered)
+        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive a StartChat on ghost-join");
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "peter#123"),
+            "Shadow-banned user must see themselves in usersOfRoom");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_UserLeftSuppressed()
+    {
+        // Ghost-join: when switching rooms, the old-room UserLeft should also be suppressed
+        // for a shadow user moving into a banned room (they were already "invisible")
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        int userLeftCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        Assert.AreEqual(0, userLeftCount,
+            "Shadow-banned user ghost-joining a banned room must NOT trigger UserLeft on the old room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_IntoExemptRoom_NormalJoin()
+    {
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        int userEnteredCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserEntered", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userEnteredCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SwitchRoom("clan XYZ");
+
+        // UserEntered should fire normally for exempt rooms
+        Assert.AreEqual(1, userEnteredCount,
+            "Shadow-banned user entering an exempt room must broadcast UserEntered normally");
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan XYZ", room);
+    }
+
+    [Test]
+    public async Task SwitchRoom_UnbannedUser_NormalSwitch_BroadcastsUserEntered()
+    {
+        // Normal (unbanned) user switching rooms: standard behavior unchanged
+        LoginNormal("peter#123");
+
+        int userEnteredCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserEntered", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userEnteredCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+
+        Assert.AreEqual(1, userEnteredCount, "Unbanned user SwitchRoom must broadcast UserEntered");
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("1 vs 1", room);
     }
 
     // ── Task 2 tests ────────────────────────────────────────────────────────────
