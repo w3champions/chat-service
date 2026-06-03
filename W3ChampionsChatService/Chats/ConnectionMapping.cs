@@ -123,9 +123,10 @@ public class ConnectionMapping
     }
 
     /// <summary>
-    /// Cache the mute status and expiry for a connection.
+    /// Cache the mute status and expiry for a connection. Seeded authoritatively at login for
+    /// every login path, so after login the cache always reflects the user's true status.
     /// Pass <c>status = MuteStatus.None</c> and <c>endDate = DateTime.MinValue</c> for an
-    /// explicitly-resolved unbanned connection (distinguishes a cache HIT-None from a MISS).
+    /// unbanned connection.
     /// </summary>
     public void SetMute(string connectionId, MuteStatus status, DateTime endDate)
     {
@@ -138,8 +139,9 @@ public class ConnectionMapping
     /// <summary>
     /// Returns true if a cache entry exists for the connection (regardless of status),
     /// and writes it to <paramref name="cached"/>. Returns false on a cache MISS.
-    /// Use this to distinguish "cached None" from "never resolved" — only a MISS triggers
-    /// a lazy DB re-resolve.
+    /// Since the cache is seeded at login for every path, a MISS only happens for a
+    /// connection that is not (yet) logged in; the send/switch hot paths consult
+    /// <see cref="GetEffectiveMuteStatus"/> instead and never re-query the DB.
     /// </summary>
     public bool TryGetMute(string connectionId, out CachedMute cached)
     {
@@ -184,7 +186,7 @@ public class ConnectionMapping
 
     /// <summary>
     /// Returns the users of <paramref name="chatRoom"/> as seen by <paramref name="viewerConnectionId"/>.
-    /// In banned rooms (see <see cref="DefaultChatRooms.IsBannedRoom"/>), shadow-banned users whose ban
+    /// In public rooms (see <see cref="DefaultChatRooms.IsPublicRoom"/>), shadow-banned users whose ban
     /// has not yet expired are hidden from all viewers except themselves (a shadow user always sees themselves).
     /// In exempt rooms (clan, lobby) the filter is a no-op — all users are visible.
     /// Uses per-connection cached expiry so the check is EXPIRY-AWARE without a DB read.
@@ -197,7 +199,7 @@ public class ConnectionMapping
             if (!_connections.TryGetValue(chatRoom, out var roomConnections))
                 return [];
 
-            var isBannedRoom = DefaultChatRooms.IsBannedRoom(chatRoom);
+            var isPublicRoom = DefaultChatRooms.IsPublicRoom(chatRoom);
             var now = DateTime.UtcNow;
 
             return roomConnections
@@ -206,10 +208,10 @@ public class ConnectionMapping
                     // Always include the viewer themselves — shadow users see themselves.
                     if (kvp.Key == viewerConnectionId) return true;
 
-                    // In banned rooms, exclude users whose effective mute status is Shadow.
+                    // In public rooms, exclude users whose effective mute status is Shadow.
                     // GetEffectiveMuteStatusNoLock is expiry-aware: an expired shadow ban returns None.
                     // We already hold lock(_connections), so call the no-lock helper directly.
-                    if (isBannedRoom && GetEffectiveMuteStatusNoLock(kvp.Key, now) == MuteStatus.Shadow)
+                    if (isPublicRoom && GetEffectiveMuteStatusNoLock(kvp.Key, now) == MuteStatus.Shadow)
                         return false;
 
                     return true;
