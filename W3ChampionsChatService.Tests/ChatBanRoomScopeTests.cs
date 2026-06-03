@@ -1112,6 +1112,307 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "Other shadow-banned users must be hidden");
     }
 
+    // ── Task 7 tests ────────────────────────────────────────────────────────────
+
+    [Test]
+    public async Task BanUser_LiveUser_FullBan_UpdatesCacheToFull()
+    {
+        // Arrange: a live user in W3C Lounge
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        // Mock Clients.Client so the PlayerBannedFromChat send doesn't NRE
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        // Admin performs ban
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+        _hubCallerContext.Setup(c => c.ConnectionId).Returns("TestId");
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        // Mute cache must be updated on the live connection
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn", out var cached),
+            "Full ban must produce a cache HIT on the live connection");
+        Assert.AreEqual(MuteStatus.Full, cached.Status,
+            "Full ban must update the cached MuteStatus to Full for the live connection");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_ShadowBan_UpdatesCacheToShadow()
+    {
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "spam", true, endDate);
+
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn", out var cached),
+            "Shadow ban must produce a cache HIT on the live connection");
+        Assert.AreEqual(MuteStatus.Shadow, cached.Status,
+            "Shadow ban must update the cached MuteStatus to Shadow for the live connection");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_FullBan_CacheEndDateMatchesBanEndDate()
+    {
+        // Verify the cached endDate is populated so expiry enforcement works from the cache
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        // Mock Clients.Client so the PlayerBannedFromChat send doesn't NRE
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDateStr = DateTime.UtcNow.AddDays(7).ToString("O");
+        await _chatHub.BanUser("victim#123", "reason", false, endDateStr);
+
+        _connectionMapping.TryGetMute("VictimConn", out var cached);
+        Assert.AreEqual(MuteStatus.Full, cached.Status);
+        // EndDate must be in the future (ban is active) and close to the requested endDate
+        Assert.Greater(cached.EndDate, DateTime.UtcNow,
+            "Cached EndDate must be in the future for an active full ban");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_FullBan_InBannedRoom_SendsPlayerBannedFromChat()
+    {
+        // Live user sitting in W3C Lounge (a banned room)
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        // Separate client proxy for the victim connection
+        var victimProxy = new Mock<ISingleClientProxy>();
+        string signalSent = null;
+        LoungeMute muteInSignal = null;
+        victimProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "PlayerBannedFromChat")
+                {
+                    signalSent = method;
+                    muteInSignal = args[0] as LoungeMute;
+                }
+            })
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        Assert.AreEqual("PlayerBannedFromChat", signalSent,
+            "Live fully-banned user in a banned room must receive PlayerBannedFromChat");
+        Assert.IsNotNull(muteInSignal,
+            "PlayerBannedFromChat payload must include the LoungeMute");
+        Assert.AreEqual("victim#123", muteInSignal.battleTag,
+            "LoungeMute in signal must have the correct battleTag");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_FullBan_InBannedRoom_NoContextAbort()
+    {
+        // G1: PlayerBannedFromChat is sent with NO Context.Abort() — the connection must stay alive
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        Assert.IsFalse(abortCalled,
+            "BanUser must NOT call Context.Abort() on the admin or victim (G1 — no abort anywhere)");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_FullBan_DoesNotEvictFromRoom()
+    {
+        // Spec §12: do NOT forcibly evict the user from their current room.
+        // Enforcement happens on their next SendMessage/SwitchRoom which reads the updated cache.
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        // The victim must still be in W3C Lounge after the ban — not evicted
+        var room = _connectionMapping.GetRoom("VictimConn");
+        Assert.AreEqual("W3C Lounge", room,
+            "BanUser must NOT evict the user from their current room (spec §12)");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_ShadowBan_SendsNoSignalToTarget()
+    {
+        // Shadow ban: illusion preserved — no PlayerBannedFromChat sent to target
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var victimProxy = new Mock<ISingleClientProxy>();
+        int victimSignalCount = 0;
+        victimProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => victimSignalCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "spam", true, endDate);
+
+        Assert.AreEqual(0, victimSignalCount,
+            "Shadow ban must send NO signal to the target (illusion preserved)");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_FullBan_SubsequentSendMessage_InBannedRoom_IsRejectedFromCache()
+    {
+        // End-to-end: full ban applied live → subsequent SendMessage in banned room is rejected
+        // WITHOUT requiring another DB read (the cache is now Full).
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        // Now switch to victim's hub context and attempt to send
+        _hubCallerContext.Setup(c => c.ConnectionId).Returns("VictimConn");
+        _chatHub.Clients = _clients.Object;
+        _chatHub.Context = _hubCallerContext.Object;
+
+        int groupSendCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => groupSendCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        await _chatHub.SendMessage("Should be rejected");
+
+        Assert.IsFalse(abortCalled, "Context.Abort() must NOT be called from SendMessage after a live ban");
+        Assert.AreEqual(0, groupSendCount,
+            "SendMessage in a banned room after a live full ban must be rejected without a DB read");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"),
+            "Rejected message must not enter history");
+    }
+
+    [Test]
+    public async Task BanUser_LiveUser_ShadowBan_SubsequentSendMessage_InBannedRoom_IsDroppedFromCache()
+    {
+        // End-to-end: shadow ban applied live → subsequent SendMessage in banned room is echo-only
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "spam", true, endDate);
+
+        // Switch to victim's hub context
+        _hubCallerContext.Setup(c => c.ConnectionId).Returns("VictimConn");
+
+        // Setup victim's caller proxy
+        var victimCallerProxy = new Mock<ISingleClientProxy>();
+        ChatMessage callerEcho = null;
+        victimCallerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "ReceiveMessage" && args.Length > 0)
+                    callerEcho = args[0] as ChatMessage;
+            })
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Caller).Returns(victimCallerProxy.Object);
+
+        int groupSendCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => groupSendCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SendMessage("Invisible message");
+
+        Assert.AreEqual(0, groupSendCount,
+            "Shadow-banned user's message in banned room must be dropped (not broadcast) after live shadow ban");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"),
+            "Dropped shadow message must not enter history");
+        Assert.IsNotNull(callerEcho, "Shadow-banned user must still receive echo of their own message");
+        Assert.AreEqual("Invisible message", callerEcho.Message);
+    }
+
+    [Test]
+    public async Task BanUser_UserNotConnected_NoException()
+    {
+        // Banning a user who is not currently connected — should complete without error
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+
+        Assert.DoesNotThrowAsync(async () =>
+            await _chatHub.BanUser("offline#999", "reason", false, endDate));
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]

@@ -335,6 +335,43 @@ public class ChatHub(
         };
 
         await _muteRepository.AddLoungeMute(loungeMuteRequest);
+
+        // Spec §12: Reconcile any live connections for this user so enforcement is instant.
+        // Parse the endDate once — used for both the cache and the PlayerBannedFromChat payload.
+        var parsedEndDate = DateTime.Parse(endDate, null, System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime();
+        var newStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+
+        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag);
+        foreach (var connId in liveConnectionIds)
+        {
+            // Update the cache so the next SendMessage/SwitchRoom enforces from the cache (no DB read).
+            _connections.SetMute(connId, newStatus, parsedEndDate);
+
+            if (!isShadowBan)
+            {
+                // Full ban — G5: notify the target so old clients render their legacy ban notice.
+                // Only send when the user is in a banned room (spec §12 / G1/G5 signal).
+                // G1: do NOT call Context.Abort() — the connection must stay alive.
+                var currentRoom = _connections.GetRoom(connId);
+                if (currentRoom != null && DefaultChatRooms.IsBannedRoom(currentRoom))
+                {
+                    var mute = new LoungeMute
+                    {
+                        battleTag = battleTag,
+                        endDate = parsedEndDate,
+                        insertDate = DateTime.UtcNow,
+                        author = adminUser.BattleTag,
+                        reason = reason,
+                        isShadowBan = false
+                    };
+                    // G1: SendAsync only — no Context.Abort().
+                    await Clients.Client(connId).SendAsync("PlayerBannedFromChat", mute);
+                }
+                // Full-ban user in an exempt room: cache is still updated (ban is active for future
+                // joins/sends), but no signal is sent — they can stay in the exempt room per spec §12.
+            }
+            // Shadow ban: no signal to the target whatsoever — preserve the illusion (spec §12).
+        }
     }
 
     internal async Task LoginAsAuthenticated(ChatUser user)
