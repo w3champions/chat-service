@@ -47,32 +47,44 @@ public class ChatHub(
             return;
         }
 
-        var muteStatus = _connections.GetMuteStatus(Context.ConnectionId);
         var inBannedRoom = DefaultChatRooms.IsBannedRoom(chatRoom);
+        var muteStatus = MuteStatus.None;
 
-        // Lazy DB resolve: mirroring SwitchRoom — if cache is None but we're in a banned room,
-        // re-resolve from DB in case a ban was applied mid-session (before Task 7 cache-reconciliation
-        // is in place via BanUser). Without Task 7 live-reconciliation, this keeps the safety net.
-        if (muteStatus == MuteStatus.None && inBannedRoom)
+        if (inBannedRoom)
         {
-            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute != null && mute.IsActive(DateTime.UtcNow))
+            var hasCached = _connections.TryGetMute(Context.ConnectionId, out var cached);
+
+            if (hasCached && cached.Status != MuteStatus.None)
             {
-                muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
-                _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
+                // Cache HIT with an active ban — honor cached status + expiry. ZERO DB reads.
+                // This is the primary §7 win: a cached-banned user does NOT hit the DB on every send.
+                muteStatus = cached.EndDate > DateTime.UtcNow ? cached.Status : MuteStatus.None;
+
+                if (muteStatus == MuteStatus.None)
+                {
+                    // Ban expired — update the cache so future sends skip the DB too.
+                    _connections.SetMute(Context.ConnectionId, MuteStatus.None, DateTime.MinValue);
+                }
             }
-        }
-
-        // Re-verify expiry from DB if cached as banned (handles edge case where ban expired mid-session).
-        // Per spec §7: the per-message DB read is scoped to cached-banned connections only (not every send).
-        if (muteStatus != MuteStatus.None)
-        {
-            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute == null || !mute.IsActive(DateTime.UtcNow))
+            else
             {
-                // Ban has expired — treat as no ban for this send
-                muteStatus = MuteStatus.None;
-                _connections.SetMuteStatus(Context.ConnectionId, MuteStatus.None);
+                // Cache MISS or cache HIT with None:
+                //   - MISS: no-clan full-ban login edge, or any first-send path.
+                //   - HIT-None: also re-resolve as a pre-Task 7 live-ban safety net
+                //     (a ban applied mid-session won't be reflected in the cached None until
+                //     Task 7 adds live cache-invalidation via BanUser; this keeps the net tight).
+                var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
+                if (mute != null && mute.IsActive(DateTime.UtcNow))
+                {
+                    muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+                    _connections.SetMute(Context.ConnectionId, muteStatus, mute.endDate);
+                }
+                else if (!hasCached)
+                {
+                    // MISS path: cache the resolved None so future sends know the entry exists.
+                    _connections.SetMute(Context.ConnectionId, MuteStatus.None, DateTime.MinValue);
+                }
+                // HIT-None path: leave cache as-is (ban is truly not there).
             }
         }
 
@@ -93,9 +105,10 @@ public class ChatHub(
         {
             if (inBannedRoom && muteStatus == MuteStatus.Shadow)
             {
-                // Drop: echo only to caller (illusion of sending)
-                Log.Information("Shadow banned user {BattleTag} sent message {Message} in banned room {Room} — dropped",
-                    user.BattleTag, trimmedMessage, chatRoom);
+                // Drop: echo only to caller (illusion of sending).
+                // Boyscout: do NOT log the raw message body — arbitrary user input should not appear in logs.
+                Log.Information("Shadow banned user {BattleTag} attempted to send in banned room {Room} — dropped",
+                    user.BattleTag, chatRoom);
                 await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
             }
             else
@@ -110,7 +123,7 @@ public class ChatHub(
     }
 
     /// <summary>
-    /// Processes chat commands and returns a boolean indicating whether a command was processed 
+    /// Processes chat commands and returns a boolean indicating whether a command was processed
     /// or the message should be sent as a normal message.
     /// </summary>
     /// <param name="message">The chat message to process.</param>
@@ -170,19 +183,37 @@ public class ChatHub(
         var oldRoom = _connections.GetRoom(Context.ConnectionId);
         var user = _connections.GetUser(Context.ConnectionId);
 
-        // Resolve the cached mute status for this connection.
-        var muteStatus = _connections.GetMuteStatus(Context.ConnectionId);
+        var muteStatus = MuteStatus.None;
+        // Capture the full cached entry BEFORE Remove so we can re-populate it afterwards.
+        var hasCachedEntry = _connections.TryGetMute(Context.ConnectionId, out var preSwitchCached);
+        var cachedEndDate = hasCachedEntry ? preSwitchCached.EndDate : DateTime.MinValue;
 
-        // Lazy re-resolve: if cache shows None but target is a banned room, check DB in case
-        // this connection was never cached (e.g. full-banned user with no clan at login).
-        if (muteStatus == MuteStatus.None && user != null && DefaultChatRooms.IsBannedRoom(chatRoom))
+        if (user != null)
         {
-            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute != null && mute.IsActive(DateTime.UtcNow))
+            if (hasCachedEntry)
             {
-                muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
-                _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
+                // Cache HIT — use the cached status with expiry; no DB read needed for any room.
+                muteStatus = (preSwitchCached.Status == MuteStatus.None || preSwitchCached.EndDate > DateTime.UtcNow)
+                    ? preSwitchCached.Status
+                    : MuteStatus.None;
             }
+            else if (DefaultChatRooms.IsBannedRoom(chatRoom))
+            {
+                // Cache MISS + target is banned — lazy resolve (no-clan full-ban edge case at login).
+                var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
+                if (mute != null && mute.IsActive(DateTime.UtcNow))
+                {
+                    muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+                    cachedEndDate = mute.endDate;
+                }
+                else
+                {
+                    cachedEndDate = DateTime.MinValue;
+                }
+                // We will cache the resolved result after Remove+Add below.
+                hasCachedEntry = false; // treat as "needs to be written after Remove+Add"
+            }
+            // Cache MISS + exempt room: muteStatus stays None; no DB read needed.
         }
 
         // G1/G2: Full-ban → graceful reject BEFORE any Remove/Add. User stays in their current room.
@@ -206,8 +237,8 @@ public class ChatHub(
 
         _connections.Remove(Context.ConnectionId);
         _connections.Add(Context.ConnectionId, chatRoom, user);
-        // Re-cache the mute status after Remove (which clears it) + Add.
-        _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
+        // Re-cache the mute status + endDate after Remove (which clears it) + Add.
+        _connections.SetMute(Context.ConnectionId, muteStatus, cachedEndDate);
 
         if (oldRoom != null)
         {
@@ -316,7 +347,8 @@ public class ChatHub(
             if (safeRoom != null)
             {
                 _connections.Add(Context.ConnectionId, safeRoom, user);
-                _connections.SetMuteStatus(Context.ConnectionId, MuteStatus.Full);
+                // Cache full-ban status + endDate so SwitchRoom/SendMessage never need a DB read.
+                _connections.SetMute(Context.ConnectionId, MuteStatus.Full, mute.endDate);
                 await Groups.AddToGroupAsync(Context.ConnectionId, safeRoom);
                 var usersOfRoom = _connections.GetUsersOfRoom(safeRoom);
                 await Clients.Group(safeRoom).SendAsync("UserEntered", user);
@@ -326,8 +358,10 @@ public class ChatHub(
             else
             {
                 // No clan: not seated in any room (spec D2).
-                // Note: SetMuteStatus is not called here because the connection is not in the mapping yet.
-                // SwitchRoom enforcement (Task 4) lazily re-resolves the mute from MongoDB for this edge case.
+                // SetMute is NOT called here — the connection is not in the mapping yet.
+                // SwitchRoom/SendMessage enforcement lazily re-resolves from MongoDB for this edge case
+                // (cache MISS path). This is acceptable: full-banned users with no clan have no room,
+                // so any SwitchRoom into a banned room still triggers the lazy resolve and is rejected.
                 // G3: STILL emit a StartChat — an empty-room payload — so legacy clients can initialize.
                 await Clients.Caller.SendAsync("StartChat", new List<ChatUser>(), new List<ChatMessage>(), (string)null, availableRooms);
             }
@@ -336,11 +370,13 @@ public class ChatHub(
         {
             // Shadow ban or no ban: connect as normal (G1 — never abort).
             var muteStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.None;
+            var muteEndDate = mute?.endDate ?? DateTime.MinValue;
             Log.Information("Accepting connection for {BattleTag}, mute={MuteStatus}, room={Room}",
                 user.BattleTag, muteStatus, memberShip.DefaultChat);
 
             _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
-            _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
+            // Cache status + endDate at login so every subsequent send/join works from the cache.
+            _connections.SetMute(Context.ConnectionId, muteStatus, muteEndDate);
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
             var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
             await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);

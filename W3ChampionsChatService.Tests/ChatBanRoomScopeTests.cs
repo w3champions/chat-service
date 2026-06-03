@@ -94,65 +94,118 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     // ── Task 1 test ────────────────────────────────────────────────────────────
 
     [Test]
-    public void ConnectionMapping_MuteStatus_DefaultIsNone()
+    public void ConnectionMapping_Mute_DefaultIsCacheMiss()
     {
+        // A connection that has never had SetMute called must be a MISS (TryGetMute returns false).
         var mapping = new ConnectionMapping();
         mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
 
-        var status = mapping.GetMuteStatus("conn1");
+        var hasCached = mapping.TryGetMute("conn1", out _);
+
+        Assert.IsFalse(hasCached, "A connection with no SetMute call must be a cache MISS");
+    }
+
+    [Test]
+    public void ConnectionMapping_SetMute_Shadow_Roundtrips()
+    {
+        var mapping = new ConnectionMapping();
+        mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
+        var endDate = DateTime.UtcNow.AddDays(1);
+
+        mapping.SetMute("conn1", MuteStatus.Shadow, endDate);
+
+        Assert.IsTrue(mapping.TryGetMute("conn1", out var cached), "Cache entry must exist after SetMute");
+        Assert.AreEqual(MuteStatus.Shadow, cached.Status);
+        Assert.AreEqual(endDate, cached.EndDate);
+        Assert.AreEqual(MuteStatus.Shadow, mapping.GetEffectiveMuteStatus("conn1", DateTime.UtcNow));
+    }
+
+    [Test]
+    public void ConnectionMapping_SetMute_Full_Roundtrips()
+    {
+        var mapping = new ConnectionMapping();
+        mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
+        var endDate = DateTime.UtcNow.AddDays(1);
+
+        mapping.SetMute("conn1", MuteStatus.Full, endDate);
+
+        Assert.IsTrue(mapping.TryGetMute("conn1", out var cached), "Cache entry must exist after SetMute");
+        Assert.AreEqual(MuteStatus.Full, cached.Status);
+        Assert.AreEqual(endDate, cached.EndDate);
+        Assert.AreEqual(MuteStatus.Full, mapping.GetEffectiveMuteStatus("conn1", DateTime.UtcNow));
+    }
+
+    [Test]
+    public void ConnectionMapping_GetEffectiveMuteStatus_UnknownConnection_ReturnsNone()
+    {
+        var mapping = new ConnectionMapping();
+
+        var status = mapping.GetEffectiveMuteStatus("no-such-conn", DateTime.UtcNow);
 
         Assert.AreEqual(MuteStatus.None, status);
     }
 
     [Test]
-    public void ConnectionMapping_SetMuteStatus_Roundtrips()
+    public void ConnectionMapping_TryGetMute_UnknownConnection_ReturnsFalse()
     {
         var mapping = new ConnectionMapping();
-        mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
 
-        mapping.SetMuteStatus("conn1", MuteStatus.Shadow);
+        var found = mapping.TryGetMute("no-such-conn", out _);
 
-        Assert.AreEqual(MuteStatus.Shadow, mapping.GetMuteStatus("conn1"));
+        Assert.IsFalse(found, "TryGetMute must return false for an unknown connection (cache MISS)");
     }
 
     [Test]
-    public void ConnectionMapping_SetMuteStatus_Full_Roundtrips()
+    public void ConnectionMapping_GetEffectiveMuteStatus_ExpiredBan_ReturnsNone()
     {
+        // A cached ban whose EndDate is in the past must be treated as None.
         var mapping = new ConnectionMapping();
         mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
+        var expiredEnd = DateTime.UtcNow.AddDays(-1);
+        mapping.SetMute("conn1", MuteStatus.Full, expiredEnd);
 
-        mapping.SetMuteStatus("conn1", MuteStatus.Full);
+        var status = mapping.GetEffectiveMuteStatus("conn1", DateTime.UtcNow);
 
-        Assert.AreEqual(MuteStatus.Full, mapping.GetMuteStatus("conn1"));
+        Assert.AreEqual(MuteStatus.None, status,
+            "Cached ban with EndDate in the past must be treated as None (expired)");
     }
 
     [Test]
-    public void ConnectionMapping_GetMuteStatus_UnknownConnection_ReturnsNone()
+    public void ConnectionMapping_SetMute_None_IsAHitWithNoneStatus()
     {
+        // An explicitly-resolved unbanned connection (SetMute None) must be a cache HIT
+        // that returns None — distinguishes "never resolved" (MISS) from "resolved, no ban".
         var mapping = new ConnectionMapping();
+        mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
 
-        var status = mapping.GetMuteStatus("no-such-conn");
+        mapping.SetMute("conn1", MuteStatus.None, DateTime.MinValue);
 
-        Assert.AreEqual(MuteStatus.None, status);
+        Assert.IsTrue(mapping.TryGetMute("conn1", out var cached), "SetMute(None) must produce a cache HIT");
+        Assert.AreEqual(MuteStatus.None, cached.Status);
+        Assert.AreEqual(MuteStatus.None, mapping.GetEffectiveMuteStatus("conn1", DateTime.UtcNow));
     }
 
     [Test]
-    public void ConnectionMapping_Remove_ClearsMuteStatus()
+    public void ConnectionMapping_Remove_ClearsMuteEntry()
     {
         var mapping = new ConnectionMapping();
         mapping.Add("conn1", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
-        mapping.SetMuteStatus("conn1", MuteStatus.Full);
+        mapping.SetMute("conn1", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         mapping.Remove("conn1");
 
-        // Direct assertion: Remove must clear the cached status immediately,
+        // Direct assertion: Remove must clear the cached entry immediately,
         // before any re-Add — guards against a Remove that silently does nothing.
-        Assert.AreEqual(MuteStatus.None, mapping.GetMuteStatus("conn1"));
+        Assert.IsFalse(mapping.TryGetMute("conn1", out _),
+            "Remove must clear the mute cache entry (cache MISS after Remove)");
+        Assert.AreEqual(MuteStatus.None, mapping.GetEffectiveMuteStatus("conn1", DateTime.UtcNow),
+            "GetEffectiveMuteStatus must return None after Remove (MISS → None)");
 
-        // After re-add (e.g. SwitchRoom) status is still None
+        // After re-add (e.g. SwitchRoom re-populates) status comes back only after explicit SetMute
         mapping.Add("conn1", "clan AB", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
 
-        Assert.AreEqual(MuteStatus.None, mapping.GetMuteStatus("conn1"));
+        Assert.IsFalse(mapping.TryGetMute("conn1", out _),
+            "After Remove+re-Add with no SetMute, cache must still be a MISS");
     }
 
     // ── Task 3 helper methods ─────────────────────────────────────────────────
@@ -350,7 +403,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     private void LoginNormal(string battleTag = "peter#123", string clanTag = null)
     {
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser(battleTag, false, clanTag, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
     }
 
     [Test]
@@ -359,7 +412,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         await AddFullBan("peter#123");
         // Seat user in a non-banned room as if they connected with a clan
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SwitchRoom("W3C Lounge");
 
@@ -377,7 +430,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddFullBan("peter#123");
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SwitchRoom(bannedRoom);
 
@@ -390,7 +443,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddFullBan("peter#123");
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SwitchRoom("clan XYZ");
 
@@ -403,7 +456,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddFullBan("peter#123");
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SwitchRoom("game-lobby-9999");
 
@@ -417,7 +470,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // G1: rejected SwitchRoom must NEVER call Context.Abort()
         await AddFullBan("peter#123");
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
@@ -435,7 +488,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // SwitchRoom must lazily resolve from DB and still reject the move into a banned room.
         await AddFullBan("peter#123");
         // Seated in a room but with no cached MuteStatus (default None), reproducing the
-        // no-clan full-ban login path where SetMuteStatus was never called.
+        // no-clan full-ban login path where SetMute was never called.
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
         await _chatHub.SwitchRoom("1 vs 1");
@@ -451,7 +504,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         int userEnteredCount = 0;
         _groupProxy
@@ -472,7 +525,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // even though UserEntered is suppressed.
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SwitchRoom("1 vs 1");
 
@@ -492,7 +545,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         // Shadow-banned user joins from "W3C Lounge"
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         List<ChatUser> startChatUsers = null;
         _callerProxy
@@ -519,7 +572,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // for a shadow user moving into a banned room (they were already "invisible")
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         int userLeftCount = 0;
         _groupProxy
@@ -539,7 +592,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         int userEnteredCount = 0;
         _groupProxy
@@ -565,7 +618,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // The target is banned, so the enter must be suppressed (ghost-join).
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "clan XYZ", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         int userLeftCount = 0;
         int userEnteredCount = 0;
@@ -595,7 +648,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // visible and the enter must fire.
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         int userLeftCount = 0;
         int userEnteredCount = 0;
@@ -658,7 +711,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // Full-banned user somehow ends up in a banned room (defense-in-depth)
         await AddFullBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
@@ -675,7 +728,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddFullBan("peter#123");
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SendMessage("Hello clan");
 
@@ -689,7 +742,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         ChatMessage callerEcho = null;
         _callerProxy
@@ -714,7 +767,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     {
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
         await _chatHub.SendMessage("Clan message");
 
@@ -727,7 +780,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     public async Task SendMessage_NoBan_NormalUser_Broadcasts()
     {
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
 
         await _chatHub.SendMessage("Normal message");
 
@@ -748,7 +801,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             isShadowBan = false
         });
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
 
         await _chatHub.SendMessage("Should broadcast");
 
@@ -760,11 +813,93 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     public async Task SendMessage_UnbannedUser_InAllRoomTypes_Broadcasts()
     {
         _connectionMapping.Add("TestId", "2 vs 2", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
 
         await _chatHub.SendMessage("Ladder message");
 
         Assert.AreEqual(1, _groupSendCount, "Unbanned user must broadcast in any room");
+    }
+
+    // ── New tests pinning cache-endDate behavior (spec §7) ────────────────────
+
+    [Test]
+    public async Task SendMessage_CacheMiss_ActiveDbBan_InBannedRoom_Enforced()
+    {
+        // Lazy-resolve success path: no cache entry (MISS) + active ban in DB + banned room → enforced.
+        // This covers the no-clan full-ban login edge case where SetMute was never called at login.
+        await AddFullBan("peter#123");
+        // Manually add the user to a banned room WITHOUT calling SetMute (simulates the no-clan login path).
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        // Do NOT call SetMute — leave a MISS.
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        await _chatHub.SendMessage("Should be rejected");
+
+        Assert.IsFalse(abortCalled, "Context.Abort() must not be called");
+        Assert.AreEqual(0, _groupSendCount,
+            "Cache-miss lazy-resolved full-ban in banned room must reject the message");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"),
+            "Rejected message must not enter history");
+    }
+
+    [Test]
+    public async Task SendMessage_CachedBan_Expired_InBannedRoom_Broadcasts()
+    {
+        // Cache shows a ban but its EndDate <= now → treated as expired → message broadcasts.
+        // Verifies expiry is honored from the cached endDate without any DB read.
+        // (No active ban in DB either, so if there WERE a DB read it would also return None —
+        //  but the point is the cache alone is sufficient.)
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        // Set a full-ban cache entry with an expiry in the PAST.
+        var expiredEndDate = DateTime.UtcNow.AddDays(-1);
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, expiredEndDate);
+
+        await _chatHub.SendMessage("Should broadcast after expiry");
+
+        Assert.AreEqual(1, _groupSendCount,
+            "Cached ban with expired EndDate must be treated as no ban — message must broadcast");
+        Assert.AreEqual(1, _chatHistory.GetMessages("W3C Lounge").Count,
+            "Message from expired-ban user must be added to history");
+    }
+
+    [Test]
+    public async Task SendMessage_CachedNonNone_ActiveBan_InBannedRoom_NoRepositoryCall()
+    {
+        // Cache HIT with non-None active ban → zero repository calls (spec §7 "no per-message DB read").
+        //
+        // Proof strategy: the live DB has NO ban for "peter#123" (SetUp drops the DB).
+        // If SendMessage consulted the DB it would find no ban and broadcast the message.
+        // Because the cache has an active shadow ban, the message is DROPPED instead.
+        // A dropped message (group count = 0) proves the decision came from the cache alone,
+        // not from a DB read (which would have returned None → broadcast).
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        // Cache a shadow ban with a future EndDate — non-None HIT, no DB read should occur.
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+        // DB has NO ban (SetUp already wiped the database).
+
+        ChatMessage callerEcho = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "ReceiveMessage" && args.Length > 0)
+                    callerEcho = args[0] as ChatMessage;
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.SendMessage("Hello lounge");
+
+        // If the DB had been consulted it would return None (no ban in DB) → message would broadcast.
+        // The message was DROPPED (group=0, echo to caller) → proves the cached shadow ban was the
+        // authoritative source, fulfilling spec §7 "no per-message DB read" for cached non-None bans.
+        Assert.AreEqual(0, _groupSendCount,
+            "Cached non-None active ban must drop the message with ZERO DB reads (spec §7)");
+        Assert.IsNotNull(callerEcho,
+            "Shadow-banned user must still receive an echo of their own message");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"),
+            "Dropped message must not enter history");
     }
 
     // ── Task 2 tests ────────────────────────────────────────────────────────────

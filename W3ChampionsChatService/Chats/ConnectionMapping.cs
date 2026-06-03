@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -10,16 +11,22 @@ public enum MuteStatus
     Full
 }
 
+/// <summary>
+/// Per-connection mute state cached at login. Carries both the resolved status and
+/// the expiry so the hub can enforce expiry from the cache alone — no per-message DB read.
+/// </summary>
+public readonly record struct CachedMute(MuteStatus Status, DateTime EndDate);
+
 public class ConnectionMapping
 {
     private readonly Dictionary<string, Dictionary<string, ChatUser>> _connections =
         new Dictionary<string, Dictionary<string, ChatUser>>();
 
-    // Per-connection mute status cache. Keyed by connectionId.
+    // Per-connection mute cache. Keyed by connectionId.
     // Guarded by the same lock (_connections) as the connection map so reads/writes
     // of both dictionaries stay atomic and consistent (no TOCTOU on Remove).
-    private readonly Dictionary<string, MuteStatus> _muteStatuses =
-        new Dictionary<string, MuteStatus>();
+    private readonly Dictionary<string, CachedMute> _mutes =
+        new Dictionary<string, CachedMute>();
 
     public List<ChatUser> GetUsersOfRoom(string chatRoom)
     {
@@ -64,7 +71,7 @@ public class ConnectionMapping
         {
             var connection = _connections.Values.SingleOrDefault(r => r.ContainsKey(connectionId));
             connection?.Remove(connectionId);
-            _muteStatuses.Remove(connectionId);
+            _mutes.Remove(connectionId);
         }
     }
 
@@ -101,19 +108,51 @@ public class ConnectionMapping
         }
     }
 
-    public void SetMuteStatus(string connectionId, MuteStatus status)
+    /// <summary>
+    /// Cache the mute status and expiry for a connection.
+    /// Pass <c>status = MuteStatus.None</c> and <c>endDate = DateTime.MinValue</c> for an
+    /// explicitly-resolved unbanned connection (distinguishes a cache HIT-None from a MISS).
+    /// </summary>
+    public void SetMute(string connectionId, MuteStatus status, DateTime endDate)
     {
         lock (_connections)
         {
-            _muteStatuses[connectionId] = status;
+            _mutes[connectionId] = new CachedMute(status, endDate);
         }
     }
 
-    public MuteStatus GetMuteStatus(string connectionId)
+    /// <summary>
+    /// Returns true if a cache entry exists for the connection (regardless of status),
+    /// and writes it to <paramref name="cached"/>. Returns false on a cache MISS.
+    /// Use this to distinguish "cached None" from "never resolved" — only a MISS triggers
+    /// a lazy DB re-resolve.
+    /// </summary>
+    public bool TryGetMute(string connectionId, out CachedMute cached)
     {
         lock (_connections)
         {
-            return _muteStatuses.TryGetValue(connectionId, out var status) ? status : MuteStatus.None;
+            return _mutes.TryGetValue(connectionId, out cached);
+        }
+    }
+
+    /// <summary>
+    /// Returns the effective mute status for <paramref name="now"/>. If there is no cache
+    /// entry, or the entry is non-None but its <c>EndDate</c> has passed, returns
+    /// <c>MuteStatus.None</c>. Does NOT trigger a DB read — call <see cref="TryGetMute"/>
+    /// first to decide whether a lazy resolve is needed.
+    /// </summary>
+    public MuteStatus GetEffectiveMuteStatus(string connectionId, DateTime now)
+    {
+        lock (_connections)
+        {
+            if (!_mutes.TryGetValue(connectionId, out var cached))
+                return MuteStatus.None;
+
+            // None is always effective (unbanned); other statuses expire when EndDate passes.
+            if (cached.Status == MuteStatus.None || cached.EndDate > now)
+                return cached.Status;
+
+            return MuteStatus.None;
         }
     }
 }
