@@ -22,6 +22,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     private ConnectionMapping _connectionMapping;
     private ChatHistory _chatHistory;
     private SettingsRepository _settingsRepository;
+    private MuteReconciliationTestHarness _reconcileHarness;
     private Mock<ISingleClientProxy> _callerProxy;
     private Mock<IClientProxy> _groupProxy;
 
@@ -41,6 +42,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping = new ConnectionMapping();
         _chatHistory = new ChatHistory();
         _settingsRepository = new SettingsRepository(MongoClient);
+        _reconcileHarness = new MuteReconciliationTestHarness(_connectionMapping);
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
         chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
@@ -52,6 +54,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _settingsRepository,
             _connectionMapping,
             _chatHistory,
+            _reconcileHarness.Service,
             null);
 
         _lastCallerMethod = null;
@@ -524,6 +527,28 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task SwitchRoom_FullBan_NoClan_RejectedByNullUserGuard()
+    {
+        // A no-clan full-banned user is seated in NO room, so GetUser returns null for their
+        // connection. A SwitchRoom attempt is therefore rejected by SwitchRoom's `user == null`
+        // early-return — NOT by the cache gate (the cache seed is defense-in-depth). The user must
+        // remain in no room and the call must be graceful (no abort, no throw).
+        await AddFullBan("peter#123");
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        Assert.IsNull(_connectionMapping.GetRoom("TestId"), "Precondition: no-clan full-ban user is in no room");
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        Assert.DoesNotThrowAsync(async () => await _chatHub.SwitchRoom("1 vs 1"),
+            "SwitchRoom with no user must return gracefully, not throw");
+
+        Assert.IsNull(_connectionMapping.GetRoom("TestId"),
+            "No-clan full-ban user must remain in no room after a SwitchRoom attempt (rejected by null-user guard)");
+        Assert.IsFalse(abortCalled, "Null-user SwitchRoom must never call Context.Abort() (G1)");
+    }
+
+    [Test]
     public async Task SwitchRoom_FullBan_ExemptThenPublic_StillRejected()
     {
         // SECURITY regression (full-ban bypass): a full-banned connection seeded with Full at login.
@@ -920,21 +945,28 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     /// <summary>
-    /// A <see cref="MuteRepository"/> spy that counts <see cref="MuteRepository.GetMutedPlayer"/>
-    /// calls so a test can assert the send/switch hot paths perform ZERO mute-repository reads.
+    /// An <see cref="IMuteRepository"/> spy (decorator over a real <see cref="MuteRepository"/>) that
+    /// counts <see cref="IMuteRepository.GetMutedPlayer"/> calls so a test can assert the send/switch
+    /// hot paths perform ZERO mute-repository reads.
     /// </summary>
-    private sealed class CountingMuteRepository(MongoDB.Driver.MongoClient client) : MuteRepository(client)
+    private sealed class CountingMuteRepository(MongoDB.Driver.MongoClient client) : IMuteRepository
     {
+        private readonly MuteRepository _inner = new(client);
+
         public int GetMutedPlayerCallCount { get; private set; }
 
-        public override Task<LoungeMute> GetMutedPlayer(string battleTag)
+        public Task<LoungeMute> GetMutedPlayer(string battleTag)
         {
             GetMutedPlayerCallCount++;
-            return base.GetMutedPlayer(battleTag);
+            return _inner.GetMutedPlayer(battleTag);
         }
+
+        public Task AddLoungeMute(LoungeMuteRequest loungeMuteRequest) => _inner.AddLoungeMute(loungeMuteRequest);
+        public Task<System.Collections.Generic.List<LoungeMute>> GetLoungeMutes() => _inner.GetLoungeMutes();
+        public Task<MongoDB.Driver.DeleteResult> DeleteLoungeMute(string battleTag) => _inner.DeleteLoungeMute(battleTag);
     }
 
-    private ChatHub BuildHubWithRepository(MuteRepository repository)
+    private ChatHub BuildHubWithRepository(IMuteRepository repository)
     {
         var chatAuthService = new Mock<IChatAuthenticationService>();
         chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
@@ -946,6 +978,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _settingsRepository,
             _connectionMapping,
             _chatHistory,
+            _reconcileHarness.Service,
             null)
         {
             Clients = _clients.Object,
@@ -1314,13 +1347,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
 
-        // Mock Clients.Client so the PlayerBannedFromChat send doesn't NRE
-        var victimProxy = new Mock<ISingleClientProxy>();
-        victimProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
-
-        // Admin performs ban
+        // Admin performs ban (the reconcile signal goes through the MuteReconciliationService harness).
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
         _hubCallerContext.Setup(c => c.ConnectionId).Returns("TestId");
@@ -1362,12 +1389,6 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
 
-        // Mock Clients.Client so the PlayerBannedFromChat send doesn't NRE
-        var victimProxy = new Mock<ISingleClientProxy>();
-        victimProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
-
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
 
@@ -1384,27 +1405,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     [Test]
     public async Task BanUser_LiveUser_FullBan_InBannedRoom_SendsPlayerBannedFromChat()
     {
-        // Live user sitting in W3C Lounge (a banned room)
+        // Live user sitting in W3C Lounge (a public room)
         var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
-
-        // Separate client proxy for the victim connection
-        var victimProxy = new Mock<ISingleClientProxy>();
-        string signalSent = null;
-        object payloadInSignal = null;
-        victimProxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((method, args, _) =>
-            {
-                if (method == "PlayerBannedFromChat")
-                {
-                    signalSent = method;
-                    payloadInSignal = args[0];
-                }
-            })
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
 
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
@@ -1412,7 +1416,9 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
         await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
 
-        Assert.AreEqual("PlayerBannedFromChat", signalSent,
+        // The reconcile signal flows through MuteReconciliationService (IHubContext), captured by the harness.
+        var payloadInSignal = _reconcileHarness.PayloadFor("VictimConn", "PlayerBannedFromChat");
+        Assert.AreEqual(1, _reconcileHarness.SignalCount("VictimConn", "PlayerBannedFromChat"),
             "Live fully-banned user in a public room must receive PlayerBannedFromChat");
         // SECURITY: the slimmed payload carries ONLY the expiry — never the LoungeMute.
         Assert.IsNotInstanceOf<LoungeMute>(payloadInSignal,
@@ -1427,12 +1433,6 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
-
-        var victimProxy = new Mock<ISingleClientProxy>();
-        victimProxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
 
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
@@ -1456,12 +1456,6 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
 
-        var victimProxy = new Mock<ISingleClientProxy>();
-        victimProxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
-
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
 
@@ -1484,22 +1478,6 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("VictimConn", "clan AB", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
 
-        var victimProxy = new Mock<ISingleClientProxy>();
-        string signalSent = null;
-        object payloadInSignal = null;
-        victimProxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((method, args, _) =>
-            {
-                if (method == "PlayerBannedFromChat")
-                {
-                    signalSent = method;
-                    payloadInSignal = args[0];
-                }
-            })
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
-
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
@@ -1509,7 +1487,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
         await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
 
-        Assert.AreEqual("PlayerBannedFromChat", signalSent,
+        var payloadInSignal = _reconcileHarness.PayloadFor("VictimConn", "PlayerBannedFromChat");
+        Assert.AreEqual(1, _reconcileHarness.SignalCount("VictimConn", "PlayerBannedFromChat"),
             "Full-banned live user in an EXEMPT room must still receive PlayerBannedFromChat (R7/G5)");
         // SECURITY: the slimmed payload carries ONLY the expiry — never the LoungeMute.
         Assert.IsNotInstanceOf<LoungeMute>(payloadInSignal,
@@ -1532,28 +1511,6 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("VictimConn2", "1 vs 1", conn2User);
         _connectionMapping.SetMute("VictimConn2", MuteStatus.None, DateTime.MinValue);
 
-        var victim1Signals = 0;
-        var victim1Proxy = new Mock<ISingleClientProxy>();
-        victim1Proxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((method, _, _) =>
-            {
-                if (method == "PlayerBannedFromChat") victim1Signals++;
-            })
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn1")).Returns(victim1Proxy.Object);
-
-        var victim2Signals = 0;
-        var victim2Proxy = new Mock<ISingleClientProxy>();
-        victim2Proxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((method, _, _) =>
-            {
-                if (method == "PlayerBannedFromChat") victim2Signals++;
-            })
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn2")).Returns(victim2Proxy.Object);
-
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
@@ -1571,10 +1528,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         Assert.AreEqual(MuteStatus.Full, cached2.Status,
             "Second connection's cache must be reconciled to Full");
 
-        // Both connections received exactly one PlayerBannedFromChat
-        Assert.AreEqual(1, victim1Signals,
+        // Both connections received exactly one PlayerBannedFromChat (via the reconcile harness)
+        Assert.AreEqual(1, _reconcileHarness.SignalCount("VictimConn1", "PlayerBannedFromChat"),
             "First connection must receive PlayerBannedFromChat");
-        Assert.AreEqual(1, victim2Signals,
+        Assert.AreEqual(1, _reconcileHarness.SignalCount("VictimConn2", "PlayerBannedFromChat"),
             "Second connection must receive PlayerBannedFromChat");
 
         Assert.IsFalse(abortCalled, "Context.Abort() must NOT be called on any connection (G1)");
@@ -1588,21 +1545,13 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
 
-        var victimProxy = new Mock<ISingleClientProxy>();
-        int victimSignalCount = 0;
-        victimProxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((_, _, _) => victimSignalCount++)
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
-
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
 
         var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
         await _chatHub.BanUser("victim#123", "spam", true, endDate);
 
-        Assert.AreEqual(0, victimSignalCount,
+        Assert.AreEqual(0, _reconcileHarness.SignalsFor("VictimConn").Count,
             "Shadow ban must send NO signal to the target (illusion preserved)");
     }
 
@@ -1614,12 +1563,6 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
-
-        var victimProxy = new Mock<ISingleClientProxy>();
-        victimProxy
-            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Returns(Task.CompletedTask);
-        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
 
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
