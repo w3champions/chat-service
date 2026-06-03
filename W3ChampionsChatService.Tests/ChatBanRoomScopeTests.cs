@@ -1516,6 +1516,28 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         Assert.AreEqual(1, userLeftCount, "Normal user disconnect must broadcast UserLeft");
     }
 
+    [Test]
+    public async Task OnDisconnectedAsync_ShadowBan_Expired_BroadcastsUserLeft()
+    {
+        // Expiry regression: a cached Shadow ban whose endDate has passed must NOT suppress UserLeft.
+        // GetEffectiveMuteStatus resolves an expired shadow ban to None, so the user was visible —
+        // their UserLeft must broadcast on disconnect, even in a banned room.
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(-1));
+
+        int userLeftCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.OnDisconnectedAsync(null);
+
+        Assert.AreEqual(1, userLeftCount,
+            "Expired shadow ban must NOT suppress UserLeft — user was visible, so UserLeft must broadcast");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]
