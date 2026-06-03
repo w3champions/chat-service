@@ -166,9 +166,15 @@ public class ChatHub(
             return;
         }
 
-        // Ghost-join flag: shadow-banned user entering a banned room receives messages
-        // but their presence is hidden from others (no UserEntered / UserLeft broadcasts).
-        var ghostJoin = DefaultChatRooms.IsBannedRoom(chatRoom) && muteStatus == MuteStatus.Shadow;
+        // Two independent presence gates, each derived from the relevant room:
+        // - suppressLeave: the user was a GHOST in the OLD room (shadow + old room is banned),
+        //   so no one ever saw them there — suppress the UserLeft on the room they're leaving.
+        // - suppressEnter: the user ghost-joins the TARGET room (shadow + target is banned),
+        //   so suppress the UserEntered on the room they're entering.
+        // Using a single target-based flag for both would leak/strand presence on cross-category
+        // shadow transitions (exempt→banned must still broadcast UserLeft; banned→exempt must not).
+        var suppressLeave = oldRoom != null && DefaultChatRooms.IsBannedRoom(oldRoom) && muteStatus == MuteStatus.Shadow;
+        var suppressEnter = DefaultChatRooms.IsBannedRoom(chatRoom) && muteStatus == MuteStatus.Shadow;
 
         _connections.Remove(Context.ConnectionId);
         _connections.Add(Context.ConnectionId, chatRoom, user);
@@ -178,7 +184,7 @@ public class ChatHub(
         if (oldRoom != null)
         {
             await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldRoom);
-            if (!ghostJoin)
+            if (!suppressLeave)
             {
                 await Clients.Group(oldRoom).SendAsync("UserLeft", user);
             }
@@ -187,7 +193,7 @@ public class ChatHub(
         await Groups.AddToGroupAsync(Context.ConnectionId, chatRoom);
 
         var usersOfRoom = _connections.GetUsersOfRoom(chatRoom);
-        if (!ghostJoin)
+        if (!suppressEnter)
         {
             await Clients.Group(chatRoom).SendAsync("UserEntered", user);
         }

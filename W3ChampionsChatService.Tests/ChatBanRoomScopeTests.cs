@@ -434,13 +434,9 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // (because they had no clan), so their MuteStatus is None in cache.
         // SwitchRoom must lazily resolve from DB and still reject the move into a banned room.
         await AddFullBan("peter#123");
-        // NOT calling _connectionMapping.SetMuteStatus — simulating the "no clan at login" path.
-        // The user is seated nowhere yet (simulating them calling SwitchRoom to try to join W3C Lounge).
-        // We DON'T add them to the mapping at all — GetUser returns null, lazy resolution must still work.
-        // Actually: the user must be seated somewhere for SwitchRoom to have a user object.
-        // Simulate: user connected but is in the mapping with None mute status (cache miss).
+        // Seated in a room but with no cached MuteStatus (default None), reproducing the
+        // no-clan full-ban login path where SetMuteStatus was never called.
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        // MuteStatus is None (default — cache miss, as if they came via the no-clan full-ban login path)
 
         await _chatHub.SwitchRoom("1 vs 1");
 
@@ -559,6 +555,66 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "Shadow-banned user entering an exempt room must broadcast UserEntered normally");
         var room = _connectionMapping.GetRoom("TestId");
         Assert.AreEqual("clan XYZ", room);
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_ExemptToBanned_StillBroadcastsUserLeft()
+    {
+        // Cross-category: shadow user was VISIBLE in an exempt room, so leaving it must still
+        // broadcast UserLeft (else a stale ghost lingers in the exempt room's user list).
+        // The target is banned, so the enter must be suppressed (ghost-join).
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "clan XYZ", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        int userLeftCount = 0;
+        int userEnteredCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserEntered", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userEnteredCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SwitchRoom("W3C Lounge");
+
+        Assert.AreEqual(1, userLeftCount,
+            "Shadow user leaving an EXEMPT room (where they were visible) must broadcast UserLeft");
+        Assert.AreEqual(0, userEnteredCount,
+            "Shadow user ghost-joining a BANNED target room must NOT broadcast UserEntered");
+    }
+
+    [Test]
+    public async Task SwitchRoom_ShadowBan_BannedToExempt_SuppressesUserLeft()
+    {
+        // Cross-category: shadow user was a GHOST in a banned room (no one saw them enter),
+        // so leaving it must NOT broadcast UserLeft. The target is exempt, so they become
+        // visible and the enter must fire.
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        int userLeftCount = 0;
+        int userEnteredCount = 0;
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserLeft", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userLeftCount++)
+            .Returns(Task.CompletedTask);
+        _groupProxy
+            .Setup(x => x.SendCoreAsync("UserEntered", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => userEnteredCount++)
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
+
+        await _chatHub.SwitchRoom("clan XYZ");
+
+        Assert.AreEqual(0, userLeftCount,
+            "Shadow user leaving a BANNED room (where they were a ghost) must NOT broadcast UserLeft");
+        Assert.AreEqual(1, userEnteredCount,
+            "Shadow user entering an EXEMPT target room must broadcast UserEntered (becomes visible)");
     }
 
     [Test]
