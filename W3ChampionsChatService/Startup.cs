@@ -29,12 +29,15 @@ public class Startup
         services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
         services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
         services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
-        services.AddTransient<MuteRepository>();
+        services.AddTransient<IMuteRepository, MuteRepository>();
         services.AddTransient<UserHasPermissionFilter>();
         services.AddHttpContextAccessor();
 
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();
+        // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
+        // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
+        services.AddSingleton<MuteReconciliationService>();
         Log.Information("Services added");
     }
 

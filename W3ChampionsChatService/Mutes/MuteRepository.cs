@@ -5,7 +5,7 @@ using System.Collections.Generic;
 
 namespace W3ChampionsChatService.Mutes;
 
-public class MuteRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
+public class MuteRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient), IMuteRepository
 {
     public Task AddLoungeMute(LoungeMuteRequest loungeMuteRequest)
     {
@@ -19,9 +19,7 @@ public class MuteRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mon
         return Upsert(loungeMute);
     }
 
-    // virtual so tests can spy on it and assert the SendMessage/SwitchRoom hot paths perform
-    // ZERO mute-repository reads (the §7 cache-only contract).
-    public virtual Task<LoungeMute> GetMutedPlayer(string battleTag)
+    public Task<LoungeMute> GetMutedPlayer(string battleTag)
     {
         return LoadFirst<LoungeMute>(battleTag.ToLower());
     }

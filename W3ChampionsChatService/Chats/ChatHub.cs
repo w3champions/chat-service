@@ -15,18 +15,29 @@ namespace W3ChampionsChatService.Chats;
 
 public class ChatHub(
     IChatAuthenticationService authenticationService,
-    MuteRepository muteRepository,
+    IMuteRepository muteRepository,
     SettingsRepository settingsRepository,
     ConnectionMapping connections,
     ChatHistory chatHistory,
+    MuteReconciliationService muteReconciliation,
     IHttpContextAccessor contextAccessor) : Hub
 {
     private readonly IChatAuthenticationService _authenticationService = authenticationService;
-    private readonly MuteRepository _muteRepository = muteRepository;
+    private readonly IMuteRepository _muteRepository = muteRepository;
     private readonly SettingsRepository _settingsRepository = settingsRepository;
     private readonly ConnectionMapping _connections = connections;
     private readonly ChatHistory _chatHistory = chatHistory;
+    private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly IHttpContextAccessor _contextAccessor = contextAccessor;
+
+    // Cap how much of an arbitrary user message is written to logs (the shadow-drop audit line) so a
+    // single huge message can't bloat the logs.
+    private const int MaxLoggedMessageLength = 500;
+
+    private static string TruncateForLog(string message) =>
+        message.Length <= MaxLoggedMessageLength
+            ? message
+            : message[..MaxLoggedMessageLength] + "…[truncated]";
 
     public async Task SendMessage(string message)
     {
@@ -49,10 +60,12 @@ public class ChatHub(
 
         // Mutes only apply in public lounge/ladder rooms; clan/lobby rooms are fully exempt.
         // Read the per-user cached status once + classify the room — ZERO DB reads on the hot path.
-        // The cache is seeded authoritatively at login (every path) and reconciled live by BanUser,
-        // so consulting GetEffectiveMuteStatus alone is sufficient and expiry-aware. ACCEPTED TRADE-OFF:
-        // an out-of-band ban written directly to Mongo (bypassing the BanUser hub) only takes effect on
-        // the user's next (re)connect — we deliberately do NOT re-query the DB per send.
+        // The cache is seeded authoritatively at login (every path) and reconciled live by every ban
+        // WRITE path (the hub's BanUser AND the REST MuteController, via MuteReconciliationService),
+        // so consulting GetEffectiveMuteStatus alone is sufficient and expiry-aware. RESIDUAL TRADE-OFF:
+        // a ban written DIRECTLY to the Mongo collection — bypassing BOTH the hub and the REST controller
+        // (e.g. a manual DB edit or migration) — only takes effect on the user's next (re)connect; we
+        // deliberately do NOT re-query the DB per send.
         var inPublicRoom = DefaultChatRooms.IsPublicRoom(chatRoom);
         var muteStatus = inPublicRoom
             ? _connections.GetEffectiveMuteStatus(Context.ConnectionId, DateTime.UtcNow)
@@ -76,9 +89,9 @@ public class ChatHub(
             if (inPublicRoom && muteStatus == MuteStatus.Shadow)
             {
                 // Drop: echo only to caller (illusion of sending). The message reaches no one else.
-                // Log the dropped attempt (incl. content) so moderators can audit shadow-banned activity.
+                // Log the dropped attempt (incl. content, bounded) so moderators can audit shadow activity.
                 Log.Information("Shadow banned user {BattleTag} attempted to send in public room {Room} — dropped: {Message}",
-                    user.BattleTag, chatRoom, trimmedMessage);
+                    user.BattleTag, chatRoom, TruncateForLog(trimmedMessage));
                 await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
             }
             else
@@ -176,9 +189,10 @@ public class ChatHub(
         }
 
         // Resolve the per-user cached status once. The cache is seeded at login (every path) and
-        // reconciled live by BanUser, so it is authoritative — consult it ONLY, never the DB.
-        // EffectiveStatus is the single expiry rule (expired ban → None). Capture the cached endDate
-        // so we can re-populate the cache after Remove (which clears it) + Add.
+        // reconciled live by every ban write path (hub + REST controller, via MuteReconciliationService),
+        // so it is authoritative — consult it ONLY, never the DB. EffectiveStatus is the single expiry
+        // rule (expired ban → None). Capture the cached endDate so we can re-populate the cache after
+        // Remove (which clears it) + Add.
         var hasCachedEntry = _connections.TryGetMute(Context.ConnectionId, out var preSwitchCached);
         var cachedEndDate = hasCachedEntry ? preSwitchCached.EndDate : DateTime.MinValue;
         var targetIsPublic = DefaultChatRooms.IsPublicRoom(chatRoom);
@@ -285,16 +299,15 @@ public class ChatHub(
 
         await _muteRepository.AddLoungeMute(loungeMuteRequest);
 
-        // Spec §12: BanUser is the canonical IN-BAND ban path — it persists the ban AND reconciles
-        // every live connection's mute cache so enforcement is instant without a per-send DB read.
-        // (An out-of-band ban written straight to Mongo only takes effect on the user's next reconnect,
-        // when LoginAsAuthenticated re-seeds the cache from the DB — accepted trade-off, see SendMessage.)
-        // Parse the endDate once — used for both the cache and the PlayerBannedFromChat payload.
-        // Use the SAME DateTimeStyles the repository uses (AdjustToUniversal) so the CACHED expiry
-        // can never disagree with the PERSISTED expiry for an offset-less endDate.
-        // Guard a malformed/empty endDate: the ban is already persisted, so on a parse failure
-        // skip the live reconcile gracefully (next reconnect re-seeds the cache from the DB)
-        // rather than throwing a hub exception after the write.
+        // Spec §12: BanUser is one of the two canonical IN-BAND ban paths (the other is the REST
+        // MuteController). Both persist the ban AND reconcile every live connection's mute cache via
+        // MuteReconciliationService, so enforcement is instant without a per-send DB read. Only a ban
+        // written DIRECTLY to the Mongo collection (bypassing both the hub and the REST controller —
+        // e.g. a manual DB edit) takes effect on the target's next reconnect.
+        // Parse the endDate once. Use the SAME DateTimeStyles the repository uses (AdjustToUniversal)
+        // so the CACHED expiry can never disagree with the PERSISTED expiry for an offset-less endDate.
+        // Guard a malformed/empty endDate: the ban is already persisted, so on a parse failure skip the
+        // live reconcile gracefully (next reconnect re-seeds the cache) rather than throwing after the write.
         if (!DateTime.TryParse(endDate, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsedEndDate))
         {
             Log.Warning("BanUser: could not parse endDate '{EndDate}' for {BattleTag} — ban persisted, skipping live cache reconcile (next reconnect will re-seed the cache)",
@@ -303,32 +316,7 @@ public class ChatHub(
         }
 
         var newStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
-
-        // Match the DB convention (GetMutedPlayer/AddLoungeMute lowercase the battleTag) by lowercasing
-        // the lookup arg too. GetConnectionIdsForUser also compares case-insensitively, so the instant
-        // reconcile works on a casing mismatch (not just via the safety-net self-heal).
-        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag.ToLower());
-        foreach (var connId in liveConnectionIds)
-        {
-            // Update the cache so the next SendMessage/SwitchRoom enforces from the cache (no DB read).
-            _connections.SetMute(connId, newStatus, parsedEndDate);
-
-            if (!isShadowBan)
-            {
-                // Full ban — R7/G5: notify the target REGARDLESS of their current room so they
-                // clearly and persistently know they're banned, independent of channel. A user
-                // full-banned while sitting in a clan/lobby room must still receive the notice
-                // (not just users in a public lounge/ladder room).
-                // G1: SendAsync only — do NOT call Context.Abort(); the connection must stay alive.
-                // §12: no forced eviction — the user keeps their current room membership.
-                // SECURITY: send only the expiry — never leak the moderation reason or the shadow flag
-                // to the client. The event name + the camelCase `endDate` field stay unchanged so old
-                // clients keep reading `.endDate`; the missing reason/isShadowBan deserialize to
-                // null/false on legacy clients (harmless).
-                await Clients.Client(connId).SendAsync("PlayerBannedFromChat", new { endDate = parsedEndDate });
-            }
-            // Shadow ban: no signal to the target whatsoever — preserve the illusion (spec §12).
-        }
+        await _muteReconciliation.ApplyMuteToLiveConnections(battleTag, newStatus, parsedEndDate);
     }
 
     internal async Task LoginAsAuthenticated(ChatUser user)
@@ -376,9 +364,12 @@ public class ChatHub(
             }
             else
             {
-                // No clan: not seated in any room (spec D2). The cache is STILL seeded above
-                // (SetMute keys by connectionId only, independent of room membership), so a later
-                // SwitchRoom into a public room enforces the full ban from the cache — no DB read.
+                // No clan: not seated in any room (spec D2). A SwitchRoom attempt by this connection
+                // is rejected by SwitchRoom's `user == null` early-return (GetUser finds no mapping
+                // entry), NOT by the cache gate. The cache is STILL seeded above as defense-in-depth:
+                // if this connection ever became seated in a public room, SendMessage would enforce
+                // the full ban from the cache (zero DB read). SetMute keys by connectionId only, so
+                // seeding works even with no room membership.
                 // G3: STILL emit a StartChat — an empty-room payload — so legacy clients can initialize.
                 await Clients.Caller.SendAsync("StartChat", new List<ChatUser>(), new List<ChatMessage>(), (string)null, availableRooms);
             }
