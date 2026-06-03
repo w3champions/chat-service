@@ -349,26 +349,22 @@ public class ChatHub(
 
             if (!isShadowBan)
             {
-                // Full ban — G5: notify the target so old clients render their legacy ban notice.
-                // Only send when the user is in a banned room (spec §12 / G1/G5 signal).
-                // G1: do NOT call Context.Abort() — the connection must stay alive.
-                var currentRoom = _connections.GetRoom(connId);
-                if (currentRoom != null && DefaultChatRooms.IsBannedRoom(currentRoom))
+                // Full ban — R7/G5: notify the target REGARDLESS of their current room so they
+                // clearly and persistently know they're banned, independent of channel. A user
+                // full-banned while sitting in a clan/lobby room must still receive the notice
+                // (not just users in a lounge/ladder room).
+                // G1: SendAsync only — do NOT call Context.Abort(); the connection must stay alive.
+                // §12: no forced eviction — the user keeps their current room membership.
+                var mute = new LoungeMute
                 {
-                    var mute = new LoungeMute
-                    {
-                        battleTag = battleTag,
-                        endDate = parsedEndDate,
-                        insertDate = DateTime.UtcNow,
-                        author = adminUser.BattleTag,
-                        reason = reason,
-                        isShadowBan = false
-                    };
-                    // G1: SendAsync only — no Context.Abort().
-                    await Clients.Client(connId).SendAsync("PlayerBannedFromChat", mute);
-                }
-                // Full-ban user in an exempt room: cache is still updated (ban is active for future
-                // joins/sends), but no signal is sent — they can stay in the exempt room per spec §12.
+                    battleTag = battleTag,
+                    endDate = parsedEndDate,
+                    insertDate = DateTime.UtcNow,
+                    author = adminUser.BattleTag,
+                    reason = reason,
+                    isShadowBan = false
+                };
+                await Clients.Client(connId).SendAsync("PlayerBannedFromChat", mute);
             }
             // Shadow ban: no signal to the target whatsoever — preserve the illusion (spec §12).
         }

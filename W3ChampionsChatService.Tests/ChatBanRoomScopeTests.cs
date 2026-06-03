@@ -1283,6 +1283,49 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task BanUser_LiveUser_FullBan_InExemptRoom_AlsoSendsPlayerBannedFromChat()
+    {
+        // R7/G5: a user full-banned while sitting in an EXEMPT room (clan/lobby) must STILL
+        // receive PlayerBannedFromChat — they must clearly and persistently know they're banned,
+        // independent of channel. The signal is NOT gated on the room being a banned room.
+        var liveUser = new ChatUser("victim#123", false, "AB", new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "clan AB", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var victimProxy = new Mock<ISingleClientProxy>();
+        string signalSent = null;
+        LoungeMute muteInSignal = null;
+        victimProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "PlayerBannedFromChat")
+                {
+                    signalSent = method;
+                    muteInSignal = args[0] as LoungeMute;
+                }
+            })
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client("VictimConn")).Returns(victimProxy.Object);
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("TestId", "W3C Lounge", adminUser);
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        Assert.AreEqual("PlayerBannedFromChat", signalSent,
+            "Full-banned live user in an EXEMPT room must still receive PlayerBannedFromChat (R7/G5)");
+        Assert.IsNotNull(muteInSignal, "PlayerBannedFromChat payload must include the LoungeMute");
+        Assert.AreEqual("victim#123", muteInSignal.battleTag);
+        Assert.IsFalse(abortCalled,
+            "Context.Abort() must NOT be called when signalling a full ban in an exempt room (G1)");
+    }
+
+    [Test]
     public async Task BanUser_LiveUser_ShadowBan_SendsNoSignalToTarget()
     {
         // Shadow ban: illusion preserved — no PlayerBannedFromChat sent to target
@@ -1401,7 +1444,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task BanUser_UserNotConnected_NoException()
+    public void BanUser_UserNotConnected_NoException()
     {
         // Banning a user who is not currently connected — should complete without error
         var adminUser = new ChatUser("admin#1", true, null, new ProfilePicture(), null, null);
@@ -1409,8 +1452,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
 
-        Assert.DoesNotThrowAsync(async () =>
-            await _chatHub.BanUser("offline#999", "reason", false, endDate));
+        Assert.DoesNotThrowAsync(() =>
+            _chatHub.BanUser("offline#999", "reason", false, endDate));
     }
 
     // ── Task 2 tests ────────────────────────────────────────────────────────────

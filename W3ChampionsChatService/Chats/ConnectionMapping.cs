@@ -142,25 +142,34 @@ public class ConnectionMapping
     /// first to decide whether a lazy resolve is needed.
     /// </summary>
     /// <remarks>
-    /// <see cref="GetUsersOfRoomForViewer"/> intentionally inlines this same expiry logic
-    /// rather than calling this method. C#'s <c>lock</c> is reentrant so calling here while
-    /// already holding <c>lock(_connections)</c> would not deadlock, but inlining keeps the
-    /// single-lock discipline explicit while iterating the room. Keep the inlined copy in
-    /// <see cref="GetUsersOfRoomForViewer"/> in sync with the expiry rule below.
+    /// The expiry rule lives in a single place: <see cref="GetEffectiveMuteStatusNoLock"/>.
+    /// This method just acquires the lock and delegates. <see cref="GetUsersOfRoomForViewer"/>
+    /// calls the no-lock helper directly because it already holds <c>lock(_connections)</c>.
     /// </remarks>
     public MuteStatus GetEffectiveMuteStatus(string connectionId, DateTime now)
     {
         lock (_connections)
         {
-            if (!_mutes.TryGetValue(connectionId, out var cached))
-                return MuteStatus.None;
-
-            // None is always effective (unbanned); other statuses expire when EndDate passes.
-            if (cached.Status == MuteStatus.None || cached.EndDate > now)
-                return cached.Status;
-
-            return MuteStatus.None;
+            return GetEffectiveMuteStatusNoLock(connectionId, now);
         }
+    }
+
+    /// <summary>
+    /// Single source of truth for the cache expiry rule. The caller MUST already hold
+    /// <c>lock(_connections)</c>. A cache MISS returns <c>None</c>; a HIT returns its status
+    /// while still effective (<c>None</c> never expires; other statuses expire once
+    /// <c>EndDate</c> has passed).
+    /// </summary>
+    private MuteStatus GetEffectiveMuteStatusNoLock(string connectionId, DateTime now)
+    {
+        if (!_mutes.TryGetValue(connectionId, out var cached))
+            return MuteStatus.None;
+
+        // None is always effective (unbanned); other statuses expire when EndDate passes.
+        if (cached.Status == MuteStatus.None || cached.EndDate > now)
+            return cached.Status;
+
+        return MuteStatus.None;
     }
 
     /// <summary>
@@ -188,14 +197,10 @@ public class ConnectionMapping
                     if (kvp.Key == viewerConnectionId) return true;
 
                     // In banned rooms, exclude users whose effective mute status is Shadow.
-                    // GetEffectiveMuteStatus is expiry-aware: an expired shadow ban returns None.
-                    if (isBannedRoom && _mutes.TryGetValue(kvp.Key, out var cached))
-                    {
-                        var effectiveStatus = (cached.Status == MuteStatus.None || cached.EndDate > now)
-                            ? cached.Status
-                            : MuteStatus.None;
-                        if (effectiveStatus == MuteStatus.Shadow) return false;
-                    }
+                    // GetEffectiveMuteStatusNoLock is expiry-aware: an expired shadow ban returns None.
+                    // We already hold lock(_connections), so call the no-lock helper directly.
+                    if (isBannedRoom && GetEffectiveMuteStatusNoLock(kvp.Key, now) == MuteStatus.Shadow)
+                        return false;
 
                     return true;
                 })
