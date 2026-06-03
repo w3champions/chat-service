@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
@@ -157,6 +158,48 @@ public class MuteReconciliationTests : IntegrationTestBase
 
         Assert.AreEqual(1, _groupSendCount,
             "After a controller unban, the user can send again in a public room without reconnecting");
+    }
+
+    [Test]
+    public async Task ControllerDelete_MixedCaseBattleTag_ActuallyDeletesRow_AndReturnsOk()
+    {
+        // Casing fix: the row is stored lowercased (AddLoungeMute), so a mixed-case DELETE must still
+        // match and remove it — and report 200 OK, not a false 404.
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "Victim#123",
+            endDate = DateTime.UtcNow.AddDays(1).ToString("O"),
+            author = "admin#1",
+            reason = "bad behavior",
+            isShadowBan = false
+        });
+
+        var result = await _controller.DeleteLoungeMute("VICTIM#123");
+
+        Assert.IsInstanceOf<OkObjectResult>(result,
+            "A mixed-case DELETE that matches a stored (lowercased) mute must return 200 OK");
+        Assert.IsNull(await _muteRepository.GetMutedPlayer("victim#123"),
+            "A mixed-case DELETE must actually remove the stored row (casing fix)");
+    }
+
+    [Test]
+    public async Task ControllerDelete_AbsentTag_ReturnsNotFound_ButStillClearsLiveCache()
+    {
+        // An explicit moderator unban of a target whose DB row is already gone/expired must STILL free
+        // any live connection (reconcile-then-respond), yet report an accurate 404 since nothing was
+        // deleted from the DB.
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
+        // No DB row exists for this tag (SetUp drops the DB; we never AddLoungeMute here).
+
+        var result = await _controller.DeleteLoungeMute("victim#123");
+
+        Assert.IsInstanceOf<NotFoundObjectResult>(result,
+            "DELETE of an absent tag must return 404 (nothing was deleted)");
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn", out var cached));
+        Assert.AreEqual(MuteStatus.None, cached.Status,
+            "An explicit unban must clear the live cache even when the DB row was already gone");
     }
 
     [Test]

@@ -64,16 +64,17 @@ public class MuteController(IMuteRepository muteRepository, MuteReconciliationSe
     {
         Log.Information("Deleting lounge mute for {BattleTag}", bTag);
         DeleteResult result = await _muteRepository.DeleteLoungeMute(bTag);
-        if (result.DeletedCount == 0)
-        {
-            NotFound($"Unable to delete. Lounge mute for {bTag} not found.");
-        }
 
-        // Clear the cached mute on the target's live connections so an unbanned user can send again
-        // server-side without reconnecting. Intentionally does not restore hidden rooms or clear the
-        // client banner — that refreshes on reconnect (no "ban lifted" event; product decision).
+        // Clear the cached mute on the target's live connections FIRST, regardless of whether a DB row
+        // was removed. An explicit moderator unban should always free live connections — even if the DB
+        // row was already gone or expired — and ClearMuteOnLiveConnections is a safe no-op when there is
+        // nothing cached. (Does not restore hidden rooms or clear the client banner — that refreshes on
+        // reconnect; no "ban lifted" event, per the product decision.)
         await _muteReconciliation.ClearMuteOnLiveConnections(bTag);
 
-        return Ok($"Lounge mute for {bTag} deleted.");
+        // Report an accurate status: 404 when nothing was deleted, 200 otherwise.
+        return result.DeletedCount == 0
+            ? NotFound($"Unable to delete. Lounge mute for {bTag} not found.")
+            : Ok($"Lounge mute for {bTag} deleted.");
     }
 }

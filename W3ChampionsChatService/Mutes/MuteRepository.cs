@@ -31,6 +31,8 @@ public class MuteRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mon
 
     public Task<DeleteResult> DeleteLoungeMute(string battleTag)
     {
-        return Delete<LoungeMute>(c => c.battleTag == battleTag);
+        // Lowercase the tag to mirror AddLoungeMute/GetMutedPlayer — the stored battleTag is always
+        // lowercased, so a mixed-case delete would otherwise silently match 0 rows.
+        return Delete<LoungeMute>(c => c.battleTag == battleTag.ToLower());
     }
 }
