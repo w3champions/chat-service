@@ -18,4 +18,10 @@ public class DefaultChatRooms()
         "Risk Europe",
         "Mini Dota",
     ];
+
+    /// <summary>
+    /// Returns true if <paramref name="room"/> is a lounge/ladder channel
+    /// where chat mutes apply. Clan and custom-game-lobby rooms return false.
+    /// </summary>
+    public static bool IsBannedRoom(string room) => Rooms.Contains(room);
 }

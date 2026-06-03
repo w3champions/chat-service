@@ -153,4 +153,28 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         Assert.AreEqual(MuteStatus.None, mapping.GetMuteStatus("conn1"));
     }
+
+    // ── Task 2 tests ────────────────────────────────────────────────────────────
+
+    [TestCase("W3C Lounge",      ExpectedResult = true)]
+    [TestCase("1 vs 1",          ExpectedResult = true)]
+    [TestCase("2 vs 2",          ExpectedResult = true)]
+    [TestCase("4 vs 4",          ExpectedResult = true)]
+    [TestCase("FFA",             ExpectedResult = true)]
+    [TestCase("Legion TD",       ExpectedResult = true)]
+    [TestCase("Survival Chaos",  ExpectedResult = true)]
+    [TestCase("Direct Strike",   ExpectedResult = true)]
+    [TestCase("Warhammer",       ExpectedResult = true)]
+    [TestCase("Castle Fight",    ExpectedResult = true)]
+    [TestCase("Risk Europe",     ExpectedResult = true)]
+    [TestCase("Mini Dota",       ExpectedResult = true)]
+    [TestCase("clan AB",         ExpectedResult = false)]
+    [TestCase("clan XYZ",        ExpectedResult = false)]
+    [TestCase("game-lobby-42",   ExpectedResult = false)]
+    [TestCase("custom_lobby",    ExpectedResult = false)]
+    [TestCase("",                ExpectedResult = false)]
+    public bool IsBannedRoom_ClassifiesCorrectly(string room)
+    {
+        return DefaultChatRooms.IsBannedRoom(room);
+    }
 }
