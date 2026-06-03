@@ -143,7 +143,12 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         mapping.SetMuteStatus("conn1", MuteStatus.Full);
 
         mapping.Remove("conn1");
-        // After re-add (e.g. SwitchRoom) status is back to None
+
+        // Direct assertion: Remove must clear the cached status immediately,
+        // before any re-Add — guards against a Remove that silently does nothing.
+        Assert.AreEqual(MuteStatus.None, mapping.GetMuteStatus("conn1"));
+
+        // After re-add (e.g. SwitchRoom) status is still None
         mapping.Add("conn1", "clan AB", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
 
         Assert.AreEqual(MuteStatus.None, mapping.GetMuteStatus("conn1"));

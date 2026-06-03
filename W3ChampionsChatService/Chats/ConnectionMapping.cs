@@ -16,6 +16,8 @@ public class ConnectionMapping
         new Dictionary<string, Dictionary<string, ChatUser>>();
 
     // Per-connection mute status cache. Keyed by connectionId.
+    // Guarded by the same lock (_connections) as the connection map so reads/writes
+    // of both dictionaries stay atomic and consistent (no TOCTOU on Remove).
     private readonly Dictionary<string, MuteStatus> _muteStatuses =
         new Dictionary<string, MuteStatus>();
 
@@ -62,9 +64,6 @@ public class ConnectionMapping
         {
             var connection = _connections.Values.SingleOrDefault(r => r.ContainsKey(connectionId));
             connection?.Remove(connectionId);
-        }
-        lock (_muteStatuses)
-        {
             _muteStatuses.Remove(connectionId);
         }
     }
@@ -104,7 +103,7 @@ public class ConnectionMapping
 
     public void SetMuteStatus(string connectionId, MuteStatus status)
     {
-        lock (_muteStatuses)
+        lock (_connections)
         {
             _muteStatuses[connectionId] = status;
         }
@@ -112,7 +111,7 @@ public class ConnectionMapping
 
     public MuteStatus GetMuteStatus(string connectionId)
     {
-        lock (_muteStatuses)
+        lock (_connections)
         {
             return _muteStatuses.TryGetValue(connectionId, out var status) ? status : MuteStatus.None;
         }
