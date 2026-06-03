@@ -637,6 +637,136 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         Assert.AreEqual("1 vs 1", room);
     }
 
+    // ── Task 5 tests ────────────────────────────────────────────────────────────
+
+    [Test]
+    public async Task SendMessage_NoRoom_MembershipCheck_Rejected()
+    {
+        // User is NOT added to any room (not in _connectionMapping)
+        // Calling SendMessage without being a member → rejected, no group broadcast
+
+        await _chatHub.SendMessage("Hello world");
+
+        Assert.AreEqual(0, _groupSendCount,
+            "Message must not be broadcast when user has no room membership");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"));
+    }
+
+    [Test]
+    public async Task SendMessage_FullBan_InBannedRoom_IsRejectedSilently()
+    {
+        // Full-banned user somehow ends up in a banned room (defense-in-depth)
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        await _chatHub.SendMessage("Hello world");
+
+        Assert.IsFalse(abortCalled, "Context.Abort() must not be called from SendMessage");
+        Assert.AreEqual(0, _groupSendCount, "Full-banned message in banned room must not be broadcast");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"));
+    }
+
+    [Test]
+    public async Task SendMessage_FullBan_InExemptRoom_Broadcasts()
+    {
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Full);
+
+        await _chatHub.SendMessage("Hello clan");
+
+        Assert.AreEqual(1, _groupSendCount, "Full-banned user's message in exempt room must broadcast");
+        Assert.AreEqual(1, _chatHistory.GetMessages("clan AB").Count);
+        Assert.AreEqual("Hello clan", _chatHistory.GetMessages("clan AB")[0].Message);
+    }
+
+    [Test]
+    public async Task SendMessage_ShadowBan_InBannedRoom_DroppedEchoToCaller()
+    {
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        ChatMessage callerEcho = null;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            {
+                if (method == "ReceiveMessage" && args.Length > 0)
+                    callerEcho = args[0] as ChatMessage;
+            })
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.SendMessage("Invisible message");
+
+        Assert.AreEqual(0, _groupSendCount, "Shadow-banned message in banned room must NOT be broadcast to group");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"), "Dropped message must not enter history");
+        Assert.IsNotNull(callerEcho, "Shadow-banned user must receive echo of their own message");
+        Assert.AreEqual("Invisible message", callerEcho.Message);
+    }
+
+    [Test]
+    public async Task SendMessage_ShadowBan_InExemptRoom_Broadcasts()
+    {
+        await AddShadowBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.Shadow);
+
+        await _chatHub.SendMessage("Clan message");
+
+        Assert.AreEqual(1, _groupSendCount, "Shadow-banned user in exempt room must broadcast normally");
+        Assert.AreEqual(1, _chatHistory.GetMessages("clan AB").Count);
+        Assert.AreEqual("Clan message", _chatHistory.GetMessages("clan AB")[0].Message);
+    }
+
+    [Test]
+    public async Task SendMessage_NoBan_NormalUser_Broadcasts()
+    {
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+
+        await _chatHub.SendMessage("Normal message");
+
+        Assert.AreEqual(1, _groupSendCount);
+        Assert.AreEqual(1, _chatHistory.GetMessages("W3C Lounge").Count);
+    }
+
+    [Test]
+    public async Task SendMessage_ExpiredMute_TreatedAsNoBan_Broadcasts()
+    {
+        // Expired mute — endDate is in the past
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "peter#123",
+            endDate = DateTime.UtcNow.AddDays(-1).ToString("O"),
+            author = "admin#1",
+            reason = "expired ban",
+            isShadowBan = false
+        });
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+
+        await _chatHub.SendMessage("Should broadcast");
+
+        Assert.AreEqual(1, _groupSendCount, "Expired ban must not restrict sending");
+        Assert.AreEqual(1, _chatHistory.GetMessages("W3C Lounge").Count);
+    }
+
+    [Test]
+    public async Task SendMessage_UnbannedUser_InAllRoomTypes_Broadcasts()
+    {
+        _connectionMapping.Add("TestId", "2 vs 2", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMuteStatus("TestId", MuteStatus.None);
+
+        await _chatHub.SendMessage("Ladder message");
+
+        Assert.AreEqual(1, _groupSendCount, "Unbanned user must broadcast in any room");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]

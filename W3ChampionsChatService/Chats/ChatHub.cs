@@ -31,52 +31,80 @@ public class ChatHub(
     public async Task SendMessage(string message)
     {
         var trimmedMessage = message.Trim();
-        if (!string.IsNullOrEmpty(trimmedMessage))
+        if (string.IsNullOrEmpty(trimmedMessage))
         {
-            var chatRoom = _connections.GetRoom(Context.ConnectionId);
-            var user = _connections.GetUser(Context.ConnectionId);
+            return;
+        }
 
-            // R6 (membership-before-send, start): a connected user may be seated in NO room
-            // (e.g. full-banned with no clan). Without a room/user there is nothing to send.
-            // Guard before dereferencing user/chatRoom to avoid an NRE. Task 5 completes room-scoping.
-            if (user == null || chatRoom == null)
-            {
-                return;
-            }
+        var chatRoom = _connections.GetRoom(Context.ConnectionId);
+        var user = _connections.GetUser(Context.ConnectionId);
 
-            // Check if player is on Lounge Mute list. If yes, handle accordingly.
+        // R6: Membership prerequisite — user must be a member of a valid room.
+        // G1/G2: graceful reject — return, never Context.Abort(), never throw.
+        if (chatRoom == null || user == null)
+        {
+            Log.Warning("SendMessage rejected: connection {ConnectionId} has no room membership", Context.ConnectionId);
+            return;
+        }
+
+        var muteStatus = _connections.GetMuteStatus(Context.ConnectionId);
+        var inBannedRoom = DefaultChatRooms.IsBannedRoom(chatRoom);
+
+        // Lazy DB resolve: mirroring SwitchRoom — if cache is None but we're in a banned room,
+        // re-resolve from DB in case a ban was applied mid-session (before Task 7 cache-reconciliation
+        // is in place via BanUser). Without Task 7 live-reconciliation, this keeps the safety net.
+        if (muteStatus == MuteStatus.None && inBannedRoom)
+        {
             var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute != null && !mute.IsActive(DateTime.UtcNow))
+            if (mute != null && mute.IsActive(DateTime.UtcNow))
             {
-                mute = null;
+                muteStatus = mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+                _connections.SetMuteStatus(Context.ConnectionId, muteStatus);
             }
+        }
 
-            // TODO (Task 5): room-scope via DefaultChatRooms.IsBannedRoom + cached GetMuteStatus; currently room-blind.
-            if (mute != null && !mute.isShadowBan)
+        // Re-verify expiry from DB if cached as banned (handles edge case where ban expired mid-session).
+        // Per spec §7: the per-message DB read is scoped to cached-banned connections only (not every send).
+        if (muteStatus != MuteStatus.None)
+        {
+            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
+            if (mute == null || !mute.IsActive(DateTime.UtcNow))
             {
-                // G1: Full ban — silently drop the message (no Context.Abort(), no teardown).
-                // The PlayerBannedFromChat notice was already sent at connect time (LoginAsAuthenticated).
-                Log.Information("Full-banned user {BattleTag} attempted to send message in room {Room} — dropped silently",
-                    user.BattleTag, chatRoom);
-                return;
+                // Ban has expired — treat as no ban for this send
+                muteStatus = MuteStatus.None;
+                _connections.SetMuteStatus(Context.ConnectionId, MuteStatus.None);
+            }
+        }
+
+        if (inBannedRoom && muteStatus == MuteStatus.Full)
+        {
+            // Defense-in-depth: full-banned user should never be in a banned room,
+            // but reject silently if they somehow are.
+            // G1: the LEGACY SendMessage called Context.Abort() here for full bans — REMOVED.
+            // G2: reject without abort, without throwing; connection + membership stay valid.
+            Log.Warning("Full-banned user {BattleTag} attempted to send in banned room {Room} — rejected",
+                user.BattleTag, chatRoom);
+            return;
+        }
+
+        var chatMessage = new ChatMessage(user, trimmedMessage);
+
+        if (!await ProcessChatCommand(chatMessage))
+        {
+            if (inBannedRoom && muteStatus == MuteStatus.Shadow)
+            {
+                // Drop: echo only to caller (illusion of sending)
+                Log.Information("Shadow banned user {BattleTag} sent message {Message} in banned room {Room} — dropped",
+                    user.BattleTag, trimmedMessage, chatRoom);
+                await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
             }
             else
             {
-                var chatMessage = new ChatMessage(user, trimmedMessage);
-                if (!await ProcessChatCommand(chatMessage))
-                {
-                    if (mute != null && mute.isShadowBan)
-                    {
-                        // Only send to caller to make them think it was sent
-                        Log.Information("Shadow banned user {BattleTag} sent message {Message}", user.BattleTag, trimmedMessage);
-                        await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
-                    }
-                    else
-                    {
-                        _chatHistory.AddMessage(chatRoom, chatMessage);
-                        await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
-                    }
-                }
+                // Broadcast to room: covers no-ban in any room AND banned users in exempt rooms.
+                // Bans only restrict sending in the lounge/ladder banned rooms; clan/lobby rooms
+                // are fully exempt — even full- and shadow-banned users can post freely there.
+                _chatHistory.AddMessage(chatRoom, chatMessage);
+                await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
             }
         }
     }
