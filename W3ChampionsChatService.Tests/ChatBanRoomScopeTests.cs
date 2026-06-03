@@ -1538,6 +1538,255 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "Expired shadow ban must NOT suppress UserLeft — user was visible, so UserLeft must broadcast");
     }
 
+    // ── Task 9 tests — expiry regression ─────────────────────────────────────────
+
+    [Test]
+    public async Task ExpiredFullBan_LoginConnectsNormally()
+    {
+        // An expired full ban must not restrict connect at all:
+        // no abort, no PlayerBannedFromChat, user seated in default room.
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "peter#123",
+            endDate = DateTime.UtcNow.AddDays(-1).ToString("O"),
+            author = "admin#1",
+            reason = "old ban",
+            isShadowBan = false
+        });
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        bool bannedSignalSent = false;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync("PlayerBannedFromChat", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => bannedSignalSent = true)
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.IsFalse(abortCalled, "Expired ban must not abort connection");
+        Assert.IsFalse(bannedSignalSent, "Expired ban must not send PlayerBannedFromChat");
+
+        // Must be seated in the default room (not blocked from entering)
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("W3C Lounge", room, "Expired-ban user must be seated in the default room");
+    }
+
+    [Test]
+    public async Task ExpiredFullBan_SwitchRoomToBannedRoom_IsAllowed()
+    {
+        // Expired ban → cached as None → SwitchRoom into a banned room must succeed.
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "peter#123",
+            endDate = DateTime.UtcNow.AddDays(-1).ToString("O"),
+            author = "admin#1",
+            reason = "old ban",
+            isShadowBan = false
+        });
+
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        // Expired: correctly cached as None (not Full)
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
+
+        await _chatHub.SwitchRoom("W3C Lounge");
+
+        Assert.AreEqual("W3C Lounge", _connectionMapping.GetRoom("TestId"),
+            "Expired ban must not block joining a banned room via SwitchRoom");
+    }
+
+    [Test]
+    public async Task ExpiredShadowBan_SendMessage_CachedExpiredEndDate_Broadcasts()
+    {
+        // Cached Shadow ban whose EndDate is in the past → treated as None at the cache level,
+        // so SendMessage must broadcast without consulting the DB.
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        // Cache a shadow ban that has already expired
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(-1));
+        // DB has NO active ban (IntegrationTestBase drops the DB before each test).
+
+        await _chatHub.SendMessage("Should broadcast now");
+
+        Assert.AreEqual(1, _groupSendCount,
+            "Cached shadow ban with expired EndDate must not restrict sending — message must broadcast");
+        Assert.AreEqual(1, _chatHistory.GetMessages("W3C Lounge").Count,
+            "Message from expired shadow-ban must enter history");
+    }
+
+    // ── Task 10 tests — §15 integration sweep ────────────────────────────────────
+
+    [Test]
+    public async Task UnbannedUser_SwitchRoom_ToAllRoomTypes_Allowed()
+    {
+        // An unbanned user must be able to switch freely between banned rooms, clan rooms, and lobbies.
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
+
+        await _chatHub.SwitchRoom("1 vs 1");
+        Assert.AreEqual("1 vs 1", _connectionMapping.GetRoom("TestId"),
+            "Unbanned user must be allowed into a banned room");
+
+        await _chatHub.SwitchRoom("clan AB");
+        Assert.AreEqual("clan AB", _connectionMapping.GetRoom("TestId"),
+            "Unbanned user must be allowed into a clan room");
+
+        await _chatHub.SwitchRoom("game-lobby-1");
+        Assert.AreEqual("game-lobby-1", _connectionMapping.GetRoom("TestId"),
+            "Unbanned user must be allowed into a lobby room");
+    }
+
+    [Test]
+    public async Task MembershipInvariant_UserNotInAnyRoom_SendRejected()
+    {
+        // R6: a user that has NO room membership must not be able to broadcast a message.
+        // ConnectionMapping has no entry for TestId at all.
+        await _chatHub.SendMessage("Ghost message");
+
+        Assert.AreEqual(0, _groupSendCount,
+            "User with no room membership must not be able to broadcast (R6 membership invariant)");
+    }
+
+    [Test]
+    public void ShadowBan_UsersOfRoom_OtherMembersDoNotSeeTheShadowUser()
+    {
+        // Integration: the ConnectionMapping used by the hub correctly hides shadow users
+        // from normal members in banned rooms.
+        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
+        var shadowUser = new ChatUser("shadow#2", false, null, new ProfilePicture(), null, null);
+
+        _connectionMapping.Add("NormalConn", "W3C Lounge", normalUser);
+        _connectionMapping.Add("ShadowConn", "W3C Lounge", shadowUser);
+        _connectionMapping.SetMute("ShadowConn", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        // Normal user's view must not include the shadow-banned user
+        var visibleToNormal = _connectionMapping.GetUsersOfRoomForViewer("W3C Lounge", "NormalConn");
+        Assert.AreEqual(1, visibleToNormal.Count,
+            "Normal user must see exactly 1 member (shadow user is hidden)");
+        Assert.AreEqual("normal#1", visibleToNormal[0].BattleTag);
+
+        // Shadow user's own view must include themselves
+        var visibleToShadow = _connectionMapping.GetUsersOfRoomForViewer("W3C Lounge", "ShadowConn");
+        Assert.AreEqual(2, visibleToShadow.Count,
+            "Shadow-banned user must see both themselves and the normal user");
+    }
+
+    [Test]
+    public async Task FullBan_PersistedDefaultChatIsBannedRoom_OverriddenToSafe()
+    {
+        // Edge case (§15): a full-banned user whose persisted DefaultChat is a banned room
+        // must NOT be seated in that banned room at connect. They must be placed in their clan
+        // room instead (default settings have DefaultChat = "W3C Lounge").
+        await AddFullBan("peter#123");
+
+        // Default ChatSettings has DefaultChat = "W3C Lounge" (a banned room).
+        // The user has ClanTag "AB" → must end up in "clan AB", not "W3C Lounge".
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+
+        var room = _connectionMapping.GetRoom("TestId");
+        Assert.AreEqual("clan AB", room,
+            "Full-banned user's persisted DefaultChat (a banned room) must be overridden to their clan room");
+        Assert.IsFalse(DefaultChatRooms.IsBannedRoom(room),
+            "The seat room after login must not be a banned room");
+    }
+
+    // ── Task 11 tests — spec §16 backward-compatibility guardrails ────────────────
+
+    [Test]
+    public async Task Compat_SwitchRoom_FullBanRejected_DoesNotAbort_KeepsCurrentRoom()
+    {
+        // G1/G2: rejecting a full-banned join must not call Context.Abort() AND must leave the
+        // user in their current valid room (return BEFORE any Remove/Add).
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "clan AB", new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        Assert.DoesNotThrowAsync(async () => await _chatHub.SwitchRoom("W3C Lounge"),
+            "Rejected SwitchRoom must return gracefully, not throw (G2)");
+        Assert.IsFalse(abortCalled, "G1: SwitchRoom rejection must never call Context.Abort()");
+        Assert.AreEqual("clan AB", _connectionMapping.GetRoom("TestId"),
+            "G2: rejected SwitchRoom must keep the user in their current valid room");
+    }
+
+    [Test]
+    public async Task Compat_SendMessage_FullBanInBannedRoom_DoesNotAbort_NoBroadcast()
+    {
+        // G1/G2: rejecting a full-banned send must not call Context.Abort(), not throw, and
+        // must leave the user's room membership intact.
+        await AddFullBan("peter#123");
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        Assert.DoesNotThrowAsync(async () => await _chatHub.SendMessage("blocked"),
+            "Rejected SendMessage must return gracefully, not throw (G2)");
+        Assert.IsFalse(abortCalled, "G1: SendMessage rejection must never call Context.Abort()");
+        Assert.AreEqual(0, _groupSendCount, "Rejected message must not be broadcast");
+        Assert.AreEqual("W3C Lounge", _connectionMapping.GetRoom("TestId"),
+            "G2: rejected SendMessage must not corrupt the user's room membership");
+    }
+
+    [Test]
+    public void Compat_SendMessage_NoRoom_MembershipReject_DoesNotAbort()
+    {
+        // G1/G2: membership-before-send rejection (null room) must not call Context.Abort() or throw.
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        Assert.DoesNotThrowAsync(async () => await _chatHub.SendMessage("ghost"),
+            "Membership-reject SendMessage must return gracefully, not throw (G2)");
+        Assert.IsFalse(abortCalled, "G1: membership rejection must never call Context.Abort()");
+        Assert.AreEqual(0, _groupSendCount,
+            "No broadcast for membership-rejected message");
+    }
+
+    [Test]
+    public async Task Compat_Login_FullBanNoClan_StillEmitsStartChat_NoAbort()
+    {
+        // G1 + G3: a full-banned user with no clan must connect without abort AND receive a
+        // StartChat so a legacy client can initialize from it.
+        await AddFullBan("peter#123");
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        bool startChatSent = false;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync("StartChat", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => startChatSent = true)
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        Assert.IsFalse(abortCalled, "G1: full-ban connect must never call Context.Abort()");
+        Assert.IsTrue(startChatSent,
+            "G3: connect must always emit a StartChat, even for full-ban with no clan/no room");
+    }
+
+    [Test]
+    public async Task Compat_Login_FullBan_StillSendsLegacyPlayerBannedFromChat()
+    {
+        // G5: legacy clients depend on PlayerBannedFromChat to render their in-channel ban notice.
+        // This must still flow at connect regardless of whether the user has a clan.
+        await AddFullBan("peter#123");
+
+        bool bannedSignalSent = false;
+        _callerProxy
+            .Setup(x => x.SendCoreAsync("PlayerBannedFromChat", It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((_, _, _) => bannedSignalSent = true)
+            .Returns(Task.CompletedTask);
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+
+        Assert.IsTrue(bannedSignalSent,
+            "G5: full-ban connect must still emit the legacy PlayerBannedFromChat event");
+    }
+
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
     [TestCase("W3C Lounge",      ExpectedResult = true)]
