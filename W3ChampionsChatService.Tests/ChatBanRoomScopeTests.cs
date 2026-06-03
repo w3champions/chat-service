@@ -7,7 +7,6 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
-using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Settings;
@@ -234,6 +233,29 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         });
     }
 
+    /// <summary>
+    /// Asserts the slimmed PlayerBannedFromChat payload exposes ONLY an <c>endDate</c> property
+    /// (a future DateTime) and leaks neither <c>reason</c> nor <c>isShadowBan</c> to the client.
+    /// The payload is an anonymous type, so it is inspected via reflection.
+    /// </summary>
+    private static void AssertPlayerBannedPayloadIsEndDateOnly(object payload)
+    {
+        Assert.IsNotNull(payload, "PlayerBannedFromChat payload must not be null");
+        var type = payload.GetType();
+        var props = type.GetProperties().Select(p => p.Name).ToList();
+
+        Assert.Contains("endDate", props,
+            "PlayerBannedFromChat payload must carry an endDate (backward-compat with old clients)");
+        Assert.IsFalse(props.Contains("reason"),
+            "SECURITY: PlayerBannedFromChat payload must NOT leak the moderation reason");
+        Assert.IsFalse(props.Contains("isShadowBan"),
+            "SECURITY: PlayerBannedFromChat payload must NOT leak the isShadowBan flag");
+
+        var endDate = (DateTime)type.GetProperty("endDate").GetValue(payload);
+        Assert.Greater(endDate, DateTime.UtcNow,
+            "The endDate in the payload must be the (future) ban expiry");
+    }
+
     // ── Task 3 tests ────────────────────────────────────────────────────────────
 
     [Test]
@@ -255,7 +277,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         await AddFullBan("peter#123");
 
         string callerMethodReceived = null;
-        LoungeMute muteReceived = null;
+        object payloadReceived = null;
         _callerProxy
             .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
             .Callback<string, object[], CancellationToken>((method, args, _) =>
@@ -263,7 +285,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
                 if (method == "PlayerBannedFromChat")
                 {
                     callerMethodReceived = method;
-                    muteReceived = args[0] as LoungeMute;
+                    payloadReceived = args[0];
                 }
             })
             .Returns(Task.CompletedTask);
@@ -271,8 +293,11 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
         Assert.AreEqual("PlayerBannedFromChat", callerMethodReceived);
-        Assert.IsNotNull(muteReceived);
-        Assert.AreEqual("peter#123", muteReceived.battleTag);
+        Assert.IsNotNull(payloadReceived);
+        // SECURITY: the slimmed payload carries ONLY the expiry — not the full LoungeMute.
+        Assert.IsNotInstanceOf<LoungeMute>(payloadReceived,
+            "PlayerBannedFromChat must NOT send the full LoungeMute (leaks reason/isShadowBan)");
+        AssertPlayerBannedPayloadIsEndDateOnly(payloadReceived);
     }
 
     [Test]
@@ -309,10 +334,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
 
-        // Must be in "clan AB", not in any banned room
+        // Must be in "clan AB", not in any public room
         var room = _connectionMapping.GetRoom("TestId");
         Assert.AreEqual("clan AB", room);
-        Assert.IsFalse(DefaultChatRooms.IsBannedRoom(room));
+        Assert.IsFalse(DefaultChatRooms.IsPublicRoom(room));
     }
 
     [Test]
@@ -481,51 +506,51 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task SwitchRoom_FullBan_NoClanInMapping_LazilReresolvesFromDB_IsRejected()
+    public async Task Login_FullBan_NoClan_SeedsCacheWithFullStatus()
     {
-        // Edge case: full-banned user with no clan was NOT in the ConnectionMapping at login
-        // (because they had no clan), so their MuteStatus is None in cache.
-        // SwitchRoom must lazily resolve from DB and still reject the move into a banned room.
+        // §7 rework: the no-clan full-ban LOGIN path now seeds the per-connection mute cache
+        // authoritatively (Full) even though the user is seated in no room. This is what lets a
+        // later SendMessage enforce the ban from the cache with zero DB reads (see
+        // SendMessage_FullBan_NoClanLogin_EnforcesWithZeroMuteRepositoryCalls).
         await AddFullBan("peter#123");
-        // Seated in a room but with no cached MuteStatus (default None), reproducing the
-        // no-clan full-ban login path where SetMute was never called.
-        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
-        await _chatHub.SwitchRoom("1 vs 1");
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
-        // Should be rejected: lazy re-resolve hits DB, finds full ban, and returns early
-        var room = _connectionMapping.GetRoom("TestId");
-        Assert.AreEqual("W3C Lounge", room,
-            "Full-banned user (lazy resolved) must not be moved into a banned room");
+        Assert.IsNull(_connectionMapping.GetRoom("TestId"), "No-clan full-ban user must be seated in no room");
+        Assert.IsTrue(_connectionMapping.TryGetMute("TestId", out var seeded),
+            "Login must seed the cache even when the user is seated in no room");
+        Assert.AreEqual(MuteStatus.Full, seeded.Status, "No-clan full-ban login must cache Full status");
+        Assert.Greater(seeded.EndDate, DateTime.UtcNow, "Cached endDate must be the (future) ban expiry");
     }
 
     [Test]
-    public async Task SwitchRoom_FullBan_NoClan_ExemptThenBanned_StillRejected()
+    public async Task SwitchRoom_FullBan_ExemptThenPublic_StillRejected()
     {
-        // SECURITY regression (full-ban bypass): a no-clan full-banned connection starts as a
-        // cache MISS. A FIRST switch into an EXEMPT room ("clan AB") is allowed and would write a
-        // cache-None entry. A SECOND switch into a BANNED room must STILL re-resolve the DB and
-        // reject — it must not trust the cache-None written by the exempt switch.
+        // SECURITY regression (full-ban bypass): a full-banned connection seeded with Full at login.
+        // A FIRST switch into an EXEMPT room ("clan AB") is allowed and the cached Full survives.
+        // A SECOND switch into a PUBLIC room must STILL reject from the cache — switching through an
+        // exempt room must not downgrade the cached ban.
         await AddFullBan("peter#123");
-        // Seated in a room but with NO cached mute (cache MISS), reproducing the no-clan login path.
-        _connectionMapping.Add("TestId", "clan SEED", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        // Seat the user via the real login path (clan → seated in clan room, cache seeded Full).
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
+        Assert.AreEqual("clan AB", _connectionMapping.GetRoom("TestId"), "Full-ban with clan seats in clan room");
+        // Prove enforcement is cache-only: remove the DB ban so any DB read would allow the move.
+        await _muteRepository.DeleteLoungeMute("peter#123");
 
-        // First switch: into an EXEMPT room — allowed, and (pre-fix) caches None.
-        await _chatHub.SwitchRoom("clan AB");
-        Assert.AreEqual("clan AB", _connectionMapping.GetRoom("TestId"),
+        // First switch: into another EXEMPT room — allowed; the cached Full status must survive.
+        await _chatHub.SwitchRoom("clan XYZ");
+        Assert.AreEqual("clan XYZ", _connectionMapping.GetRoom("TestId"),
             "Switch into an exempt room must be allowed");
 
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
-        // Second switch: into a BANNED room — must re-resolve the ban and reject.
+        // Second switch: into a PUBLIC room — must reject from the surviving cached Full.
         await _chatHub.SwitchRoom("W3C Lounge");
 
         var room = _connectionMapping.GetRoom("TestId");
-        Assert.AreEqual("clan AB", room,
-            "Full-banned user must NOT enter a banned room after a prior exempt switch (cache-None must not bypass the ban)");
-        Assert.IsFalse(_connectionMapping.GetUsersOfRoom("clan AB").Count == 0,
-            "User must remain seated in the exempt room");
+        Assert.AreEqual("clan XYZ", room,
+            "Full-banned user must NOT enter a public room after a prior exempt switch (cached ban must survive)");
         Assert.IsFalse(abortCalled, "Rejected SwitchRoom must not call Context.Abort() (G1)");
     }
 
@@ -853,14 +878,15 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     // ── New tests pinning cache-endDate behavior (spec §7) ────────────────────
 
     [Test]
-    public async Task SendMessage_CacheMiss_ActiveDbBan_InBannedRoom_Enforced()
+    public async Task SendMessage_FullBan_LoginSeedsCache_EnforcedWithoutDbRead()
     {
-        // Lazy-resolve success path: no cache entry (MISS) + active ban in DB + banned room → enforced.
-        // This covers the no-clan full-ban login edge case where SetMute was never called at login.
-        await AddFullBan("peter#123");
-        // Manually add the user to a banned room WITHOUT calling SetMute (simulates the no-clan login path).
+        // §7 rework: SendMessage consults the per-connection cache ONLY — never the DB.
+        // A full-banned user seated in a public room (e.g. a stale membership) is enforced from
+        // the cache. Proof of "no DB read": the DB has NO ban for this user (SetUp wipes the DB),
+        // yet the cached Full status still rejects the message — a DB read would have allowed it.
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
-        // Do NOT call SetMute — leave a MISS.
+        _connectionMapping.SetMute("TestId", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
+        // DB has NO ban (SetUp dropped the database) — only the cache knows about the ban.
 
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
@@ -869,9 +895,175 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         Assert.IsFalse(abortCalled, "Context.Abort() must not be called");
         Assert.AreEqual(0, _groupSendCount,
-            "Cache-miss lazy-resolved full-ban in banned room must reject the message");
+            "Cached full-ban in a public room must reject the message (enforced from cache, no DB read)");
         Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"),
             "Rejected message must not enter history");
+    }
+
+    [Test]
+    public async Task SendMessage_CacheMiss_OutOfBandDbBan_InPublicRoom_NotEnforced_AcceptedTradeoff()
+    {
+        // ACCEPTED TRADE-OFF (§7): the send hot path consults the cache ONLY, never the DB.
+        // An out-of-band ban written straight to Mongo (NOT via the BanUser hub) is NOT reflected
+        // in the cache, so it does NOT take effect until the user's next reconnect (which re-seeds
+        // the cache at login). Here we simulate an unseeded connection (cache MISS) with a DB ban:
+        // the message must BROADCAST — proving SendMessage does not re-query the DB per send.
+        await AddFullBan("peter#123");
+        // Seat the user WITHOUT seeding the cache (cache MISS) — models a never-reconnected connection.
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        await _chatHub.SendMessage("Out-of-band ban not yet effective");
+
+        Assert.AreEqual(1, _groupSendCount,
+            "Out-of-band DB ban (cache MISS) must NOT be enforced on the send hot path — accepted trade-off");
+        Assert.AreEqual(1, _chatHistory.GetMessages("W3C Lounge").Count);
+    }
+
+    /// <summary>
+    /// A <see cref="MuteRepository"/> spy that counts <see cref="MuteRepository.GetMutedPlayer"/>
+    /// calls so a test can assert the send/switch hot paths perform ZERO mute-repository reads.
+    /// </summary>
+    private sealed class CountingMuteRepository(MongoDB.Driver.MongoClient client) : MuteRepository(client)
+    {
+        public int GetMutedPlayerCallCount { get; private set; }
+
+        public override Task<LoungeMute> GetMutedPlayer(string battleTag)
+        {
+            GetMutedPlayerCallCount++;
+            return base.GetMutedPlayer(battleTag);
+        }
+    }
+
+    private ChatHub BuildHubWithRepository(MuteRepository repository)
+    {
+        var chatAuthService = new Mock<IChatAuthenticationService>();
+        chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
+            .ReturnsAsync(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        var hub = new ChatHub(
+            chatAuthService.Object,
+            repository,
+            _settingsRepository,
+            _connectionMapping,
+            _chatHistory,
+            null)
+        {
+            Clients = _clients.Object,
+            Context = _hubCallerContext.Object,
+            Groups = new Mock<IGroupManager>().Object,
+        };
+        return hub;
+    }
+
+    [Test]
+    public async Task SendMessage_UnmutedUser_InPublicRoom_MakesZeroMuteRepositoryCalls()
+    {
+        // §7 contract: the SendMessage hot path consults the per-connection cache ONLY.
+        // An unmuted user sending in a public room must NOT hit the mute repository at all.
+        var countingRepo = new CountingMuteRepository(MongoClient);
+        var hub = BuildHubWithRepository(countingRepo);
+
+        // Seat an unmuted user in a public room with an explicit cached None (as login would seed).
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
+
+        await hub.SendMessage("hello world");
+
+        Assert.AreEqual(0, countingRepo.GetMutedPlayerCallCount,
+            "SendMessage must make ZERO mute-repository reads on the hot path (§7 cache-only)");
+        Assert.AreEqual(1, _groupSendCount, "Unmuted message must broadcast to the room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_UnmutedUser_MakesZeroMuteRepositoryCalls()
+    {
+        // §7 contract: SwitchRoom consults the per-connection cache ONLY — no mute-repository read.
+        var countingRepo = new CountingMuteRepository(MongoClient);
+        var hub = BuildHubWithRepository(countingRepo);
+
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.None, DateTime.MinValue);
+
+        await hub.SwitchRoom("1 vs 1");
+
+        Assert.AreEqual(0, countingRepo.GetMutedPlayerCallCount,
+            "SwitchRoom must make ZERO mute-repository reads on the hot path (§7 cache-only)");
+        Assert.AreEqual("1 vs 1", _connectionMapping.GetRoom("TestId"),
+            "Unmuted user must be moved into the target room");
+    }
+
+    [Test]
+    public async Task SendMessage_FullBan_NoClanLogin_EnforcesWithZeroMuteRepositoryCalls()
+    {
+        // §7 + no-clan login seeding: after login (one DB read to resolve the ban), the cache is
+        // seeded. A subsequent SendMessage in a public room must enforce the ban with ZERO further
+        // mute-repository reads — the only DB read happens at login, never on the send hot path.
+        var countingRepo = new CountingMuteRepository(MongoClient);
+        // Persist a full ban via the (non-spy) repo so the login resolve finds it.
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "peter#123",
+            endDate = DateTime.UtcNow.AddDays(1).ToString("O"),
+            author = "admin#1",
+            reason = "test ban",
+            isShadowBan = false
+        });
+        var hub = BuildHubWithRepository(countingRepo);
+
+        // No-clan full-ban login: seats in no room, seeds the cache with Full.
+        await hub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "Login resolves the ban with exactly one mute-repository read");
+
+        // Seat the cached full-banned user into a public room to exercise the SendMessage gate.
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        await hub.SendMessage("should be rejected");
+
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "SendMessage must NOT add any mute-repository read beyond the single login resolve (§7)");
+        Assert.AreEqual(0, _groupSendCount,
+            "Cached full-ban must reject the message in a public room");
+    }
+
+    [Test]
+    public async Task SendMessage_ShadowBan_InPublicRoom_LogsDropWithMessageContent()
+    {
+        // §3: a shadow-banned user's silently dropped message must be logged INCLUDING the content
+        // (BattleTag, room, AND the attempted message) so moderators can audit shadow activity.
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
+
+        var capturedLogs = new List<string>();
+        var sink = new DelegatingLogSink(evt => capturedLogs.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        Serilog.Log.Logger = new Serilog.LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        try
+        {
+            const string secretMessage = "shadow-drop-audit-marker-42";
+            await _chatHub.SendMessage(secretMessage);
+
+            Assert.AreEqual(0, _groupSendCount, "Shadow-banned message must not broadcast to the room");
+            var dropLog = capturedLogs.FirstOrDefault(l => l.Contains("dropped"));
+            Assert.IsNotNull(dropLog, "Shadow-banned drop must emit a log line");
+            StringAssert.Contains("peter#123", dropLog, "Drop log must include the BattleTag");
+            StringAssert.Contains("W3C Lounge", dropLog, "Drop log must include the room");
+            StringAssert.Contains(secretMessage, dropLog, "Drop log must include the attempted message content");
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            (Serilog.Log.Logger as IDisposable)?.Dispose();
+        }
+    }
+
+    /// <summary>A Serilog sink that forwards each event to a callback (for asserting log content).</summary>
+    private sealed class DelegatingLogSink(Action<Serilog.Events.LogEvent> onEmit) : Serilog.Core.ILogEventSink
+    {
+        public void Emit(Serilog.Events.LogEvent logEvent) => onEmit(logEvent);
     }
 
     [Test]
@@ -1200,7 +1392,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         // Separate client proxy for the victim connection
         var victimProxy = new Mock<ISingleClientProxy>();
         string signalSent = null;
-        LoungeMute muteInSignal = null;
+        object payloadInSignal = null;
         victimProxy
             .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
             .Callback<string, object[], CancellationToken>((method, args, _) =>
@@ -1208,7 +1400,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
                 if (method == "PlayerBannedFromChat")
                 {
                     signalSent = method;
-                    muteInSignal = args[0] as LoungeMute;
+                    payloadInSignal = args[0];
                 }
             })
             .Returns(Task.CompletedTask);
@@ -1221,11 +1413,11 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
 
         Assert.AreEqual("PlayerBannedFromChat", signalSent,
-            "Live fully-banned user in a banned room must receive PlayerBannedFromChat");
-        Assert.IsNotNull(muteInSignal,
-            "PlayerBannedFromChat payload must include the LoungeMute");
-        Assert.AreEqual("victim#123", muteInSignal.battleTag,
-            "LoungeMute in signal must have the correct battleTag");
+            "Live fully-banned user in a public room must receive PlayerBannedFromChat");
+        // SECURITY: the slimmed payload carries ONLY the expiry — never the LoungeMute.
+        Assert.IsNotInstanceOf<LoungeMute>(payloadInSignal,
+            "PlayerBannedFromChat must NOT send the full LoungeMute (leaks reason/isShadowBan)");
+        AssertPlayerBannedPayloadIsEndDateOnly(payloadInSignal);
     }
 
     [Test]
@@ -1294,7 +1486,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         var victimProxy = new Mock<ISingleClientProxy>();
         string signalSent = null;
-        LoungeMute muteInSignal = null;
+        object payloadInSignal = null;
         victimProxy
             .Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
             .Callback<string, object[], CancellationToken>((method, args, _) =>
@@ -1302,7 +1494,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
                 if (method == "PlayerBannedFromChat")
                 {
                     signalSent = method;
-                    muteInSignal = args[0] as LoungeMute;
+                    payloadInSignal = args[0];
                 }
             })
             .Returns(Task.CompletedTask);
@@ -1319,8 +1511,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         Assert.AreEqual("PlayerBannedFromChat", signalSent,
             "Full-banned live user in an EXEMPT room must still receive PlayerBannedFromChat (R7/G5)");
-        Assert.IsNotNull(muteInSignal, "PlayerBannedFromChat payload must include the LoungeMute");
-        Assert.AreEqual("victim#123", muteInSignal.battleTag);
+        // SECURITY: the slimmed payload carries ONLY the expiry — never the LoungeMute.
+        Assert.IsNotInstanceOf<LoungeMute>(payloadInSignal,
+            "PlayerBannedFromChat must NOT send the full LoungeMute (leaks reason/isShadowBan)");
+        AssertPlayerBannedPayloadIsEndDateOnly(payloadInSignal);
         Assert.IsFalse(abortCalled,
             "Context.Abort() must NOT be called when signalling a full ban in an exempt room (G1)");
     }
@@ -1733,22 +1927,22 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task FullBan_PersistedDefaultChatIsBannedRoom_OverriddenToSafe()
+    public async Task FullBan_PersistedDefaultChatIsPublicRoom_OverriddenToSafe()
     {
-        // Edge case (§15): a full-banned user whose persisted DefaultChat is a banned room
-        // must NOT be seated in that banned room at connect. They must be placed in their clan
+        // Edge case (§15): a full-banned user whose persisted DefaultChat is a public room
+        // must NOT be seated in that public room at connect. They must be placed in their clan
         // room instead (default settings have DefaultChat = "W3C Lounge").
         await AddFullBan("peter#123");
 
-        // Default ChatSettings has DefaultChat = "W3C Lounge" (a banned room).
+        // Default ChatSettings has DefaultChat = "W3C Lounge" (a public room).
         // The user has ClanTag "AB" → must end up in "clan AB", not "W3C Lounge".
         await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
 
         var room = _connectionMapping.GetRoom("TestId");
         Assert.AreEqual("clan AB", room,
-            "Full-banned user's persisted DefaultChat (a banned room) must be overridden to their clan room");
-        Assert.IsFalse(DefaultChatRooms.IsBannedRoom(room),
-            "The seat room after login must not be a banned room");
+            "Full-banned user's persisted DefaultChat (a public room) must be overridden to their clan room");
+        Assert.IsFalse(DefaultChatRooms.IsPublicRoom(room),
+            "The seat room after login must not be a public room");
     }
 
     // ── Task 11 tests — spec §16 backward-compatibility guardrails ────────────────
@@ -1850,30 +2044,30 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
     // ── Task 2 tests ────────────────────────────────────────────────────────────
 
-    [TestCase("W3C Lounge",      ExpectedResult = true)]
-    [TestCase("1 vs 1",          ExpectedResult = true)]
-    [TestCase("2 vs 2",          ExpectedResult = true)]
-    [TestCase("4 vs 4",          ExpectedResult = true)]
-    [TestCase("FFA",             ExpectedResult = true)]
-    [TestCase("Legion TD",       ExpectedResult = true)]
-    [TestCase("Survival Chaos",  ExpectedResult = true)]
-    [TestCase("Direct Strike",   ExpectedResult = true)]
-    [TestCase("Warhammer",       ExpectedResult = true)]
-    [TestCase("Castle Fight",    ExpectedResult = true)]
-    [TestCase("Risk Europe",     ExpectedResult = true)]
-    [TestCase("Mini Dota",       ExpectedResult = true)]
-    // Mixed-case variants of banned rooms must still be caught (case-insensitive ban check)
-    [TestCase("w3c lounge",      ExpectedResult = true)]
-    [TestCase("1 VS 1",          ExpectedResult = true)]
-    [TestCase("LEGION TD",       ExpectedResult = true)]
-    [TestCase("clan AB",         ExpectedResult = false)]
-    [TestCase("clan XYZ",        ExpectedResult = false)]
-    [TestCase("game-lobby-42",   ExpectedResult = false)]
-    [TestCase("custom_lobby",    ExpectedResult = false)]
-    [TestCase("",                ExpectedResult = false)]
-    [TestCase(null,              ExpectedResult = false)]
-    public bool IsBannedRoom_ClassifiesCorrectly(string room)
+    [TestCase("W3C Lounge", ExpectedResult = true)]
+    [TestCase("1 vs 1", ExpectedResult = true)]
+    [TestCase("2 vs 2", ExpectedResult = true)]
+    [TestCase("4 vs 4", ExpectedResult = true)]
+    [TestCase("FFA", ExpectedResult = true)]
+    [TestCase("Legion TD", ExpectedResult = true)]
+    [TestCase("Survival Chaos", ExpectedResult = true)]
+    [TestCase("Direct Strike", ExpectedResult = true)]
+    [TestCase("Warhammer", ExpectedResult = true)]
+    [TestCase("Castle Fight", ExpectedResult = true)]
+    [TestCase("Risk Europe", ExpectedResult = true)]
+    [TestCase("Mini Dota", ExpectedResult = true)]
+    // Mixed-case variants of public rooms must still be caught (case-insensitive check)
+    [TestCase("w3c lounge", ExpectedResult = true)]
+    [TestCase("1 VS 1", ExpectedResult = true)]
+    [TestCase("LEGION TD", ExpectedResult = true)]
+    [TestCase("clan AB", ExpectedResult = false)]
+    [TestCase("clan XYZ", ExpectedResult = false)]
+    [TestCase("game-lobby-42", ExpectedResult = false)]
+    [TestCase("custom_lobby", ExpectedResult = false)]
+    [TestCase("", ExpectedResult = false)]
+    [TestCase(null, ExpectedResult = false)]
+    public bool IsPublicRoom_ClassifiesCorrectly(string room)
     {
-        return DefaultChatRooms.IsBannedRoom(room);
+        return DefaultChatRooms.IsPublicRoom(room);
     }
 }
