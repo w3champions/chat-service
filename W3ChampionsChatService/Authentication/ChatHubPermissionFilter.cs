@@ -1,6 +1,5 @@
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
 
@@ -19,10 +18,9 @@ namespace W3ChampionsChatService.Authentication;
 /// Rejections throw <see cref="HubException"/> (a graceful, client-visible error) — NEVER
 /// <c>Context.Abort()</c>; the connection stays alive.
 /// </summary>
-public class ChatHubPermissionFilter(IW3CAuthenticationService authService, IHttpContextAccessor contextAccessor) : IHubFilter
+public class ChatHubPermissionFilter(IW3CAuthenticationService authService) : IHubFilter
 {
     private readonly IW3CAuthenticationService _authService = authService;
-    private readonly IHttpContextAccessor _contextAccessor = contextAccessor;
 
     // The moderator-only hub methods that require the Moderation permission.
     private static readonly HashSet<string> ProtectedMethods = new()
@@ -42,8 +40,12 @@ public class ChatHubPermissionFilter(IW3CAuthenticationService authService, IHtt
             return await next(invocationContext);
         }
 
-        // Same token source as OnConnectedAsync: the access_token query string.
-        var token = _contextAccessor.HttpContext?.Request.Query["access_token"];
+        // Read the access_token from the SignalR connection's HttpContext. IHttpContextAccessor is NOT
+        // usable here: it is null for hub-METHOD invocations over WebSockets (only populated during the
+        // handshake). HubCallerContext.GetHttpContext() reads the connection's IHttpContextFeature,
+        // which is reliably populated at handshake and persists for the connection lifetime.
+        var httpContext = invocationContext.Context.GetHttpContext();
+        var token = httpContext?.Request.Query["access_token"];
         var auth = _authService.GetUserByToken(token);
 
         if (auth == null || !auth.IsAdmin || !auth.Permissions.Contains(EPermission.Moderation))
