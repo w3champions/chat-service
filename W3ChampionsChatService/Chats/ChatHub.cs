@@ -153,20 +153,13 @@ public class ChatHub(
         var user = _connections.GetUser(Context.ConnectionId);
         if (user != null)
         {
-            // Capture room and mute status BEFORE Remove (which clears the cache entry).
+            // Capture the room BEFORE Remove. Shadow users are full room members (no presence-hiding),
+            // so UserLeft is unconditional on room membership — only guard against a null room
+            // (a full-ban no-clan user has no room — G3/G2: no crash).
             var chatRoom = _connections.GetRoom(Context.ConnectionId);
-            var muteStatus = _connections.GetEffectiveMuteStatus(Context.ConnectionId, DateTime.UtcNow);
             _connections.Remove(Context.ConnectionId);
 
-            // Guard against null room (full-ban no-clan user has no room — G3/G2: no crash).
-            // Suppress UserLeft for shadow-banned users in public rooms: they were never announced
-            // as present (ghost-join), so broadcasting UserLeft would break the illusion (spec §6).
-            // Shadow users in exempt rooms (clan/lobby) were announced normally — broadcast as usual.
-            var suppressUserLeft = muteStatus == MuteStatus.Shadow
-                && chatRoom != null
-                && DefaultChatRooms.IsPublicRoom(chatRoom);
-
-            if (!suppressUserLeft && chatRoom != null)
+            if (chatRoom != null)
             {
                 await Clients.Group(chatRoom).SendAsync("UserLeft", user);
             }
@@ -207,41 +200,25 @@ public class ChatHub(
             return;
         }
 
-        // Two independent presence gates, each derived from the relevant room:
-        // - suppressLeave: the user was a GHOST in the OLD room (shadow + old room is public),
-        //   so no one ever saw them there — suppress the UserLeft on the room they're leaving.
-        // - suppressEnter: the user ghost-joins the TARGET room (shadow + target is public),
-        //   so suppress the UserEntered on the room they're entering.
-        // Using a single target-based flag for both would leak/strand presence on cross-category
-        // shadow transitions (exempt→public must still broadcast UserLeft; public→exempt must not).
-        var suppressLeave = oldRoom != null && DefaultChatRooms.IsPublicRoom(oldRoom) && muteStatus == MuteStatus.Shadow;
-        var suppressEnter = targetIsPublic && muteStatus == MuteStatus.Shadow;
-
         _connections.Remove(Context.ConnectionId);
         _connections.Add(Context.ConnectionId, chatRoom, user);
         // Re-cache the mute status + endDate after Remove (which clears it) + Add — the cache survives
         // the switch with the same authoritative status it had before.
         _connections.SetMute(Context.ConnectionId, muteStatus, cachedEndDate);
 
+        // Shadow users are full room members — no presence-hiding. UserLeft/UserEntered are
+        // unconditional on room membership; the only remaining shadow effect is the SendMessage drop.
         if (oldRoom != null)
         {
             await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldRoom);
-            if (!suppressLeave)
-            {
-                await Clients.Group(oldRoom).SendAsync("UserLeft", user);
-            }
+            await Clients.Group(oldRoom).SendAsync("UserLeft", user);
         }
 
         await Groups.AddToGroupAsync(Context.ConnectionId, chatRoom);
 
-        var usersOfRoom = _connections.GetUsersOfRoomForViewer(chatRoom, Context.ConnectionId);
-        if (!suppressEnter)
-        {
-            await Clients.Group(chatRoom).SendAsync("UserEntered", user);
-        }
-        // Caller receives their viewer-filtered user list: they always see themselves;
-        // other shadow-banned users are hidden from them in public rooms (spec §6).
-        await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom), chatRoom);
+        await Clients.Group(chatRoom).SendAsync("UserEntered", user);
+        // Caller receives the full member list of the room — every member is visible.
+        await Clients.Caller.SendAsync("StartChat", _connections.GetUsersOfRoom(chatRoom), _chatHistory.GetMessages(chatRoom), chatRoom);
 
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
         memberShip.Update(chatRoom);
@@ -360,10 +337,9 @@ public class ChatHub(
             {
                 _connections.Add(Context.ConnectionId, safeRoom, user);
                 await Groups.AddToGroupAsync(Context.ConnectionId, safeRoom);
-                var usersOfRoom = _connections.GetUsersOfRoomForViewer(safeRoom, Context.ConnectionId);
                 await Clients.Group(safeRoom).SendAsync("UserEntered", user);
-                // G3: StartChat with the seated room's payload.
-                await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(safeRoom), safeRoom, availableRooms);
+                // G3: StartChat with the seated room's full member list.
+                await Clients.Caller.SendAsync("StartChat", _connections.GetUsersOfRoom(safeRoom), _chatHistory.GetMessages(safeRoom), safeRoom, availableRooms);
             }
             else
             {
@@ -388,9 +364,8 @@ public class ChatHub(
             // Cache status + endDate at login so every subsequent send/join works from the cache.
             _connections.SetMute(Context.ConnectionId, muteStatus, muteEndDate);
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
-            var usersOfRoom = _connections.GetUsersOfRoomForViewer(memberShip.DefaultChat, Context.ConnectionId);
             await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
-            await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat, DefaultChatRooms.Rooms);
+            await Clients.Caller.SendAsync("StartChat", _connections.GetUsersOfRoom(memberShip.DefaultChat), _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat, DefaultChatRooms.Rooms);
         }
     }
 

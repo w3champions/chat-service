@@ -691,8 +691,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_GhostJoin_NoUserEnteredBroadcast()
+    public async Task SwitchRoom_ShadowBan_IntoPublicRoom_BroadcastsUserEntered()
     {
+        // T3: shadow users are full members — NO presence-hiding. UserEntered fires unconditionally
+        // when joining a public room (the only remaining shadow effect is the SendMessage drop).
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
@@ -706,14 +708,13 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.SwitchRoom("1 vs 1");
 
-        Assert.AreEqual(0, userEnteredCount, "Shadow-banned user must NOT trigger UserEntered in a banned room");
+        Assert.AreEqual(1, userEnteredCount, "Shadow-banned user MUST broadcast UserEntered (no presence-hiding)");
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_UserIsMovedIntoGroup()
+    public async Task SwitchRoom_ShadowBan_IntoPublicRoom_UserIsMovedIntoGroup()
     {
-        // Ghost-join: shadow-banned user IS added to the group (can receive messages)
-        // even though UserEntered is suppressed.
+        // Shadow-banned user IS added to the new room (can receive messages) — a normal member move.
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
@@ -726,7 +727,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_CallerReceivesStartChat()
+    public async Task SwitchRoom_ShadowBan_IntoPublicRoom_CallerReceivesStartChat_FullMemberList()
     {
         await AddShadowBan("peter#123");
 
@@ -750,17 +751,18 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.SwitchRoom("1 vs 1");
 
-        // Shadow-banned user sees themselves in the list (their own view is unfiltered)
-        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive a StartChat on ghost-join");
+        // T3: the caller receives the FULL member list — themselves AND every other member.
+        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive a StartChat on join");
         Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "peter#123"),
             "Shadow-banned user must see themselves in usersOfRoom");
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "normal#1"),
+            "Shadow-banned user must see other members in usersOfRoom (no presence-hiding)");
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_IntoBannedRoom_UserLeftSuppressed()
+    public async Task SwitchRoom_ShadowBan_IntoPublicRoom_BroadcastsUserLeftOnOldRoom()
     {
-        // Ghost-join: when switching rooms, the old-room UserLeft should also be suppressed
-        // for a shadow user moving into a banned room (they were already "invisible")
+        // T3: shadow users are full members — leaving the old room fires UserLeft unconditionally.
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
@@ -774,8 +776,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.SwitchRoom("1 vs 1");
 
-        Assert.AreEqual(0, userLeftCount,
-            "Shadow-banned user ghost-joining a banned room must NOT trigger UserLeft on the old room");
+        Assert.AreEqual(1, userLeftCount,
+            "Shadow-banned user MUST trigger UserLeft on the old room (no presence-hiding)");
     }
 
     [Test]
@@ -802,11 +804,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_ExemptToBanned_StillBroadcastsUserLeft()
+    public async Task SwitchRoom_ShadowBan_ExemptToPublic_BothLeaveAndEnterFire()
     {
-        // Cross-category: shadow user was VISIBLE in an exempt room, so leaving it must still
-        // broadcast UserLeft (else a stale ghost lingers in the exempt room's user list).
-        // The target is banned, so the enter must be suppressed (ghost-join).
+        // T3: no presence-hiding. Both the old-room UserLeft and the target-room UserEntered fire
+        // unconditionally, regardless of room category.
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "clan XYZ", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
@@ -825,18 +826,14 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.SwitchRoom("W3C Lounge");
 
-        Assert.AreEqual(1, userLeftCount,
-            "Shadow user leaving an EXEMPT room (where they were visible) must broadcast UserLeft");
-        Assert.AreEqual(0, userEnteredCount,
-            "Shadow user ghost-joining a BANNED target room must NOT broadcast UserEntered");
+        Assert.AreEqual(1, userLeftCount, "Leaving the old room must broadcast UserLeft");
+        Assert.AreEqual(1, userEnteredCount, "Joining the public target room must broadcast UserEntered");
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_BannedToExempt_SuppressesUserLeft()
+    public async Task SwitchRoom_ShadowBan_PublicToExempt_BothLeaveAndEnterFire()
     {
-        // Cross-category: shadow user was a GHOST in a banned room (no one saw them enter),
-        // so leaving it must NOT broadcast UserLeft. The target is exempt, so they become
-        // visible and the enter must fire.
+        // T3: no presence-hiding. Both UserLeft (old public room) and UserEntered (exempt target) fire.
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
@@ -855,10 +852,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.SwitchRoom("clan XYZ");
 
-        Assert.AreEqual(0, userLeftCount,
-            "Shadow user leaving a BANNED room (where they were a ghost) must NOT broadcast UserLeft");
-        Assert.AreEqual(1, userEnteredCount,
-            "Shadow user entering an EXEMPT target room must broadcast UserEntered (becomes visible)");
+        Assert.AreEqual(1, userLeftCount, "Leaving the old public room must broadcast UserLeft");
+        Assert.AreEqual(1, userEnteredCount, "Joining the exempt target room must broadcast UserEntered");
     }
 
     [Test]
@@ -1271,8 +1266,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     // ── Task 6 tests ────────────────────────────────────────────────────────────
 
     [Test]
-    public void ConnectionMapping_GetUsersOfRoomForViewer_ShadowBanInBannedRoom_HiddenFromOthers()
+    public void ConnectionMapping_GetUsersOfRoom_ShadowBanInBannedRoom_VisibleToAll()
     {
+        // T3: shadow users are full room members — NO presence-hiding. They appear in usersOfRoom
+        // for everyone (the only remaining shadow effect is the SendMessage drop).
         var mapping = new ConnectionMapping();
         var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
         var shadowUser = new ChatUser("shadow#2", false, null, new ProfilePicture(), null, null);
@@ -1281,25 +1278,15 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         mapping.Add("conn-shadow", "W3C Lounge", shadowUser);
         mapping.SetMute("conn-shadow", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
-        // Normal user viewing — shadow user must be hidden
-        var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
-        Assert.AreEqual(1, visibleToNormal.Count);
-        Assert.AreEqual("normal#1", visibleToNormal[0].BattleTag);
-        var tagsVisibleToNormal = visibleToNormal.Select(u => u.BattleTag).ToList();
-        Assert.IsFalse(tagsVisibleToNormal.Contains("shadow#2"),
-            "Non-viewer must NOT see the shadow-banned user's battleTag");
-        Assert.IsTrue(tagsVisibleToNormal.Contains("normal#1"),
-            "Non-viewer must see the normal user's battleTag");
-
-        // Shadow user viewing themselves — they see both
-        var visibleToShadow = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-shadow");
-        Assert.AreEqual(2, visibleToShadow.Count);
-        Assert.IsTrue(visibleToShadow.Any(u => u.BattleTag == "shadow#2"),
-            "Shadow-banned viewer must see their own battleTag");
+        var users = mapping.GetUsersOfRoom("W3C Lounge");
+        var tags = users.Select(u => u.BattleTag).ToList();
+        Assert.AreEqual(2, users.Count, "Shadow user must be a visible member of the room");
+        CollectionAssert.Contains(tags, "shadow#2", "Shadow-banned user must be visible to others");
+        CollectionAssert.Contains(tags, "normal#1");
     }
 
     [Test]
-    public void ConnectionMapping_GetUsersOfRoomForViewer_ShadowBanInExemptRoom_Visible()
+    public void ConnectionMapping_GetUsersOfRoom_ShadowBanInExemptRoom_VisibleToAll()
     {
         var mapping = new ConnectionMapping();
         var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
@@ -1309,50 +1296,29 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         mapping.Add("conn-shadow", "clan AB", shadowUser);
         mapping.SetMute("conn-shadow", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
-        // In exempt room, shadow user is fully visible to normal viewer
-        var visibleToNormal = mapping.GetUsersOfRoomForViewer("clan AB", "conn-normal");
-        Assert.AreEqual(2, visibleToNormal.Count);
+        var users = mapping.GetUsersOfRoom("clan AB");
+        Assert.AreEqual(2, users.Count, "All users (incl. shadow) are visible in exempt rooms too");
     }
 
     [Test]
-    public void ConnectionMapping_GetUsersOfRoomForViewer_FullBan_NotShadowHidden()
+    public void ConnectionMapping_GetUsersOfRoom_FullBan_Visible()
     {
         var mapping = new ConnectionMapping();
         var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
         var fullBanUser = new ChatUser("banned#3", false, null, new ProfilePicture(), null, null);
 
-        // Full-banned users should never be in a banned room (rejected at SwitchRoom),
-        // but if they somehow are, they appear as-is — only Shadow status is presence-hidden.
+        // Full-banned users should never be in a public room (rejected at SwitchRoom),
+        // but if they somehow are, they appear as-is — there is no presence-hiding at all.
         mapping.Add("conn-normal", "W3C Lounge", normalUser);
         mapping.Add("conn-banned", "W3C Lounge", fullBanUser);
         mapping.SetMute("conn-banned", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
 
-        // Full-banned user is NOT shadow-hidden; they simply shouldn't be here.
-        var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
-        Assert.AreEqual(2, visibleToNormal.Count);
+        var users = mapping.GetUsersOfRoom("W3C Lounge");
+        Assert.AreEqual(2, users.Count);
     }
 
     [Test]
-    public void ConnectionMapping_GetUsersOfRoomForViewer_ExpiredShadowBan_NotHidden()
-    {
-        // An EXPIRED shadow ban must NOT cause hiding — expiry-aware via GetEffectiveMuteStatus.
-        var mapping = new ConnectionMapping();
-        var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
-        var expiredShadowUser = new ChatUser("expired#4", false, null, new ProfilePicture(), null, null);
-
-        mapping.Add("conn-normal", "W3C Lounge", normalUser);
-        mapping.Add("conn-expired", "W3C Lounge", expiredShadowUser);
-        // Shadow ban that ended in the past
-        mapping.SetMute("conn-expired", MuteStatus.Shadow, DateTime.UtcNow.AddDays(-1));
-
-        // Expired shadow ban → user IS visible to others (ban has expired)
-        var visibleToNormal = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-normal");
-        Assert.AreEqual(2, visibleToNormal.Count,
-            "User with EXPIRED shadow ban must not be hidden — expiry-aware filtering");
-    }
-
-    [Test]
-    public void ConnectionMapping_GetUsersOfRoomForViewer_NoBan_AllVisible()
+    public void ConnectionMapping_GetUsersOfRoom_NoBan_AllVisible()
     {
         var mapping = new ConnectionMapping();
         var user1 = new ChatUser("user#1", false, null, new ProfilePicture(), null, null);
@@ -1360,18 +1326,17 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         mapping.Add("conn-1", "W3C Lounge", user1);
         mapping.Add("conn-2", "W3C Lounge", user2);
-        // No SetMute calls — both are cache misses (treated as None)
 
-        var visibleToUser1 = mapping.GetUsersOfRoomForViewer("W3C Lounge", "conn-1");
-        Assert.AreEqual(2, visibleToUser1.Count,
+        var users = mapping.GetUsersOfRoom("W3C Lounge");
+        Assert.AreEqual(2, users.Count,
             "Normal (unbanned) users must never be excluded from the user list");
     }
 
     [Test]
-    public async Task SwitchRoom_ShadowBan_CallerReceivesStartChat_SeesSelf_OthersExcluded()
+    public async Task SwitchRoom_ShadowBan_CallerReceivesStartChat_SeesAllMembers()
     {
-        // Full integration: when a shadow-banned user ghost-joins a banned room,
-        // the StartChat sent to them (the viewer) must include themselves but not other shadow users.
+        // T3: when a shadow-banned user joins a public room, the StartChat sent to them includes
+        // EVERY member — themselves, normal users, AND other shadow users (no presence-hiding).
         await AddShadowBan("peter#123");
 
         // Add another shadow-banned user already in "1 vs 1"
@@ -1399,23 +1364,20 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.SwitchRoom("1 vs 1");
 
-        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive StartChat on ghost-join");
-        // peter#123 (the viewer) must see themselves
+        Assert.IsNotNull(startChatUsers, "Shadow-banned user must receive StartChat on join");
         Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "peter#123"),
             "Shadow-banned viewer must see themselves in usersOfRoom");
-        // normal#1 must be visible (not shadow-banned)
         Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "normal#1"),
             "Normal user must be visible to the shadow-banned viewer");
-        // shadow-other#5 must be hidden from peter (also shadow-banned, not the viewer)
-        Assert.IsFalse(startChatUsers.Any(u => u.BattleTag == "shadow-other#5"),
-            "Other shadow-banned users must be hidden from the shadow-banned viewer");
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "shadow-other#5"),
+            "Other shadow-banned users must ALSO be visible (no presence-hiding)");
     }
 
     [Test]
-    public async Task Login_ShadowBan_StartChat_FiltersOtherShadowUsers()
+    public async Task Login_ShadowBan_StartChat_ShowsAllMembers()
     {
-        // Integration: on login, shadow-banned user's StartChat (in the default room, a banned room)
-        // must hide other shadow users but show themselves and normal users.
+        // T3: on login, the shadow-banned user's StartChat shows EVERY member of the room — themselves,
+        // normal users, AND other shadow users (no presence-hiding).
         await AddShadowBan("peter#123");
 
         // Another shadow user already in W3C Lounge
@@ -1444,8 +1406,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "Shadow-banned viewer must see themselves");
         Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "normal#1"),
             "Normal user must be visible to shadow-banned viewer");
-        Assert.IsFalse(startChatUsers.Any(u => u.BattleTag == "other-shadow#9"),
-            "Other shadow-banned users must be hidden");
+        Assert.IsTrue(startChatUsers.Any(u => u.BattleTag == "other-shadow#9"),
+            "Other shadow-banned users must ALSO be visible (no presence-hiding)");
     }
 
     // ── Task 7 tests ────────────────────────────────────────────────────────────
@@ -1768,8 +1730,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     // ── Task 8 tests ────────────────────────────────────────────────────────────
 
     [Test]
-    public async Task OnDisconnectedAsync_ShadowBan_InBannedRoom_NoUserLeftBroadcast()
+    public async Task OnDisconnectedAsync_ShadowBan_InPublicRoom_BroadcastsUserLeft()
     {
+        // T3: shadow users are full members — disconnecting from a public room broadcasts UserLeft
+        // unconditionally (no presence-hiding).
         await AddShadowBan("peter#123");
         _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute("TestId", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
@@ -1783,8 +1747,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
 
         await _chatHub.OnDisconnectedAsync(null);
 
-        Assert.AreEqual(0, userLeftCount,
-            "Shadow-banned user leaving a banned room must NOT broadcast UserLeft");
+        Assert.AreEqual(1, userLeftCount,
+            "Shadow-banned user leaving a public room MUST broadcast UserLeft (no presence-hiding)");
     }
 
     [Test]
@@ -1957,10 +1921,10 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public void ShadowBan_UsersOfRoom_OtherMembersDoNotSeeTheShadowUser()
+    public void ShadowBan_UsersOfRoom_AllMembersSeeTheShadowUser()
     {
-        // Integration: the ConnectionMapping used by the hub correctly hides shadow users
-        // from normal members in banned rooms.
+        // T3: the ConnectionMapping room member list contains the shadow user for EVERYONE — there is
+        // no presence-hiding (the only remaining shadow effect is the SendMessage drop).
         var normalUser = new ChatUser("normal#1", false, null, new ProfilePicture(), null, null);
         var shadowUser = new ChatUser("shadow#2", false, null, new ProfilePicture(), null, null);
 
@@ -1968,16 +1932,11 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping.Add("ShadowConn", "W3C Lounge", shadowUser);
         _connectionMapping.SetMute("ShadowConn", MuteStatus.Shadow, DateTime.UtcNow.AddDays(1));
 
-        // Normal user's view must not include the shadow-banned user
-        var visibleToNormal = _connectionMapping.GetUsersOfRoomForViewer("W3C Lounge", "NormalConn");
-        Assert.AreEqual(1, visibleToNormal.Count,
-            "Normal user must see exactly 1 member (shadow user is hidden)");
-        Assert.AreEqual("normal#1", visibleToNormal[0].BattleTag);
-
-        // Shadow user's own view must include themselves
-        var visibleToShadow = _connectionMapping.GetUsersOfRoomForViewer("W3C Lounge", "ShadowConn");
-        Assert.AreEqual(2, visibleToShadow.Count,
-            "Shadow-banned user must see both themselves and the normal user");
+        var users = _connectionMapping.GetUsersOfRoom("W3C Lounge");
+        var tags = users.Select(u => u.BattleTag).ToList();
+        Assert.AreEqual(2, users.Count, "Both members are visible (no presence-hiding)");
+        CollectionAssert.Contains(tags, "normal#1");
+        CollectionAssert.Contains(tags, "shadow#2", "Shadow user is a visible member to everyone");
     }
 
     [Test]
