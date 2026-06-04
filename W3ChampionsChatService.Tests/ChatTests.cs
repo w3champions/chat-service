@@ -52,7 +52,7 @@ public class ChatTests : IntegrationTestBase
             _settingsRepository,
             _connectionMapping,
             _chatHistory,
-            new MuteReconciliationTestHarness(_connectionMapping).Service,
+            new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
             null);
 
         // Setup message capturing proxies

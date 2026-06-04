@@ -292,26 +292,12 @@ public class ChatHub(
             reason = reason
         };
 
-        await _muteRepository.AddLoungeMute(loungeMuteRequest);
-
         // Spec §12: BanUser is one of the two canonical IN-BAND ban paths (the other is the REST
-        // MuteController). Both persist the ban AND reconcile every live connection's mute cache via
-        // MuteReconciliationService, so enforcement is instant without a per-send DB read. Only a ban
-        // written DIRECTLY to the Mongo collection (bypassing both the hub and the REST controller —
+        // MuteController). Both delegate to MuteReconciliationService.ApplyBanAsync, which persists the
+        // ban AND reconciles every live connection's mute cache, so enforcement is instant without a
+        // per-send DB read. Only a ban written DIRECTLY to the Mongo collection (bypassing both paths —
         // e.g. a manual DB edit) takes effect on the target's next reconnect.
-        // Parse the endDate once. Use the SAME DateTimeStyles the repository uses (AdjustToUniversal)
-        // so the CACHED expiry can never disagree with the PERSISTED expiry for an offset-less endDate.
-        // Guard a malformed/empty endDate: the ban is already persisted, so on a parse failure skip the
-        // live reconcile gracefully (next reconnect re-seeds the cache) rather than throwing after the write.
-        if (!DateTime.TryParse(endDate, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsedEndDate))
-        {
-            Log.Warning("BanUser: could not parse endDate '{EndDate}' for {BattleTag} — ban persisted, skipping live cache reconcile (next reconnect will re-seed the cache)",
-                endDate, battleTag);
-            return;
-        }
-
-        var newStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
-        await _muteReconciliation.ApplyMuteToLiveConnections(battleTag, newStatus, parsedEndDate);
+        await _muteReconciliation.ApplyBanAsync(loungeMuteRequest);
     }
 
     internal async Task LoginAsAuthenticated(ChatUser user)

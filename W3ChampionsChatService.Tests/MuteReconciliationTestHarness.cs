@@ -22,7 +22,7 @@ public sealed class MuteReconciliationTestHarness
     // connectionId -> list of (method, firstArg) sent to that connection's client proxy.
     private readonly Dictionary<string, List<(string Method, object Payload)>> _sends = new();
 
-    public MuteReconciliationTestHarness(ConnectionMapping connections)
+    public MuteReconciliationTestHarness(ConnectionMapping connections, IMuteRepository muteRepository = null)
     {
         var hubClients = new Mock<IHubClients>();
         hubClients
@@ -48,7 +48,12 @@ public sealed class MuteReconciliationTestHarness
         var hubContext = new Mock<IHubContext<ChatHub>>();
         hubContext.Setup(h => h.Clients).Returns(hubClients.Object);
 
-        Service = new MuteReconciliationService(connections, hubContext.Object);
+        // Default to a no-op mock repo so existing call sites that don't exercise ApplyBanAsync compile
+        // unchanged; tests that assert persistence pass a real MuteRepository.
+        Service = new MuteReconciliationService(
+            connections,
+            hubContext.Object,
+            muteRepository ?? new Mock<IMuteRepository>().Object);
     }
 
     /// <summary>All (method, payload) signals sent to <paramref name="connectionId"/>, in order.</summary>

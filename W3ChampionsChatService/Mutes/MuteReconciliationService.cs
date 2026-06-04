@@ -1,6 +1,8 @@
 using System;
+using System.Globalization;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using Serilog;
 using W3ChampionsChatService.Chats;
 
 namespace W3ChampionsChatService.Mutes;
@@ -18,11 +20,45 @@ namespace W3ChampionsChatService.Mutes;
 /// </para>
 /// Shares the singleton <see cref="ConnectionMapping"/> with the hub and uses
 /// <see cref="IHubContext{ChatHub}"/> to push client signals from outside the hub call context.
+/// <para>
+/// Lifetime: registered as a singleton. <see cref="IMuteRepository"/> resolves to
+/// <see cref="MuteRepository"/>, which wraps a thread-safe singleton <c>MongoClient</c>, so injecting
+/// it directly into a singleton is safe (no captured scoped/transient state).
+/// </para>
 /// </summary>
-public class MuteReconciliationService(ConnectionMapping connections, IHubContext<ChatHub> hubContext)
+public class MuteReconciliationService(
+    ConnectionMapping connections,
+    IHubContext<ChatHub> hubContext,
+    IMuteRepository muteRepository)
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
+    private readonly IMuteRepository _muteRepository = muteRepository;
+
+    /// <summary>
+    /// Single home for the IN-BAND ban orchestration shared by the hub (<see cref="ChatHub.BanUser"/>)
+    /// and the REST controller (<see cref="MuteController"/>): persist the mute, then reconcile every
+    /// live connection of the target. Returns <c>(success, parsedEndDate)</c> — <c>success == false</c>
+    /// when the endDate could not be parsed (the mute is still persisted; the live reconcile is skipped
+    /// and the target's next reconnect re-seeds the cache).
+    /// </summary>
+    public async Task<(bool success, DateTime parsedEndDate)> ApplyBanAsync(LoungeMuteRequest request)
+    {
+        await _muteRepository.AddLoungeMute(request);
+
+        // Parse the endDate with the SAME DateTimeStyles the repository uses (AdjustToUniversal) so the
+        // CACHED expiry can never disagree with the PERSISTED expiry for an offset-less endDate.
+        if (!DateTime.TryParse(request.endDate, null, DateTimeStyles.AdjustToUniversal, out var parsedEndDate))
+        {
+            Log.Warning("ApplyBanAsync: could not parse endDate '{EndDate}' for {BattleTag} — ban persisted, skipping live cache reconcile (next reconnect will re-seed the cache)",
+                request.endDate, request.battleTag);
+            return (false, DateTime.MinValue);
+        }
+
+        var status = request.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
+        await ApplyMuteToLiveConnections(request.battleTag, status, parsedEndDate);
+        return (true, parsedEndDate);
+    }
 
     /// <summary>
     /// Applies a mute to every live connection of <paramref name="battleTag"/>: updates the cached

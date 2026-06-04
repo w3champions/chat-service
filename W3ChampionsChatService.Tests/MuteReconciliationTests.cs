@@ -37,7 +37,9 @@ public class MuteReconciliationTests : IntegrationTestBase
     {
         _muteRepository = new MuteRepository(MongoClient);
         _connectionMapping = new ConnectionMapping();
-        _harness = new MuteReconciliationTestHarness(_connectionMapping);
+        // Wire the reconciliation service's ApplyBanAsync to the REAL repo so controller/hub bans
+        // actually persist to (and are removable from) the live DB in these tests.
+        _harness = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository);
         _controller = new MuteController(_muteRepository, _harness.Service);
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
@@ -237,5 +239,132 @@ public class MuteReconciliationTests : IntegrationTestBase
         Assert.AreEqual("endDate", props[0].Name, "The only payload property must be endDate");
         Assert.AreEqual(endDate, (DateTime)props[0].GetValue(payload),
             "Payload endDate must equal the ban expiry");
+    }
+
+    // ── T5 ApplyBanAsync (consolidated ban orchestration) ─────────────────────
+
+    [Test]
+    public async Task ApplyBanAsync_FullBan_PersistsAndReconciles()
+    {
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var (success, parsed) = await _harness.Service.ApplyBanAsync(new LoungeMuteRequest
+        {
+            battleTag = "victim#123",
+            endDate = DateTime.UtcNow.AddDays(1).ToString("O"),
+            author = "admin#1",
+            reason = "bad behavior",
+            isShadowBan = false
+        });
+
+        Assert.IsTrue(success, "Full ban with a valid endDate must succeed");
+        Assert.Greater(parsed, DateTime.UtcNow, "Parsed endDate must be the future ban expiry");
+        // Persisted to the DB.
+        Assert.IsNotNull(await _muteRepository.GetMutedPlayer("victim#123"), "ApplyBanAsync must persist the mute");
+        // Live connection reconciled to Full + received the signal.
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn", out var cached));
+        Assert.AreEqual(MuteStatus.Full, cached.Status, "Live cache must be reconciled to Full");
+        Assert.AreEqual(1, _harness.SignalCount("VictimConn", "PlayerBannedFromChat"),
+            "Full ban must push PlayerBannedFromChat");
+    }
+
+    [Test]
+    public async Task ApplyBanAsync_ShadowBan_PersistsAndReconciles_Silent()
+    {
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var (success, _) = await _harness.Service.ApplyBanAsync(new LoungeMuteRequest
+        {
+            battleTag = "victim#123",
+            endDate = DateTime.UtcNow.AddDays(1).ToString("O"),
+            author = "admin#1",
+            reason = "spam",
+            isShadowBan = true
+        });
+
+        Assert.IsTrue(success);
+        var persisted = await _muteRepository.GetMutedPlayer("victim#123");
+        Assert.IsNotNull(persisted);
+        Assert.IsTrue(persisted.isShadowBan, "Shadow ban must persist with isShadowBan=true");
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn", out var cached));
+        Assert.AreEqual(MuteStatus.Shadow, cached.Status, "Live cache must be reconciled to Shadow");
+        Assert.AreEqual(0, _harness.SignalsFor("VictimConn").Count,
+            "Shadow ban must send NO signal to the target (illusion preserved)");
+    }
+
+    [Test]
+    public async Task ApplyBanAsync_MalformedEndDate_ReturnsFailure_PersistsThenSkipsReconcile()
+    {
+        // Use a mock repo whose AddLoungeMute succeeds (no-op) so the ban is "persisted" but the
+        // subsequent TryParse fails — isolating the parse-failure branch. (The real MuteRepository's
+        // AddLoungeMute would itself throw on a malformed date before we reach the TryParse guard.)
+        var mutes = new Mock<IMuteRepository>();
+        var persisted = false;
+        mutes.Setup(m => m.AddLoungeMute(It.IsAny<LoungeMuteRequest>()))
+            .Callback(() => persisted = true)
+            .Returns(Task.CompletedTask);
+        var harness = new MuteReconciliationTestHarness(_connectionMapping, mutes.Object);
+
+        var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
+        _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
+        _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+
+        var (success, parsed) = await harness.Service.ApplyBanAsync(new LoungeMuteRequest
+        {
+            battleTag = "victim#123",
+            endDate = "not-a-real-date",
+            author = "admin#1",
+            reason = "x",
+            isShadowBan = false
+        });
+
+        Assert.IsFalse(success, "A malformed endDate must return success=false");
+        Assert.AreEqual(DateTime.MinValue, parsed);
+        Assert.IsTrue(persisted, "The ban is still persisted before the parse failure");
+        // The live cache must NOT have been reconciled (still None) and no signal sent.
+        Assert.IsTrue(_connectionMapping.TryGetMute("VictimConn", out var cached));
+        Assert.AreEqual(MuteStatus.None, cached.Status, "Live cache must NOT be reconciled on a parse failure");
+        Assert.AreEqual(0, harness.SignalsFor("VictimConn").Count, "No signal on a parse failure");
+    }
+
+    [Test]
+    public async Task ApplyBanAsync_HubBanUser_And_ControllerAddLoungeMute_ProduceIdenticalCacheState()
+    {
+        // Two live connections of the same battleTag; ban one via the hub, the other via the controller.
+        // Both paths go through ApplyBanAsync → identical cache state.
+        _connectionMapping.Add("HubConn", "W3C Lounge", new ChatUser("victim#123", false, null, new ProfilePicture(), null, null));
+        _connectionMapping.SetMute("HubConn", MuteStatus.None, DateTime.MinValue);
+
+        // Admin seat for the hub BanUser (GetUser must resolve for the caller).
+        _connectionMapping.Add("TestId", "W3C Lounge", new ChatUser("admin#1", true, null, new ProfilePicture(), null, null));
+        var hubContext = new Mock<HubCallerContext>();
+        hubContext.Setup(c => c.ConnectionId).Returns("TestId");
+        _chatHub.Context = hubContext.Object;
+
+        var endDate = DateTime.UtcNow.AddDays(1).ToString("O");
+        await _chatHub.BanUser("victim#123", "bad behavior", false, endDate);
+
+        Assert.IsTrue(_connectionMapping.TryGetMute("HubConn", out var afterHub));
+        var hubStatus = afterHub.Status;
+
+        // Reset that connection's cache and ban via the controller instead.
+        _connectionMapping.SetMute("HubConn", MuteStatus.None, DateTime.MinValue);
+        await _controller.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "victim#123",
+            endDate = endDate,
+            author = "admin#1",
+            reason = "bad behavior",
+            isShadowBan = false
+        });
+
+        Assert.IsTrue(_connectionMapping.TryGetMute("HubConn", out var afterController));
+        Assert.AreEqual(hubStatus, afterController.Status,
+            "Hub BanUser and controller AddLoungeMute must produce identical cache status");
+        Assert.AreEqual(MuteStatus.Full, afterController.Status);
     }
 }

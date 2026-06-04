@@ -42,7 +42,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _connectionMapping = new ConnectionMapping();
         _chatHistory = new ChatHistory();
         _settingsRepository = new SettingsRepository(MongoClient);
-        _reconcileHarness = new MuteReconciliationTestHarness(_connectionMapping);
+        // Wire ApplyBanAsync to the real repo so hub BanUser persists to (and is removable from) the DB.
+        _reconcileHarness = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository);
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
         chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))

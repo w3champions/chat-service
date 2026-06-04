@@ -1,8 +1,6 @@
-using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using W3ChampionsChatService.Authentication;
-using W3ChampionsChatService.Chats;
 using Serilog;
 using MongoDB.Driver;
 
@@ -37,23 +35,12 @@ public class MuteController(IMuteRepository muteRepository, MuteReconciliationSe
         }
 
         Log.Information("Adding lounge mute shadowBan={IsShadowBan} for {BattleTag} until {EndDate} by {Author}. Reason: {Reason}", loungeMuteRequest.isShadowBan, loungeMuteRequest.battleTag, loungeMuteRequest.endDate, loungeMuteRequest.author, loungeMuteRequest.reason);
-        await _muteRepository.AddLoungeMute(loungeMuteRequest);
 
-        // The REST POST is an IN-BAND ban path: reconcile the target's live connections so the mute
-        // takes effect immediately (zero per-send DB read), not only on their next reconnect.
-        // Parse the endDate with the SAME DateTimeStyles the repository uses (AdjustToUniversal) so the
-        // cached expiry matches the persisted expiry. On a parse failure the ban is already persisted —
-        // skip the live reconcile gracefully (the target's next reconnect re-seeds the cache).
-        if (DateTime.TryParse(loungeMuteRequest.endDate, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsedEndDate))
-        {
-            var status = loungeMuteRequest.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
-            await _muteReconciliation.ApplyMuteToLiveConnections(loungeMuteRequest.battleTag, status, parsedEndDate);
-        }
-        else
-        {
-            Log.Warning("AddLoungeMute: could not parse endDate '{EndDate}' for {BattleTag} — ban persisted, skipping live cache reconcile (next reconnect will re-seed the cache)",
-                loungeMuteRequest.endDate, loungeMuteRequest.battleTag);
-        }
+        // The REST POST is an IN-BAND ban path: ApplyBanAsync persists the mute AND reconciles the
+        // target's live connections so the mute takes effect immediately (zero per-send DB read), not
+        // only on their next reconnect. A malformed endDate still persists; the live reconcile is
+        // skipped and the target's next reconnect re-seeds the cache.
+        await _muteReconciliation.ApplyBanAsync(loungeMuteRequest);
 
         return Ok($"Lounge mute for {loungeMuteRequest.battleTag} inserted successfully.");
     }
