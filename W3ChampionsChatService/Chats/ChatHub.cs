@@ -30,6 +30,9 @@ public class ChatHub(
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly IHttpContextAccessor _contextAccessor = contextAccessor;
 
+    // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
+    private const int MaxMessageLength = 1024;
+
     // Cap how much of an arbitrary user message is written to logs (the shadow-drop audit line) so a
     // single huge message can't bloat the logs.
     private const int MaxLoggedMessageLength = 500;
@@ -50,11 +53,26 @@ public class ChatHub(
         var chatRoom = _connections.GetRoom(Context.ConnectionId);
         var user = _connections.GetUser(Context.ConnectionId);
 
-        // R6: Membership prerequisite — user must be a member of a valid room.
-        // G1/G2: graceful reject — return, never Context.Abort(), never throw.
-        if (chatRoom == null || user == null)
+        // R6: Membership prerequisite. G1/G2: graceful reject — return, never Context.Abort(), never throw.
+        // Split so the log carries the battletag whenever we have a user (an unauthenticated connection
+        // has none — log the ConnectionId only).
+        if (user == null)
         {
-            Log.Warning("SendMessage rejected: connection {ConnectionId} has no room membership", Context.ConnectionId);
+            Log.Warning("SendMessage rejected: unauthenticated connection {ConnectionId}", Context.ConnectionId);
+            return;
+        }
+        if (chatRoom == null)
+        {
+            Log.Warning("SendMessage rejected: authenticated user {BattleTag} has no room membership (connection {ConnectionId})",
+                user.BattleTag, Context.ConnectionId);
+            return;
+        }
+
+        // Reject over-length messages gracefully (user is non-null here so the log carries the battletag).
+        if (trimmedMessage.Length > MaxMessageLength)
+        {
+            Log.Warning("SendMessage rejected: message from {BattleTag} exceeds {MaxLength} characters ({ActualLength})",
+                user.BattleTag, MaxMessageLength, trimmedMessage.Length);
             return;
         }
 

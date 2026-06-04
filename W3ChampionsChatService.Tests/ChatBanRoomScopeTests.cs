@@ -1205,6 +1205,131 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         public void Emit(Serilog.Events.LogEvent logEvent) => onEmit(logEvent);
     }
 
+    // ── T1 max message length (1024) ──────────────────────────────────────────
+
+    [Test]
+    public async Task SendMessage_ExactlyMaxLength_Broadcasts()
+    {
+        LoginNormal("peter#123");
+        var message = new string('a', 1024);
+
+        await _chatHub.SendMessage(message);
+
+        Assert.AreEqual(1, _groupSendCount, "A message of exactly 1024 chars must broadcast");
+        Assert.AreEqual(1, _chatHistory.GetMessages("W3C Lounge").Count);
+    }
+
+    [Test]
+    public async Task SendMessage_OneOverMaxLength_Rejected()
+    {
+        LoginNormal("peter#123");
+        var message = new string('a', 1025);
+
+        await _chatHub.SendMessage(message);
+
+        Assert.AreEqual(0, _groupSendCount, "A 1025-char message must be rejected (not broadcast)");
+        Assert.IsEmpty(_chatHistory.GetMessages("W3C Lounge"), "Over-length message must not enter history");
+    }
+
+    [Test]
+    public async Task SendMessage_FarOverMaxLength_RejectedWithoutAbort()
+    {
+        LoginNormal("peter#123");
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+        var message = new string('a', 5000);
+
+        await _chatHub.SendMessage(message);
+
+        Assert.AreEqual(0, _groupSendCount, "A 5000-char message must be rejected");
+        Assert.IsFalse(abortCalled, "Over-length rejection must never call Context.Abort() (G1)");
+    }
+
+    [Test]
+    public async Task SendMessage_OverMaxLength_LogsWarningWithBattleTag()
+    {
+        LoginNormal("peter#123");
+        var capturedLogs = new List<string>();
+        var sink = new DelegatingLogSink(evt => capturedLogs.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        Serilog.Log.Logger = new Serilog.LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        try
+        {
+            await _chatHub.SendMessage(new string('a', 2000));
+
+            var rejectLog = capturedLogs.FirstOrDefault(l => l.Contains("exceeds"));
+            Assert.IsNotNull(rejectLog, "Over-length send must emit a warning log");
+            StringAssert.Contains("peter#123", rejectLog, "Over-length warning must include the battleTag");
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            (Serilog.Log.Logger as IDisposable)?.Dispose();
+        }
+    }
+
+    // ── T2 battletag in rejection logs ────────────────────────────────────────
+
+    [Test]
+    public async Task SendMessage_NullUser_LogsConnectionIdOnly_NoBattleTag()
+    {
+        // Unauthenticated connection (no RegisterUser/Add) → GetUser null → log carries ConnectionId,
+        // and has no battletag '#' marker.
+        var capturedLogs = new List<string>();
+        var sink = new DelegatingLogSink(evt => capturedLogs.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        Serilog.Log.Logger = new Serilog.LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        try
+        {
+            await _chatHub.SendMessage("hello");
+
+            var rejectLog = capturedLogs.FirstOrDefault(l => l.Contains("rejected"));
+            Assert.IsNotNull(rejectLog, "Unauthenticated send must emit a rejection log");
+            StringAssert.Contains("TestId", rejectLog, "Null-user rejection log must include the ConnectionId");
+            StringAssert.DoesNotContain("#", rejectLog, "Null-user rejection log must NOT carry a battletag");
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            (Serilog.Log.Logger as IDisposable)?.Dispose();
+        }
+    }
+
+    [Test]
+    public async Task SendMessage_NoRoom_UserPresent_LogsBattleTag()
+    {
+        // User registered (T4) but seated in NO room → room-null rejection log carries the battletag.
+        _connectionMapping.RegisterUser("TestId", new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        var capturedLogs = new List<string>();
+        var sink = new DelegatingLogSink(evt => capturedLogs.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        Serilog.Log.Logger = new Serilog.LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        try
+        {
+            await _chatHub.SendMessage("hello");
+
+            Assert.AreEqual(0, _groupSendCount, "No-room send must be rejected (not broadcast)");
+            var rejectLog = capturedLogs.FirstOrDefault(l => l.Contains("no room membership"));
+            Assert.IsNotNull(rejectLog, "No-room send must emit a rejection log");
+            StringAssert.Contains("peter#123", rejectLog, "No-room rejection log must include the battleTag");
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            (Serilog.Log.Logger as IDisposable)?.Dispose();
+        }
+    }
+
     [Test]
     public async Task SendMessage_CachedBan_Expired_InBannedRoom_Broadcasts()
     {
