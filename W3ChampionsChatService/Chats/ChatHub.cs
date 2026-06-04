@@ -349,6 +349,9 @@ public class ChatHub(
             // Seed the per-connection mute cache authoritatively for BOTH branches so the send/switch
             // hot paths enforce from the cache alone (zero DB reads), even on the no-clan/no-room edge.
             _connections.SetMute(Context.ConnectionId, MuteStatus.Full, mute.endDate);
+            // Register the connection→user mapping so GetUser is authoritative even when the user is
+            // seated in no room (no-clan branch below). The clan branch's Add also registers.
+            _connections.RegisterUser(Context.ConnectionId, user);
 
             // Seat in clan room if available, else no room (spec D2 — empty state).
             var safeRoom = string.IsNullOrWhiteSpace(user.ClanTag) ? null : $"clan {user.ClanTag}";
@@ -364,12 +367,11 @@ public class ChatHub(
             }
             else
             {
-                // No clan: not seated in any room (spec D2). A SwitchRoom attempt by this connection
-                // is rejected by SwitchRoom's `user == null` early-return (GetUser finds no mapping
-                // entry), NOT by the cache gate. The cache is STILL seeded above as defense-in-depth:
-                // if this connection ever became seated in a public room, SendMessage would enforce
-                // the full ban from the cache (zero DB read). SetMute keys by connectionId only, so
-                // seeding works even with no room membership.
+                // No clan: not seated in any room (spec D2), but the connection→user mapping IS
+                // registered above, so GetUser is non-null. A later SwitchRoom into a public room is
+                // rejected by the Full→public cache gate (not by a user==null guard); a switch into an
+                // exempt clan/lobby room is allowed. The mute cache (seeded above) enforces the full ban
+                // from the cache on any subsequent send (zero DB read).
                 // G3: STILL emit a StartChat — an empty-room payload — so legacy clients can initialize.
                 await Clients.Caller.SendAsync("StartChat", new List<ChatUser>(), new List<ChatMessage>(), (string)null, availableRooms);
             }
@@ -395,6 +397,9 @@ public class ChatHub(
     public async Task UpdateUserProfilePicture(string chatRoom, ProfilePicture profilePicture)
     {
         var user = _connections.GetUser(Context.ConnectionId);
+        // Graceful guard: an unauthenticated/unregistered connection has no user — return without
+        // dereferencing (prevents a latent NRE). No Context.Abort.
+        if (user == null) return;
         user.ProfilePicture = profilePicture;
         await Clients.Group(chatRoom).SendAsync("UserUpdated", user);
     }

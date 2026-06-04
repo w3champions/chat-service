@@ -39,6 +39,13 @@ public class ConnectionMapping
     private readonly Dictionary<string, CachedMute> _mutes =
         new Dictionary<string, CachedMute>();
 
+    // Per-connection user, keyed by connectionId. This is the AUTHORITATIVE record of which
+    // ChatUser owns a connection — independent of room membership — so GetUser is non-null even
+    // for a connection seated in no room (e.g. a no-clan full-banned user). Guarded by the same
+    // lock (_connections) as the other maps.
+    private readonly Dictionary<string, ChatUser> _users =
+        new Dictionary<string, ChatUser>();
+
     public List<ChatUser> GetUsersOfRoom(string chatRoom)
     {
         lock (_connections)
@@ -64,6 +71,22 @@ public class ConnectionMapping
                     chatUsers.Add(connectionId, user);
                 }
             }
+            // Add is the room-seated path; it also registers the connection→user mapping so a single
+            // call covers both. (No-room seats use RegisterUser instead.)
+            _users[connectionId] = user;
+        }
+    }
+
+    /// <summary>
+    /// Registers a connection→user mapping WITHOUT seating the connection in any room. For no-room
+    /// seats only (e.g. a no-clan full-banned user); room-seated callers use <see cref="Add"/>, which
+    /// also registers. This keeps <see cref="GetUser"/> authoritative for every authenticated connection.
+    /// </summary>
+    public void RegisterUser(string connectionId, ChatUser user)
+    {
+        lock (_connections)
+        {
+            _users[connectionId] = user;
         }
     }
 
@@ -71,8 +94,8 @@ public class ConnectionMapping
     {
         lock (_connections)
         {
-            var connection = _connections.Values.SingleOrDefault(r => r.ContainsKey(connectionId));
-            return connection?[connectionId];
+            // Authoritative O(1) lookup; non-null for both room-seated and no-room connections.
+            return _users.TryGetValue(connectionId, out var user) ? user : null;
         }
     }
 
@@ -83,6 +106,7 @@ public class ConnectionMapping
             var connection = _connections.Values.SingleOrDefault(r => r.ContainsKey(connectionId));
             connection?.Remove(connectionId);
             _mutes.Remove(connectionId);
+            _users.Remove(connectionId);
         }
     }
 
@@ -104,21 +128,15 @@ public class ConnectionMapping
     {
         lock (_connections)
         {
-            var connectionIds = new List<string>();
-            foreach (var chatRoomConnections in _connections.Values)
-            {
-                foreach (var connection in chatRoomConnections)
-                {
-                    // Case-insensitive match: the DB lowercases battleTags (see MuteRepository),
-                    // while connection-stored tags keep their original casing — so an exact (==)
-                    // compare would silently miss a casing mismatch (e.g. live-ban reconcile).
-                    if (string.Equals(connection.Value.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase))
-                    {
-                        connectionIds.Add(connection.Key);
-                    }
-                }
-            }
-            return connectionIds;
+            // Scan _users (the single source of truth for connection→user), so a no-room seat
+            // (e.g. a no-clan full-banned user) is reconcilable — room buckets would miss it.
+            // Case-insensitive match: the DB lowercases battleTags (see MuteRepository), while
+            // connection-stored tags keep their original casing — so an exact (==) compare would
+            // silently miss a casing mismatch (e.g. live-ban reconcile).
+            return _users
+                .Where(kvp => string.Equals(kvp.Value.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase))
+                .Select(kvp => kvp.Key)
+                .ToList();
         }
     }
 

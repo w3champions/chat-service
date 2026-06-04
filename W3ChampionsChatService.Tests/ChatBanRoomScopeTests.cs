@@ -210,6 +210,71 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             "After Remove+re-Add with no SetMute, cache must still be a MISS");
     }
 
+    // ── T4 connection-level user tracking ─────────────────────────────────────
+
+    [Test]
+    public void ConnectionMapping_RegisterUser_GetUserNonNull_GetRoomNull()
+    {
+        var mapping = new ConnectionMapping();
+        var user = new ChatUser("p#1", false, null, new ProfilePicture(), null, null);
+
+        mapping.RegisterUser("conn1", user);
+
+        Assert.AreSame(user, mapping.GetUser("conn1"), "GetUser must return the registered user");
+        Assert.IsNull(mapping.GetRoom("conn1"), "RegisterUser must NOT seat the connection in any room");
+    }
+
+    [Test]
+    public void ConnectionMapping_RegisterUser_NoRoom_GetConnectionIdsForUser_FindsIt()
+    {
+        var mapping = new ConnectionMapping();
+        mapping.RegisterUser("conn1", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
+
+        var ids = mapping.GetConnectionIdsForUser("p#1");
+
+        CollectionAssert.Contains(ids, "conn1",
+            "GetConnectionIdsForUser must find a no-room (RegisterUser-only) connection");
+    }
+
+    [Test]
+    public void ConnectionMapping_RegisterUser_ThenRemove_GetUserNull()
+    {
+        var mapping = new ConnectionMapping();
+        mapping.RegisterUser("conn1", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
+
+        mapping.Remove("conn1");
+
+        Assert.IsNull(mapping.GetUser("conn1"), "Remove must clear the registered user");
+        CollectionAssert.DoesNotContain(mapping.GetConnectionIdsForUser("p#1"), "conn1",
+            "Remove must drop the connection from GetConnectionIdsForUser");
+    }
+
+    [Test]
+    public void ConnectionMapping_Add_ThenGetUser_StillWorks()
+    {
+        // Regression: Add must also register the connection→user mapping.
+        var mapping = new ConnectionMapping();
+        var user = new ChatUser("p#1", false, null, new ProfilePicture(), null, null);
+        mapping.Add("conn1", "W3C Lounge", user);
+
+        Assert.AreSame(user, mapping.GetUser("conn1"), "Add must register the user for GetUser");
+        Assert.AreEqual("W3C Lounge", mapping.GetRoom("conn1"));
+    }
+
+    [Test]
+    public void ConnectionMapping_GetConnectionIdsForUser_FindsRoomSeatedAndNoRoomConns()
+    {
+        var mapping = new ConnectionMapping();
+        mapping.Add("roomConn", "W3C Lounge", new ChatUser("p#1", false, null, new ProfilePicture(), null, null));
+        mapping.RegisterUser("noRoomConn", new ChatUser("P#1", false, null, new ProfilePicture(), null, null));
+
+        var ids = mapping.GetConnectionIdsForUser("p#1");
+
+        CollectionAssert.Contains(ids, "roomConn", "Room-seated connection must be found");
+        CollectionAssert.Contains(ids, "noRoomConn", "No-room connection must be found (case-insensitive)");
+        Assert.AreEqual(2, ids.Count);
+    }
+
     // ── Task 3 helper methods ─────────────────────────────────────────────────
 
     private async Task AddFullBan(string battleTag, int daysFromNow = 1)
@@ -527,12 +592,47 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task SwitchRoom_FullBan_NoClan_RejectedByNullUserGuard()
+    public async Task Login_FullBan_NoClan_GetUser_NonNull()
     {
-        // A no-clan full-banned user is seated in NO room, so GetUser returns null for their
-        // connection. A SwitchRoom attempt is therefore rejected by SwitchRoom's `user == null`
-        // early-return — NOT by the cache gate (the cache seed is defense-in-depth). The user must
-        // remain in no room and the call must be graceful (no abort, no throw).
+        // T4: the no-clan full-ban login path registers the connection→user mapping, so GetUser is
+        // authoritative (non-null) even though the user is seated in no room.
+        await AddFullBan("peter#123");
+
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+
+        var user = _connectionMapping.GetUser("TestId");
+        Assert.IsNotNull(user, "No-clan full-ban login must register the user (GetUser non-null)");
+        Assert.AreEqual("peter#123", user.BattleTag);
+        Assert.IsNull(_connectionMapping.GetRoom("TestId"), "User is still seated in no room");
+    }
+
+    [Test]
+    public async Task SwitchRoom_FullBan_NoClan_IntoPublicRoom_RejectedByCacheGate()
+    {
+        // T4 + cache gate: a no-clan full-banned user now has a non-null user (registered at login),
+        // so SwitchRoom is NOT rejected by the user==null guard. Switching into a PUBLIC room is
+        // instead rejected by the Full→public cache gate; the user stays in no room, gracefully.
+        await AddFullBan("peter#123");
+        await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
+        Assert.IsNotNull(_connectionMapping.GetUser("TestId"), "Precondition: user is registered (non-null)");
+        Assert.IsNull(_connectionMapping.GetRoom("TestId"), "Precondition: no-clan full-ban user is in no room");
+
+        bool abortCalled = false;
+        _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
+
+        Assert.DoesNotThrowAsync(async () => await _chatHub.SwitchRoom("1 vs 1"),
+            "SwitchRoom into a public room must return gracefully, not throw");
+
+        Assert.IsNull(_connectionMapping.GetRoom("TestId"),
+            "Full-banned user must remain in no room — public target rejected by the Full→public cache gate");
+        Assert.IsFalse(abortCalled, "Rejected SwitchRoom must never call Context.Abort() (G1)");
+    }
+
+    [Test]
+    public async Task Login_FullBan_NoClan_SwitchRoomToExempt_IsAllowed()
+    {
+        // T4: a no-clan full-banned user (registered, no room) CAN switch into an exempt clan/lobby
+        // room — the cache gate only blocks public targets. No abort/throw.
         await AddFullBan("peter#123");
         await _chatHub.LoginAsAuthenticated(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
         Assert.IsNull(_connectionMapping.GetRoom("TestId"), "Precondition: no-clan full-ban user is in no room");
@@ -540,12 +640,23 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
-        Assert.DoesNotThrowAsync(async () => await _chatHub.SwitchRoom("1 vs 1"),
-            "SwitchRoom with no user must return gracefully, not throw");
+        Assert.DoesNotThrowAsync(async () => await _chatHub.SwitchRoom("clan XYZ"),
+            "SwitchRoom into an exempt room must return gracefully, not throw");
 
-        Assert.IsNull(_connectionMapping.GetRoom("TestId"),
-            "No-clan full-ban user must remain in no room after a SwitchRoom attempt (rejected by null-user guard)");
-        Assert.IsFalse(abortCalled, "Null-user SwitchRoom must never call Context.Abort() (G1)");
+        Assert.AreEqual("clan XYZ", _connectionMapping.GetRoom("TestId"),
+            "No-clan full-ban user must be allowed into an exempt (clan/lobby) room");
+        Assert.IsFalse(abortCalled, "Allowed SwitchRoom must never call Context.Abort() (G1)");
+    }
+
+    [Test]
+    public void UpdateUserProfilePicture_NullUser_DoesNotThrow()
+    {
+        // T4 boyscout: an unregistered connection has no user — UpdateUserProfilePicture must return
+        // gracefully instead of NRE-ing on a null user.
+        // (No login/registration for "TestId" → GetUser returns null.)
+        Assert.DoesNotThrowAsync(() =>
+            _chatHub.UpdateUserProfilePicture("W3C Lounge", new ProfilePicture()),
+            "UpdateUserProfilePicture with no registered user must not throw");
     }
 
     [Test]
