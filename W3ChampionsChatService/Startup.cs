@@ -3,6 +3,7 @@ using Serilog;
 
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.HttpOverrides;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
@@ -23,18 +24,24 @@ public class Startup
         var mongoClient = new MongoClient(mongoConnectionString.Replace("'", ""));
         services.AddSingleton(mongoClient);
 
-        services.AddSignalR();
+        // SECURITY: the hub permission filter enforces Moderation on the moderator-only hub methods.
+        // The MVC [UserHasPermission] attribute is inert on SignalR, so this filter is the real gate.
+        services.AddSignalR(options => { options.AddFilter<ChatHubPermissionFilter>(); });
 
         services.AddTransient<SettingsRepository>();
         services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
         services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
         services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();
-        services.AddTransient<MuteRepository>();
+        services.AddTransient<IMuteRepository, MuteRepository>();
         services.AddTransient<UserHasPermissionFilter>();
+        services.AddTransient<ChatHubPermissionFilter>();
         services.AddHttpContextAccessor();
 
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();
+        // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
+        // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
+        services.AddSingleton<MuteReconciliationService>();
         Log.Information("Services added");
     }
 

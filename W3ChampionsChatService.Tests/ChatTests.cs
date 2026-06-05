@@ -52,6 +52,7 @@ public class ChatTests : IntegrationTestBase
             _settingsRepository,
             _connectionMapping,
             _chatHistory,
+            new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
             null);
 
         // Setup message capturing proxies
@@ -152,34 +153,32 @@ public class ChatTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task BannedUser_CannotSendMessage()
+    public async Task BannedUser_SendMessage_IsRejectedSilently()
     {
-        // Login before ban
+        // Login first (not yet banned)
         await LoginUser();
 
-        // Reset the group message flag after login
+        // Reset group flag after login
         _groupMessageSent = false;
 
-        // Setup muted player
-        var mute = new LoungeMuteRequest
-        {
-            battleTag = "peter#123",
-            endDate = DateTime.UtcNow.AddDays(1).ToString(),
-            author = "modmoto#2809"
-        };
+        // Mock Clients.Client so BanUser's PlayerBannedFromChat send doesn't NRE.
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client(It.IsAny<string>())).Returns(victimProxy.Object);
 
-        await _muteRepository.AddLoungeMute(mute);
+        // Ban the user via the canonical in-band path (BanUser), which reconciles the live cache.
+        // §7: a direct out-of-band DB write would NOT be enforced until reconnect; BanUser is the path.
+        await _chatHub.BanUser("peter#123", "bad behavior", false, DateTime.UtcNow.AddDays(1).ToString("O"));
 
-        // Set up tracking for Context.Abort()
+        // Ensure Abort is NOT called (new behavior)
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
-        // Send message
         await _chatHub.SendMessage("Hello world");
 
-        // Verify connection aborted and message not sent
-        Assert.IsTrue(abortCalled);
-        Assert.IsFalse(_groupMessageSent, "No message should be sent to the group for banned users");
+        Assert.IsFalse(abortCalled, "Context.Abort() must not be called from SendMessage");
+        Assert.IsFalse(_groupMessageSent, "No message should be broadcast to the group");
         Assert.AreEqual(0, _chatHistory.GetMessages("W3C Lounge").Count);
     }
 
@@ -246,16 +245,9 @@ public class ChatTests : IntegrationTestBase
         // Login before shadow ban
         await LoginUser();
 
-        // Setup shadow banned player
-        var mute = new LoungeMuteRequest
-        {
-            battleTag = "peter#123",
-            endDate = DateTime.UtcNow.AddDays(1).ToString(),
-            author = "modmoto#2809",
-            isShadowBan = true
-        };
-
-        await _muteRepository.AddLoungeMute(mute);
+        // Shadow-ban the user via the canonical in-band path (BanUser), which reconciles the live
+        // cache. §7: a direct out-of-band DB write would not be enforced on the send hot path.
+        await _chatHub.BanUser("peter#123", "spam", true, DateTime.UtcNow.AddDays(1).ToString("O"));
 
         // Send message
         await _chatHub.SendMessage("Hello world");
@@ -271,30 +263,30 @@ public class ChatTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task BackwardsCompatibility_RegularMuteStillWorks()
+    public async Task BackwardsCompatibility_RegularMuteStillBlocks()
     {
         // Login before ban
         await LoginUser();
 
-        // Setup regular mute (without isShadowBan property)
-        var mute = new LoungeMuteRequest
-        {
-            battleTag = "peter#123",
-            endDate = DateTime.UtcNow.AddDays(1).ToString(),
-            author = "modmoto#2809"
-            // isShadowBan defaults to false
-        };
+        _groupMessageSent = false;
 
-        await _muteRepository.AddLoungeMute(mute);
+        // Mock Clients.Client so BanUser's PlayerBannedFromChat send doesn't NRE.
+        var victimProxy = new Mock<ISingleClientProxy>();
+        victimProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _clients.Setup(c => c.Client(It.IsAny<string>())).Returns(victimProxy.Object);
 
-        // Set up tracking for Context.Abort()
+        // Regular (full) mute applied via the canonical in-band path (BanUser).
+        // §7: BanUser reconciles the live cache so enforcement is instant without a per-send DB read.
+        await _chatHub.BanUser("peter#123", "bad behavior", false, DateTime.UtcNow.AddDays(1).ToString("O"));
+
         bool abortCalled = false;
         _hubCallerContext.Setup(c => c.Abort()).Callback(() => abortCalled = true);
 
-        // Send message should result in abort
         await _chatHub.SendMessage("Hello world");
 
-        Assert.IsTrue(abortCalled);
+        // No abort from SendMessage in the new design — full-ban enforces by dropping message
+        Assert.IsFalse(abortCalled, "Context.Abort() must not be called from SendMessage");
         Assert.IsFalse(_groupMessageSent);
         Assert.AreEqual(0, _chatHistory.GetMessages("W3C Lounge").Count);
     }

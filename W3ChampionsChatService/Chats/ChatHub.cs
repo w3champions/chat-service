@@ -1,76 +1,130 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Settings;
 using Serilog;
-using W3ChampionsChatService.Authentication;
 
 [assembly: InternalsVisibleTo("W3ChampionsChatService.Tests")]
 namespace W3ChampionsChatService.Chats;
 
 public class ChatHub(
     IChatAuthenticationService authenticationService,
-    MuteRepository muteRepository,
+    IMuteRepository muteRepository,
     SettingsRepository settingsRepository,
     ConnectionMapping connections,
     ChatHistory chatHistory,
+    MuteReconciliationService muteReconciliation,
     IHttpContextAccessor contextAccessor) : Hub
 {
     private readonly IChatAuthenticationService _authenticationService = authenticationService;
-    private readonly MuteRepository _muteRepository = muteRepository;
+    private readonly IMuteRepository _muteRepository = muteRepository;
     private readonly SettingsRepository _settingsRepository = settingsRepository;
     private readonly ConnectionMapping _connections = connections;
     private readonly ChatHistory _chatHistory = chatHistory;
+    private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly IHttpContextAccessor _contextAccessor = contextAccessor;
+
+    // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
+    private const int MaxMessageLength = 1024;
+
+    // Cap how much of an arbitrary user message is written to logs (the shadow-drop audit line) so a
+    // single huge message can't bloat the logs.
+    private const int MaxLoggedMessageLength = 500;
+
+    private static string TruncateForLog(string message) =>
+        message.Length <= MaxLoggedMessageLength
+            ? message
+            : message[..MaxLoggedMessageLength] + "…[truncated]";
 
     public async Task SendMessage(string message)
     {
         var trimmedMessage = message.Trim();
-        if (!string.IsNullOrEmpty(trimmedMessage))
+        if (string.IsNullOrEmpty(trimmedMessage))
         {
-            var chatRoom = _connections.GetRoom(Context.ConnectionId);
-            var user = _connections.GetUser(Context.ConnectionId);
+            return;
+        }
 
-            // Check if player is on Lounge Mute list. If yes, handle accordingly.
-            var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
-            if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) <= 0)
-            {
-                mute = null;
-            }
+        var chatRoom = _connections.GetRoom(Context.ConnectionId);
+        var user = _connections.GetUser(Context.ConnectionId);
 
-            if (mute != null && !mute.isShadowBan)
+        // R6: Membership prerequisite. G1/G2: graceful reject — return, never Context.Abort(), never throw.
+        // Split so the log carries the battletag whenever we have a user (an unauthenticated connection
+        // has none — log the ConnectionId only).
+        if (user == null)
+        {
+            Log.Warning("SendMessage rejected: unauthenticated connection {ConnectionId}", Context.ConnectionId);
+            return;
+        }
+        if (chatRoom == null)
+        {
+            Log.Warning("SendMessage rejected: authenticated user {BattleTag} has no room membership (connection {ConnectionId})",
+                user.BattleTag, Context.ConnectionId);
+            return;
+        }
+
+        // Reject over-length messages gracefully (user is non-null here so the log carries the battletag).
+        if (trimmedMessage.Length > MaxMessageLength)
+        {
+            Log.Warning("SendMessage rejected: message from {BattleTag} exceeds {MaxLength} characters ({ActualLength})",
+                user.BattleTag, MaxMessageLength, trimmedMessage.Length);
+            return;
+        }
+
+        // Mutes only apply in public lounge/ladder rooms; clan/lobby rooms are fully exempt.
+        // Read the per-user cached status once + classify the room — ZERO DB reads on the hot path.
+        // The cache is seeded authoritatively at login (every path) and reconciled live by every ban
+        // WRITE path (the hub's BanUser AND the REST MuteController, via MuteReconciliationService),
+        // so consulting GetEffectiveMuteStatus alone is sufficient and expiry-aware. RESIDUAL TRADE-OFF:
+        // a ban written DIRECTLY to the Mongo collection — bypassing BOTH the hub and the REST controller
+        // (e.g. a manual DB edit or migration) — only takes effect on the user's next (re)connect; we
+        // deliberately do NOT re-query the DB per send.
+        var inPublicRoom = DefaultChatRooms.IsPublicRoom(chatRoom);
+        var muteStatus = inPublicRoom
+            ? _connections.GetEffectiveMuteStatus(Context.ConnectionId, DateTime.UtcNow)
+            : MuteStatus.None;
+
+        if (inPublicRoom && muteStatus == MuteStatus.Full)
+        {
+            // Defense-in-depth: full-banned user should never be in a public room,
+            // but reject silently if they somehow are.
+            // G1: the LEGACY SendMessage called Context.Abort() here for full bans — REMOVED.
+            // G2: reject without abort, without throwing; connection + membership stay valid.
+            Log.Warning("Full-banned user {BattleTag} attempted to send in public room {Room} — rejected",
+                user.BattleTag, chatRoom);
+            return;
+        }
+
+        var chatMessage = new ChatMessage(user, trimmedMessage);
+
+        if (!await ProcessChatCommand(chatMessage))
+        {
+            if (inPublicRoom && muteStatus == MuteStatus.Shadow)
             {
-                // Regular mute: disconnect
-                await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
-                Context.Abort();
+                // Drop: echo only to caller (illusion of sending). The message reaches no one else.
+                // Log the dropped attempt (incl. content, bounded) so moderators can audit shadow activity.
+                Log.Information("Shadow banned user {BattleTag} attempted to send in public room {Room} — dropped: {Message}",
+                    user.BattleTag, chatRoom, TruncateForLog(trimmedMessage));
+                await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
             }
             else
             {
-                var chatMessage = new ChatMessage(user, trimmedMessage);
-                if (!await ProcessChatCommand(chatMessage))
-                {
-                    if (mute != null && mute.isShadowBan)
-                    {
-                        // Only send to caller to make them think it was sent
-                        Log.Information("Shadow banned user {BattleTag} sent message {Message}", user.BattleTag, trimmedMessage);
-                        await Clients.Caller.SendAsync("ReceiveMessage", chatMessage);
-                    }
-                    else
-                    {
-                        _chatHistory.AddMessage(chatRoom, chatMessage);
-                        await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
-                    }
-                }
+                // Broadcast to room: covers no-ban in any room AND banned users in exempt rooms.
+                // Bans only restrict sending in the public lounge/ladder rooms; clan/lobby rooms
+                // are fully exempt — even full- and shadow-banned users can post freely there.
+                _chatHistory.AddMessage(chatRoom, chatMessage);
+                await Clients.Group(chatRoom).SendAsync("ReceiveMessage", chatMessage);
             }
         }
     }
 
     /// <summary>
-    /// Processes chat commands and returns a boolean indicating whether a command was processed 
+    /// Processes chat commands and returns a boolean indicating whether a command was processed
     /// or the message should be sent as a normal message.
     /// </summary>
     /// <param name="message">The chat message to process.</param>
@@ -117,9 +171,16 @@ public class ChatHub(
         var user = _connections.GetUser(Context.ConnectionId);
         if (user != null)
         {
+            // Capture the room BEFORE Remove. Shadow users are full room members (no presence-hiding),
+            // so UserLeft is unconditional on room membership — only guard against a null room
+            // (a full-ban no-clan user has no room — G3/G2: no crash).
             var chatRoom = _connections.GetRoom(Context.ConnectionId);
             _connections.Remove(Context.ConnectionId);
-            await Clients.Group(chatRoom).SendAsync("UserLeft", user);
+
+            if (chatRoom != null)
+            {
+                await Clients.Group(chatRoom).SendAsync("UserLeft", user);
+            }
         }
 
         await base.OnDisconnectedAsync(exception);
@@ -130,16 +191,52 @@ public class ChatHub(
         var oldRoom = _connections.GetRoom(Context.ConnectionId);
         var user = _connections.GetUser(Context.ConnectionId);
 
+        // R6/G1/G2: a connection with no user (not logged in, or a no-clan full-ban with no seat)
+        // cannot switch rooms. Reject gracefully — return, never Context.Abort(), never throw.
+        if (user == null)
+        {
+            Log.Warning("SwitchRoom rejected: connection {ConnectionId} has no user", Context.ConnectionId);
+            return;
+        }
+
+        // Resolve the per-user cached status once. The cache is seeded at login (every path) and
+        // reconciled live by every ban write path (hub + REST controller, via MuteReconciliationService),
+        // so it is authoritative — consult it ONLY, never the DB. EffectiveStatus is the single expiry
+        // rule (expired ban → None). Capture the cached endDate so we can re-populate the cache after
+        // Remove (which clears it) + Add.
+        var hasCachedEntry = _connections.TryGetMute(Context.ConnectionId, out var preSwitchCached);
+        var cachedEndDate = hasCachedEntry ? preSwitchCached.EndDate : DateTime.MinValue;
+        var targetIsPublic = DefaultChatRooms.IsPublicRoom(chatRoom);
+        var muteStatus = hasCachedEntry ? preSwitchCached.EffectiveStatus(DateTime.UtcNow) : MuteStatus.None;
+
+        // G1/G2: Full-ban → graceful reject BEFORE any Remove/Add. User stays in their current room.
+        // No Context.Abort(), no throw, no connection teardown.
+        if (targetIsPublic && muteStatus == MuteStatus.Full)
+        {
+            Log.Information("Full-banned user {BattleTag} rejected from joining public room {Room} — staying in {OldRoom}",
+                user.BattleTag, chatRoom, oldRoom);
+            return;
+        }
+
         _connections.Remove(Context.ConnectionId);
         _connections.Add(Context.ConnectionId, chatRoom, user);
+        // Re-cache the mute status + endDate after Remove (which clears it) + Add — the cache survives
+        // the switch with the same authoritative status it had before.
+        _connections.SetMute(Context.ConnectionId, muteStatus, cachedEndDate);
 
-        await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldRoom);
+        // Shadow users are full room members — no presence-hiding. UserLeft/UserEntered are
+        // unconditional on room membership; the only remaining shadow effect is the SendMessage drop.
+        if (oldRoom != null)
+        {
+            await Groups.RemoveFromGroupAsync(Context.ConnectionId, oldRoom);
+            await Clients.Group(oldRoom).SendAsync("UserLeft", user);
+        }
+
         await Groups.AddToGroupAsync(Context.ConnectionId, chatRoom);
 
-        var usersOfRoom = _connections.GetUsersOfRoom(chatRoom);
-        await Clients.Group(oldRoom).SendAsync("UserLeft", user);
         await Clients.Group(chatRoom).SendAsync("UserEntered", user);
-        await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(chatRoom), chatRoom);
+        // Caller receives the full member list of the room — every member is visible.
+        await Clients.Caller.SendAsync("StartChat", _connections.GetUsersOfRoom(chatRoom), _chatHistory.GetMessages(chatRoom), chatRoom);
 
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
         memberShip.Update(chatRoom);
@@ -195,35 +292,93 @@ public class ChatHub(
             reason = reason
         };
 
-        await _muteRepository.AddLoungeMute(loungeMuteRequest);
+        // Spec §12: BanUser is one of the two canonical IN-BAND ban paths (the other is the REST
+        // MuteController). Both delegate to MuteReconciliationService.ApplyBanAsync, which persists the
+        // ban AND reconciles every live connection's mute cache, so enforcement is instant without a
+        // per-send DB read. Only a ban written DIRECTLY to the Mongo collection (bypassing both paths —
+        // e.g. a manual DB edit) takes effect on the target's next reconnect.
+        await _muteReconciliation.ApplyBanAsync(loungeMuteRequest);
     }
 
     internal async Task LoginAsAuthenticated(ChatUser user)
     {
         var memberShip = await _settingsRepository.Load(user.BattleTag) ?? new ChatSettings(user.BattleTag);
-
         var mute = await _muteRepository.GetMutedPlayer(user.BattleTag);
 
-        if (mute != null && DateTime.Compare(mute.endDate, DateTime.UtcNow) > 0 && !mute.isShadowBan)
+        // Treat expired mutes as no mute
+        if (mute != null && !mute.IsActive(DateTime.UtcNow))
         {
-            Log.Information("Declining connection for {BattleTag} because they are banned until {EndDate}", user.BattleTag, mute.endDate);
-            await Clients.Caller.SendAsync("PlayerBannedFromChat", mute);
-            Context.Abort();
+            mute = null;
+        }
+
+        var isFullBan = mute != null && !mute.isShadowBan;
+        var isShadowBan = mute != null && mute.isShadowBan;
+
+        if (isFullBan)
+        {
+            // G1: do NOT abort — connect the user. G5: still send legacy PlayerBannedFromChat.
+            Log.Information("Full-banned user {BattleTag} connecting — sending ban notice, filtering rooms", user.BattleTag);
+
+            // G5: legacy ban notice so old clients render their notice.
+            // SECURITY: send only the expiry — never leak the moderation reason or the shadow flag.
+            // The event name + camelCase `endDate` field stay unchanged for backward-compat.
+            await Clients.Caller.SendAsync("PlayerBannedFromChat", new { endDate = mute.endDate });
+
+            // Filtered channel list excludes all public lounge/ladder rooms (spec §5.1).
+            var availableRooms = new List<string>();
+
+            // Seed the per-connection mute cache authoritatively for BOTH branches so the send/switch
+            // hot paths enforce from the cache alone (zero DB reads), even on the no-clan/no-room edge.
+            _connections.SetMute(Context.ConnectionId, MuteStatus.Full, mute.endDate);
+            // Register the connection→user mapping so GetUser is authoritative even when the user is
+            // seated in no room (no-clan branch below). The clan branch's Add also registers.
+            _connections.RegisterUser(Context.ConnectionId, user);
+
+            // Seat in clan room if available, else no room (spec D2 — empty state).
+            var safeRoom = string.IsNullOrWhiteSpace(user.ClanTag) ? null : $"clan {user.ClanTag}";
+
+            if (safeRoom != null)
+            {
+                _connections.Add(Context.ConnectionId, safeRoom, user);
+                await Groups.AddToGroupAsync(Context.ConnectionId, safeRoom);
+                await Clients.Group(safeRoom).SendAsync("UserEntered", user);
+                // G3: StartChat with the seated room's full member list.
+                await Clients.Caller.SendAsync("StartChat", _connections.GetUsersOfRoom(safeRoom), _chatHistory.GetMessages(safeRoom), safeRoom, availableRooms);
+            }
+            else
+            {
+                // No clan: not seated in any room (spec D2), but the connection→user mapping IS
+                // registered above, so GetUser is non-null. A later SwitchRoom into a public room is
+                // rejected by the Full→public cache gate (not by a user==null guard); a switch into an
+                // exempt clan/lobby room is allowed. The mute cache (seeded above) enforces the full ban
+                // from the cache on any subsequent send (zero DB read).
+                // G3: STILL emit a StartChat — an empty-room payload — so legacy clients can initialize.
+                await Clients.Caller.SendAsync("StartChat", new List<ChatUser>(), new List<ChatMessage>(), (string)null, availableRooms);
+            }
         }
         else
         {
-            Log.Information("Accepting connection for {BattleTag} and adding to room {Room}", user.BattleTag, memberShip.DefaultChat);
+            // Shadow ban or no ban: connect as normal (G1 — never abort).
+            var muteStatus = isShadowBan ? MuteStatus.Shadow : MuteStatus.None;
+            var muteEndDate = mute?.endDate ?? DateTime.MinValue;
+            Log.Information("Accepting connection for {BattleTag}, mute={MuteStatus}, room={Room}",
+                user.BattleTag, muteStatus, memberShip.DefaultChat);
+
             _connections.Add(Context.ConnectionId, memberShip.DefaultChat, user);
+            // Cache status + endDate at login so every subsequent send/join works from the cache.
+            _connections.SetMute(Context.ConnectionId, muteStatus, muteEndDate);
             await Groups.AddToGroupAsync(Context.ConnectionId, memberShip.DefaultChat);
-            var usersOfRoom = _connections.GetUsersOfRoom(memberShip.DefaultChat);
             await Clients.Group(memberShip.DefaultChat).SendAsync("UserEntered", user);
-            await Clients.Caller.SendAsync("StartChat", usersOfRoom, _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat, DefaultChatRooms.Rooms);
+            await Clients.Caller.SendAsync("StartChat", _connections.GetUsersOfRoom(memberShip.DefaultChat), _chatHistory.GetMessages(memberShip.DefaultChat), memberShip.DefaultChat, DefaultChatRooms.Rooms);
         }
     }
 
     public async Task UpdateUserProfilePicture(string chatRoom, ProfilePicture profilePicture)
     {
         var user = _connections.GetUser(Context.ConnectionId);
+        // Graceful guard: an unauthenticated/unregistered connection has no user — return without
+        // dereferencing (prevents a latent NRE). No Context.Abort.
+        if (user == null) return;
         user.ProfilePicture = profilePicture;
         await Clients.Group(chatRoom).SendAsync("UserUpdated", user);
     }

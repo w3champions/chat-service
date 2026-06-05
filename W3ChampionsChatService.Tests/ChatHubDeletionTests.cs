@@ -47,6 +47,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _settingsRepository,
             _connectionMapping,
             _chatHistory,
+            new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
             null);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
