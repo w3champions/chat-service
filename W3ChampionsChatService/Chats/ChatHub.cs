@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Settings;
 using Serilog;
@@ -242,7 +243,7 @@ public class ChatHub(
         await _settingsRepository.Save(memberShip);
     }
 
-    // Moderation enforced by ChatHubPermissionFilter (the [UserHasPermission] MVC attribute is inert on SignalR).
+    [UserHasPermission(EPermission.Moderation)]
     public async Task DeleteMessage(string messageId)
     {
         var deletedMessage = _chatHistory.DeleteMessage(messageId);
@@ -256,7 +257,7 @@ public class ChatHub(
         }
     }
 
-    // Moderation enforced by ChatHubPermissionFilter (the [UserHasPermission] MVC attribute is inert on SignalR).
+    [UserHasPermission(EPermission.Moderation)]
     public async Task PurgeMessagesFromUser(string battleTag)
     {
         var deletedMessages = _chatHistory.DeleteMessagesFromUser(battleTag);
@@ -275,7 +276,7 @@ public class ChatHub(
         }
     }
 
-    // Moderation enforced by ChatHubPermissionFilter (the [UserHasPermission] MVC attribute is inert on SignalR).
+    [UserHasPermission(EPermission.Moderation)]
     public async Task BanUser(string battleTag, string reason, bool isShadowBan, string endDate)
     {
         var adminUser = _connections.GetUser(Context.ConnectionId);
