@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using Microsoft.IdentityModel.Tokens;
+using Serilog;
 
 namespace W3ChampionsChatService.Authentication;
 
@@ -48,9 +49,17 @@ public class W3CUserAuthentication
             var btag = claims.Claims.First(c => c.Type == "battleTag").Value;
             var isAdmin = Boolean.Parse(claims.Claims.First(c => c.Type == "isAdmin").Value);
             var name = claims.Claims.First(c => c.Type == "name").Value;
+            // Keep only the permissions chat-service recognizes. identification-service grows its own
+            // EPermission vocabulary independently (e.g. it added "Warnings" in #76, which this enum does
+            // not contain); an unrecognized value must NOT fail the whole authentication. A hard
+            // Enum.Parse on an unknown value throws, gets swallowed below, and the user is silently
+            // rejected at connect with only a generic "failed to authenticate" warning. Skip unknown
+            // values via TryParse instead — chat-service only acts on the subset it understands.
             var permissions = claims.Claims
                     .Where(claim => claim.Type == "permissions")
-                    .Select(x => Enum.Parse<EPermission>(x.Value))
+                    .Select(x => Enum.TryParse<EPermission>(x.Value, out var permission) ? (EPermission?)permission : null)
+                    .Where(permission => permission.HasValue)
+                    .Select(permission => permission.Value)
                     .ToHashSet();
             return new W3CUserAuthentication
             {
@@ -60,8 +69,12 @@ public class W3CUserAuthentication
                 Permissions = permissions
             };
         }
-        catch (Exception)
+        catch (Exception ex)
         {
+            // Never swallow silently: a swallowed exception here surfaces only as a generic
+            // "Receiver {ConnectionId} failed to authenticate" warning in ChatHub, making auth failures
+            // undiagnosable. Log the real reason (bad signature, malformed token, missing claim, …).
+            Log.Warning(ex, "Failed to validate chat authentication token");
             return null;
         }
     }

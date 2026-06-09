@@ -1,4 +1,10 @@
+using System;
 using System.Collections.Generic;
+using System.IdentityModel.Tokens.Jwt;
+using System.Linq;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text.Json;
 using Microsoft.Extensions.Primitives;
 using Microsoft.IdentityModel.Tokens;
 using NUnit.Framework;
@@ -77,5 +83,76 @@ public class AuthenticationTests
 
         Assert.Throws<SecurityTokenValidationException>(() =>
             UserHasPermissionFilter.GetToken(authorization));
+    }
+
+    // ── Permission-vocabulary drift between identification-service and chat-service ────────
+    //
+    // identification-service can grant permissions that chat-service's EPermission enum does not yet
+    // contain (e.g. "Warnings", added id-service-side in #76 after chat-service's enum was last
+    // touched). Its JWT carries `permissions` as a serialized JSON array — the JWT handler expands it
+    // into one claim per element on read. chat-service must tolerate an unrecognized element: the user
+    // still authenticates and the permissions it DOES understand are retained. A hard Enum.Parse on an
+    // unknown value throws, is swallowed by FromJWT's catch, and the whole login silently fails with
+    // only "Receiver {ConnectionId} failed to authenticate" in the logs.
+
+    /// <summary>
+    /// Builds a JWT signed with a freshly-generated RSA keypair, carrying the same claim shape the
+    /// identification-service emits — crucially the <c>permissions</c> claim as a serialized JSON array
+    /// (<see cref="JsonClaimValueTypes.JsonArray"/>), which the handler expands into one claim per
+    /// element on read. Returns the token plus the matching public-key PEM that
+    /// <see cref="W3CUserAuthentication.FromJWT"/> validates against.
+    /// </summary>
+    private static (string jwt, string publicKeyPem) CreateSignedJwt(string battleTag, bool isAdmin, IEnumerable<string> permissions)
+    {
+        using var rsa = RSA.Create(2048);
+        var publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
+
+        var signingCredentials = new SigningCredentials(new RsaSecurityKey(rsa), SecurityAlgorithms.RsaSha256)
+        {
+            CryptoProviderFactory = new CryptoProviderFactory { CacheSignatureProviders = false },
+        };
+
+        var token = new JwtSecurityToken(
+            claims: new[]
+            {
+                new Claim("battleTag", battleTag),
+                new Claim("isAdmin", isAdmin.ToString()),
+                new Claim("name", battleTag.Split('#')[0]),
+                new Claim("permissions", JsonSerializer.Serialize(permissions.ToList()), JsonClaimValueTypes.JsonArray),
+            },
+            signingCredentials: signingCredentials,
+            expires: DateTime.UtcNow.AddDays(7));
+
+        return (new JwtSecurityTokenHandler().WriteToken(token), publicKeyPem);
+    }
+
+    [Test]
+    public void FromJWT_TokenWithPermissionUnknownToChatService_StillAuthenticates()
+    {
+        // Reproduces the production incident: a moderator was granted "Warnings" (unknown to chat-service).
+        var (jwt, publicKeyPem) = CreateSignedJwt("moderator#123", isAdmin: true,
+            new[] { "Moderation", "Warnings" });
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem);
+
+        Assert.IsNotNull(result, "A user holding a permission unknown to chat-service must still authenticate");
+        Assert.AreEqual("moderator#123", result.BattleTag);
+        Assert.IsTrue(result.IsAdmin);
+        Assert.IsTrue(result.Permissions.Contains(EPermission.Moderation), "Known permissions must be retained");
+        Assert.AreEqual(1, result.Permissions.Count, "The unknown 'Warnings' permission must be dropped, not crash the parse");
+    }
+
+    [Test]
+    public void FromJWT_TokenWithOnlyKnownPermissions_ParsesAll()
+    {
+        // Control: proves the JSON-array claim is expanded into per-element claims and all known
+        // permissions parse. Passes both before and after the tolerant-parse fix.
+        var (jwt, publicKeyPem) = CreateSignedJwt("admin#1", isAdmin: true,
+            new[] { "Moderation", "Queue" });
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem);
+
+        Assert.IsNotNull(result);
+        CollectionAssert.AreEquivalent(new[] { EPermission.Moderation, EPermission.Queue }, result.Permissions);
     }
 }
