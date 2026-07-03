@@ -66,6 +66,12 @@ public class Startup
         // share the SAME in-memory session state.
         services.AddSingleton<ISessionRegistry, SessionRegistry>();
 
+        // C3 hub protocol core
+        // Singleton: the injectable-clock foundation for every timer-driven fan-out service (tasks
+        // 13, 14, 15) — tests substitute Microsoft.Extensions.Time.Testing.FakeTimeProvider so those
+        // services never depend on real wall-clock delays.
+        services.AddSingleton(TimeProvider.System);
+
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).

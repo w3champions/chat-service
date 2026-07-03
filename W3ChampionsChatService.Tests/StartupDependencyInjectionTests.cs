@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -125,6 +126,20 @@ public class StartupDependencyInjectionTests
         var repo = provider.GetRequiredService<IMuteRepository>();
         Assert.IsInstanceOf<MuteRepository>(repo,
             "IMuteRepository must resolve to the concrete MuteRepository");
+    }
+
+    [Test]
+    public void TimeProvider_IsRegisteredAsSystemSingleton()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<TimeProvider>();
+        var second = provider.GetRequiredService<TimeProvider>();
+
+        Assert.AreSame(first, second,
+            "TimeProvider MUST be a singleton — every timer-driven fan-out service (C3 tasks 13/14/15) needs the SAME injectable clock");
+        Assert.AreSame(TimeProvider.System, first,
+            "the production TimeProvider registration must be TimeProvider.System (real wall-clock time)");
     }
 
     [Test]
