@@ -181,6 +181,18 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void ActivityCoalescer_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<ActivityCoalescer>();
+        var second = provider.GetRequiredService<ActivityCoalescer>();
+
+        Assert.AreSame(first, second,
+            "ActivityCoalescer MUST be a singleton — it holds the per-(connection, channel) coalescing window state that the send-path fan-out routing writes and the flush hosted service (Task 15) drains; a transient would fragment that shared window state");
+    }
+
+    [Test]
     public void FanOutEngine_IsSingleton_SharedAcrossResolutions()
     {
         using var provider = BuildProvider();
@@ -247,5 +259,15 @@ public class StartupDependencyInjectionTests
             "index creation + catalog seeding must run at startup");
         Assert.IsTrue(hostedServices.Any(s => s is WeeklyCleanupService),
             "weekly cleanup must be scheduled");
+    }
+
+    [Test]
+    public void FanOutFlushService_IsHostedService()
+    {
+        using var provider = BuildProvider();
+
+        var hostedServices = provider.GetServices<IHostedService>().ToList();
+        Assert.IsTrue(hostedServices.Any(s => s is FanOutFlushService),
+            "the FanOutFlushService MUST be registered as a hosted service — it is the single 1s clock that drives the Task 13 coalescer and Task 14 accumulator FlushDue calls in production");
     }
 }

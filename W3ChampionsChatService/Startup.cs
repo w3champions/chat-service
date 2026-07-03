@@ -109,6 +109,12 @@ public class Startup
         // routing; the flush machinery + the sibling accumulator singleton stay Task 15's).
         services.AddSingleton<FanOutEngine>();
 
+        // Task 15: the single production driver behind the Task 13/14 aggregators. Hosted service — its
+        // 1s PeriodicTimer is the ONLY thing that calls FlushDue in production, draining the coalescer
+        // (10s) and the accumulator (5s) on the injected TimeProvider clock. Without it the pure,
+        // deterministic-time sinks above would never fire outside tests.
+        services.AddHostedService<FanOutFlushService>();
+
         // Task 10: JoinChannel's implicit-semiPublic-creation throttle. Singleton — a transient
         // registration would fragment each battleTag's per-hour creation counter across hub
         // invocations, defeating the cap. A SEPARATE singleton from MintRateLimiter, not a second
