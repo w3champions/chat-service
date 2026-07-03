@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Domain;
@@ -22,7 +23,7 @@ public static class ChatDomainIndexes
         await EnsureChannelIndexes(db);
         await EnsureMembershipIndexes(db);
         await EnsureMessageIndexes(db);
-        // Task 7 extends: mention_inbox
+        await EnsureMentionInboxIndexes(db);
     }
 
     private static async Task EnsureChannelIndexes(IMongoDatabase db)
@@ -71,6 +72,20 @@ public static class ChatDomainIndexes
                 new CreateIndexOptions { Name = "ix_sender_sentAt" }),
             new CreateIndexModel<ChannelMessage>(
                 Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ExpiresAt),
+                new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
+        ]);
+    }
+
+    private static async Task EnsureMentionInboxIndexes(IMongoDatabase db)
+    {
+        var inbox = db.GetCollection<MentionInboxEntry>(ChatCollections.MentionInbox);
+        await inbox.Indexes.CreateManyAsync(
+        [
+            new CreateIndexModel<MentionInboxEntry>(
+                Builders<MentionInboxEntry>.IndexKeys.Ascending(e => e.BattleTag),
+                new CreateIndexOptions { Name = "ix_battleTag" }),
+            new CreateIndexModel<MentionInboxEntry>(
+                Builders<MentionInboxEntry>.IndexKeys.Ascending(e => e.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
         ]);
     }
