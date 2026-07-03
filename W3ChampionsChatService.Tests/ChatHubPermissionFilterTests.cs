@@ -1,14 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Http.Connections.Features;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Sessions;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -16,25 +14,23 @@ namespace W3ChampionsChatService.Tests;
 /// SECURITY tests for <see cref="ChatHubPermissionFilter"/> — the generic, ATTRIBUTE-DRIVEN gate on
 /// hub methods. The required permission is whatever the invoked method declares via
 /// <c>[UserHasPermission(...)]</c>; the filter reads it off <c>invocationContext.HubMethod</c> via
-/// reflection (no hardcoded method-name list). The auth resolution is verified against the real
-/// <see cref="IW3CAuthenticationService"/> / <see cref="W3CUserAuthentication"/> API
-/// (GetUserByToken → IsAdmin + Permissions).
+/// reflection (no hardcoded method-name list). The authorization decision requires the caller's
+/// identity to be an admin AND to hold the declared permission.
 /// <para>
-/// The token is driven through the REAL source the filter uses in production:
-/// <c>invocationContext.Context.GetHttpContext()</c>, which reads the connection's
-/// <see cref="IHttpContextFeature"/>. These tests do NOT mock <c>IHttpContextAccessor</c> — that
-/// accessor is null for hub-method invocations over a live socket, so a test relying on it would be a
-/// false green. A revert to IHttpContextAccessor makes the token-source regression test fail.
+/// C2: identity is resolved through the REAL production path — a per-connection session snapshot in
+/// <see cref="ISessionRegistry"/>, keyed by <c>Context.ConnectionId</c>. These tests seed identity via
+/// a real <see cref="SessionRegistry"/> (<c>Register(connectionId, identity, null)</c>) and drive the
+/// caller's connectionId through a <see cref="HubCallerContext"/> that stubs ONLY <c>.ConnectionId</c>.
+/// No JWT, no HttpContext, and no <c>IHttpContextAccessor</c> are involved: the filter never reads the
+/// query string anymore, so a fail-closed connection is one with no (or a displaced) registry session.
 /// </para>
 /// </summary>
 public class ChatHubPermissionFilterTests
 {
-    private const string FakeToken = "fake.jwt.token";
-
     /// <summary>
     /// A purpose-built hub whose methods declare different (or no) <c>[UserHasPermission]</c>
     /// attributes — so the tests can prove the required permission genuinely comes from the attribute,
-    /// not a constant baked into the filter. Methods are never invoked (the filter's `next` is mocked).
+    /// not a constant baked into the filter. Methods are never invoked (the filter's `next` is stubbed).
     /// </summary>
     private class TestHub : Hub
     {
@@ -47,23 +43,24 @@ public class ChatHubPermissionFilterTests
         public void Unprotected() { }
     }
 
-    private static W3CUserAuthentication User(bool isAdmin, params EPermission[] permissions) => new()
+    private static W3CUserAuthentication Identity(bool isAdmin, params EPermission[] permissions) =>
+        Identity("user#1", isAdmin, permissions);
+
+    private static W3CUserAuthentication Identity(string battleTag, bool isAdmin, params EPermission[] permissions) => new()
     {
-        BattleTag = "user#1",
+        BattleTag = battleTag,
         Name = "user",
         IsAdmin = isAdmin,
         Permissions = new HashSet<EPermission>(permissions),
     };
 
     /// <summary>
-    /// Builds a HubInvocationContext for <paramref name="hubMethodName"/> on <typeparamref name="THub"/>
-    /// whose <c>Context.GetHttpContext()</c> returns a DefaultHttpContext carrying <paramref name="token"/>
-    /// in <c>Request.Query["access_token"]</c> — exactly how SignalR exposes the handshake HttpContext
-    /// during a hub-method invocation. Pass <c>token = null</c> to simulate a connection whose
-    /// HttpContext has no access_token; <paramref name="withHttpContext"/> = false simulates no
-    /// HttpContext at all (GetHttpContext returns null).
+    /// Builds a real <see cref="HubInvocationContext"/> for <paramref name="hubMethodName"/> on
+    /// <typeparamref name="THub"/> whose <c>Context.ConnectionId</c> is <paramref name="connectionId"/>.
+    /// Nothing else on the context is stubbed — the filter resolves identity from the registry by this
+    /// connectionId alone (no FeatureCollection, no HttpContext, no accessor).
     /// </summary>
-    private static HubInvocationContext BuildContext<THub>(string hubMethodName, string token = FakeToken, bool withHttpContext = true)
+    private static HubInvocationContext BuildContext<THub>(string hubMethodName, string connectionId)
         where THub : Hub
     {
         var methodInfo = typeof(THub).GetMethod(hubMethodName)
@@ -71,32 +68,22 @@ public class ChatHubPermissionFilterTests
         var hub = new Mock<Hub>().Object;
         var serviceProvider = new Mock<IServiceProvider>().Object;
 
-        // The connection's feature collection is where GetHttpContext() reads the HttpContext from
-        // (SignalR uses the IHttpContextFeature from Microsoft.AspNetCore.Http.Connections.Features).
-        var features = new FeatureCollection();
-        if (withHttpContext)
-        {
-            var httpContext = new DefaultHttpContext();
-            if (token != null)
-            {
-                httpContext.Request.QueryString = new QueryString($"?access_token={token}");
-            }
-            var httpContextFeature = new Mock<IHttpContextFeature>();
-            httpContextFeature.Setup(f => f.HttpContext).Returns(httpContext);
-            features.Set<IHttpContextFeature>(httpContextFeature.Object);
-        }
-
         var callerContext = new Mock<HubCallerContext>();
-        callerContext.Setup(c => c.Features).Returns(features);
+        callerContext.Setup(c => c.ConnectionId).Returns(connectionId);
 
         return new HubInvocationContext(callerContext.Object, serviceProvider, hub, methodInfo, Array.Empty<object>());
     }
 
-    private static ChatHubPermissionFilter BuildFilter(W3CUserAuthentication resolved)
+    /// <summary>
+    /// A filter backed by a REAL registry in which <paramref name="connectionId"/> maps to
+    /// <paramref name="identity"/> — the exact seam the hub uses at connect (<c>Register(..., null)</c>
+    /// context is fine here; the filter never touches it).
+    /// </summary>
+    private static ChatHubPermissionFilter FilterWith(string connectionId, W3CUserAuthentication identity)
     {
-        var authService = new Mock<IW3CAuthenticationService>();
-        authService.Setup(a => a.GetUserByToken(It.IsAny<string>())).Returns(resolved);
-        return new ChatHubPermissionFilter(authService.Object);
+        var registry = new SessionRegistry();
+        registry.Register(connectionId, identity, null);
+        return new ChatHubPermissionFilter(registry);
     }
 
     private static ValueTask<object> PassThrough(HubInvocationContext _) => new((object)"ok");
@@ -109,16 +96,17 @@ public class ChatHubPermissionFilterTests
     public void RealChatHub_ModeratorOnlyMethods_DeclareTheAttribute_AndAreEnforced(string method)
     {
         // Drives the ACTUAL ChatHub method metadata: the attribute must be present (the filter reads it),
-        // and a non-moderator is rejected.
+        // and a REGISTERED non-moderator connection is rejected (acceptance 6).
         var attrs = typeof(ChatHub).GetMethod(method)
             .GetCustomAttributes(typeof(UserHasPermissionAttribute), true);
         Assert.IsNotEmpty(attrs, $"{method} must declare [UserHasPermission] (the filter enforces what it declares)");
 
-        var filter = BuildFilter(User(isAdmin: false));
-        var ctx = BuildContext<ChatHub>(method);
+        const string connectionId = "conn-nonmod";
+        var filter = FilterWith(connectionId, Identity(isAdmin: false));
+        var ctx = BuildContext<ChatHub>(method, connectionId);
 
         Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
-            $"A non-moderator must be rejected from {method}");
+            $"A registered non-moderator must be rejected from {method}");
     }
 
     // ── Attribute-driven enforcement (purpose-built TestHub) ──────────────────────────────
@@ -126,8 +114,9 @@ public class ChatHubPermissionFilterTests
     [Test]
     public void AttributedMethod_NonModerator_ThrowsHubException()
     {
-        var filter = BuildFilter(User(isAdmin: false));
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration));
+        const string connectionId = "conn-1";
+        var filter = FilterWith(connectionId, Identity(isAdmin: false));
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), connectionId);
 
         Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
             "A non-moderator must be rejected from a [UserHasPermission(Moderation)] method");
@@ -137,8 +126,9 @@ public class ChatHubPermissionFilterTests
     public void AttributedMethod_AdminWithoutThatPermission_ThrowsHubException()
     {
         // Admin, but holds a DIFFERENT permission than the one the method declares → rejected.
-        var filter = BuildFilter(User(isAdmin: true, EPermission.Maps));
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration));
+        const string connectionId = "conn-1";
+        var filter = FilterWith(connectionId, Identity(isAdmin: true, EPermission.Maps));
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), connectionId);
 
         Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
             "An admin without the declared permission must be rejected");
@@ -147,8 +137,9 @@ public class ChatHubPermissionFilterTests
     [Test]
     public async Task AttributedMethod_AdminWithDeclaredPermission_PassesThrough()
     {
-        var filter = BuildFilter(User(isAdmin: true, EPermission.Moderation));
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration));
+        const string connectionId = "conn-1";
+        var filter = FilterWith(connectionId, Identity(isAdmin: true, EPermission.Moderation));
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), connectionId);
 
         var result = await filter.InvokeMethodAsync(ctx, PassThrough);
 
@@ -160,8 +151,9 @@ public class ChatHubPermissionFilterTests
     {
         // The method declares Queue (not Moderation). A user holding ONLY Moderation must be REJECTED,
         // proving the required permission comes from the attribute, not a Moderation constant in the filter.
-        var filter = BuildFilter(User(isAdmin: true, EPermission.Moderation));
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresQueue));
+        const string connectionId = "conn-1";
+        var filter = FilterWith(connectionId, Identity(isAdmin: true, EPermission.Moderation));
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresQueue), connectionId);
 
         Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
             "Holding Moderation must NOT satisfy a method that declares [UserHasPermission(Queue)]");
@@ -171,86 +163,102 @@ public class ChatHubPermissionFilterTests
     public async Task AttributeDrivesTheRequiredPermission_HolderOfDeclaredPermissionPasses()
     {
         // Same Queue-declaring method: a user holding Queue passes — the attribute's permission is honored.
-        var filter = BuildFilter(User(isAdmin: true, EPermission.Queue));
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresQueue));
+        const string connectionId = "conn-1";
+        var filter = FilterWith(connectionId, Identity(isAdmin: true, EPermission.Queue));
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresQueue), connectionId);
 
         var result = await filter.InvokeMethodAsync(ctx, PassThrough);
 
         Assert.AreEqual("ok", result, "Holding the declared Queue permission must pass");
     }
 
+    // ── Un-attributed methods bypass ALL identity work (acceptance 6, second half) ────────
+
     [Test]
-    public async Task UnattributedMethod_NonModerator_PassesThrough_NoAuthRequired()
+    public async Task UnattributedMethod_SkipsIdentityResolution_Entirely()
     {
-        // No [UserHasPermission] → unprotected → passes through WITHOUT any JWT decode.
-        var authService = new Mock<IW3CAuthenticationService>();
-        var filter = new ChatHubPermissionFilter(authService.Object);
-        var ctx = BuildContext<TestHub>(nameof(TestHub.Unprotected));
+        // MockBehavior.Strict with NO setups: any call into the registry throws. The method has no
+        // [UserHasPermission], so passing straight through PROVES the filter never consulted the registry.
+        var registry = new Mock<ISessionRegistry>(MockBehavior.Strict);
+        var filter = new ChatHubPermissionFilter(registry.Object);
+        var ctx = BuildContext<TestHub>(nameof(TestHub.Unprotected), "conn-unprotected");
 
         var result = await filter.InvokeMethodAsync(ctx, PassThrough);
 
         Assert.AreEqual("ok", result, "An unprotected method must pass through for anyone");
-        authService.Verify(a => a.GetUserByToken(It.IsAny<string>()), Times.Never,
-            "An unprotected method must NOT trigger a JWT decode");
+        registry.VerifyNoOtherCalls();
     }
 
     [Test]
     public async Task RealChatHub_SendMessage_IsUnprotected_PassesThrough()
     {
-        // SendMessage on the real ChatHub carries no [UserHasPermission] → any user passes through.
-        var authService = new Mock<IW3CAuthenticationService>();
-        var filter = new ChatHubPermissionFilter(authService.Object);
-        var ctx = BuildContext<ChatHub>(nameof(ChatHub.SendMessage));
+        // SendMessage on the real ChatHub carries no [UserHasPermission] → any connection passes through,
+        // and the strict mock proves no identity resolution happens.
+        var registry = new Mock<ISessionRegistry>(MockBehavior.Strict);
+        var filter = new ChatHubPermissionFilter(registry.Object);
+        var ctx = BuildContext<ChatHub>(nameof(ChatHub.SendMessage), "conn-send");
 
         var result = await filter.InvokeMethodAsync(ctx, PassThrough);
 
         Assert.AreEqual("ok", result, "SendMessage is unprotected and must pass through");
-        authService.Verify(a => a.GetUserByToken(It.IsAny<string>()), Times.Never);
+        registry.VerifyNoOtherCalls();
     }
 
-    // ── Token-source / fail-closed behavior (unchanged from the GetHttpContext fix) ───────
+    // ── Fail-closed: no session, or a displaced stale connection, is rejected ─────────────
 
     [Test]
-    public void MissingToken_AttributedMethod_ThrowsHubException()
+    public void UnregisteredConnection_AttributedMethod_ThrowsHubException()
     {
-        // HttpContext present but no access_token in the query → GetUserByToken returns null → rejected.
-        var filter = BuildFilter(resolved: null);
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), token: null);
+        // A real registry with NO Register for this connection → TryGetByConnectionId is false → rejected.
+        var filter = new ChatHubPermissionFilter(new SessionRegistry());
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), "conn-unregistered");
 
         Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
-            "A missing/invalid token must be rejected from an attributed method");
+            "A connection with no registry session must be rejected (fail-closed)");
     }
 
     [Test]
-    public void NoHttpContextOnConnection_AttributedMethod_ThrowsHubException()
+    public void DisplacedStaleConnection_AttributedMethod_ThrowsHubException()
     {
-        // GetHttpContext() returns null (no IHttpContextFeature) → token null → GetUserByToken null →
-        // rejected (fail-closed). Guards against an NRE and proves the filter reads from the connection.
-        var filter = BuildFilter(resolved: null);
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), withHttpContext: false);
+        // Register OLD, then register NEW for the SAME battleTag: NEW displaces OLD. Even though OLD's
+        // captured identity WAS a moderator, TryGetByConnectionId(oldConn) now returns false, so invoking
+        // an attributed method as the stale OLD connection is rejected — pins the Task-5 fail-closed
+        // behavior at the permission filter.
+        const string oldConn = "conn-old";
+        const string newConn = "conn-new";
+        var moderator = Identity("mod#1", isAdmin: true, EPermission.Moderation);
+        var registry = new SessionRegistry();
+        registry.Register(oldConn, moderator, null);
+        registry.Register(newConn, moderator, null); // displaces OLD
+
+        var filter = new ChatHubPermissionFilter(registry);
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), oldConn);
 
         Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
-            "A connection with no HttpContext must be rejected (fail-closed)");
+            "A displaced stale connection must be rejected even though its identity was a moderator");
     }
 
+    // ── Identity is resolved per-connectionId, never from ambient state ───────────────────
+
     [Test]
-    public async Task Token_ComesFromConnectionHttpContext_NotAccessor()
+    public async Task Identity_ComesFromRegistry_ByConnectionId()
     {
-        // Regression guard: the moderator is allowed ONLY because the token is read from
-        // Context.GetHttpContext() (the connection's IHttpContextFeature). A revert to
-        // IHttpContextAccessor would yield a null token here → HubException → this test fails.
-        string capturedToken = null;
-        var authService = new Mock<IW3CAuthenticationService>();
-        authService.Setup(a => a.GetUserByToken(It.IsAny<string>()))
-            .Callback<string>(t => capturedToken = t)
-            .Returns(User(isAdmin: true, EPermission.Moderation));
-        var filter = new ChatHubPermissionFilter(authService.Object);
-        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), token: "moderator-token-xyz");
+        // Two distinct sessions with different permissions live in the SAME registry; each connectionId
+        // gets its own verdict. Distinguished ONLY by connectionId — the identity source is the
+        // connection, not any ambient/shared state.
+        const string modConn = "conn-mod";
+        const string plainConn = "conn-plain";
+        var registry = new SessionRegistry();
+        registry.Register(modConn, Identity("mod#1", isAdmin: true, EPermission.Moderation), null);
+        registry.Register(plainConn, Identity("plain#1", isAdmin: false), null);
+        var filter = new ChatHubPermissionFilter(registry);
 
-        var result = await filter.InvokeMethodAsync(ctx, PassThrough);
+        var modResult = await filter.InvokeMethodAsync(
+            BuildContext<TestHub>(nameof(TestHub.RequiresModeration), modConn), PassThrough);
+        Assert.AreEqual("ok", modResult, "The moderator connection resolves to a moderator identity and passes");
 
-        Assert.AreEqual("ok", result, "Moderator must pass when the token is read from the connection HttpContext");
-        Assert.AreEqual("moderator-token-xyz", capturedToken,
-            "The filter must resolve the token from Context.GetHttpContext().Request.Query[\"access_token\"]");
+        Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(
+                BuildContext<TestHub>(nameof(TestHub.RequiresModeration), plainConn), PassThrough),
+            "The non-moderator connection, distinguished only by its connectionId, is rejected");
     }
 }

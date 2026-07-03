@@ -2,6 +2,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
+using W3ChampionsChatService.Sessions;
 
 namespace W3ChampionsChatService.Authentication;
 
@@ -13,24 +14,27 @@ namespace W3ChampionsChatService.Authentication;
 /// <para>
 /// SECURITY: the MVC <c>[UserHasPermission]</c> attribute is an <c>IAsyncActionFilter</c>, which the
 /// SignalR hub pipeline never runs — so on a hub method it is inert without this filter. This filter
-/// reads the attribute off the invoked method via reflection and applies the SAME stateless JWT
-/// resolution as the MVC filter: decode the <c>access_token</c> via
-/// <see cref="IW3CAuthenticationService.GetUserByToken"/> and require <c>IsAdmin</c> + the declared
-/// permission. A method WITHOUT the attribute is unprotected and passes straight through (no JWT decode).
+/// reads the attribute off the invoked method via reflection and resolves the caller's identity from
+/// the per-connection <see cref="ISessionRegistry"/> by <c>Context.ConnectionId</c>: the identity
+/// snapshot captured at connect (ticket handshake, C2) and fixed for the connection's lifetime. No JWT
+/// is decoded per invocation — the query-string <c>access_token</c> no longer reaches hub methods. The
+/// registry is fail-closed: an unregistered connection, or a DISPLACED stale connection, resolves to
+/// no session and is rejected. Passing then requires <c>IsAdmin</c> AND the declared permission. A
+/// method WITHOUT the attribute is unprotected and passes straight through with zero identity work.
 /// </para>
 /// Rejections throw <see cref="HubException"/> (a graceful, client-visible error) — NEVER
 /// <c>Context.Abort()</c>; the connection stays alive.
 /// </summary>
-public class ChatHubPermissionFilter(IW3CAuthenticationService authService) : IHubFilter
+public class ChatHubPermissionFilter(ISessionRegistry sessionRegistry) : IHubFilter
 {
-    private readonly IW3CAuthenticationService _authService = authService;
+    private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
 
     public async ValueTask<object> InvokeMethodAsync(
         HubInvocationContext invocationContext,
         System.Func<HubInvocationContext, ValueTask<object>> next)
     {
         // The required permission is whatever the method declares via [UserHasPermission(...)].
-        // No attribute → unprotected method (e.g. SendMessage) → pass straight through, no auth.
+        // No attribute → unprotected method (e.g. SendMessage) → pass straight through, no identity work.
         var permissionAttribute = invocationContext.HubMethod
             .GetCustomAttributes(typeof(UserHasPermissionAttribute), inherit: true)
             .Cast<UserHasPermissionAttribute>()
@@ -41,22 +45,17 @@ public class ChatHubPermissionFilter(IW3CAuthenticationService authService) : IH
             return await next(invocationContext);
         }
 
-        var requiredPermission = permissionAttribute.Permission;
-
-        // Read the access_token from the SignalR connection's HttpContext. IHttpContextAccessor is NOT
-        // usable here: it is null for hub-METHOD invocations over WebSockets (only populated during the
-        // handshake). HubCallerContext.GetHttpContext() reads the connection's IHttpContextFeature,
-        // which is reliably populated at handshake and persists for the connection lifetime.
-        var httpContext = invocationContext.Context.GetHttpContext();
-        var token = httpContext?.Request.Query["access_token"];
-        var auth = _authService.GetUserByToken(token);
-
-        if (auth == null || !auth.IsAdmin || !auth.Permissions.Contains(requiredPermission))
+        // C2: identity is the session snapshot registered at connect (ticket handshake) — resolved by
+        // ConnectionId from the in-memory registry. No JWT ever reaches hub invocations anymore. The
+        // registry is fail-closed: an unregistered or displaced-stale connection resolves to no session.
+        if (!_sessionRegistry.TryGetByConnectionId(invocationContext.Context.ConnectionId, out var session)
+            || !session.Identity.IsAdmin
+            || !session.Identity.Permissions.Contains(permissionAttribute.Permission))
         {
-            Log.Warning("Hub method {Method} rejected: caller {BattleTag} lacks {Permission} permission",
-                invocationContext.HubMethodName, auth?.BattleTag ?? "<unauthenticated>", requiredPermission);
+            Log.Warning("Hub method {Method} rejected: connection {ConnectionId} lacks {Permission}",
+                invocationContext.HubMethod.Name, invocationContext.Context.ConnectionId, permissionAttribute.Permission);
             // Graceful, client-visible rejection — never Context.Abort().
-            throw new HubException($"Unauthorized: {requiredPermission} permission required");
+            throw new HubException($"Unauthorized: {permissionAttribute.Permission} permission required");
         }
 
         return await next(invocationContext);
