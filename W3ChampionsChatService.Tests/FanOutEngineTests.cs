@@ -167,4 +167,34 @@ public class FanOutEngineTests
         // echo against its own ack {messageId, seq} — that dedup is client-side and out of scope here.
         Assert.AreEqual(1, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));
     }
+
+    [Test]
+    public async Task OnMessagePersisted_OneRecipientSendThrows_OthersStillReceive_NoExceptionPropagates()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // Two focused connections on the same channel; neither is the sender, so both are ordinary
+        // non-shadow recipients — isolates the fault-tolerance behavior from shadow-routing.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
+        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+
+        // Simulate AuthorConnection's SendAsync throwing (e.g. its connection was torn down mid-loop),
+        // via the harness's mock client for that connectionId.
+        harness.ThrowOnSend(AuthorConnection);
+
+        // Must not throw: a single recipient's failed send is fault-isolated inside OnMessagePersisted,
+        // never propagating up to the already-succeeded persist/ack in SendMessage. Awaiting directly
+        // (rather than via Assert.DoesNotThrowAsync) means an unhandled exception here fails the test
+        // with the real stack trace.
+        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false);
+
+        // The failing connection recorded no signal (its SendAsync faulted before capture)...
+        Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));
+        // ...but the OTHER focused connection still received its full MessageReceived push.
+        Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.MessageReceived));
+        var dto = harness.PayloadFor(OtherFocusedConnection, ChatEvents.MessageReceived) as MessageDto;
+        Assert.IsNotNull(dto);
+        Assert.AreEqual("message-1", dto.Id);
+    }
 }

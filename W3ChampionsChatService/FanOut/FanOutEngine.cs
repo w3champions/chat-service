@@ -1,5 +1,7 @@
+using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using Serilog;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Messages;
@@ -22,6 +24,13 @@ namespace W3ChampionsChatService.FanOut;
 /// Singleton (registered in <see cref="Startup"/>): it holds no per-call state and is shared by every
 /// hub invocation, mirroring the other C3 fan-out registries. Task 15 owns the REMAINING fan-out DI
 /// (ActivityCoalescer / ViewersAccumulator / the flush hosted service) — not registered here.
+/// <para>
+/// Fault isolation (review fix): each per-recipient <c>SendAsync</c> is wrapped so one recipient's
+/// failed send (e.g. a connection torn down mid-fan-out) cannot abort delivery to the remaining
+/// focused viewers, and can never propagate out of <see cref="OnMessagePersisted"/> — the caller has
+/// already durably persisted the message and must still return its typed <c>Ok</c> ack. Live delivery
+/// is best-effort; a missed recipient refetches via <c>GetMessages</c> on open.
+/// </para>
 /// </summary>
 public class FanOutEngine(IHubContext<ChatHub> hubContext, FocusRegistry focusRegistry)
 {
@@ -74,7 +83,19 @@ public class FanOutEngine(IHubContext<ChatHub> hubContext, FocusRegistry focusRe
                 continue;
             }
 
-            await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.MessageReceived, dto);
+            // Fault isolation (review fix): live delivery is best-effort — a missed recipient refetches
+            // via GetMessages on open. A single recipient's torn-down connection must not abort the
+            // remaining focused viewers' delivery, and must NEVER propagate out of OnMessagePersisted —
+            // the caller (SendMessage) has already durably persisted the message and returns its typed
+            // Ok ack regardless of fan-out hiccups.
+            try
+            {
+                await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.MessageReceived, dto);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Fan-out send of MessageReceived failed for connection {ConnectionId} on channel {ChannelId} — skipping, other recipients unaffected", connectionId, channel.Id);
+            }
         }
     }
 }

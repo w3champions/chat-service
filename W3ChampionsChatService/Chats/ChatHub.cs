@@ -46,8 +46,9 @@ public partial class ChatHub(
     ChannelCreationRateLimiter channelCreationRateLimiter,
     // C3 (Task 11): the durable send pipeline — SendMessage(channelId, content) in
     // ChatHub.Messaging.cs. MessageRepository inserts the ChannelMessage (the OLD single-arg
-    // SendMessage never persisted to Mongo); FanOutEngine is the post-persist fan-out seam (no-op
-    // stub here, filled by Task 12).
+    // SendMessage never persisted to Mongo); FanOutEngine is the post-persist fan-out seam — focused
+    // MessageReceived delivery + shadow-author-only routing (Task 12), with fault-isolated per-recipient
+    // sends.
     MessageRepository messageRepository,
     FanOutEngine fanOutEngine) : Hub
 {

@@ -31,6 +31,12 @@ public sealed class HubPushCaptureHarness
     // connections in later tasks (13, 14, 15), so every read/write must be synchronized.
     private readonly List<(string ConnectionId, string Method, object Payload)> _sends = new();
 
+    // ConnectionIds configured (via ThrowOnSend) to fault on every subsequent SendAsync/SendCoreAsync
+    // instead of recording — used to simulate a torn-down connection for fan-out resilience tests
+    // (e.g. FanOutEngine's per-recipient fault isolation). Guarded by lock (_sends) alongside the
+    // capture list since both are read/written from the same Client(connectionId) callback.
+    private readonly Dictionary<string, Exception> _throwingConnections = new();
+
     public HubPushCaptureHarness()
     {
         var hubClients = new Mock<IHubClients>();
@@ -41,19 +47,44 @@ public sealed class HubPushCaptureHarness
                 var proxy = new Mock<ISingleClientProxy>();
                 proxy
                     .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-                    .Callback<string, object[], CancellationToken>((method, args, _) =>
+                    .Returns<string, object[], CancellationToken>((method, args, _) =>
                     {
+                        Exception exceptionToThrow;
+                        lock (_sends)
+                        {
+                            _throwingConnections.TryGetValue(connectionId, out exceptionToThrow);
+                        }
+
+                        if (exceptionToThrow != null)
+                        {
+                            return Task.FromException(exceptionToThrow);
+                        }
+
                         lock (_sends)
                         {
                             _sends.Add((connectionId, method, args.Length > 0 ? args[0] : null));
                         }
-                    })
-                    .Returns(Task.CompletedTask);
+                        return Task.CompletedTask;
+                    });
                 return proxy.Object;
             });
 
         _hubContextMock = new Mock<IHubContext<ChatHub>>();
         _hubContextMock.Setup(h => h.Clients).Returns(hubClients.Object);
+    }
+
+    /// <summary>
+    /// Configures every subsequent <c>SendAsync</c>/<c>SendCoreAsync</c> call to
+    /// <paramref name="connectionId"/> to fault with <paramref name="exception"/> (or a default
+    /// <see cref="InvalidOperationException"/>) instead of recording the signal — simulating a
+    /// recipient connection torn down mid-fan-out. Other connections are unaffected.
+    /// </summary>
+    public void ThrowOnSend(string connectionId, Exception exception = null)
+    {
+        lock (_sends)
+        {
+            _throwingConnections[connectionId] = exception ?? new InvalidOperationException($"Simulated send failure for connection '{connectionId}'");
+        }
     }
 
     /// <summary>The mock <see cref="IHubContext{ChatHub}"/> to inject into the service under test.</summary>

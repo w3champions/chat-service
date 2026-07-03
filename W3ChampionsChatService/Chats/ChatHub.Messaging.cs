@@ -46,7 +46,9 @@ public partial class ChatHub
     /// <see cref="Channels.ChannelRepository.AllocateSeq"/> atomically $inc LastSeq + $set LastMessageAt,
     /// then insert a <see cref="ChannelMessage"/> carrying the send-time sender snapshot, content,
     /// shadow flag, and the type-derived expiry.</item>
-    /// <item>Fan-out seam <see cref="FanOut.FanOutEngine.OnMessagePersisted"/> (no-op stub until Task 12).</item>
+    /// <item>Fan-out seam <see cref="FanOut.FanOutEngine.OnMessagePersisted"/> — delivers the full
+    /// <c>MessageReceived</c> payload to the channel's focused viewers, with shadow-author-only routing
+    /// (Task 12; per-recipient sends are fault-isolated so one failed push cannot affect this ack).</item>
     /// <item>Return <see cref="ChatResultCode.Ok"/> with the inserted message id + allocated seq.</item>
     /// </list>
     /// <para>
@@ -148,7 +150,9 @@ public partial class ChatHub
         };
         await _messageRepository.Insert(message);
 
-        // 8. Fan-out seam (no-op until Task 12: focused delivery + shadow-author-only routing).
+        // 8. Fan-out seam (Task 12): focused MessageReceived delivery + shadow-author-only routing.
+        // Per-recipient sends are fault-isolated inside FanOutEngine, so a fan-out hiccup never turns
+        // this already-persisted message's ack into an error below.
         await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow);
 
         // 9. Typed ack.
