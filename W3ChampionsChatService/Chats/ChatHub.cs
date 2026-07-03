@@ -242,33 +242,40 @@ public class ChatHub(
 
     public override async Task OnDisconnectedAsync(Exception exception)
     {
-        // C3 (Task 8): tear down this connection's in-memory fan-out state FIRST and UNCONDITIONALLY so
-        // it can never leak past the socket's lifetime — these three removals must run even if the
-        // legacy UserLeft broadcast below throws. All three are synchronous, self-contained, no-op-if-
-        // absent removals (nothing here can early-return or throw before they complete).
+        // C3 (Task 8): tear down this connection's in-memory fan-out state UNCONDITIONALLY so it can
+        // never leak past the socket's lifetime. INVARIANT, enforced structurally (not by statement
+        // order): the three removals below live in a `finally`, so they ALWAYS run — even if the
+        // legacy teardown in the `try` throws — and a future edit inserting code above/around them
+        // cannot silently skip them. All three are synchronous, self-contained, no-op-if-absent
+        // removals.
         // NOTE: Task 14 later routes focus removals through a ViewersAccumulator (so a leaving viewer
         // emits ViewersChanged); until then this is a plain removal with no fan-out.
-        _focusRegistry.RemoveConnection(Context.ConnectionId);
-        _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
-        _messageRateLimiter.RemoveConnection(Context.ConnectionId);
-
-        // Identity-checked teardown lives INSIDE the registry — the hub stays dumb. Safe against the
-        // displaced-old-socket race: a dying OLD socket will NOT evict the NEW session.
-        _sessionRegistry.Unregister(Context.ConnectionId);
-
-        var user = _connections.GetUser(Context.ConnectionId);
-        if (user != null)
+        try
         {
-            // Capture the room BEFORE Remove. Shadow users are full room members (no presence-hiding),
-            // so UserLeft is unconditional on room membership — only guard against a null room
-            // (a full-ban no-clan user has no room — G3/G2: no crash).
-            var chatRoom = _connections.GetRoom(Context.ConnectionId);
-            _connections.Remove(Context.ConnectionId);
+            // Identity-checked teardown lives INSIDE the registry — the hub stays dumb. Safe against the
+            // displaced-old-socket race: a dying OLD socket will NOT evict the NEW session.
+            _sessionRegistry.Unregister(Context.ConnectionId);
 
-            if (chatRoom != null)
+            var user = _connections.GetUser(Context.ConnectionId);
+            if (user != null)
             {
-                await Clients.Group(chatRoom).SendAsync("UserLeft", user);
+                // Capture the room BEFORE Remove. Shadow users are full room members (no presence-hiding),
+                // so UserLeft is unconditional on room membership — only guard against a null room
+                // (a full-ban no-clan user has no room — G3/G2: no crash).
+                var chatRoom = _connections.GetRoom(Context.ConnectionId);
+                _connections.Remove(Context.ConnectionId);
+
+                if (chatRoom != null)
+                {
+                    await Clients.Group(chatRoom).SendAsync("UserLeft", user);
+                }
             }
+        }
+        finally
+        {
+            _focusRegistry.RemoveConnection(Context.ConnectionId);
+            _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
+            _messageRateLimiter.RemoveConnection(Context.ConnectionId);
         }
 
         await base.OnDisconnectedAsync(exception);

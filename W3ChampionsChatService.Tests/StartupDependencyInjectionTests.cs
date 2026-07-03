@@ -7,10 +7,12 @@ using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -140,6 +142,54 @@ public class StartupDependencyInjectionTests
             "TimeProvider MUST be a singleton — every timer-driven fan-out service (C3 tasks 13/14/15) needs the SAME injectable clock");
         Assert.AreSame(TimeProvider.System, first,
             "the production TimeProvider registration must be TimeProvider.System (real wall-clock time)");
+    }
+
+    [Test]
+    public void FocusRegistry_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<FocusRegistry>();
+        var second = provider.GetRequiredService<FocusRegistry>();
+
+        Assert.AreSame(first, second,
+            "FocusRegistry MUST be a singleton — a transient registration would silently fragment the in-memory fan-out state each connection seeds and tears down");
+    }
+
+    [Test]
+    public void OnlineMemberRegistry_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<OnlineMemberRegistry>();
+        var second = provider.GetRequiredService<OnlineMemberRegistry>();
+
+        Assert.AreSame(first, second,
+            "OnlineMemberRegistry MUST be a singleton — a transient registration would silently fragment the in-memory fan-out state each connection seeds and tears down");
+    }
+
+    [Test]
+    public void MessageRateLimiter_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<MessageRateLimiter>();
+        var second = provider.GetRequiredService<MessageRateLimiter>();
+
+        Assert.AreSame(first, second,
+            "MessageRateLimiter MUST be a singleton — a transient registration would silently fragment the in-memory fan-out state each connection seeds and tears down");
+    }
+
+    [Test]
+    public void SessionStateAssembler_Resolves()
+    {
+        using var provider = BuildProvider();
+
+        // SessionStateAssembler is registered Transient (per-connect state assembly, no long-lived
+        // state of its own) — assert only that its whole dependency graph resolves, NOT singleton
+        // sharing (unlike the three fan-out registries above).
+        Assert.IsNotNull(provider.GetRequiredService<SessionStateAssembler>(),
+            "SessionStateAssembler must resolve from the DI container");
     }
 
     [Test]
