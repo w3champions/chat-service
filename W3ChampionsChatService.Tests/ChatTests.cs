@@ -7,7 +7,9 @@ using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -39,7 +41,7 @@ public class ChatTests : IntegrationTestBase
         ResetSetups();
 
         var chatAuthenticationService = new Mock<IChatAuthenticationService>();
-        chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
+        chatAuthenticationService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("peter#123", false, "AB", new ProfilePicture(), null, null));
         _chatAuthenticationService = chatAuthenticationService.Object;
         _connectionMapping = new ConnectionMapping();
@@ -53,7 +55,9 @@ public class ChatTests : IntegrationTestBase
             _connectionMapping,
             _chatHistory,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
-            null);
+            new TicketStore(),
+            new SessionRegistry(),
+            new UserDirectoryRepository(MongoClient));
 
         // Setup message capturing proxies
         _capturedCallerMessage = null;

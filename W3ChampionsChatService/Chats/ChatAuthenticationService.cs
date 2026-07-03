@@ -8,38 +8,40 @@ namespace W3ChampionsChatService.Chats;
 
 public interface IChatAuthenticationService
 {
-    Task<ChatUser> GetUser(string chatKey);
+    Task<ChatUser> GetUserFromIdentity(W3CUserAuthentication identity);
 }
 
 public class ChatAuthenticationService(
     MongoClient mongoClient,
-    IW3CAuthenticationService authenticationService,
     IWebsiteBackendRepository websiteBackendRepository
 ) : MongoDbRepositoryBase(mongoClient), IChatAuthenticationService
 {
-    private readonly IW3CAuthenticationService _authenticationService = authenticationService;
     private readonly IWebsiteBackendRepository _websiteBackendRepository = websiteBackendRepository;
 
-    public async Task<ChatUser> GetUser(string chatKey)
+    // HARD CUTOVER (C2): the JWT decode is GONE — it happened once, at ticket mint. Here we only
+    // ENRICH an already-proven identity snapshot (from the consumed ticket) with wb flair.
+    public async Task<ChatUser> GetUserFromIdentity(W3CUserAuthentication identity)
     {
         try
         {
-            var user = _authenticationService.GetUserByToken(chatKey);
-            if (user == null) return null;
-            var userDetails = await _websiteBackendRepository.GetChatDetails(user.BattleTag);
+            var userDetails = await _websiteBackendRepository.GetChatDetails(identity.BattleTag);
             var chatColor = userDetails?.ChatColor;
             var chatIcons = userDetails?.ChatIcons ?? [];
-            if (user.IsAdmin)
+            if (identity.IsAdmin)
             {
                 chatColor = ChatColor.AdminColor;
                 chatIcons = [ChatIcon.AdminIcon, .. chatIcons];
             }
-            return new ChatUser(user.BattleTag, user.IsAdmin, userDetails?.ClanId, userDetails?.ProfilePicture, chatColor, chatIcons);
+            return new ChatUser(identity.BattleTag, identity.IsAdmin, userDetails?.ClanId, userDetails?.ProfilePicture, chatColor, chatIcons);
         }
         catch (Exception ex)
         {
-            Log.Error(ex, "Error getting user by token");
-            return null;
+            // Decision 11: the ticket ALREADY proved identity, so a wb outage must NOT fail a
+            // proven-authenticated connect. Log and connect with a plain fallback — NEVER null (the
+            // old GetUser returned null on failure → connect rejected; this is a deliberate
+            // resilience improvement). Full flair is restored on the next successful enrichment.
+            Log.Warning(ex, "Failed to enrich chat user {BattleTag} from wb — connecting with plain fallback", identity.BattleTag);
+            return new ChatUser(identity.BattleTag, identity.IsAdmin, null, new ProfilePicture(), null, null);
         }
     }
 }

@@ -7,9 +7,12 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -46,7 +49,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         _reconcileHarness = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository);
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
-        chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
+        chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
         _chatHub = new ChatHub(
@@ -56,7 +59,9 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _connectionMapping,
             _chatHistory,
             _reconcileHarness.Service,
-            null);
+            new TicketStore(),
+            new SessionRegistry(),
+            new UserDirectoryRepository(MongoClient));
 
         _lastCallerMethod = null;
         _lastCallerArgs = null;
@@ -1076,7 +1081,7 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
     private ChatHub BuildHubWithRepository(IMuteRepository repository)
     {
         var chatAuthService = new Mock<IChatAuthenticationService>();
-        chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
+        chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
         var hub = new ChatHub(
@@ -1086,7 +1091,9 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _connectionMapping,
             _chatHistory,
             _reconcileHarness.Service,
-            null)
+            new TicketStore(),
+            new SessionRegistry(),
+            new UserDirectoryRepository(MongoClient))
         {
             Clients = _clients.Object,
             Context = _hubCallerContext.Object,

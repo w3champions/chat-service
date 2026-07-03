@@ -5,9 +5,12 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -43,7 +46,7 @@ public class MuteReconciliationTests : IntegrationTestBase
         _controller = new MuteController(_muteRepository, _harness.Service);
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
-        chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
+        chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null));
 
         _chatHub = new ChatHub(
@@ -53,7 +56,9 @@ public class MuteReconciliationTests : IntegrationTestBase
             _connectionMapping,
             new ChatHistory(),
             _harness.Service,
-            null);
+            new TicketStore(),
+            new SessionRegistry(),
+            new UserDirectoryRepository(MongoClient));
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();

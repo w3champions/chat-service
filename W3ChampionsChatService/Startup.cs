@@ -66,8 +66,6 @@ public class Startup
         // share the SAME in-memory session state.
         services.AddSingleton<ISessionRegistry, SessionRegistry>();
 
-        services.AddHttpContextAccessor();
-
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).

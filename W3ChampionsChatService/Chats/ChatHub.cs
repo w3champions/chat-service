@@ -3,11 +3,12 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Users;
 using Serilog;
 
 [assembly: InternalsVisibleTo("W3ChampionsChatService.Tests")]
@@ -20,7 +21,9 @@ public class ChatHub(
     ConnectionMapping connections,
     ChatHistory chatHistory,
     MuteReconciliationService muteReconciliation,
-    IHttpContextAccessor contextAccessor) : Hub
+    ITicketStore ticketStore,
+    ISessionRegistry sessionRegistry,
+    UserDirectoryRepository userDirectory) : Hub
 {
     private readonly IChatAuthenticationService _authenticationService = authenticationService;
     private readonly IMuteRepository _muteRepository = muteRepository;
@@ -28,7 +31,9 @@ public class ChatHub(
     private readonly ConnectionMapping _connections = connections;
     private readonly ChatHistory _chatHistory = chatHistory;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
-    private readonly IHttpContextAccessor _contextAccessor = contextAccessor;
+    private readonly ITicketStore _ticketStore = ticketStore;
+    private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
+    private readonly UserDirectoryRepository _userDirectory = userDirectory;
 
     // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
     private const int MaxMessageLength = 1024;
@@ -154,20 +159,56 @@ public class ChatHub(
 
     public override async Task OnConnectedAsync()
     {
-        var accessToken = _contextAccessor?.HttpContext?.Request.Query["access_token"];
-        var user = await _authenticationService.GetUser(accessToken);
-        if (user == null)
+        // HARD CUTOVER (C2): access_token carries a one-time TICKET minted by POST /auth/session.
+        // A raw JWT lands here too — it is simply not a valid ticket and is rejected.
+        var ticket = Context.GetHttpContext()?.Request.Query["access_token"].ToString();
+        if (string.IsNullOrEmpty(ticket) || !_ticketStore.TryConsume(ticket, DateTime.UtcNow, out var identity))
         {
             Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
             await Clients.Caller.SendAsync("AuthorizationFailed");
-            Context.Abort();
+            Context.Abort(); // the ONLY rejection-style abort (unchanged policy); ban paths never abort
             return;
         }
+
+        // Single connection per battleTag (ChatLimits.MaxConnectionsPerBattleTag == 1): new wins.
+        var displaced = _sessionRegistry.Register(Context.ConnectionId, identity, Context);
+        if (displaced != null)
+        {
+            // Contract (acceptance 4): notify the OLD connection, THEN close it — event BEFORE close.
+            // This displacement close is contract-mandated; it is NOT a ban path (bans never abort).
+            await Clients.Client(displaced.ConnectionId).SendAsync("ConnectionDisplaced", "Connected elsewhere");
+            displaced.Context?.Abort();
+        }
+
+        await UpsertDirectoryStub(identity);
+        var user = await _authenticationService.GetUserFromIdentity(identity);
         await LoginAsAuthenticated(user);
+    }
+
+    // Stub directory upsert (full enrichment is C6). Read-modify-write via Load → set → Upsert so a
+    // future cached Profile is preserved. Non-fatal: a directory write must never fail a connect.
+    private async Task UpsertDirectoryStub(W3CUserAuthentication identity)
+    {
+        try
+        {
+            var entry = await _userDirectory.Load(identity.BattleTag)
+                ?? new UserDirectoryEntry { BattleTag = identity.BattleTag };
+            entry.NormalizedName = identity.Name?.Trim().ToLowerInvariant();
+            entry.LastSeenAt = DateTime.UtcNow;
+            await _userDirectory.Upsert(entry);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to upsert user_directory stub for {BattleTag}", identity.BattleTag);
+        }
     }
 
     public override async Task OnDisconnectedAsync(Exception exception)
     {
+        // Identity-checked teardown lives INSIDE the registry — the hub stays dumb. Safe against the
+        // displaced-old-socket race: a dying OLD socket will NOT evict the NEW session.
+        _sessionRegistry.Unregister(Context.ConnectionId);
+
         var user = _connections.GetUser(Context.ConnectionId);
         if (user != null)
         {

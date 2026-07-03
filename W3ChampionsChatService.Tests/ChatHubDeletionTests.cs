@@ -4,9 +4,12 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -33,7 +36,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
         _mockAllExceptProxy = new Mock<IClientProxy>();
 
         var chatAuthenticationService = new Mock<IChatAuthenticationService>();
-        chatAuthenticationService.Setup(m => m.GetUser(It.IsAny<string>()))
+        chatAuthenticationService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("admin#123", true, "Admin", new ProfilePicture(), null, null));
         _chatAuthenticationService = chatAuthenticationService.Object;
 
@@ -48,7 +51,9 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _connectionMapping,
             _chatHistory,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
-            null);
+            new TicketStore(),
+            new SessionRegistry(),
+            new UserDirectoryRepository(MongoClient));
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);
