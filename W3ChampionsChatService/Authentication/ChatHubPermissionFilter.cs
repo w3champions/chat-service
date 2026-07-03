@@ -52,8 +52,13 @@ public class ChatHubPermissionFilter(ISessionRegistry sessionRegistry) : IHubFil
             || !session.Identity.IsAdmin
             || !session.Identity.Permissions.Contains(permissionAttribute.Permission))
         {
-            Log.Warning("Hub method {Method} rejected: connection {ConnectionId} lacks {Permission}",
-                invocationContext.HubMethod.Name, invocationContext.Context.ConnectionId, permissionAttribute.Permission);
+            // session is null on the no-session branch (TryGetByConnectionId returned false) → "<unregistered>".
+            // When a session WAS resolved (registered-but-under-privileged reject), the caller's battleTag is
+            // the durable attribution key for an attempted moderator action — far more useful than an
+            // ephemeral connectionId for audit (OWASP A09). Never log any token/ticket.
+            Log.Warning("Hub method {Method} rejected: connection {ConnectionId} (battleTag {BattleTag}) lacks {Permission}",
+                invocationContext.HubMethod.Name, invocationContext.Context.ConnectionId,
+                session?.Identity.BattleTag ?? "<unregistered>", permissionAttribute.Permission);
             // Graceful, client-visible rejection — never Context.Abort().
             throw new HubException($"Unauthorized: {permissionAttribute.Permission} permission required");
         }

@@ -135,6 +135,22 @@ public class ChatHubPermissionFilterTests
     }
 
     [Test]
+    public void AttributedMethod_NonAdminHoldingPermission_ThrowsHubException()
+    {
+        // Independently pins the IsAdmin conjunct: a NON-admin who nonetheless holds the declared
+        // permission must STILL be rejected (authorization is IsAdmin AND permission, not permission alone).
+        // Mutation-sensitive: removing `!session.Identity.IsAdmin` from the filter must make exactly this
+        // test fail — every other non-admin case also lacks the permission, so only this one isolates the
+        // IsAdmin half of the conjunct.
+        const string connectionId = "conn-1";
+        var filter = FilterWith(connectionId, Identity(isAdmin: false, EPermission.Moderation));
+        var ctx = BuildContext<TestHub>(nameof(TestHub.RequiresModeration), connectionId);
+
+        Assert.ThrowsAsync<HubException>(async () => await filter.InvokeMethodAsync(ctx, PassThrough),
+            "A non-admin holding the declared permission must STILL be rejected (IsAdmin is required)");
+    }
+
+    [Test]
     public async Task AttributedMethod_AdminWithDeclaredPermission_PassesThrough()
     {
         const string connectionId = "conn-1";
