@@ -89,6 +89,23 @@ public class FocusRegistry
         }
     }
 
+    /// <summary>
+    /// The battleTag recorded for <paramref name="connectionId"/> at focus time, if the connection
+    /// currently has any focus state. Returns <c>false</c> (with a null <paramref name="battleTag"/>)
+    /// for a connection with no focus entries. Used by the disconnect path (Task 14) to route the
+    /// connection's focus removals through the <see cref="ViewersAccumulator"/> with the correct
+    /// battleTag BEFORE <see cref="RemoveConnection"/> clears it — the pre-window baseline the
+    /// accumulator captures there is what reconciles a displaced socket's leave against a same-window
+    /// reconnect.
+    /// </summary>
+    public bool TryGetBattleTag(string connectionId, out string battleTag)
+    {
+        lock (_lock)
+        {
+            return _battleTagByConnection.TryGetValue(connectionId, out battleTag);
+        }
+    }
+
     /// <summary>Snapshot of the connectionIds currently focused on <paramref name="channelId"/>.</summary>
     public IReadOnlyCollection<string> GetFocusedConnections(string channelId)
     {

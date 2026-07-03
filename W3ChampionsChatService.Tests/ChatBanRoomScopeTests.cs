@@ -83,7 +83,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             new MembershipRepository(MongoClient, channelRepository),
             new ChannelCreationRateLimiter(),
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            FanOutEngineTestFactory.CreateIgnored());
+            FanOutEngineTestFactory.CreateIgnored(),
+            ViewersAccumulatorTestFactory.CreateIgnored());
 
         _lastCallerMethod = null;
         _lastCallerArgs = null;
@@ -1133,7 +1134,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             new MembershipRepository(MongoClient, channelRepository),
             new ChannelCreationRateLimiter(),
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            FanOutEngineTestFactory.CreateIgnored())
+            FanOutEngineTestFactory.CreateIgnored(),
+            ViewersAccumulatorTestFactory.CreateIgnored())
         {
             Clients = _clients.Object,
             Context = _hubCallerContext.Object,

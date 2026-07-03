@@ -80,7 +80,8 @@ public class MuteReconciliationTests : IntegrationTestBase
             new MembershipRepository(MongoClient, channelRepository),
             new ChannelCreationRateLimiter(),
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            FanOutEngineTestFactory.CreateIgnored());
+            FanOutEngineTestFactory.CreateIgnored(),
+            ViewersAccumulatorTestFactory.CreateIgnored());
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();

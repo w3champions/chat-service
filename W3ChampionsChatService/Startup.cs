@@ -79,13 +79,14 @@ public class Startup
         // path seeds and the disconnect path (plus later Join/Leave/Focus/rate-limit paths) mutate, so
         // every hub invocation MUST share the SAME instance → Singleton, exactly like the C2
         // ConnectionMapping/SessionRegistry above; a transient would silently fragment fan-out state.
-        // Task 15 owns the REMAINING fan-out DI (the ViewersAccumulator + the flush hosted service) +
-        // their DI-coverage tests — do NOT register those here, and do NOT re-register the four below
-        // (or the FanOutEngine) there. NOTE: the ActivityCoalescer is registered HERE (Task 13), not in
-        // Task 15, because FanOutEngine now takes it as a constructor dependency (activity routing) — a
-        // dependency of an already-registered singleton MUST itself be DI-resolvable now or the whole
-        // FanOutEngine resolution fails. Task 15 wires it into the flush hosted service; it does not
-        // re-register it.
+        // Task 15 owns the REMAINING fan-out DI (the flush hosted service) + its DI-coverage tests — do
+        // NOT re-register the singletons below (or the FanOutEngine / ViewersAccumulator) there. NOTE:
+        // the ActivityCoalescer (Task 13) and the ViewersAccumulator (Task 14) are registered HERE, not
+        // in Task 15, because they are each a constructor dependency of an already-registered consumer
+        // (FanOutEngine takes the coalescer for activity routing; ChatHub takes the accumulator for
+        // focus/unfocus/disconnect viewer-roster routing) — a dependency of an already-resolvable
+        // consumer MUST itself be DI-resolvable now or that consumer's resolution fails. Task 15 wires
+        // both into the flush hosted service; it does not re-register them.
         services.AddTransient<SessionStateAssembler>();
         services.AddSingleton<FocusRegistry>();
         services.AddSingleton<OnlineMemberRegistry>();
@@ -95,6 +96,13 @@ public class Startup
         // it holds the per-(connection, channel) coalescing window state that the fan-out routing (every
         // send) writes and the flush hosted service (Task 15) drains; a transient would fragment it.
         services.AddSingleton<ActivityCoalescer>();
+
+        // Task 14: the batched ViewersChanged sink. Singleton — it holds the per-channel accumulation
+        // window (changed battleTags + their pre-window viewing baseline) that the hub's focus/unfocus/
+        // disconnect routing writes and the flush hosted service (Task 15) drains ≤ every 5s; a transient
+        // would fragment that shared window state AND break the C2 displacement reconciliation (the
+        // disconnect and the reconnect-refocus must hit the SAME accumulator instance to cancel out).
+        services.AddSingleton<ViewersAccumulator>();
 
         // Task 11: the send pipeline's post-persist fan-out seam. Singleton — it holds no per-call
         // state and is shared by every hub invocation (Task 12 focused delivery + Task 13 activity

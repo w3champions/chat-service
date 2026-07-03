@@ -193,6 +193,18 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void ViewersAccumulator_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<ViewersAccumulator>();
+        var second = provider.GetRequiredService<ViewersAccumulator>();
+
+        Assert.AreSame(first, second,
+            "ViewersAccumulator MUST be a singleton — the hub's focus/unfocus/disconnect routing and the flush hosted service (Task 15) must share the SAME per-channel accumulation window, and the C2 displacement reconciliation (disconnect + reconnect-refocus) only cancels out if both hit the SAME instance");
+    }
+
+    [Test]
     public void SessionStateAssembler_Resolves()
     {
         using var provider = BuildProvider();

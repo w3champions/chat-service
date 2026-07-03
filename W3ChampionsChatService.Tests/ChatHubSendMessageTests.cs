@@ -127,7 +127,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _membershipRepository,
             _channelCreationRateLimiter,
             _messageRepository,
-            _fanOutEngine);
+            _fanOutEngine,
+            ViewersAccumulatorTestFactory.CreateIgnored());
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

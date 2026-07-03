@@ -61,6 +61,12 @@ public partial class ChatHub
             return new FocusChannelResult(ChatResultCode.PermissionDenied);
         }
 
+        // C3 (Task 14): route the viewer-roster change into the batched ViewersChanged accumulator
+        // BEFORE the FocusRegistry mutation, so its captured pre-window baseline reflects this battleTag
+        // as it was BEFORE this focus (i.e. NOT-yet-viewing on a genuine first focus). Emits nothing
+        // itself — the flush hosted service (Task 15) drains the accumulated batch ≤ every 5s.
+        _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+
         _focusRegistry.Focus(Context.ConnectionId, channelId, battleTag);
 
         // Roster = the channel's ACTIVE viewers (online AND focused) from FocusRegistry — NEVER from
@@ -76,6 +82,17 @@ public partial class ChatHub
 
     public Task<ChannelOperationResult> UnfocusChannel(string channelId)
     {
+        // C3 (Task 14): route the viewer-roster change into the batched ViewersChanged accumulator
+        // BEFORE the FocusRegistry mutation, so its captured pre-window baseline reflects this battleTag
+        // as it was BEFORE this unfocus (i.e. VIEWING while still focused). The battleTag comes from
+        // FocusRegistry's own per-connection record (not the session) so this stays as unconditional
+        // and identity-independent as the Unfocus below — a connection with no focus state records
+        // nothing. Emits nothing itself; the flush service drains the batch ≤ every 5s.
+        if (_focusRegistry.TryGetBattleTag(Context.ConnectionId, out var battleTag))
+        {
+            _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        }
+
         // Idempotent, unconditional: FocusRegistry.Unfocus is already a no-op for an unknown
         // (connection, channel) pair, so unfocusing a channel the caller never focused (or an
         // unregistered connection) still returns Ok — there is nothing to reject.

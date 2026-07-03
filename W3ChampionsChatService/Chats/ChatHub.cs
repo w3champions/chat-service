@@ -50,7 +50,13 @@ public partial class ChatHub(
     // MessageReceived delivery + shadow-author-only routing (Task 12), with fault-isolated per-recipient
     // sends.
     MessageRepository messageRepository,
-    FanOutEngine fanOutEngine) : Hub
+    FanOutEngine fanOutEngine,
+    // C3 (Task 14): the batched ViewersChanged sink. The hub ROUTES viewer-roster changes into it
+    // (FocusChannel/UnfocusChannel in ChatHub.Channels.cs, and the disconnect teardown below) BEFORE
+    // the corresponding FocusRegistry mutation, so the accumulator captures each battleTag's
+    // pre-window viewing baseline as it was BEFORE the change. Singleton (Startup) — it holds the
+    // per-channel accumulation window every route writes and the flush hosted service (Task 15) drains.
+    ViewersAccumulator viewersAccumulator) : Hub
 {
     // No longer read after Task 8 moved identity→ChatUser resolution into SessionStateAssembler
     // (LoginAsAuthenticated, the last remaining reader, is no longer called from connect). Retained as
@@ -79,6 +85,8 @@ public partial class ChatHub(
     // C3 (Task 11): the durable send pipeline's message store + post-persist fan-out seam.
     private readonly MessageRepository _messageRepository = messageRepository;
     private readonly FanOutEngine _fanOutEngine = fanOutEngine;
+    // C3 (Task 14): the batched ViewersChanged sink — see the constructor param doc comment above.
+    private readonly ViewersAccumulator _viewersAccumulator = viewersAccumulator;
 
     // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
     private const int MaxMessageLength = 1024;
@@ -275,8 +283,9 @@ public partial class ChatHub(
         // legacy teardown in the `try` throws — and a future edit inserting code above/around them
         // cannot silently skip them. All three are synchronous, self-contained, no-op-if-absent
         // removals.
-        // NOTE: Task 14 later routes focus removals through a ViewersAccumulator (so a leaving viewer
-        // emits ViewersChanged); until then this is a plain removal with no fan-out.
+        // Task 14 (C2 amendment): the focus teardown now routes THROUGH the ViewersAccumulator FIRST
+        // (in the finally, BEFORE FocusRegistry.RemoveConnection) so a leaving viewer's disappearance
+        // is reconciled against a same-window reconnect rather than always read as a leave.
         try
         {
             // Identity-checked teardown lives INSIDE the registry — the hub stays dumb. Safe against the
@@ -300,6 +309,24 @@ public partial class ChatHub(
         }
         finally
         {
+            // Task 14 (C2 amendment) — the displacement-reconciliation hook. BEFORE FocusRegistry drops
+            // this connection's focus entries, route each of them through the ViewersAccumulator so the
+            // accumulator captures the battleTag's pre-window baseline (= VIEWING right now, since the
+            // removal hasn't happened yet). A NEW connection re-focusing the SAME channel with the SAME
+            // battleTag within the 5s window then re-establishes current==baseline, so the flush nets to
+            // NO delta (the displaced socket's leave and the reconnect's join cancel). The battleTag is
+            // the one FocusRegistry stored for this connection; GetFocusedChannels/RemoveConnection are
+            // read/cleared here while FocusRegistry still holds the entries. Kept in the always-run
+            // finally so teardown is unconditional even if the try above throws.
+            if (_focusRegistry.TryGetBattleTag(Context.ConnectionId, out var focusedBattleTag))
+            {
+                var now = _timeProvider.GetUtcNow().UtcDateTime;
+                foreach (var channelId in _focusRegistry.GetFocusedChannels(Context.ConnectionId))
+                {
+                    _viewersAccumulator.RecordChange(channelId, focusedBattleTag, now);
+                }
+            }
+
             _focusRegistry.RemoveConnection(Context.ConnectionId);
             _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
             _messageRateLimiter.RemoveConnection(Context.ConnectionId);
