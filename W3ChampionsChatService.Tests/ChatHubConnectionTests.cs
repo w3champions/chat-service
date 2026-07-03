@@ -15,9 +15,13 @@ using Microsoft.IdentityModel.Tokens;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
@@ -48,6 +52,17 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private MuteReconciliationService _reconcileService;
     private Mock<IChatAuthenticationService> _authService;
 
+    // C3 (Task 8) hub deps: the SessionState assembler + the in-memory fan-out registries the connect
+    // path seeds and the disconnect path tears down. The registries are SHARED across every hub built
+    // in a test so multi-connection (displacement/reconnect) and disconnect-teardown assertions see
+    // the same state. The assembler shares the SAME _onlineMemberRegistry instance it is asked to seed.
+    private ChannelRepository _channelRepository;
+    private MembershipRepository _membershipRepository;
+    private FocusRegistry _focusRegistry;
+    private OnlineMemberRegistry _onlineMemberRegistry;
+    private MessageRateLimiter _messageRateLimiter;
+    private SessionStateAssembler _assembler;
+
     // Shared, ORDERED capture of every per-target signal AND every abort, across all connections, so
     // the event-before-close ordering (acceptance 4) is asserted on ONE deterministic sequence:
     // Clients.Client(id)/Caller sends append (id, method); each Context.Abort() appends (id, "ABORT").
@@ -70,6 +85,19 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
                 new ChatUser(id.BattleTag, id.IsAdmin, null, new ProfilePicture(), null, null));
+
+        _channelRepository = new ChannelRepository(MongoClient);
+        _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
+        _focusRegistry = new FocusRegistry();
+        _onlineMemberRegistry = new OnlineMemberRegistry();
+        _messageRateLimiter = new MessageRateLimiter();
+        _assembler = new SessionStateAssembler(
+            _membershipRepository,
+            _channelRepository,
+            _muteRepository,
+            _authService.Object,
+            _onlineMemberRegistry,
+            _connectionMapping);
     }
 
     private static W3CUserAuthentication Identity(string battleTag = BattleTag, string name = "peter", bool isAdmin = false) =>
@@ -86,7 +114,12 @@ public class ChatHubConnectionTests : IntegrationTestBase
             _reconcileService,
             _ticketStore,
             _sessionRegistry,
-            _userDirectory);
+            _userDirectory,
+            _assembler,
+            _focusRegistry,
+            _onlineMemberRegistry,
+            _messageRateLimiter,
+            TimeProvider.System);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -176,7 +209,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
         Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-1", out var session),
             "A valid ticket must register the session under its connection id");
         Assert.AreEqual(BattleTag, session.Identity.BattleTag, "The registered identity is the ticket's snapshot");
-        Assert.IsNotNull(_connectionMapping.GetUser("conn-1"), "Seating (LoginAsAuthenticated) must have run");
+        Assert.IsNotNull(_connectionMapping.GetUser("conn-1"),
+            "The assembler seeds the legacy connection→user mapping (RegisterUser) so MuteReconciliationService can still reach this connection");
         Assert.IsFalse(_ticketStore.TryConsume(ticket, DateTime.UtcNow, out _),
             "The ticket must be single-use — it was already consumed at connect");
     }
@@ -253,8 +287,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
 
         Assert.AreEqual("conn-new", _sessionRegistry.GetByBattleTag(BattleTag).ConnectionId,
             "The NEW connection is the live one for this battleTag");
-        Assert.IsTrue(_sends.Contains(("conn-new", "StartChat")),
-            "The NEW connection's caller receives the normal StartChat");
+        Assert.IsTrue(_sends.Contains(("conn-new", ChatEvents.SessionState)),
+            "The NEW connection's caller receives its SessionState snapshot");
     }
 
     [Test]
@@ -307,5 +341,93 @@ public class ChatHubConnectionTests : IntegrationTestBase
         Assert.IsNotNull(entry.Profile, "The pre-existing Profile must be preserved (read-modify-write)");
         Assert.AreEqual("clan-1", entry.Profile.ClanId);
         Assert.AreEqual(7, entry.Profile.RankNumber);
+    }
+
+    [Test]
+    public async Task ValidTicket_Connect_PushesSessionState_ToCallerOnly()
+    {
+        // Acceptance 8: on connect the hub pushes the SessionState snapshot to the CALLER only — it is
+        // that connection's private state rebuild, never a room/group broadcast. (Replaces the legacy
+        // StartChat push.)
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-1", ticket);
+
+        await hub.OnConnectedAsync();
+
+        Assert.IsTrue(_sends.Contains(("conn-1", ChatEvents.SessionState)),
+            "The caller must receive its SessionState snapshot on connect");
+        Assert.IsFalse(_sends.Contains(("group", ChatEvents.SessionState)),
+            "SessionState is caller-private — it must NEVER be broadcast to a group");
+    }
+
+    [Test]
+    public async Task Connect_FullBan_SendsPlayerBannedFromChat_AndSessionState()
+    {
+        // A full-banned user still connects (bans never abort — C2/G1). The caller receives BOTH its
+        // SessionState snapshot AND the legacy PlayerBannedFromChat notice (expiry only). The shadow
+        // flag / reason never leave the boundary — the notice carries endDate alone.
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = BattleTag,
+            endDate = DateTime.UtcNow.AddDays(1).ToString("O"),
+            author = "admin#1",
+            reason = "test ban",
+            isShadowBan = false,
+        });
+
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-ban", ticket);
+
+        await hub.OnConnectedAsync();
+
+        Assert.IsTrue(_sends.Contains(("conn-ban", ChatEvents.SessionState)),
+            "A full-banned user still receives its SessionState snapshot");
+        Assert.IsTrue(_sends.Contains(("conn-ban", ChatEvents.PlayerBannedFromChat)),
+            "A full ban must also push the legacy PlayerBannedFromChat notice to the caller");
+    }
+
+    [Test]
+    public async Task Reconnect_SecondConnect_GetsFreshSessionState()
+    {
+        // Acceptance 8 seed: every (re)connect rebuilds state from a FRESH SessionState snapshot. The
+        // same battleTag reconnecting (a new connection displacing the old) gets its own snapshot.
+        var ticketOld = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (oldHub, _) = BuildConnection("conn-old", ticketOld);
+        await oldHub.OnConnectedAsync();
+        Assert.IsTrue(_sends.Contains(("conn-old", ChatEvents.SessionState)),
+            "The first connect gets a SessionState snapshot");
+
+        var ticketNew = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (newHub, _) = BuildConnection("conn-new", ticketNew);
+        await newHub.OnConnectedAsync();
+
+        Assert.IsTrue(_sends.Contains(("conn-new", ChatEvents.SessionState)),
+            "The reconnect gets its own FRESH SessionState snapshot");
+    }
+
+    [Test]
+    public async Task Disconnect_RemovesRegistryState()
+    {
+        // On disconnect the hub tears down every in-memory fan-out registry entry for the connection so
+        // nothing leaks past the socket's lifetime. FocusRegistry + MessageRateLimiter are populated by
+        // later hub methods (Tasks 9/11) and OnlineMemberRegistry is connect-seeded only when the user
+        // has channel-backed memberships (this fresh identity has none) — so seed all three directly to
+        // prove OnDisconnectedAsync removes every one.
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-1", ticket);
+        await hub.OnConnectedAsync();
+
+        _focusRegistry.Focus("conn-1", "chan-1", BattleTag);
+        _onlineMemberRegistry.Join("chan-1", "conn-1", new MemberState(BattleTag, NotificationLevel.All, 0));
+        _messageRateLimiter.TryAcquire("conn-1", "chan-1", DateTime.UtcNow);
+
+        await hub.OnDisconnectedAsync(null);
+
+        Assert.IsEmpty(_focusRegistry.GetFocusedConnections("chan-1"),
+            "FocusRegistry must hold no entry for the connection after disconnect");
+        Assert.IsEmpty(_onlineMemberRegistry.GetMembers("chan-1"),
+            "OnlineMemberRegistry must hold no entry for the connection after disconnect");
+        Assert.AreEqual(0, _messageRateLimiter.TrackedChannelCount("conn-1"),
+            "MessageRateLimiter must hold no bucket state for the connection after disconnect");
     }
 }

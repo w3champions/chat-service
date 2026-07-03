@@ -5,8 +5,12 @@ using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
@@ -44,6 +48,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
         _chatHistory = new ChatHistory();
         _settingsRepository = new SettingsRepository(MongoClient);
 
+        var channelRepository = new ChannelRepository(MongoClient);
+        var onlineMemberRegistry = new OnlineMemberRegistry();
         _chatHub = new ChatHub(
             _chatAuthenticationService,
             _muteRepository,
@@ -53,7 +59,18 @@ public class ChatHubDeletionTests : IntegrationTestBase
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
             new TicketStore(),
             new SessionRegistry(),
-            new UserDirectoryRepository(MongoClient));
+            new UserDirectoryRepository(MongoClient),
+            new SessionStateAssembler(
+                new MembershipRepository(MongoClient, channelRepository),
+                channelRepository,
+                _muteRepository,
+                _chatAuthenticationService,
+                onlineMemberRegistry,
+                _connectionMapping),
+            new FocusRegistry(),
+            onlineMemberRegistry,
+            new MessageRateLimiter(),
+            TimeProvider.System);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

@@ -8,8 +8,12 @@ using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
@@ -52,6 +56,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
+        var channelRepository = new ChannelRepository(MongoClient);
+        var onlineMemberRegistry = new OnlineMemberRegistry();
         _chatHub = new ChatHub(
             chatAuthService.Object,
             _muteRepository,
@@ -61,7 +67,18 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _reconcileHarness.Service,
             new TicketStore(),
             new SessionRegistry(),
-            new UserDirectoryRepository(MongoClient));
+            new UserDirectoryRepository(MongoClient),
+            new SessionStateAssembler(
+                new MembershipRepository(MongoClient, channelRepository),
+                channelRepository,
+                _muteRepository,
+                chatAuthService.Object,
+                onlineMemberRegistry,
+                _connectionMapping),
+            new FocusRegistry(),
+            onlineMemberRegistry,
+            new MessageRateLimiter(),
+            TimeProvider.System);
 
         _lastCallerMethod = null;
         _lastCallerArgs = null;
@@ -1084,6 +1101,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
         chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync(new ChatUser("peter#123", false, null, new ProfilePicture(), null, null));
 
+        var channelRepository = new ChannelRepository(MongoClient);
+        var onlineMemberRegistry = new OnlineMemberRegistry();
         var hub = new ChatHub(
             chatAuthService.Object,
             repository,
@@ -1093,7 +1112,18 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             _reconcileHarness.Service,
             new TicketStore(),
             new SessionRegistry(),
-            new UserDirectoryRepository(MongoClient))
+            new UserDirectoryRepository(MongoClient),
+            new SessionStateAssembler(
+                new MembershipRepository(MongoClient, channelRepository),
+                channelRepository,
+                repository,
+                chatAuthService.Object,
+                onlineMemberRegistry,
+                _connectionMapping),
+            new FocusRegistry(),
+            onlineMemberRegistry,
+            new MessageRateLimiter(),
+            TimeProvider.System)
         {
             Clients = _clients.Object,
             Context = _hubCallerContext.Object,

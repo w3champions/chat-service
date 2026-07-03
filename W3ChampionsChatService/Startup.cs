@@ -9,11 +9,13 @@ using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
@@ -71,6 +73,19 @@ public class Startup
         // 13, 14, 15) — tests substitute Microsoft.Extensions.Time.Testing.FakeTimeProvider so those
         // services never depend on real wall-clock delays.
         services.AddSingleton(TimeProvider.System);
+
+        // Task 8 hub deps. The assembler is per-connect state assembly (no long-lived state of its
+        // own) → Transient. The three fan-out registries hold shared in-memory state that the connect
+        // path seeds and the disconnect path (plus later Join/Leave/Focus/rate-limit paths) mutate, so
+        // every hub invocation MUST share the SAME instance → Singleton, exactly like the C2
+        // ConnectionMapping/SessionRegistry above; a transient would silently fragment fan-out state.
+        // Task 15 owns the REMAINING fan-out singletons (ActivityCoalescer, ViewersAccumulator,
+        // FanOutEngine) + the flush hosted service + their DI-coverage tests — do NOT register those
+        // here, and do NOT re-register the three below there.
+        services.AddTransient<SessionStateAssembler>();
+        services.AddSingleton<FocusRegistry>();
+        services.AddSingleton<OnlineMemberRegistry>();
+        services.AddSingleton<MessageRateLimiter>();
 
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();

@@ -5,7 +5,9 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
@@ -23,8 +25,16 @@ public class ChatHub(
     MuteReconciliationService muteReconciliation,
     ITicketStore ticketStore,
     ISessionRegistry sessionRegistry,
-    UserDirectoryRepository userDirectory) : Hub
+    UserDirectoryRepository userDirectory,
+    SessionStateAssembler assembler,
+    FocusRegistry focusRegistry,
+    OnlineMemberRegistry onlineMemberRegistry,
+    MessageRateLimiter messageRateLimiter,
+    TimeProvider timeProvider) : Hub
 {
+    // No longer read after Task 8 moved identity→ChatUser resolution into SessionStateAssembler
+    // (LoginAsAuthenticated, the last remaining reader, is no longer called from connect). Retained as
+    // a constructor dependency until Task 19 strips LoginAsAuthenticated and the legacy scaffolding.
     private readonly IChatAuthenticationService _authenticationService = authenticationService;
     private readonly IMuteRepository _muteRepository = muteRepository;
     private readonly SettingsRepository _settingsRepository = settingsRepository;
@@ -34,6 +44,14 @@ public class ChatHub(
     private readonly ITicketStore _ticketStore = ticketStore;
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
     private readonly UserDirectoryRepository _userDirectory = userDirectory;
+    // C3 (Task 8): the SessionState snapshot assembler + the in-memory fan-out registries this hub
+    // seeds on connect and tears down on disconnect. TimeProvider supplies the trusted server clock
+    // for the connect-path `now` handed to the assembler (mute-expiry resolution).
+    private readonly SessionStateAssembler _assembler = assembler;
+    private readonly FocusRegistry _focusRegistry = focusRegistry;
+    private readonly OnlineMemberRegistry _onlineMemberRegistry = onlineMemberRegistry;
+    private readonly MessageRateLimiter _messageRateLimiter = messageRateLimiter;
+    private readonly TimeProvider _timeProvider = timeProvider;
 
     // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
     private const int MaxMessageLength = 1024;
@@ -181,8 +199,27 @@ public class ChatHub(
         }
 
         await UpsertDirectoryStub(identity);
-        var user = await _authenticationService.GetUserFromIdentity(identity);
-        await LoginAsAuthenticated(user);
+
+        // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
+        // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
+        // snapshot to the CALLER only — it is that connection's private state rebuild (spec acceptance
+        // 8), never a group broadcast. This REPLACES the legacy LoginAsAuthenticated push, which stays
+        // in the file (still exercised by legacy suites) but is no longer called from connect; it is
+        // stripped in Task 19. FATAL by design: if AssembleAndSeed throws (e.g. a Mongo hiccup) the
+        // connect fails exactly as the legacy login read did — an authenticated connection with no
+        // snapshot is useless — so we do NOT swallow it (unlike the non-fatal directory stub above).
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now);
+        await Clients.Caller.SendAsync(ChatEvents.SessionState, dto);
+
+        if (muteStatus == MuteStatus.Full)
+        {
+            // Full ban → also push the legacy PlayerBannedFromChat notice so old clients render it.
+            // SECURITY: expiry ONLY — never the reason or the shadow flag. The endDate comes straight
+            // off the DTO's own MuteState (present iff Full), mirroring MuteReconciliationService's
+            // PlayerBannedFromChat payload shape ({ endDate }).
+            await Clients.Caller.SendAsync(ChatEvents.PlayerBannedFromChat, new { endDate = dto.MuteState.EndDate });
+        }
     }
 
     // Stub directory upsert (full enrichment is C6). Read-modify-write via Load → set → Upsert so a
@@ -205,6 +242,16 @@ public class ChatHub(
 
     public override async Task OnDisconnectedAsync(Exception exception)
     {
+        // C3 (Task 8): tear down this connection's in-memory fan-out state FIRST and UNCONDITIONALLY so
+        // it can never leak past the socket's lifetime — these three removals must run even if the
+        // legacy UserLeft broadcast below throws. All three are synchronous, self-contained, no-op-if-
+        // absent removals (nothing here can early-return or throw before they complete).
+        // NOTE: Task 14 later routes focus removals through a ViewersAccumulator (so a leaving viewer
+        // emits ViewersChanged); until then this is a plain removal with no fan-out.
+        _focusRegistry.RemoveConnection(Context.ConnectionId);
+        _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
+        _messageRateLimiter.RemoveConnection(Context.ConnectionId);
+
         // Identity-checked teardown lives INSIDE the registry — the hub stays dumb. Safe against the
         // displaced-old-socket race: a dying OLD socket will NOT evict the NEW session.
         _sessionRegistry.Unregister(Context.ConnectionId);
