@@ -27,6 +27,8 @@ public sealed class HubPushCaptureHarness
 
     // Ordered across ALL connections, in the order SendCoreAsync was invoked — lets a test assert
     // cross-connection fan-out ordering, not just per-connection ordering.
+    // Guarded by lock (_sends) — this harness is deliberately hit by fan-out under parallel
+    // connections in later tasks (13, 14, 15), so every read/write must be synchronized.
     private readonly List<(string ConnectionId, string Method, object Payload)> _sends = new();
 
     public HubPushCaptureHarness()
@@ -41,7 +43,10 @@ public sealed class HubPushCaptureHarness
                     .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
                     .Callback<string, object[], CancellationToken>((method, args, _) =>
                     {
-                        _sends.Add((connectionId, method, args.Length > 0 ? args[0] : null));
+                        lock (_sends)
+                        {
+                            _sends.Add((connectionId, method, args.Length > 0 ? args[0] : null));
+                        }
                     })
                     .Returns(Task.CompletedTask);
                 return proxy.Object;
@@ -55,23 +60,56 @@ public sealed class HubPushCaptureHarness
     public IHubContext<ChatHub> HubContext => _hubContextMock.Object;
 
     /// <summary>Every <c>(connectionId, method, payload)</c> signal sent, in send order, across ALL connections.</summary>
-    public IReadOnlyList<(string ConnectionId, string Method, object Payload)> AllSignals => _sends;
+    public IReadOnlyList<(string ConnectionId, string Method, object Payload)> AllSignals
+    {
+        get
+        {
+            lock (_sends)
+            {
+                return _sends.ToList();
+            }
+        }
+    }
 
     /// <summary>All (method, payload) signals sent to <paramref name="connectionId"/>, in order.</summary>
-    public IReadOnlyList<(string Method, object Payload)> SignalsFor(string connectionId) =>
-        _sends
+    public IReadOnlyList<(string Method, object Payload)> SignalsFor(string connectionId)
+    {
+        List<(string ConnectionId, string Method, object Payload)> snapshot;
+        lock (_sends)
+        {
+            snapshot = _sends.ToList();
+        }
+
+        return snapshot
             .Where(s => s.ConnectionId == connectionId)
             .Select(s => (s.Method, s.Payload))
             .ToList();
+    }
 
     /// <summary>The first payload sent to <paramref name="connectionId"/> for <paramref name="method"/>, or null.</summary>
-    public object PayloadFor(string connectionId, string method) =>
-        _sends
+    public object PayloadFor(string connectionId, string method)
+    {
+        List<(string ConnectionId, string Method, object Payload)> snapshot;
+        lock (_sends)
+        {
+            snapshot = _sends.ToList();
+        }
+
+        return snapshot
             .Where(s => s.ConnectionId == connectionId && s.Method == method)
             .Select(s => s.Payload)
             .FirstOrDefault();
+    }
 
     /// <summary>How many times <paramref name="method"/> was sent to <paramref name="connectionId"/>.</summary>
-    public int SignalCount(string connectionId, string method) =>
-        _sends.Count(s => s.ConnectionId == connectionId && s.Method == method);
+    public int SignalCount(string connectionId, string method)
+    {
+        List<(string ConnectionId, string Method, object Payload)> snapshot;
+        lock (_sends)
+        {
+            snapshot = _sends.ToList();
+        }
+
+        return snapshot.Count(s => s.ConnectionId == connectionId && s.Method == method);
+    }
 }
