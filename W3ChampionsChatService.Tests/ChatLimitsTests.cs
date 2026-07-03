@@ -38,4 +38,14 @@ public class ChatLimitsTests
         Assert.AreEqual(30, ChatLimits.TicketMintPerIpLimit);
         Assert.AreEqual(TimeSpan.FromMinutes(1), ChatLimits.TicketMintWindow);
     }
+
+    [Test]
+    public void MessagePageSizeAndAutoThrottleConstants_MatchC3PlanDecisionTask1()
+    {
+        // C3 plan decision (Task 1) — NOT spec §13; hard-coded, adjust here only.
+        Assert.AreEqual(100, ChatLimits.MessagePageSize);
+        Assert.AreEqual(5, ChatLimits.AutoThrottleViolationThreshold);
+        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleWindow);
+        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleDuration);
+    }
 }

@@ -64,4 +64,16 @@ public static class ChatLimits
     public const int TicketMintPerBattleTagLimit = 10;
     public const int TicketMintPerIpLimit = 30;
     public static readonly TimeSpan TicketMintWindow = TimeSpan.FromMinutes(1);
+
+    /// <summary>GetMessages page size cap (C3 plan decision, Task 1 — not spec §13; requested
+    /// limits above this are clamped down, never rejected).</summary>
+    public const int MessagePageSize = 100;
+
+    /// <summary>Auto-throttle escalation (C3 plan decision, Task 1). Spec §13 pins only "60s
+    /// automatic throttle"; the trigger threshold/window are NOT spec-pinned — cheap to change
+    /// (C3-plan.md Open question 3). Repeated rate-limit violations within the window escalate to
+    /// a hard per-connection throttle for the duration below, plus a moderation log entry.</summary>
+    public const int AutoThrottleViolationThreshold = 5;
+    public static readonly TimeSpan AutoThrottleWindow = TimeSpan.FromSeconds(60);
+    public static readonly TimeSpan AutoThrottleDuration = TimeSpan.FromSeconds(60);
 }
