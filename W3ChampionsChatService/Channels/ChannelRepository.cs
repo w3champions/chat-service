@@ -22,8 +22,9 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
 
     /// <summary>
     /// Atomically allocates the next per-channel sequence number via findOneAndUpdate $inc
-    /// on the channel doc. Strictly monotonic under concurrency (single-document atomicity);
-    /// single service instance by design.
+    /// on the channel doc. Strictly monotonic under concurrency — guaranteed by MongoDB
+    /// single-document $inc atomicity, so it holds regardless of service-instance count
+    /// (the service also runs single-instance by design).
     /// </summary>
     public async Task<long> AllocateSeq(string channelId)
     {

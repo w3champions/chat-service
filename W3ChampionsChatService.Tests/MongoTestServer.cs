@@ -30,6 +30,9 @@ public class MongoTestServer
     [OneTimeTearDown]
     public async Task StopMongo()
     {
-        await _container.DisposeAsync();
+        if (_container is not null)
+        {
+            await _container.DisposeAsync();
+        }
     }
 }
