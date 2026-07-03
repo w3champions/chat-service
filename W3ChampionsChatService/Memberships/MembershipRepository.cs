@@ -7,12 +7,7 @@ using W3ChampionsChatService.Domain;
 
 namespace W3ChampionsChatService.Memberships;
 
-// CS9107: mongoClient is intentionally re-used below to compose ChannelRepository for
-// CountNameJoinableMembershipsForUser's LoadByIds reuse — MongoClient is a cheap, thread-safe
-// connection-pool handle, safe to hold via both this class and the base.
-#pragma warning disable CS9107
-public class MembershipRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
-#pragma warning restore CS9107
+public class MembershipRepository(MongoClient mongoClient, ChannelRepository channelRepository) : MongoDbRepositoryBase(mongoClient)
 {
     private IMongoCollection<ChannelMembership> Memberships =>
         CreateCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
@@ -51,9 +46,8 @@ public class MembershipRepository(MongoClient mongoClient) : MongoDbRepositoryBa
         var memberships = await LoadForUser(battleTag);
         if (memberships.Count == 0) return 0;
 
-        // Composes ChannelRepository so the type filter reuses LoadByIds rather than
-        // duplicating its query (see CS9107 suppression note on the class declaration).
-        var channelRepository = new ChannelRepository(mongoClient);
+        // Reuses the injected ChannelRepository so the type filter reuses LoadByIds rather than
+        // duplicating its query.
         var channels = await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId));
         var nameJoinableChannelIds = channels
             .Where(c => c.Type == ChannelType.Public || c.Type == ChannelType.SemiPublic)

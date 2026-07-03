@@ -14,7 +14,7 @@ public class MembershipRepositoryTests : IntegrationTestBase
     [Test]
     public async Task Membership_RoundTrips_WithDefaults()
     {
-        var repo = new MembershipRepository(MongoClient);
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
         var membership = new ChannelMembership
         {
             ChannelId = "chan1",
@@ -33,7 +33,7 @@ public class MembershipRepositoryTests : IntegrationTestBase
     [Test]
     public async Task LoadForUser_ReturnsAllChannelsOfThatUser_ViaBattleTagIndex()
     {
-        var repo = new MembershipRepository(MongoClient);
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
         await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
         await repo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
         await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Wolf#456", JoinedAt = DateTime.UtcNow });
@@ -48,7 +48,7 @@ public class MembershipRepositoryTests : IntegrationTestBase
     public async Task DuplicateMembership_IsRejectedByUniqueIndex()
     {
         await ChatDomainIndexes.EnsureAllAsync(MongoClient);
-        var repo = new MembershipRepository(MongoClient);
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
         await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
 
         Assert.ThrowsAsync<MongoWriteException>(
@@ -74,7 +74,7 @@ public class MembershipRepositoryTests : IntegrationTestBase
     [Test]
     public async Task UpdateLastReadSeq_IsMonotonicMax()
     {
-        var repo = new MembershipRepository(MongoClient);
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
         await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow, LastReadSeq = 5 });
 
         await repo.UpdateLastReadSeq("chan1", "Peter#123", 10);
@@ -90,7 +90,7 @@ public class MembershipRepositoryTests : IntegrationTestBase
     [Test]
     public async Task SetNotificationLevel_Persists()
     {
-        var repo = new MembershipRepository(MongoClient);
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
         await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
         Assert.AreEqual(NotificationLevel.All, (await repo.Load("chan1", "Peter#123")).NotificationLevel);
 
@@ -112,7 +112,7 @@ public class MembershipRepositoryTests : IntegrationTestBase
         await channelRepo.Insert(sys);
         await channelRepo.Insert(dm);
 
-        var membershipRepo = new MembershipRepository(MongoClient);
+        var membershipRepo = new MembershipRepository(MongoClient, channelRepo);
         await membershipRepo.Insert(new ChannelMembership { ChannelId = pub.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
         await membershipRepo.Insert(new ChannelMembership { ChannelId = semi.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
         await membershipRepo.Insert(new ChannelMembership { ChannelId = sys.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });

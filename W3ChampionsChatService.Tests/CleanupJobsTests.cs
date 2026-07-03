@@ -15,7 +15,7 @@ public class CleanupJobsTests : IntegrationTestBase
     public async Task SemiPublicGc_DeletesOnlyChannelsWithNoMembersAndNoMessages()
     {
         var channelRepo = new ChannelRepository(MongoClient);
-        var membershipRepo = new MembershipRepository(MongoClient);
+        var membershipRepo = new MembershipRepository(MongoClient, channelRepo);
         var messageRepo = new MessageRepository(MongoClient);
 
         var empty = new ChatChannel { Type = ChannelType.SemiPublic, Name = "dead", NormalizedName = "dead" };
@@ -49,7 +49,7 @@ public class CleanupJobsTests : IntegrationTestBase
     [Test]
     public async Task IdleMembershipPruning_RemovesMembershipsOfUsersIdleOverOneYear()
     {
-        var membershipRepo = new MembershipRepository(MongoClient);
+        var membershipRepo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
         var directoryRepo = new UserDirectoryRepository(MongoClient);
         var now = DateTime.UtcNow;
 
