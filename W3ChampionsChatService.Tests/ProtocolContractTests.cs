@@ -4,6 +4,7 @@ using NUnit.Framework;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 
 namespace W3ChampionsChatService.Tests;
@@ -115,7 +116,7 @@ public class ProtocolContractTests
     [Test]
     public void GetMessagesResult_CarriesMessagesWithModeratorFlagSlots()
     {
-        var sender = new MessageSenderDto("Peter#123", "Peter", Flair: null);
+        var sender = new MessageSender { BattleTag = "Peter#123", Name = "Peter" };
         var message = new MessageDto("m1", "c1", 1, sender, "hi", DateTime.UtcNow, Deleted: false, Shadow: false);
 
         var result = new GetMessagesResult(ChatResultCode.Ok, Messages: new[] { message });
