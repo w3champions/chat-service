@@ -231,6 +231,33 @@ public class ActivityCoalescerTests
         Assert.IsNull(dto.Preview, "the ChannelActivity preview slot must be null in C3");
     }
 
+    [Test]
+    public async Task Offer_OutOfOrderLowerSeq_DoesNotRegressEmittedSeq()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+
+        // First offer: seq 6 — window elapsed (first ever offer for this pair) → emits immediately,
+        // opening the window.
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0);
+        Assert.AreEqual(1, harness.SignalCount(MemberConn, ChatEvents.ChannelActivity));
+        var first = harness.PayloadFor(MemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.AreEqual(6, first.LastSeq);
+
+        // A LOWER seq (5) arrives within the same window — e.g. a race between concurrent
+        // OnMessagePersisted -> Offer calls for the same channel landing out of seq order at the
+        // coalescer's lock. It must coalesce into the pending WITHOUT regressing the tracked seq below
+        // the already-emitted 6.
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0.AddSeconds(1));
+        Assert.AreEqual(1, harness.SignalCount(MemberConn, ChatEvents.ChannelActivity), "the lower out-of-order offer must not trigger an extra emit");
+
+        // Once the window elapses, the flush must carry the MAX tracked seq (6), never the lower 5 — a
+        // client must never observe ChannelActivity.lastSeq regress.
+        await coalescer.FlushDue(T0.AddSeconds(11));
+        var payloads = ActivityPayloads(harness, MemberConn);
+        Assert.AreEqual(2, payloads.Count);
+        Assert.AreEqual(6, payloads[1].LastSeq, "the flush must never regress below the already-emitted seq 6");
+    }
+
     // ---- Engine-routing tests ----------------------------------------------------------------------
 
     [Test]

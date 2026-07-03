@@ -64,10 +64,19 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// the activity is emitted immediately and the window reopens; otherwise it is COALESCED into the
     /// pending, keeping only the latest seq, with no emit. Emission is still subject to the emit-time
     /// unread suppression.
+    /// <para>
+    /// MONOTONIC: <c>seq</c> is allocated at persist time, but the <c>OnMessagePersisted</c> → <c>Offer</c>
+    /// fan-out calls for the same channel are only serialized by this coalescer's lock — under concurrent
+    /// same-channel sends they can reach the lock out of seq order. Both the pending store and the
+    /// immediate emit below track the MAX of whatever was already pending/emitted and the newly offered
+    /// seq, so a lower out-of-order offer coalesces harmlessly instead of ever regressing the seq a client
+    /// observes.
+    /// </para>
     /// </summary>
     public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now)
     {
         bool emit;
+        long emitSeq = 0;
 
         lock (_lock)
         {
@@ -84,25 +93,32 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
 
             if (now - entry.LastSentAt >= ChatLimits.ChannelActivityCoalesce)
             {
-                // Window elapsed → emit this seq now and reopen the window. Advancing LastSentAt here
-                // (even if the emit is later suppressed) is what keeps resumed emissions 10s-spaced.
+                // Window elapsed → emit now and reopen the window. The emitted seq is the MAX of the
+                // offered seq and anything already tracked (a stale pending or the last emit) so a
+                // lower out-of-order offer never regresses what the client observes. Advancing
+                // LastSentAt here (even if the emit is later suppressed) is what keeps resumed
+                // emissions 10s-spaced.
+                emitSeq = Math.Max(Math.Max(entry.PendingLastSeq, entry.LastEmittedSeq), lastSeq);
                 entry.LastSentAt = now;
                 entry.HasPending = false;
                 entry.PendingLastSeq = 0;
+                entry.LastEmittedSeq = emitSeq;
                 emit = true;
             }
             else
             {
-                // Within the window → collapse into the single pending, keeping ONLY the latest seq.
+                // Within the window → collapse into the single pending, keeping ONLY the latest
+                // (highest) seq — a lower out-of-order offer must never overwrite a higher pending, or
+                // regress below what has already been emitted.
                 entry.HasPending = true;
-                entry.PendingLastSeq = lastSeq;
+                entry.PendingLastSeq = Math.Max(Math.Max(entry.PendingLastSeq, entry.LastEmittedSeq), lastSeq);
                 emit = false;
             }
         }
 
         if (emit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, lastSeq);
+            await EmitIfNotSuppressed(connectionId, channelId, emitSeq);
         }
     }
 
@@ -126,8 +142,11 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                     {
                         entry.LastSentAt = now;
                         entry.HasPending = false;
-                        var seq = entry.PendingLastSeq;
+                        // PendingLastSeq is already the running MAX (kept monotonic by Offer), but guard
+                        // against LastEmittedSeq too so a flush can never regress what was last emitted.
+                        var seq = Math.Max(entry.PendingLastSeq, entry.LastEmittedSeq);
                         entry.PendingLastSeq = 0;
+                        entry.LastEmittedSeq = seq;
 
                         (toEmit ??= new List<(string, string, long)>())
                             .Add((connectionId, channelId, seq));
@@ -214,12 +233,16 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// The coalescing window state for one (connection, channel). Plain mutable fields, mutated only
     /// under the coalescer's lock (mirrors <see cref="MessageRateLimiter"/>'s per-connection state).
     /// <see cref="LastSentAt"/> defaults to <see cref="DateTime.MinValue"/> so the first offer is always
-    /// "window elapsed" and fires immediately.
+    /// "window elapsed" and fires immediately. <see cref="LastEmittedSeq"/> is the running high-water
+    /// mark of every seq this (connection, channel) has emitted or pended — both <see cref="Offer"/> and
+    /// <see cref="FlushDue"/> take the MAX against it so an out-of-order lower offer can never regress
+    /// the seq a client observes.
     /// </summary>
     private sealed class Entry
     {
         internal DateTime LastSentAt;
         internal bool HasPending;
         internal long PendingLastSeq;
+        internal long LastEmittedSeq;
     }
 }
