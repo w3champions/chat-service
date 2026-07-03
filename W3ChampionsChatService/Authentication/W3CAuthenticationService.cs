@@ -13,20 +13,34 @@ public class W3CAuthenticationService : IW3CAuthenticationService
 {
     private static readonly string JwtPublicKey = Regex.Unescape(Environment.GetEnvironmentVariable("JWT_PUBLIC_KEY") ?? "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA6N6yiNe392lG5W+4LKDD\nNOr53vvolpC7098x6tWbw0E3Jkg8n3Y8A1qC9+7tFYXV8I5UlQdT1Oy/BxbPuNR0\nS/zr93WeYkLCWlfh7yjFKwNbRSoWXL36lFhy85H+5HNGfjKpTm5HLTXKRH1P4lLk\n3Gfz0p84OXeumUs9cDRz7WSSEeGTpD4oA3qGgS18F2U394No/YfNIOyJCOzDRaN9\nMx8H2VcsOvZnGqeCWKtY+7fh1YQQqR2ebZb1eA0qziloxnXhI2sUXUnjK68YIV3d\nXaFhYuSsJQoXuHzIA1opcFkGhkQI+wVyLzaAPhWiU0MCvoRf+kxfmW8gaUdT+2ar\no2C2lXp5Y/0xyrl3w0bzinQ79n+PH0pixu00r4/892IksS5SexdZ1Ka5TaHdnWGR\njM1p1DmFqyKvm98wsoq4ZsgYVrMHOY3qDRdb4ss93HjgA5gh6q3rnLFdUC8T+FgL\nkwZIsRm4+a0by3xwglHgWBOu81Pzy4F1dQOV3C31cgLsMZvBW0D01I7F/Y5YFU1A\nlLgKocWLLDEnWMh+078H3PyRH9W3vuQGfD6CAfEu8jbETgZeZqiyR45yDGeyZlWE\nbtiZjF00dkblGb5z5BFRtYHwL2Cfi6XJnby77NYHPTUH1GrfdL+sp7QEDe9k/4h6\nsYbv9oAYja2AuGxDba1MJHUCAwEAAQ==\n-----END PUBLIC KEY-----\n");
 
+    private readonly string _publicKey;
+
+    public W3CAuthenticationService() : this(JwtPublicKey) { }
+
+    // Test seam (assembly has InternalsVisibleTo): inject a generated key instead of the env/static one.
+    internal W3CAuthenticationService(string publicKeyPem) => _publicKey = publicKeyPem;
+
     public W3CUserAuthentication GetUserByToken(string jwt)
     {
-        return W3CUserAuthentication.FromJWT(jwt, JwtPublicKey);
+        return W3CUserAuthentication.FromJWT(jwt, _publicKey);
+    }
+
+    // Mint-only policy (contract §3): signature + exp. Issuer/audience stay unvalidated (tokens carry neither).
+    public W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt)
+    {
+        return W3CUserAuthentication.FromJWT(jwt, _publicKey, validateLifetime: true);
     }
 }
 
 public interface IW3CAuthenticationService
 {
     W3CUserAuthentication GetUserByToken(string jwt);
+    W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt);
 }
 
 public class W3CUserAuthentication
 {
-    public static W3CUserAuthentication FromJWT(string jwt, string publicKey)
+    public static W3CUserAuthentication FromJWT(string jwt, string publicKey, bool validateLifetime = false)
     {
         try
         {
@@ -37,7 +51,7 @@ public class W3CUserAuthentication
             {
                 ValidateIssuer = false,
                 ValidateAudience = false,
-                ValidateLifetime = false,
+                ValidateLifetime = validateLifetime,
                 ValidateTokenReplay = false,
                 ValidateActor = false,
                 ValidateIssuerSigningKey = true,
