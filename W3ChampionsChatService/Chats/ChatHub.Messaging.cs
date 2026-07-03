@@ -255,8 +255,11 @@ public partial class ChatHub
     /// reverse-index lookup — mirrors <see cref="SendMessage(string, string)"/>'s step 3) →
     /// <see cref="ChatResultCode.NotMember"/> if the caller isn't a member.</item>
     /// <item>Channel load (needed for the clamp ceiling below); missing → <see cref="ChatResultCode.NotFound"/>
-    /// — the member-of-a-deleted-channel edge. Defensive/beyond this task's named tests, but kept
-    /// consistent with the SAME edge handled by <see cref="GetMessages"/> and <see cref="FocusChannel"/>.</item>
+    /// — the member-of-a-deleted-channel edge. Defensive/beyond this task's named tests, but the SAME
+    /// guard <see cref="SendMessage(string, string)"/> applies on its own is-member-true branch (its
+    /// step 5). <see cref="GetMessages"/> and <see cref="FocusChannel"/> do NOT share this edge — both
+    /// only load the channel on their non-member cold path, so a member of an orphaned channel never
+    /// reaches a channel load there.</item>
     /// <item>Clamp: <c>Math.Min(seq, channel.LastSeq)</c> — a client must never mark a channel read
     /// past its actual last message, or unread would go negative and mask future messages.</item>
     /// <item>Advance BOTH stores with the CLAMPED value (dual-store monotonic invariant below), then
@@ -301,7 +304,8 @@ public partial class ChatHub
         }
 
         // 3. Load the channel — needed for the clamp ceiling. A member whose channel doc is gone
-        // (deleted) → NotFound, mirroring SendMessage/GetMessages/FocusChannel's same edge.
+        // (deleted) → NotFound, mirroring SendMessage's same is-member-true-branch guard (GetMessages
+        // and FocusChannel don't share this edge — they only load the channel on the non-member path).
         var channel = await _channelRepository.Load(channelId);
         if (channel == null)
         {

@@ -288,6 +288,23 @@ public class ChatHubMarkReadTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Member-of-a-deleted-channel edge (defensive — see the doc comment on ChatHub.MarkRead)
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task MarkRead_UnknownChannel_ReturnsNotFound()
+    {
+        // Member-of-a-deleted-channel edge: the registry says member, but no channel doc exists.
+        const string ghostChannelId = "ghost-channel-id";
+        await SeedMember("conn-1", BattleTag, ghostChannelId);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.MarkRead(ghostChannelId, 5);
+
+        Assert.AreEqual(ChatResultCode.NotFound, result.Code);
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Acceptance 7's regression clause: a fresh reconnect-assembled SessionState reflects unread 0
     // ---------------------------------------------------------------------------------------------
 
