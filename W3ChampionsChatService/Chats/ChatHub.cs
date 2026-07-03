@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
@@ -34,7 +35,14 @@ public partial class ChatHub(
     TimeProvider timeProvider,
     // C3 (Task 9): resolves a channel for the FocusChannel NotFound-vs-NotMember split (cold path,
     // only reached when the caller is NOT already a member per OnlineMemberRegistry).
-    ChannelRepository channelRepository) : Hub
+    ChannelRepository channelRepository,
+    // C3 (Task 10): JoinChannel/LeaveChannel/SetNotificationLevel — membership self-service reads and
+    // writes ChannelMembership rows directly (Load/Insert/Delete/SetNotificationLevel/
+    // CountNameJoinableMembershipsForUser), and the creation throttle gates implicit semiPublic
+    // creation (JoinChannel resolution step 2, "not found" branch) — a SEPARATE singleton from
+    // MintRateLimiter (see FanOut/ChannelCreationRateLimiter.cs doc comment for why).
+    MembershipRepository membershipRepository,
+    ChannelCreationRateLimiter channelCreationRateLimiter) : Hub
 {
     // No longer read after Task 8 moved identity→ChatUser resolution into SessionStateAssembler
     // (LoginAsAuthenticated, the last remaining reader, is no longer called from connect). Retained as
@@ -57,6 +65,9 @@ public partial class ChatHub(
     private readonly MessageRateLimiter _messageRateLimiter = messageRateLimiter;
     private readonly TimeProvider _timeProvider = timeProvider;
     private readonly ChannelRepository _channelRepository = channelRepository;
+    // C3 (Task 10): membership self-service deps — see the constructor param doc comment above.
+    private readonly MembershipRepository _membershipRepository = membershipRepository;
+    private readonly ChannelCreationRateLimiter _channelCreationRateLimiter = channelCreationRateLimiter;
 
     // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
     private const int MaxMessageLength = 1024;

@@ -51,6 +51,7 @@ public class ChatHubFocusTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
 
     [SetUp]
@@ -75,6 +76,7 @@ public class ChatHubFocusTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -101,7 +103,9 @@ public class ChatHubFocusTests : IntegrationTestBase
             _onlineMemberRegistry,
             _messageRateLimiter,
             TimeProvider.System,
-            _channelRepository);
+            _channelRepository,
+            _membershipRepository,
+            _channelCreationRateLimiter);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

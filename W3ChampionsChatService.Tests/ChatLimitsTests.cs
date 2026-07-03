@@ -48,4 +48,12 @@ public class ChatLimitsTests
         Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleWindow);
         Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleDuration);
     }
+
+    [Test]
+    public void ChannelCreationWindow_MatchesC3PlanDecisionTask10()
+    {
+        // C3 plan decision (Task 10) — the window backing ChannelCreationPerHour's "per hour" (not
+        // itself spec §13 text, mirrors TicketMintWindow's role for the mint limits above).
+        Assert.AreEqual(TimeSpan.FromHours(1), ChatLimits.ChannelCreationWindow);
+    }
 }

@@ -35,6 +35,7 @@ public static class ChatLimits
 
     /// <summary>Group/semi-public creation per user per hour.</summary>
     public const int ChannelCreationPerHour = 5;
+    public static readonly TimeSpan ChannelCreationWindow = TimeSpan.FromHours(1);
 
     /// <summary>Focused set size.</summary>
     public const int MaxFocusedChannels = 10;

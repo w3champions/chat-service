@@ -79,7 +79,9 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             onlineMemberRegistry,
             new MessageRateLimiter(),
             TimeProvider.System,
-            channelRepository);
+            channelRepository,
+            new MembershipRepository(MongoClient, channelRepository),
+            new ChannelCreationRateLimiter());
 
         _lastCallerMethod = null;
         _lastCallerArgs = null;
@@ -1125,7 +1127,9 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             onlineMemberRegistry,
             new MessageRateLimiter(),
             TimeProvider.System,
-            channelRepository)
+            channelRepository,
+            new MembershipRepository(MongoClient, channelRepository),
+            new ChannelCreationRateLimiter())
         {
             Clients = _clients.Object,
             Context = _hubCallerContext.Object,

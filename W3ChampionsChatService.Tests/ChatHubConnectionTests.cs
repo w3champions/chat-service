@@ -61,6 +61,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
 
     // Shared, ORDERED capture of every per-target signal AND every abort, across all connections, so
@@ -91,6 +92,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -120,7 +122,9 @@ public class ChatHubConnectionTests : IntegrationTestBase
             _onlineMemberRegistry,
             _messageRateLimiter,
             TimeProvider.System,
-            _channelRepository);
+            _channelRepository,
+            _membershipRepository,
+            _channelCreationRateLimiter);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

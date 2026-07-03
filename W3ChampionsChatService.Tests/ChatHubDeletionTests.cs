@@ -71,7 +71,9 @@ public class ChatHubDeletionTests : IntegrationTestBase
             onlineMemberRegistry,
             new MessageRateLimiter(),
             TimeProvider.System,
-            channelRepository);
+            channelRepository,
+            new MembershipRepository(MongoClient, channelRepository),
+            new ChannelCreationRateLimiter());
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

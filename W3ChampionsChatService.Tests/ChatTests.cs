@@ -75,7 +75,9 @@ public class ChatTests : IntegrationTestBase
             onlineMemberRegistry,
             new MessageRateLimiter(),
             TimeProvider.System,
-            channelRepository);
+            channelRepository,
+            new MembershipRepository(MongoClient, channelRepository),
+            new ChannelCreationRateLimiter());
 
         // Setup message capturing proxies
         _capturedCallerMessage = null;

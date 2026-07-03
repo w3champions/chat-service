@@ -87,6 +87,12 @@ public class Startup
         services.AddSingleton<OnlineMemberRegistry>();
         services.AddSingleton<MessageRateLimiter>();
 
+        // Task 10: JoinChannel's implicit-semiPublic-creation throttle. Singleton — a transient
+        // registration would fragment each battleTag's per-hour creation counter across hub
+        // invocations, defeating the cap. A SEPARATE singleton from MintRateLimiter, not a second
+        // instance of it (see FanOut/ChannelCreationRateLimiter.cs doc comment).
+        services.AddSingleton<ChannelCreationRateLimiter>();
+
         services.AddSingleton<ConnectionMapping>();
         services.AddSingleton<ChatHistory>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).

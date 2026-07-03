@@ -193,6 +193,18 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void ChannelCreationRateLimiter_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<ChannelCreationRateLimiter>();
+        var second = provider.GetRequiredService<ChannelCreationRateLimiter>();
+
+        Assert.AreSame(first, second,
+            "ChannelCreationRateLimiter MUST be a singleton — a transient registration would fragment each battleTag's per-hour creation counter across hub invocations, defeating JoinChannel's creation cap");
+    }
+
+    [Test]
     public void ChatDomainRepositories_AndHostedServices_Resolve()
     {
         using var provider = BuildProvider();
