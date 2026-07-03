@@ -6,8 +6,7 @@ namespace W3ChampionsChatService.Tests;
 
 public class IntegrationTestBase
 {
-    //protected readonly MongoClient MongoClient = new MongoClient("mongodb://localhost:27017/");
-    protected readonly MongoClient MongoClient = new MongoClient("mongodb://157.90.1.251:3512/");
+    protected MongoClient MongoClient => MongoTestServer.Client;
 
     [SetUp]
     public async Task Setup()
