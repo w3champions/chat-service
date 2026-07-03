@@ -1,4 +1,5 @@
 using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Sessions;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -9,9 +10,10 @@ namespace W3ChampionsChatService.Tests;
 /// offer — the engine is inert from the test's point of view.
 /// <para>
 /// Centralised so the engine's dependency list (which grew in Task 13 to include the
-/// <see cref="OnlineMemberRegistry"/> + <see cref="ActivityCoalescer"/>) is threaded through ONE place
-/// instead of every hub-test setup. Tests that DO assert on fan-out delivery construct the engine
-/// explicitly with their own shared harness/registries (see FanOutEngineTests / ActivityCoalescerTests).
+/// <see cref="OnlineMemberRegistry"/> + <see cref="ActivityCoalescer"/>, and in Task 18 to include
+/// <see cref="ISessionRegistry"/>) is threaded through ONE place instead of every hub-test setup.
+/// Tests that DO assert on fan-out delivery construct the engine explicitly with their own shared
+/// harness/registries (see FanOutEngineTests / ActivityCoalescerTests / ChannelEventEmitterTests).
 /// </para>
 /// </summary>
 internal static class FanOutEngineTestFactory
@@ -24,6 +26,7 @@ internal static class FanOutEngineTestFactory
             harness.HubContext,
             new FocusRegistry(),
             members,
-            new ActivityCoalescer(harness.HubContext, members));
+            new ActivityCoalescer(harness.HubContext, members),
+            new SessionRegistry());
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.Memberships;
 
 namespace W3ChampionsChatService.Protocol;
 
@@ -47,7 +48,18 @@ public record ChannelDto(
 public record MembershipDto(
     NotificationLevel NotificationLevel,
     long LastReadSeq,
-    MembershipRole Role);
+    MembershipRole Role)
+{
+    /// <summary>
+    /// The single shared mapper from the persisted <see cref="ChannelMembership"/> down to this wire
+    /// shape — used by both <see cref="SessionStateAssembler"/> (the Channels list on every
+    /// (re)connect) and <see cref="FanOut.FanOutEngine.PushChannelAdded"/> (the live
+    /// <c>ChannelAdded</c> push), so the two call sites can never drift on which membership fields
+    /// are client-visible.
+    /// </summary>
+    public static MembershipDto From(ChannelMembership membership) =>
+        new(membership.NotificationLevel, membership.LastReadSeq, membership.Role);
+}
 
 /// <summary>
 /// The caller's own profile. BOUNDARY-PRIVATE PROJECTION (C2 amendment): <see cref="Permissions"/>

@@ -101,7 +101,7 @@ public class SessionStateAssembler(
         var unreadCount = Math.Max(0L, channel.LastSeq - membership.LastReadSeq);
         return new ChannelDto(
             channel,
-            new MembershipDto(membership.NotificationLevel, membership.LastReadSeq, membership.Role),
+            MembershipDto.From(membership),
             unreadCount,
             unreadCount > 0);
     }

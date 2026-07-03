@@ -8,6 +8,7 @@ using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Sessions;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -71,7 +72,7 @@ public class ActivityCoalescerTests
         var focus = new FocusRegistry();
         var members = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer);
+        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, new SessionRegistry());
         return (harness, focus, members, engine);
     }
 
@@ -379,7 +380,7 @@ public class ActivityCoalescerTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0));
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer);
+        var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer, new SessionRegistry());
 
         // A send routes an offer to the unfocused level-All member, creating coalescing state.
         await engine.OnMessagePersisted(Channel(), Message(seq: 5), AuthorConn, isShadow: false, T0);

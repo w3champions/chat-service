@@ -6,6 +6,7 @@ using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Sessions;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -38,13 +39,15 @@ public class FanOutEngineTests
     private static ChatChannel Channel() =>
         new ChatChannel { Id = ChannelId, Type = ChannelType.Public };
 
-    // The Task-13 activity routing gives FanOutEngine two more deps. A helper keeps every test's
+    // The Task-13 activity routing gives FanOutEngine two more deps, and Task 18 adds a third
+    // (ISessionRegistry, for the ChannelAdded/ChannelRemoved emit helpers — unused by these
+    // OnMessagePersisted tests, so a throwaway instance is enough). A helper keeps every test's
     // construction terse; the OnlineMemberRegistry stays empty in these tests so no activity is routed.
     private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry)
     {
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer);
+        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, new SessionRegistry());
     }
 
     private static ChannelMessage Message(bool shadowFlag = false, MessageDeletion deletion = null) =>

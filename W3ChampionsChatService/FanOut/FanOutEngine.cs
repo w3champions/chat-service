@@ -6,8 +6,10 @@ using Serilog;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Sessions;
 
 namespace W3ChampionsChatService.FanOut;
 
@@ -38,27 +40,46 @@ namespace W3ChampionsChatService.FanOut;
 /// already durably persisted the message and must still return its typed <c>Ok</c> ack. Live delivery
 /// is best-effort; a missed recipient refetches via <c>GetMessages</c> on open.
 /// </para>
+/// <para>
+/// Task 18 adds the <see cref="ISessionRegistry"/> dependency plus <see cref="PushChannelAdded"/> /
+/// <see cref="PushChannelRemoved"/> — the <c>ChannelAdded</c>/<c>ChannelRemoved</c> emit helpers.
+/// CONTRACT COMPLETENESS ONLY: C3 defines the shapes and provides these helpers, but does not call
+/// them — C5/C7 wire the actual channel-add/remove triggers (channel creation, invite-join,
+/// moderator removal, etc.) in later chunks. Both are single-connection pushes (mirroring the
+/// existing <c>Clients.Client(connectionId).SendAsync(...)</c> pattern above), resolved via
+/// <see cref="ISessionRegistry.GetByBattleTag"/> rather than the focused/online-member indexes, since
+/// a channel add/remove targets a SPECIFIC user's live connection regardless of what they currently
+/// have focused.
+/// </para>
 /// </summary>
 public class FanOutEngine(
     IHubContext<ChatHub> hubContext,
     FocusRegistry focusRegistry,
     OnlineMemberRegistry onlineMemberRegistry,
-    ActivityCoalescer activityCoalescer)
+    ActivityCoalescer activityCoalescer,
+    ISessionRegistry sessionRegistry)
 {
     // The SignalR delivery channel — pushes the full MessageReceived payload to targeted connections.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
 
     // The focused-channel index (Tasks 8/9). OnMessagePersisted reads GetFocusedConnections to target
     // full MessageReceived at focused viewers only — the "never full payloads to unfocused" guardrail.
+    // PushChannelRemoved (Task 18) also uses this to clear a removed channel's focus entry.
     private readonly FocusRegistry _focusRegistry = focusRegistry;
 
     // The online-member subscription index (Task 5). OnMessagePersisted enumerates a channel's online
     // members (with connectionIds) to route the unfocused level-All ones to the ActivityCoalescer.
+    // PushChannelAdded/PushChannelRemoved (Task 18) seed/clear a single (channel, connection) entry.
     private readonly OnlineMemberRegistry _onlineMemberRegistry = onlineMemberRegistry;
 
     // The coalescing/suppressing sink for unfocused level-All ChannelActivity (Task 13). This engine
     // only OFFERS (routes); the coalescer owns the ≥10s window + >100-unread suppression + emit.
     private readonly ActivityCoalescer _activityCoalescer = activityCoalescer;
+
+    // The battleTag->live-connection resolver (Task 18). PushChannelAdded/PushChannelRemoved target a
+    // SPECIFIC user's connection by battleTag rather than a channel's focused/online set, so they
+    // resolve through this instead of FocusRegistry/OnlineMemberRegistry.
+    private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
 
     /// <summary>
     /// Called by the send pipeline AFTER the message is durably persisted (seq allocated + inserted).
@@ -157,6 +178,92 @@ public class FanOutEngine(
 
             await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now);
         }
+    }
+
+    /// <summary>
+    /// Pushes a newly-added channel to <paramref name="membership"/>'s owning user's LIVE connection
+    /// (spec §11 <c>ChannelAdded</c>). CONTRACT COMPLETENESS ONLY (Task 18): C5/C7 trigger this — e.g.
+    /// an auto-join on lobby/ladder load, or an invite acceptance — C3 only defines the shape and
+    /// provides this emit helper; there are no production callers yet, only tests.
+    /// <list type="bullet">
+    /// <item>Resolves the target connection via <see cref="ISessionRegistry.GetByBattleTag"/> — NOT
+    /// via <see cref="FocusRegistry"/>/<see cref="OnlineMemberRegistry"/>, since the user may not have
+    /// this (or any) channel focused/seeded yet.</item>
+    /// <item>NO-OP if the user is currently offline (<c>GetByBattleTag</c> returns null): the channel
+    /// and membership are already durably persisted by the caller BEFORE this is invoked, so an
+    /// offline user simply picks the channel up via the next <c>SessionState</c> on connect —
+    /// mirroring <see cref="OnMessagePersisted"/>'s live-delivery-is-best-effort posture.</item>
+    /// <item>SEEDS the <see cref="OnlineMemberRegistry"/> for (channel, connection) BEFORE emitting, so
+    /// this channel's activity fan-out (<see cref="OnMessagePersisted"/>) can route to this connection
+    /// starting with the very next message — without this seed the newly-added channel would stay
+    /// invisible to activity routing until the user's next reconnect re-seeds it via
+    /// <see cref="SessionStateAssembler"/>.</item>
+    /// </list>
+    /// </summary>
+    public async Task PushChannelAdded(ChatChannel channel, ChannelMembership membership, bool focus)
+    {
+        var battleTag = membership.BattleTag;
+        var session = _sessionRegistry.GetByBattleTag(battleTag);
+        if (session == null)
+        {
+            // Offline — nothing to push to, and nothing to seed (there is no live connection to seed
+            // the OnlineMemberRegistry entry against).
+            return;
+        }
+
+        _onlineMemberRegistry.Join(
+            channel.Id,
+            session.ConnectionId,
+            new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq));
+
+        var dto = new ChannelAddedDto(channel, MembershipDto.From(membership), focus);
+        await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelAdded, dto);
+    }
+
+    /// <summary>
+    /// Tells <paramref name="battleTag"/>'s LIVE connection to drop <paramref name="channelId"/> from
+    /// its channel list (spec §11 <c>ChannelRemoved</c>). CONTRACT COMPLETENESS ONLY (Task 18): C5/C7
+    /// trigger this — C3 only defines the shape and provides this emit helper; there are no production
+    /// callers yet, only tests.
+    /// <list type="bullet">
+    /// <item>NO-OP if the user is currently offline — the membership row is already durably removed by
+    /// the caller BEFORE this is invoked, so an offline user's next <c>SessionState</c> on connect
+    /// simply omits the channel.</item>
+    /// <item>Cleans the <see cref="OnlineMemberRegistry"/> and <see cref="FocusRegistry"/> entries for
+    /// (channelId, connection) so this connection is never fanned out to (activity or focus) after the
+    /// removal.</item>
+    /// </list>
+    /// <para>
+    /// C5/C7 WIRING NOTE — DELIBERATE SCOPE BOUNDARY (Task 18): this cleans the
+    /// <see cref="OnlineMemberRegistry"/>/<see cref="FocusRegistry"/> ONLY. Unlike
+    /// <c>ChatHub.LeaveChannel</c> (Task 14's fix), it does NOT route the removal through
+    /// <see cref="ViewersAccumulator"/> — so a forced removal of a CURRENTLY-FOCUSED viewer will NOT
+    /// emit a <c>ViewersChanged{left}</c> to the channel's remaining viewers. This is the SAME class of
+    /// gap Task 14 fixed for the user-initiated <c>LeaveChannel</c>, deliberately left open here
+    /// because there is no caller yet to exercise it and no clock/accumulator dependency to justify
+    /// wiring speculatively (YAGNI). WHEN C5/C7 wire the trigger, they (or a future revision of this
+    /// helper) MUST decide whether a forced removal should emit <c>ViewersChanged{left}</c> to
+    /// remaining viewers — if so, route the removed battleTag through
+    /// <see cref="ViewersAccumulator.RecordChange"/> BEFORE calling <see cref="FocusRegistry.Unfocus"/>
+    /// below, mirroring <c>ChatHub.LeaveChannel</c>'s ordering exactly.
+    /// </para>
+    /// </summary>
+    public async Task PushChannelRemoved(string channelId, string battleTag)
+    {
+        var session = _sessionRegistry.GetByBattleTag(battleTag);
+        if (session == null)
+        {
+            return;
+        }
+
+        // C5/C7 WIRING NOTE: see the doc comment above — a currently-focused viewer's removal does not
+        // route through ViewersAccumulator.RecordChange here, so remaining viewers get no ViewersChanged
+        // {left} for this forced removal (Task 14 parity gap, deliberately deferred to the eventual caller).
+        _onlineMemberRegistry.Leave(channelId, session.ConnectionId);
+        _focusRegistry.Unfocus(session.ConnectionId, channelId);
+
+        var dto = new ChannelRemovedDto(channelId);
+        await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelRemoved, dto);
     }
 
     /// <summary>
