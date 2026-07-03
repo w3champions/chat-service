@@ -290,6 +290,21 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void ChatHub_ConstructorGraph_ResolvesFromDi_IncludingMentionCleaner()
+    {
+        // C4 Task 3 added IMentionInboxCleaner as a ChatHub constructor dependency (the durable
+        // DeleteMessage pipeline calls it). SignalR activates the hub via ActivatorUtilities, so its
+        // ENTIRE constructor graph — including the new cleaner param — must be resolvable from the DI
+        // container, or every hub connection fails at activation. Constructing it here is the smoke test.
+        using var provider = BuildProvider();
+        using var scope = provider.CreateScope();
+
+        var hub = ActivatorUtilities.CreateInstance<ChatHub>(scope.ServiceProvider);
+
+        Assert.IsNotNull(hub, "ChatHub's full constructor graph (incl. IMentionInboxCleaner) must resolve from DI");
+    }
+
+    [Test]
     public void SignalR_MaximumReceiveMessageSize_IsPinnedBelowDefault()
     {
         using var provider = BuildProvider();

@@ -11,6 +11,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
@@ -312,7 +313,8 @@ public class ViewersAccumulatorTests : IntegrationTestBase
             _channelCreationRateLimiter,
             new MessageRepository(MongoClient),
             FanOutEngineTestFactory.CreateIgnored(),
-            _accumulator);
+            _accumulator,
+            new NoOpMentionInboxCleaner());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
         var context = new Mock<HubCallerContext>();

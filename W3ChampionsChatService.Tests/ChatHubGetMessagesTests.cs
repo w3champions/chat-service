@@ -10,6 +10,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
@@ -114,7 +115,8 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
             _channelCreationRateLimiter,
             _messageRepository,
             _fanOutEngine,
-            ViewersAccumulatorTestFactory.CreateIgnored());
+            ViewersAccumulatorTestFactory.CreateIgnored(),
+            new NoOpMentionInboxCleaner());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

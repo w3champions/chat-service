@@ -214,4 +214,60 @@ public class FanOutEngineTests
         Assert.IsNotNull(dto);
         Assert.AreEqual("message-1", dto.Id);
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // C4 (Task 3) PushMessageDeleted — the moderation removal emit helper (D4). Delivers the FINAL
+    // channel-scoped MessageDeletedDto to the channel's FOCUSED connections, MINUS the excluded set
+    // (the moderated author's own connections, computed by the hub). Mirrors OnMessagePersisted's
+    // focused-only targeting + per-recipient fault isolation.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PushMessageDeleted_DeliversChannelScopedDto_ToFocusedConnections_ExceptExcluded()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The moderated author AND a viewer are both focused on the channel; a third connection is a
+        // member but NOT focused (absent from the focused index entirely).
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
+        var engine = NewEngine(harness, focusRegistry);
+
+        await engine.PushMessageDeleted(ChannelId, "message-1", new[] { AuthorConnection });
+
+        // The focused viewer receives exactly one channel-scoped MessageDeletedDto.
+        Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.MessageDeleted));
+        var dto = harness.PayloadFor(OtherFocusedConnection, ChatEvents.MessageDeleted) as MessageDeletedDto;
+        Assert.IsNotNull(dto, "a focused viewer must receive a MessageDeletedDto payload");
+        Assert.AreEqual(ChannelId, dto.ChannelId);
+        Assert.AreEqual("message-1", dto.MessageId);
+
+        // The excluded (author) connection is skipped — the moderated user is not tipped off live.
+        Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.MessageDeleted));
+        // An unfocused connection never receives the removal (it never received the message either).
+        Assert.AreEqual(0, harness.SignalCount(UnfocusedMemberConnection, ChatEvents.MessageDeleted));
+    }
+
+    [Test]
+    public async Task PushMessageDeleted_OneRecipientSendThrows_OthersStillReceive_NoExceptionPropagates()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // Two focused connections, neither excluded — isolates the fault-tolerance behavior.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
+        var engine = NewEngine(harness, focusRegistry);
+
+        // AuthorConnection's SendAsync faults (e.g. its connection was torn down mid-loop).
+        harness.ThrowOnSend(AuthorConnection);
+
+        // Must not throw: a single recipient's failed send is fault-isolated inside PushMessageDeleted,
+        // never propagating up to the hub's already-committed soft-delete + audit.
+        await engine.PushMessageDeleted(ChannelId, "message-1", Array.Empty<string>());
+
+        // The failing connection recorded no signal...
+        Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.MessageDeleted));
+        // ...but the OTHER focused connection still received its removal push.
+        Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.MessageDeleted));
+    }
 }

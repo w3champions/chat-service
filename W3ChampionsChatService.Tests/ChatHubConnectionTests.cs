@@ -19,6 +19,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
@@ -121,7 +122,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
             _channelCreationRateLimiter,
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             FanOutEngineTestFactory.CreateIgnored(),
-            ViewersAccumulatorTestFactory.CreateIgnored());
+            ViewersAccumulatorTestFactory.CreateIgnored(),
+            new NoOpMentionInboxCleaner());
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
