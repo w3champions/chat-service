@@ -75,7 +75,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             new MembershipRepository(MongoClient, channelRepository),
             new ChannelCreationRateLimiter(),
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            new FanOutEngine(new HubPushCaptureHarness().HubContext));
+            new FanOutEngine(new HubPushCaptureHarness().HubContext, new FocusRegistry()));
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

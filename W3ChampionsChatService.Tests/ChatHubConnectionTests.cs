@@ -126,7 +126,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
             _membershipRepository,
             _channelCreationRateLimiter,
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            new FanOutEngine(new HubPushCaptureHarness().HubContext));
+            new FanOutEngine(new HubPushCaptureHarness().HubContext, new FocusRegistry()));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

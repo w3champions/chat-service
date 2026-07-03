@@ -3,39 +3,78 @@ using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Messages;
+using W3ChampionsChatService.Protocol;
 
 namespace W3ChampionsChatService.FanOut;
 
 /// <summary>
-/// C3 (Task 11): the single seam the send pipeline calls once a message is durably persisted. This
-/// task creates the seam ONLY — <see cref="OnMessagePersisted"/> is a deliberate no-op for now.
+/// The single seam the send pipeline calls once a message is durably persisted (seam created in Task
+/// 11; body filled in Task 12). <see cref="OnMessagePersisted"/> delivers the full
+/// <c>MessageReceived</c> payload to the channel's online+focused viewers ONLY, with
+/// shadow-author-only routing (a shadow message reaches nobody but its own author, preserving the
+/// illusion). It delivers through <see cref="IHubContext{ChatHub}"/> targeting the focused connections
+/// from <see cref="FocusRegistry"/>.
 /// <para>
-/// Task 12 fills the body: focused <c>MessageReceived</c> delivery to the channel's online+focused
-/// viewers, coalesced <c>ChannelActivity</c> to the rest, and shadow-author-only routing (a shadow
-/// message reaches nobody but its own author, preserving the illusion). It delivers through
-/// <see cref="IHubContext{ChatHub}"/> — captured here as the seam dependency so both the DI wiring and
-/// the send path (which already calls this method) are proven before Task 12 lands.
+/// This engine does NOT emit the unfocused members' coalesced <c>ChannelActivity</c> — that is Task
+/// 13's ActivityCoalescer, driven by the flush hosted service, and MUST NOT be sent from here (the
+/// "no full payloads to unfocused" guardrail).
 /// </para>
 /// Singleton (registered in <see cref="Startup"/>): it holds no per-call state and is shared by every
 /// hub invocation, mirroring the other C3 fan-out registries. Task 15 owns the REMAINING fan-out DI
 /// (ActivityCoalescer / ViewersAccumulator / the flush hosted service) — not registered here.
 /// </summary>
-public class FanOutEngine(IHubContext<ChatHub> hubContext)
+public class FanOutEngine(IHubContext<ChatHub> hubContext, FocusRegistry focusRegistry)
 {
-    // Retained as the seam dependency (Task 12 delivers focused/coalesced fan-out through it). Not yet
-    // read — mirrors ChatHub's retained-but-unread constructor deps until the task that consumes it.
+    // The SignalR delivery channel — pushes the full MessageReceived payload to targeted connections.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
+
+    // The focused-channel index (Tasks 8/9). OnMessagePersisted reads GetFocusedConnections to target
+    // full MessageReceived at focused viewers only — the "never full payloads to unfocused" guardrail.
+    private readonly FocusRegistry _focusRegistry = focusRegistry;
 
     /// <summary>
     /// Called by the send pipeline AFTER the message is durably persisted (seq allocated + inserted).
-    /// No-op until Task 12, which implements focused delivery + shadow-author-only routing.
+    /// Delivers the full <c>MessageReceived</c> payload to the channel's FOCUSED connections only, with
+    /// shadow-author-only routing.
+    /// <list type="bullet">
+    /// <item>Non-shadow: every focused connection receives it — INCLUDING the sender's own focused
+    /// connection (the echo; the client dedups against its ack <c>{messageId, seq}</c>).</item>
+    /// <item>Shadow (<paramref name="isShadow"/> true): ONLY the author's own focused connection
+    /// (<paramref name="senderConnectionId"/>) receives it — the intersection of the focused set and the
+    /// author's connection. No other connection may see a shadow post (shadow-ban integrity). If the
+    /// author is not focused on the channel, the intersection is empty and the message reaches no one.</item>
+    /// </list>
+    /// GUARDRAIL: UNFOCUSED connections never receive <c>MessageReceived</c> — full payloads go to
+    /// focused connections only. Unfocused members' notification is the coalesced <c>ChannelActivity</c>
+    /// (Task 13), NOT emitted here.
     /// </summary>
-    public Task OnMessagePersisted(ChatChannel channel, ChannelMessage message, string senderConnectionId, bool isShadow)
+    public async Task OnMessagePersisted(ChatChannel channel, ChannelMessage message, string senderConnectionId, bool isShadow)
     {
-        // The parameters are the pinned seam signature the send path (Task 11) already calls;
-        // discarded here so the unused-parameter analyzer (IDE0060, error-level) stays green until
-        // Task 12 consumes them to deliver focused/coalesced fan-out.
-        _ = (channel, message, senderConnectionId, isShadow);
-        return Task.CompletedTask;
+        // Build the user-facing projection. deleted/shadow are ALWAYS false for user-facing delivery:
+        // they are C4 moderator-rendering slots, and forcing false — even on a shadow author's OWN echo
+        // — is the load-bearing illusion that keeps a shadow-banned author from learning they are muted
+        // (C3-plan.md decision 7).
+        var dto = new MessageDto(
+            Id: message.Id,
+            ChannelId: channel.Id,
+            Seq: message.Seq,
+            Sender: message.Sender,
+            Content: message.Content,
+            SentAt: message.SentAt,
+            Deleted: false,
+            Shadow: false);
+
+        // The ONLY delivery targets: connections currently focused on this channel. Iterating this set
+        // (never the membership roster) is what enforces the "no full payloads to unfocused" guardrail.
+        foreach (var connectionId in _focusRegistry.GetFocusedConnections(channel.Id))
+        {
+            // Shadow-ban integrity: a shadow post reaches nobody but its own author's connection.
+            if (isShadow && connectionId != senderConnectionId)
+            {
+                continue;
+            }
+
+            await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.MessageReceived, dto);
+        }
     }
 }
