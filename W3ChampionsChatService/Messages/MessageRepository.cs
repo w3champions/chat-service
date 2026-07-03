@@ -42,4 +42,59 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         Messages.UpdateOneAsync(
             m => m.Id == messageId,
             Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt }));
+
+    /// <summary>
+    /// Newest-first page strictly older than <paramref name="beforeSeq"/> (null = latest page),
+    /// returned in ascending seq order. Seq-anchored: paging with the previous page's minimum seq
+    /// is immune to concurrent appends — a later insert can never gap or dupe an already-fetched page.
+    /// </summary>
+    public async Task<List<ChannelMessage>> LoadPageBefore(string channelId, string viewerBattleTag, long? beforeSeq, int limit)
+    {
+        var effectiveLimit = ClampLimit(limit);
+        var filterBuilder = Builders<ChannelMessage>.Filter;
+        var filter = UserVisible(channelId, viewerBattleTag);
+        if (beforeSeq.HasValue)
+        {
+            filter = filterBuilder.And(filter, filterBuilder.Lt(m => m.Seq, beforeSeq.Value));
+        }
+
+        var page = await Messages.Find(filter).SortByDescending(m => m.Seq).Limit(effectiveLimit).ToListAsync();
+        page.Reverse();
+        return page;
+    }
+
+    /// <summary>
+    /// Window centered on <paramref name="aroundSeq"/>: up to limit/2 messages strictly before it,
+    /// plus the target (if visible) and up to limit/2 after — two queries, merged ascending.
+    /// </summary>
+    public async Task<List<ChannelMessage>> LoadPageAround(string channelId, string viewerBattleTag, long aroundSeq, int limit)
+    {
+        var effectiveLimit = ClampLimit(limit);
+        var half = effectiveLimit / 2;
+        var filterBuilder = Builders<ChannelMessage>.Filter;
+        var baseFilter = UserVisible(channelId, viewerBattleTag);
+
+        var before = new List<ChannelMessage>();
+        if (half > 0)
+        {
+            before = await Messages
+                .Find(filterBuilder.And(baseFilter, filterBuilder.Lt(m => m.Seq, aroundSeq)))
+                .SortByDescending(m => m.Seq)
+                .Limit(half)
+                .ToListAsync();
+            before.Reverse();
+        }
+
+        var targetAndAfter = await Messages
+            .Find(filterBuilder.And(baseFilter, filterBuilder.Gte(m => m.Seq, aroundSeq)))
+            .SortBy(m => m.Seq)
+            .Limit(half + 1)
+            .ToListAsync();
+
+        before.AddRange(targetAndAfter);
+        return before;
+    }
+
+    /// <summary>Requested limits above the page-size cap are clamped down, never rejected.</summary>
+    private static int ClampLimit(int limit) => Math.Clamp(limit, 1, ChatLimits.MessagePageSize);
 }

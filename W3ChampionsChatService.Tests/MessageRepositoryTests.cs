@@ -130,4 +130,107 @@ public class MessageRepositoryTests : IntegrationTestBase
         Assert.IsNotNull(stillThere, "soft delete must never remove the record — moderators need it");
         Assert.IsNotNull(stillThere.Deleted);
     }
+
+    [Test]
+    public async Task LoadPageBefore_ReturnsNewestFirstWindow_ExclusiveOfBeforeSeq()
+    {
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 10; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq));
+        }
+
+        var page = await repo.LoadPageBefore("chan1", "Peter#123", 8, 3);
+
+        CollectionAssert.AreEqual(new[] { 5L, 6L, 7L }, page.Select(m => m.Seq).ToArray());
+    }
+
+    [Test]
+    public async Task LoadPageBefore_NullBeforeSeq_ReturnsLatestPage()
+    {
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 10; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq));
+        }
+
+        var page = await repo.LoadPageBefore("chan1", "Peter#123", null, 3);
+
+        CollectionAssert.AreEqual(new[] { 8L, 9L, 10L }, page.Select(m => m.Seq).ToArray());
+    }
+
+    [Test]
+    public async Task LoadPageBefore_PagesBackwards_NoGapsNoDupes_AcrossConcurrentInsert()
+    {
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 10; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq));
+        }
+
+        var firstPage = await repo.LoadPageBefore("chan1", "Peter#123", null, 5);
+        CollectionAssert.AreEqual(new[] { 6L, 7L, 8L, 9L, 10L }, firstPage.Select(m => m.Seq).ToArray());
+
+        // Simulate a send arriving while the client is still paging backwards.
+        await repo.Insert(NewMessage("chan1", 11));
+
+        var minSeqOfFirstPage = firstPage.Min(m => m.Seq);
+        var secondPage = await repo.LoadPageBefore("chan1", "Peter#123", minSeqOfFirstPage, 5);
+        CollectionAssert.AreEqual(new[] { 1L, 2L, 3L, 4L, 5L }, secondPage.Select(m => m.Seq).ToArray());
+
+        var union = firstPage.Select(m => m.Seq).Concat(secondPage.Select(m => m.Seq)).OrderBy(s => s).ToArray();
+        CollectionAssert.AreEqual(Enumerable.Range(1, 10).Select(i => (long)i).ToArray(), union);
+        Assert.AreEqual(10, union.Distinct().Count(), "pages must not overlap across the concurrent insert");
+    }
+
+    [Test]
+    public async Task LoadPageAround_ReturnsTargetPlusWindowBothSides()
+    {
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 21; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq));
+        }
+
+        var page = await repo.LoadPageAround("chan1", "Peter#123", 11, 10);
+
+        CollectionAssert.AreEqual(Enumerable.Range(6, 11).Select(i => (long)i).ToArray(), page.Select(m => m.Seq).ToArray());
+    }
+
+    [Test]
+    public async Task LoadPage_RespectsUserVisibleFilter()
+    {
+        var repo = new MessageRepository(MongoClient);
+        var normal = NewMessage("chan1", 1, "Peter#123");
+        var deleted = NewMessage("chan1", 2, "Peter#123");
+        var foreignShadow = NewMessage("chan1", 3, "Wolf#456");
+        foreignShadow.Shadow = true;
+        var ownShadow = NewMessage("chan1", 4, "Peter#123");
+        ownShadow.Shadow = true;
+
+        await repo.Insert(normal);
+        await repo.Insert(deleted);
+        await repo.Insert(foreignShadow);
+        await repo.Insert(ownShadow);
+        await repo.MarkDeleted(deleted.Id, "Mod#1", DateTime.UtcNow);
+
+        var before = await repo.LoadPageBefore("chan1", "Peter#123", null, 10);
+        CollectionAssert.AreEqual(new[] { 1L, 4L }, before.Select(m => m.Seq).ToArray());
+
+        var around = await repo.LoadPageAround("chan1", "Peter#123", 1, 10);
+        CollectionAssert.AreEqual(new[] { 1L, 4L }, around.Select(m => m.Seq).ToArray());
+    }
+
+    [Test]
+    public async Task LoadPageBefore_ClampsLimitToMessagePageSize()
+    {
+        var repo = new MessageRepository(MongoClient);
+        var inserts = Enumerable.Range(1, ChatLimits.MessagePageSize + 5)
+            .Select(seq => repo.Insert(NewMessage("chan1", seq)));
+        await Task.WhenAll(inserts);
+
+        var page = await repo.LoadPageBefore("chan1", "Peter#123", null, ChatLimits.MessagePageSize * 10);
+
+        Assert.AreEqual(ChatLimits.MessagePageSize, page.Count);
+    }
 }
