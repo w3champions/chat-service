@@ -14,6 +14,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
 
@@ -53,6 +54,13 @@ public class Startup
         services.AddTransient<CleanupJobs>();
         services.AddHostedService<ChatDomainBootstrap>();   // indexes + catalog seeding at boot
         services.AddHostedService<WeeklyCleanupService>();  // weekly GC + membership pruning
+
+        // C2 auth v2
+        // Singletons: both hold in-memory state that the mint (REST AuthSessionController) and
+        // connect (Task 6 hub) paths must share — a per-request/transient instance would silently
+        // break the mint→connect handoff and the rate windows.
+        services.AddSingleton<ITicketStore, TicketStore>();
+        services.AddSingleton<MintRateLimiter>();
 
         services.AddHttpContextAccessor();
 

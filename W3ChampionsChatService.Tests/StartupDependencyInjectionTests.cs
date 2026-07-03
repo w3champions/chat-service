@@ -2,6 +2,7 @@ using System.Linq;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
@@ -9,6 +10,7 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
@@ -57,6 +59,40 @@ public class StartupDependencyInjectionTests
         // Resolving twice returns the same singleton instance.
         Assert.AreSame(service, provider.GetRequiredService<MuteReconciliationService>(),
             "MuteReconciliationService is registered as a singleton");
+    }
+
+    [Test]
+    public void ITicketStore_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<ITicketStore>();
+        var second = provider.GetRequiredService<ITicketStore>();
+
+        Assert.AreSame(first, second,
+            "ITicketStore MUST be a singleton — the mint (REST AuthSessionController) and connect (Task 6 hub) paths must share the SAME ticket store");
+    }
+
+    [Test]
+    public void MintRateLimiter_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<MintRateLimiter>();
+        var second = provider.GetRequiredService<MintRateLimiter>();
+
+        Assert.AreSame(first, second,
+            "MintRateLimiter MUST be a singleton so its rate windows persist across requests");
+    }
+
+    [Test]
+    public void AuthSessionControllerDependencies_Resolve()
+    {
+        using var provider = BuildProvider();
+
+        Assert.IsNotNull(provider.GetRequiredService<IW3CAuthenticationService>());
+        Assert.IsNotNull(provider.GetRequiredService<ITicketStore>());
+        Assert.IsNotNull(provider.GetRequiredService<MintRateLimiter>());
     }
 
     [Test]
