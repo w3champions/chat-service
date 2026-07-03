@@ -17,7 +17,6 @@ using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
-using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService;
@@ -37,7 +36,6 @@ public class Startup
         // The MVC [UserHasPermission] attribute is inert on SignalR, so this filter is the real gate.
         services.AddSignalR(options => { options.AddFilter<ChatHubPermissionFilter>(); });
 
-        services.AddTransient<SettingsRepository>();
         services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
         services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
         services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();

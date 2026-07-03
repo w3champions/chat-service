@@ -12,7 +12,6 @@ using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
-using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
@@ -26,7 +25,6 @@ public class ChatHubDeletionTests : IntegrationTestBase
     private Mock<HubCallerContext> _hubCallerContext;
     private ConnectionMapping _connectionMapping;
     private ChatHistory _chatHistory;
-    private SettingsRepository _settingsRepository;
     private Mock<IClientProxy> _mockAllProxy;
     private Mock<IClientProxy> _mockAllExceptProxy;
 
@@ -46,14 +44,10 @@ public class ChatHubDeletionTests : IntegrationTestBase
 
         _connectionMapping = new ConnectionMapping();
         _chatHistory = new ChatHistory();
-        _settingsRepository = new SettingsRepository(MongoClient);
 
         var channelRepository = new ChannelRepository(MongoClient);
         var onlineMemberRegistry = new OnlineMemberRegistry();
         _chatHub = new ChatHub(
-            _chatAuthenticationService,
-            _muteRepository,
-            _settingsRepository,
             _connectionMapping,
             _chatHistory,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,

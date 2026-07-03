@@ -23,7 +23,6 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
-using W3ChampionsChatService.Settings;
 using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
@@ -47,7 +46,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private ConnectionMapping _connectionMapping;
     private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
-    private SettingsRepository _settingsRepository;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
     private Mock<IChatAuthenticationService> _authService;
@@ -77,7 +75,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _connectionMapping = new ConnectionMapping();
         _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
-        _settingsRepository = new SettingsRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
         _sends.Clear();
@@ -108,9 +105,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private (ChatHub Hub, Mock<HubCallerContext> Context) BuildConnection(string connectionId, string accessToken)
     {
         var hub = new ChatHub(
-            _authService.Object,
-            _muteRepository,
-            _settingsRepository,
             _connectionMapping,
             _chatHistory,
             _reconcileService,

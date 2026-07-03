@@ -3,7 +3,7 @@ namespace W3ChampionsChatService.Domain;
 /// <summary>
 /// Spec §5 collection names. All NEW collections use these explicit names via
 /// MongoDbRepositoryBase.CreateCollection&lt;T&gt;(name); legacy collections
-/// (LoungeMute, ChatSettings) keep the typeof(T).Name convention untouched.
+/// (e.g. LoungeMute) keep the typeof(T).Name convention untouched.
 /// </summary>
 public static class ChatCollections
 {

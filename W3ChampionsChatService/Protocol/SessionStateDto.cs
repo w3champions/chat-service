@@ -15,10 +15,9 @@ namespace W3ChampionsChatService.Protocol;
 /// object, or the mute shadow flag — see <see cref="OwnProfileDto"/> and <see cref="MuteStateDto"/>.
 /// </para>
 /// <see cref="PublicCatalog"/> is always present (decision 1: client fallback) EXCEPT on a FULL-ban
-/// connect, where the assembler filters it to empty (carries the legacy
-/// <c>LoginAsAuthenticated</c> room-scope semantics — a full-banned user's public rooms stay
-/// hidden). <see cref="PendingDmRequests"/>/<see cref="MentionUnreadCount"/> are C3 stubs — always
-/// empty/zero until the DM and mention-inbox features land.
+/// connect, where the assembler filters it to empty (the full-ban room-scope rule — a full-banned
+/// user's public rooms stay hidden). <see cref="PendingDmRequests"/>/<see cref="MentionUnreadCount"/>
+/// are C3 stubs — always empty/zero until the DM and mention-inbox features land.
 /// </summary>
 public record SessionStateDto(
     IReadOnlyList<ChannelDto> Channels,

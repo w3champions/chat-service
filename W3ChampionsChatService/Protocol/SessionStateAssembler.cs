@@ -56,10 +56,9 @@ public class SessionStateAssembler(
 
         var muteStatus = ResolveMuteStatus(mutedPlayer, now);
 
-        // Full-ban connects carry the legacy LoginAsAuthenticated room-scope semantics: the public
-        // catalog (name-joinable rooms the caller isn't already a member of) is hidden. Existing
-        // memberships (Channels below) are untouched — a full-banned user keeps the rooms they're
-        // already in.
+        // Full-ban room-scope rule: the public catalog (name-joinable rooms the caller isn't already a
+        // member of) is hidden on a full-ban connect. Existing memberships (Channels below) are
+        // untouched — a full-banned user keeps the rooms they're already in.
         IReadOnlyList<ChatChannel> effectivePublicCatalog = muteStatus == MuteStatus.Full
             ? Array.Empty<ChatChannel>()
             : publicCatalog;

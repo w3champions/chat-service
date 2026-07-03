@@ -116,9 +116,9 @@ public partial class ChatHub
     /// with that normalized name, across every <see cref="ChannelType"/>:
     /// <list type="bullet">
     /// <item><b>Public</b> — the full-ban gate: a full-banned caller (<see cref="ConnectionMapping.GetEffectiveMuteStatus"/>
-    /// == <see cref="MuteStatus.Full"/>) is denied (carries the legacy <c>LoginAsAuthenticated</c>
-    /// room-scope semantics — a full ban hides/blocks public rooms). SemiPublic is deliberately EXEMPT
-    /// from this gate.</item>
+    /// == <see cref="MuteStatus.Full"/>) is denied — the full-ban room-scope rule blocks joining public
+    /// rooms (mirrored on connect by <see cref="Protocol.SessionStateAssembler"/>, which hides the public
+    /// catalog for a full-banned user). SemiPublic is deliberately EXEMPT from this gate.</item>
     /// <item><b>SemiPublic</b> — proceeds straight to the membership steps below, no gate.</item>
     /// <item><b>System / Dm / GroupDm</b> (any ACL-governed, non-name-joinable type) — denied. A name
     /// collision with an ACL channel (e.g. a live match's System channel) must NEVER fall through to
@@ -166,8 +166,8 @@ public partial class ChatHub
         {
             if (channel.Type == ChannelType.Public)
             {
-                // Full-ban gate: carries LoginAsAuthenticated's room-scope semantics — a full-banned
-                // user cannot join public channels. SemiPublic is exempt (falls through below).
+                // Full-ban gate: the full-ban room-scope rule blocks a full-banned user from joining
+                // public channels. SemiPublic is exempt (falls through below).
                 if (_connections.GetEffectiveMuteStatus(Context.ConnectionId, now) == MuteStatus.Full)
                 {
                     return new JoinChannelResult(ChatResultCode.PermissionDenied);
