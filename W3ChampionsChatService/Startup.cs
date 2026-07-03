@@ -34,7 +34,20 @@ public class Startup
 
         // SECURITY: the hub permission filter enforces Moderation on the moderator-only hub methods.
         // The MVC [UserHasPermission] attribute is inert on SignalR, so this filter is the real gate.
-        services.AddSignalR(options => { options.AddFilter<ChatHubPermissionFilter>(); });
+        services.AddSignalR(options =>
+        {
+            options.AddFilter<ChatHubPermissionFilter>();
+            // T11 hardening: pin an EXPLICIT receive-size cap well below SignalR's 32KB default.
+            // The largest legitimate client→server payload is SendMessage(channelId, content) with
+            // content <= ChatLimits.MaxMessageLength (512 chars); every other hub arg (channelIds,
+            // battleTags, seqs, notification levels) is tiny by comparison. 16KB gives generous
+            // headroom over a 512-char message even at multi-byte UTF-8 (up to 4 bytes/char) plus
+            // JSON/MessagePack framing overhead, while rejecting oversized frames at the SignalR
+            // transport BEFORE they reach the content-cap Trim/length-check allocation in
+            // ChatHub.Messaging.cs — defense-in-depth against a client sending an oversized frame to
+            // force needless buffering/allocation ahead of the app-level validation.
+            options.MaximumReceiveMessageSize = 16 * 1024;
+        });
 
         services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
         services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();

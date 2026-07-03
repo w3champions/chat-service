@@ -81,6 +81,11 @@ public partial class ChatHub(
         // HARD CUTOVER (C2): access_token carries a one-time TICKET minted by POST /auth/session.
         // A raw JWT lands here too — it is simply not a valid ticket and is rejected.
         var ticket = Context.GetHttpContext()?.Request.Query["access_token"].ToString();
+        // Deliberate wall-clock seam, NOT routed through _timeProvider: the ticket is minted with
+        // DateTime.UtcNow by the REST AuthSessionController (a separate process boundary that has no
+        // access to this hub's injected clock), so the consume-side check MUST compare against the
+        // same wall clock the mint side used. This is intentionally decoupled from the injectable
+        // fan-out clock below — TicketStore TTL correctness does not depend on TimeProvider.
         if (string.IsNullOrEmpty(ticket) || !_ticketStore.TryConsume(ticket, DateTime.UtcNow, out var identity))
         {
             Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
@@ -99,7 +104,13 @@ public partial class ChatHub(
             displaced.Context?.Abort();
         }
 
-        await UpsertDirectoryStub(identity);
+        // Single clock read for the whole connect path — reused for both the directory stub's
+        // LastSeenAt and the assembler's mute-expiry resolution below, so every "now" on this path
+        // comes from the SAME injected TimeProvider read instead of each step taking its own
+        // independent wall-clock snapshot (identical in production; makes the path deterministically
+        // testable under a FakeTimeProvider).
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        await UpsertDirectoryStub(identity, now);
 
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
         // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
@@ -107,7 +118,6 @@ public partial class ChatHub(
         // 8), never a group broadcast. FATAL by design: if AssembleAndSeed throws (e.g. a Mongo hiccup)
         // the connect fails — an authenticated connection with no snapshot is useless — so we do NOT
         // swallow it (unlike the non-fatal directory stub above).
-        var now = _timeProvider.GetUtcNow().UtcDateTime;
         var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now);
         await Clients.Caller.SendAsync(ChatEvents.SessionState, dto);
 
@@ -123,14 +133,16 @@ public partial class ChatHub(
 
     // Stub directory upsert (full enrichment is C6). Read-modify-write via Load → set → Upsert so a
     // future cached Profile is preserved. Non-fatal: a directory write must never fail a connect.
-    private async Task UpsertDirectoryStub(W3CUserAuthentication identity)
+    // `now` is the caller's single injected-clock read (OnConnectedAsync) — routed through, not read
+    // again here, so this stays on the SAME TimeProvider clock as the rest of the connect path.
+    private async Task UpsertDirectoryStub(W3CUserAuthentication identity, DateTime now)
     {
         try
         {
             var entry = await _userDirectory.Load(identity.BattleTag)
                 ?? new UserDirectoryEntry { BattleTag = identity.BattleTag };
             entry.NormalizedName = identity.Name?.Trim().ToLowerInvariant();
-            entry.LastSeenAt = DateTime.UtcNow;
+            entry.LastSeenAt = now;
             await _userDirectory.Upsert(entry);
         }
         catch (Exception ex)

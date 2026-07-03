@@ -1,7 +1,9 @@
 using System;
 using System.Linq;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
@@ -269,5 +271,21 @@ public class StartupDependencyInjectionTests
         var hostedServices = provider.GetServices<IHostedService>().ToList();
         Assert.IsTrue(hostedServices.Any(s => s is FanOutFlushService),
             "the FanOutFlushService MUST be registered as a hosted service — it is the single 1s clock that drives the Task 13 coalescer and Task 14 accumulator FlushDue calls in production");
+    }
+
+    [Test]
+    public void SignalR_MaximumReceiveMessageSize_IsPinnedBelowDefault()
+    {
+        using var provider = BuildProvider();
+
+        var hubOptions = provider.GetRequiredService<IOptions<HubOptions>>().Value;
+
+        // T11 hardening: MUST be an EXPLICIT, non-default cap — SignalR's built-in default is 32KB
+        // (32 * 1024). Pinned to 16KB, comfortably above the largest legitimate payload
+        // (SendMessage content <= ChatLimits.MaxMessageLength == 512 chars) and well below the
+        // 32KB default, so oversized frames are rejected at the transport before the content-cap
+        // Trim/length-check allocation in ChatHub.Messaging.cs ever runs.
+        Assert.AreEqual(16 * 1024, hubOptions.MaximumReceiveMessageSize,
+            "MaximumReceiveMessageSize must be pinned to the explicit 16KB cap, not left at SignalR's 32KB default");
     }
 }

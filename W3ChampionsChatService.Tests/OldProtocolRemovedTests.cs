@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using NUnit.Framework;
@@ -46,6 +47,66 @@ public class OldProtocolRemovedTests
             "Legacy internal LoginAsAuthenticated must be deleted.");
         Assert.That(NonPublicMethod("ProcessChatCommand"), Is.Null,
             "Legacy private ProcessChatCommand must be deleted.");
+    }
+
+    /// <summary>
+    /// C3 (Task 21) hub-surface guardrail. Complements <see cref="OldProtocol_MethodsAreGone"/> (which
+    /// asserts specific LEGACY methods are gone) with a POSITIVE inventory: the full set of public
+    /// methods PHYSICALLY DECLARED on <see cref="ChatHub"/> — <see cref="BindingFlags.DeclaredOnly"/>
+    /// excludes members merely INHERITED from <see cref="Microsoft.AspNetCore.SignalR.Hub"/> (e.g. the
+    /// Clients/Context/Groups property accessors), so this only sees what ChatHub itself contributes.
+    /// A partial class compiles into ONE type, so this sees every method across all three
+    /// declaration files (ChatHub.cs, ChatHub.Channels.cs, ChatHub.Messaging.cs) together. Asserts the
+    /// name set is EXACTLY: the eight new-protocol client→server methods (Task 9-13/16-17) + the three
+    /// kept legacy moderation methods (DeleteMessage/PurgeMessagesFromUser/BanUser, still
+    /// [UserHasPermission(Moderation)]-gated) + the two Hub lifecycle overrides
+    /// (OnConnectedAsync/OnDisconnectedAsync, `public override` — client-callable indirectly via the
+    /// SignalR connection lifecycle, not by name, but still part of the public surface). Also asserts
+    /// the RAW count matches the expected count (not just the deduped name set) so a same-named
+    /// overload sneaking back in (e.g. a second SendMessage) fails loudly too. A future accidental
+    /// public method addition OR removal on ChatHub fails this test.
+    /// </summary>
+    [Test]
+    public void HubSurface_ExactlyMatchesPinnedSet()
+    {
+        var declaredPublicMethods = HubType
+            .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Where(m => !m.IsSpecialName) // excludes property/event accessors; ChatHub declares none
+            .ToList();
+
+        var expected = new HashSet<string>
+        {
+            // Hub lifecycle overrides (public override, physically declared in ChatHub.cs)
+            nameof(ChatHub.OnConnectedAsync),
+            nameof(ChatHub.OnDisconnectedAsync),
+            // New protocol (C3): FocusChannel/UnfocusChannel (ChatHub.Channels.cs), JoinChannel/
+            // LeaveChannel/SetNotificationLevel (ChatHub.Channels.cs), SendMessage(channelId, content)/
+            // GetMessages/MarkRead (ChatHub.Messaging.cs).
+            "FocusChannel",
+            "UnfocusChannel",
+            "JoinChannel",
+            "LeaveChannel",
+            "SetNotificationLevel",
+            "SendMessage",
+            "GetMessages",
+            "MarkRead",
+            // Legacy moderation trio (kept, ChatHub.cs)
+            "DeleteMessage",
+            "PurgeMessagesFromUser",
+            "BanUser",
+        };
+
+        var actualNames = declaredPublicMethods.Select(m => m.Name).ToHashSet();
+
+        Assert.That(actualNames, Is.EquivalentTo(expected),
+            "ChatHub's public client-callable method surface must be EXACTLY the pinned new-protocol " +
+            "set + the legacy moderation trio + the two Hub lifecycle overrides. A diff here means a " +
+            "method was added or removed without updating this guardrail (and very likely without " +
+            "updating the client contract too).");
+        Assert.That(declaredPublicMethods.Count, Is.EqualTo(expected.Count),
+            "no method NAME above should have more than one overload — a same-named overload " +
+            "sneaking back in (e.g. a second SendMessage) would collapse into the same set entry " +
+            "above and hide behind this raw-count check instead.");
     }
 
     private static MethodInfo PublicMethod(string name) =>
