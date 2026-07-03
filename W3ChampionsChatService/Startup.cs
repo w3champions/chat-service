@@ -79,13 +79,18 @@ public class Startup
         // path seeds and the disconnect path (plus later Join/Leave/Focus/rate-limit paths) mutate, so
         // every hub invocation MUST share the SAME instance → Singleton, exactly like the C2
         // ConnectionMapping/SessionRegistry above; a transient would silently fragment fan-out state.
-        // Task 15 owns the REMAINING fan-out singletons (ActivityCoalescer, ViewersAccumulator,
-        // FanOutEngine) + the flush hosted service + their DI-coverage tests — do NOT register those
-        // here, and do NOT re-register the three below there.
+        // Task 15 owns the REMAINING fan-out singletons (ActivityCoalescer, ViewersAccumulator) + the
+        // flush hosted service + their DI-coverage tests — do NOT register those here, and do NOT
+        // re-register the three below (or the FanOutEngine) there.
         services.AddTransient<SessionStateAssembler>();
         services.AddSingleton<FocusRegistry>();
         services.AddSingleton<OnlineMemberRegistry>();
         services.AddSingleton<MessageRateLimiter>();
+
+        // Task 11: the send pipeline's post-persist fan-out seam. Singleton — it holds no per-call
+        // state and is shared by every hub invocation (Task 12 fills its body; the flush machinery +
+        // the sibling coalescer/accumulator singletons stay Task 15's).
+        services.AddSingleton<FanOutEngine>();
 
         // Task 10: JoinChannel's implicit-semiPublic-creation throttle. Singleton — a transient
         // registration would fragment each battleTag's per-hour creation counter across hub

@@ -8,6 +8,7 @@ using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
@@ -42,7 +43,13 @@ public partial class ChatHub(
     // creation (JoinChannel resolution step 2, "not found" branch) — a SEPARATE singleton from
     // MintRateLimiter (see FanOut/ChannelCreationRateLimiter.cs doc comment for why).
     MembershipRepository membershipRepository,
-    ChannelCreationRateLimiter channelCreationRateLimiter) : Hub
+    ChannelCreationRateLimiter channelCreationRateLimiter,
+    // C3 (Task 11): the durable send pipeline — SendMessage(channelId, content) in
+    // ChatHub.Messaging.cs. MessageRepository inserts the ChannelMessage (the OLD single-arg
+    // SendMessage never persisted to Mongo); FanOutEngine is the post-persist fan-out seam (no-op
+    // stub here, filled by Task 12).
+    MessageRepository messageRepository,
+    FanOutEngine fanOutEngine) : Hub
 {
     // No longer read after Task 8 moved identity→ChatUser resolution into SessionStateAssembler
     // (LoginAsAuthenticated, the last remaining reader, is no longer called from connect). Retained as
@@ -68,6 +75,9 @@ public partial class ChatHub(
     // C3 (Task 10): membership self-service deps — see the constructor param doc comment above.
     private readonly MembershipRepository _membershipRepository = membershipRepository;
     private readonly ChannelCreationRateLimiter _channelCreationRateLimiter = channelCreationRateLimiter;
+    // C3 (Task 11): the durable send pipeline's message store + post-persist fan-out seam.
+    private readonly MessageRepository _messageRepository = messageRepository;
+    private readonly FanOutEngine _fanOutEngine = fanOutEngine;
 
     // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
     private const int MaxMessageLength = 1024;

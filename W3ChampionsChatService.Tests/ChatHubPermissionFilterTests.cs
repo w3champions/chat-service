@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
@@ -63,7 +64,11 @@ public class ChatHubPermissionFilterTests
     private static HubInvocationContext BuildContext<THub>(string hubMethodName, string connectionId)
         where THub : Hub
     {
-        var methodInfo = typeof(THub).GetMethod(hubMethodName)
+        // Resolve by name tolerating OVERLOADS: ChatHub.SendMessage is overloaded (the legacy
+        // single-arg method + the C3 two-arg pipeline), so GetMethod(name) alone throws
+        // AmbiguousMatchException. The filter's decision is per-attribute, and neither SendMessage
+        // overload carries [UserHasPermission], so the first name match is representative here.
+        var methodInfo = typeof(THub).GetMethods().FirstOrDefault(m => m.Name == hubMethodName)
             ?? throw new InvalidOperationException($"{typeof(THub).Name} has no method '{hubMethodName}'");
         var hub = new Mock<Hub>().Object;
         var serviceProvider = new Mock<IServiceProvider>().Object;

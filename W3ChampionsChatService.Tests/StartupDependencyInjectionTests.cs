@@ -181,6 +181,18 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void FanOutEngine_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<FanOutEngine>();
+        var second = provider.GetRequiredService<FanOutEngine>();
+
+        Assert.AreSame(first, second,
+            "FanOutEngine MUST be a singleton — the send pipeline's post-persist fan-out seam is shared by every hub invocation (Task 12 fills its body); a transient would fragment that shared fan-out state");
+    }
+
+    [Test]
     public void SessionStateAssembler_Resolves()
     {
         using var provider = BuildProvider();
