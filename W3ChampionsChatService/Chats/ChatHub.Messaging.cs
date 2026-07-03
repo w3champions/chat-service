@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using Serilog;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
@@ -100,6 +101,18 @@ public partial class ChatHub
         var decision = _messageRateLimiter.TryAcquire(connectionId, channelId, now);
         if (decision.JustAutoThrottled)
         {
+            // Moderation-attribution log: MessageRateLimiter only has the ephemeral connectionId in
+            // scope, so a reconnect-flapping spammer can't be correlated across auto-throttle episodes
+            // from its line alone. The hub has the durable battleTag (session.Identity.BattleTag) right
+            // here, so it logs its own attributed line — mirrors the battleTag-attribution style of
+            // ChatHubPermissionFilter/BanUser's moderation logs. The limiter's own connectionId-only
+            // line (MessageRateLimiter.TryAcquire) stays as-is (MessageRateLimiterTests asserts on it),
+            // so this auto-throttle episode is intentionally logged twice — once per durable identity
+            // (this line) and once from the pure limiter (connectionId only).
+            Log.Warning(
+                "Auto-throttled chat connection {ConnectionId} (battleTag {BattleTag}) after repeated rate-limit violations",
+                connectionId,
+                session.Identity.BattleTag);
             await Clients.Caller.SendAsync(ChatEvents.ThrottleNotice, new { retryAfterSeconds = decision.RetryAfterSeconds });
         }
         if (!decision.Allowed)

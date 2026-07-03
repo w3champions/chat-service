@@ -212,6 +212,10 @@ public partial class ChatHub(
             Log.Information("Deleted message '{MessageContent}' from {MessageSender} by request of {AdminUserName}", deletedMessage.Message, deletedMessage.User.BattleTag, adminUser.BattleTag);
 
             var authorConnectionIds = _connections.GetConnectionIdsForUser(deletedMessage.User.BattleTag);
+            // NOTE (C4 hand-off): this event NAME now matches the new pinned ChatEvents.MessageDeleted,
+            // but the payload below is still the LEGACY bare message-id string — the pinned shape is
+            // MessageDeletedDto{ChannelId, MessageId} (Protocol/ModerationEvents.cs). Do not mistake the
+            // matching name for "already ported" — C4 owns porting this legacy trio onto the new DTO shape.
             await Clients.AllExcept(authorConnectionIds).SendAsync("MessageDeleted", deletedMessage.Id);
         }
     }

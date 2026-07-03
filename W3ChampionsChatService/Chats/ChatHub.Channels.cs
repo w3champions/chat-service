@@ -34,12 +34,11 @@ public partial class ChatHub
 
         var battleTag = session.Identity.BattleTag;
 
-        // Hot path: membership is read from OnlineMemberRegistry (seeded at connect from the caller's
-        // channel-backed memberships, zero DB) — case-insensitive, matching the casing convention used
-        // throughout Sessions/FanOut (a live battleTag keeps its connect-time casing; DB-derived ones
-        // are lowercased).
-        var isMember = _onlineMemberRegistry.GetMembers(channelId)
-            .Any(m => string.Equals(m.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase));
+        // Hot path: membership via OnlineMemberRegistry.IsMember (seeded at connect from the caller's
+        // channel-backed memberships, zero DB, O(1) reverse-index lookup — no roster copy under the
+        // lock, mirrors SendMessage/GetMessages/MarkRead). MaxConnectionsPerBattleTag == 1, so "this
+        // connection is a member" is equivalent to "this battleTag is a member".
+        var isMember = _onlineMemberRegistry.IsMember(Context.ConnectionId, channelId);
 
         if (!isMember)
         {
