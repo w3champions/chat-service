@@ -30,8 +30,22 @@ public class FanOutEngineTests
     private const string UnfocusedMemberConnection = "conn-unfocused-member";
     private const string AuthorBattleTag = "Author#1";
 
+    // A fixed instant for the threaded-in server clock. These Task-12 tests seed only the FocusRegistry
+    // (not the OnlineMemberRegistry), so the Task-13 activity routing finds no members to offer — the
+    // MessageReceived assertions here are unaffected by the routing extension.
+    private static readonly DateTime Now = new DateTime(2026, 7, 3, 12, 0, 0, DateTimeKind.Utc);
+
     private static ChatChannel Channel() =>
         new ChatChannel { Id = ChannelId, Type = ChannelType.Public };
+
+    // The Task-13 activity routing gives FanOutEngine two more deps. A helper keeps every test's
+    // construction terse; the OnlineMemberRegistry stays empty in these tests so no activity is routed.
+    private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry)
+    {
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
+        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer);
+    }
 
     private static ChannelMessage Message(bool shadowFlag = false, MessageDeletion deletion = null) =>
         new ChannelMessage
@@ -55,9 +69,9 @@ public class FanOutEngineTests
         var focusRegistry = new FocusRegistry();
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
-        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false);
+        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
         // Every focused connection receives exactly one full MessageReceived payload.
         Assert.AreEqual(1, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));
@@ -81,9 +95,9 @@ public class FanOutEngineTests
         // AuthorConnection is focused; UnfocusedMemberConnection is a channel member but NOT focused,
         // so it is absent from the focused index entirely.
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
-        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false);
+        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
         // Guardrail: the unfocused member receives ZERO MessageReceived signals. Full payloads go to
         // focused connections only; the unfocused member's notification is ChannelActivity (Task 13).
@@ -98,7 +112,7 @@ public class FanOutEngineTests
         var harness = new HubPushCaptureHarness();
         var focusRegistry = new FocusRegistry();
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
         // A shadow author's own echo: the persisted message is flagged Shadow AND has a Deleted marker,
         // yet the user-facing DTO must FORCE both false so the author never learns they are shadow-banned.
@@ -106,7 +120,7 @@ public class FanOutEngineTests
             shadowFlag: true,
             deletion: new MessageDeletion { By = "moderator#1", At = DateTime.UtcNow });
 
-        await engine.OnMessagePersisted(Channel(), flagged, AuthorConnection, isShadow: true);
+        await engine.OnMessagePersisted(Channel(), flagged, AuthorConnection, isShadow: true, Now);
 
         var dto = harness.PayloadFor(AuthorConnection, ChatEvents.MessageReceived) as MessageDto;
         Assert.IsNotNull(dto, "shadow author's own focused connection must receive its echo");
@@ -122,9 +136,9 @@ public class FanOutEngineTests
         // Both the shadow author AND a second member are focused on the same channel.
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
-        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true);
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
 
         // The author's own focused connection receives the echo (with shadow:false — the illusion)...
         Assert.AreEqual(1, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));
@@ -142,9 +156,9 @@ public class FanOutEngineTests
         var focusRegistry = new FocusRegistry();
         // Only a NON-author connection is focused; the shadow author is not focused on the channel.
         focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
-        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true);
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
 
         // A shadow message whose author is not focused simply reaches no one — the intersection of the
         // focused set and the author's connection is empty. The other focused member never sees it.
@@ -159,9 +173,9 @@ public class FanOutEngineTests
         var harness = new HubPushCaptureHarness();
         var focusRegistry = new FocusRegistry();
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
-        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false);
+        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
         // The sender's own focused connection receives the echo (non-shadow). The client dedups this
         // echo against its own ack {messageId, seq} — that dedup is client-side and out of scope here.
@@ -177,7 +191,7 @@ public class FanOutEngineTests
         // non-shadow recipients — isolates the fault-tolerance behavior from shadow-routing.
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
-        var engine = new FanOutEngine(harness.HubContext, focusRegistry);
+        var engine = NewEngine(harness, focusRegistry);
 
         // Simulate AuthorConnection's SendAsync throwing (e.g. its connection was torn down mid-loop),
         // via the harness's mock client for that connectionId.
@@ -187,7 +201,7 @@ public class FanOutEngineTests
         // never propagating up to the already-succeeded persist/ack in SendMessage. Awaiting directly
         // (rather than via Assert.DoesNotThrowAsync) means an unhandled exception here fails the test
         // with the real stack trace.
-        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false);
+        await engine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
         // The failing connection recorded no signal (its SendAsync faulted before capture)...
         Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));

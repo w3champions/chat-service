@@ -79,17 +79,26 @@ public class Startup
         // path seeds and the disconnect path (plus later Join/Leave/Focus/rate-limit paths) mutate, so
         // every hub invocation MUST share the SAME instance → Singleton, exactly like the C2
         // ConnectionMapping/SessionRegistry above; a transient would silently fragment fan-out state.
-        // Task 15 owns the REMAINING fan-out singletons (ActivityCoalescer, ViewersAccumulator) + the
-        // flush hosted service + their DI-coverage tests — do NOT register those here, and do NOT
-        // re-register the three below (or the FanOutEngine) there.
+        // Task 15 owns the REMAINING fan-out DI (the ViewersAccumulator + the flush hosted service) +
+        // their DI-coverage tests — do NOT register those here, and do NOT re-register the four below
+        // (or the FanOutEngine) there. NOTE: the ActivityCoalescer is registered HERE (Task 13), not in
+        // Task 15, because FanOutEngine now takes it as a constructor dependency (activity routing) — a
+        // dependency of an already-registered singleton MUST itself be DI-resolvable now or the whole
+        // FanOutEngine resolution fails. Task 15 wires it into the flush hosted service; it does not
+        // re-register it.
         services.AddTransient<SessionStateAssembler>();
         services.AddSingleton<FocusRegistry>();
         services.AddSingleton<OnlineMemberRegistry>();
         services.AddSingleton<MessageRateLimiter>();
 
+        // Task 13: the coalescing/suppressing sink for unfocused level-All ChannelActivity. Singleton —
+        // it holds the per-(connection, channel) coalescing window state that the fan-out routing (every
+        // send) writes and the flush hosted service (Task 15) drains; a transient would fragment it.
+        services.AddSingleton<ActivityCoalescer>();
+
         // Task 11: the send pipeline's post-persist fan-out seam. Singleton — it holds no per-call
-        // state and is shared by every hub invocation (Task 12 fills its body; the flush machinery +
-        // the sibling coalescer/accumulator singletons stay Task 15's).
+        // state and is shared by every hub invocation (Task 12 focused delivery + Task 13 activity
+        // routing; the flush machinery + the sibling accumulator singleton stay Task 15's).
         services.AddSingleton<FanOutEngine>();
 
         // Task 10: JoinChannel's implicit-semiPublic-creation throttle. Singleton — a transient

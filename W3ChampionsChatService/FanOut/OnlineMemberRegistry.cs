@@ -114,6 +114,45 @@ public class OnlineMemberRegistry
     }
 
     /// <summary>
+    /// Snapshot of every online member's <c>(connectionId, state)</c> pair for <paramref name="channelId"/>.
+    /// Unlike <see cref="GetMembers"/> (which projects away the connectionId), this keeps the key so the
+    /// fan-out engine (Task 13) can, per member, both consult <see cref="FocusRegistry"/> for the
+    /// focused/unfocused split AND target the coalesced <c>ChannelActivity</c> at the right connection.
+    /// </summary>
+    public IReadOnlyCollection<(string ConnectionId, MemberState State)> GetMembersWithConnections(string channelId)
+    {
+        lock (_lock)
+        {
+            if (!_membersByChannel.TryGetValue(channelId, out var members))
+            {
+                return Array.Empty<(string, MemberState)>();
+            }
+
+            var result = new List<(string ConnectionId, MemberState State)>(members.Count);
+            foreach (var kvp in members)
+            {
+                result.Add((kvp.Key, kvp.Value));
+            }
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// The live <see cref="MemberState"/> for a single (channelId, connectionId), or false if that
+    /// connection has no membership entry in the channel. The ActivityCoalescer (Task 13) reads this at
+    /// EMIT time to recompute the member's current unread (offeredLastSeq − <see cref="MemberState.LastReadSeq"/>)
+    /// for the &gt;100 suppression check — deliberately a fresh read, because a MarkRead between the
+    /// coalescer's offer and its flush can change the suppression outcome.
+    /// </summary>
+    public bool TryGetMember(string channelId, string connectionId, out MemberState state)
+    {
+        lock (_lock)
+        {
+            return TryGetNoLock(channelId, connectionId, out state);
+        }
+    }
+
+    /// <summary>
     /// O(1) membership test for <paramref name="connectionId"/> in <paramref name="channelId"/> — reads
     /// the <c>_channelsByConnection</c> reverse index only, so it never allocates or copies a channel's
     /// roster. Exists for hot paths (e.g. <c>ChatHub.SendMessage</c>) that must reject a non-member

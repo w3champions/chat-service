@@ -96,7 +96,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
-        _fanOutEngine = new FanOutEngine(new HubPushCaptureHarness().HubContext, new FocusRegistry());
+        _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,

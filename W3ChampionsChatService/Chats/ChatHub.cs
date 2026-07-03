@@ -303,6 +303,9 @@ public partial class ChatHub(
             _focusRegistry.RemoveConnection(Context.ConnectionId);
             _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
             _messageRateLimiter.RemoveConnection(Context.ConnectionId);
+            // Task 13: also drop the connection's ChannelActivity coalescing state (routed through the
+            // fan-out engine, which owns the coalescer) so the singleton can't leak past the socket.
+            _fanOutEngine.OnConnectionClosed(Context.ConnectionId);
         }
 
         await base.OnDisconnectedAsync(exception);

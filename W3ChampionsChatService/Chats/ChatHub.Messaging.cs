@@ -150,10 +150,13 @@ public partial class ChatHub
         };
         await _messageRepository.Insert(message);
 
-        // 8. Fan-out seam (Task 12): focused MessageReceived delivery + shadow-author-only routing.
-        // Per-recipient sends are fault-isolated inside FanOutEngine, so a fan-out hiccup never turns
-        // this already-persisted message's ack into an error below.
-        await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow);
+        // 8. Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
+        // delivery + shadow-author-only routing, then unfocused level-All members are routed to the
+        // ActivityCoalescer. `now` is threaded in (not re-read) so the whole send — rate limit, persist,
+        // expiry, and fan-out coalescing — decides against the SAME server instant. Per-recipient sends
+        // are fault-isolated inside FanOutEngine, so a fan-out hiccup never turns this already-persisted
+        // message's ack into an error below.
+        await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow, now);
 
         // 9. Typed ack.
         return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq);

@@ -79,7 +79,7 @@ public class ChatTests : IntegrationTestBase
             new MembershipRepository(MongoClient, channelRepository),
             new ChannelCreationRateLimiter(),
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            new FanOutEngine(new HubPushCaptureHarness().HubContext, new FocusRegistry()));
+            FanOutEngineTestFactory.CreateIgnored());
 
         // Setup message capturing proxies
         _capturedCallerMessage = null;

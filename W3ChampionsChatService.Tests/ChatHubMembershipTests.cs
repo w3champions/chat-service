@@ -106,7 +106,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
             _membershipRepository,
             _channelCreationRateLimiter,
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
-            new FanOutEngine(new HubPushCaptureHarness().HubContext, new FocusRegistry()));
+            FanOutEngineTestFactory.CreateIgnored());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
