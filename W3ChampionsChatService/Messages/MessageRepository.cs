@@ -95,6 +95,12 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         return before;
     }
 
-    /// <summary>Requested limits above the page-size cap are clamped down, never rejected.</summary>
+    /// <summary>
+    /// Requested limits above the page-size cap are clamped down, never rejected. The lower
+    /// bound of 1 is load-bearing: MongoDB.Driver's <c>.Limit(0)</c> means "no limit" (returns
+    /// every matching document), so a limit of 0 must never reach <c>.Limit()</c> unchanged.
+    /// Do not simplify this to <see cref="Math.Min"/> — that would silently reintroduce the
+    /// unbounded-return footgun for a caller-supplied limit of 0 or less.
+    /// </summary>
     private static int ClampLimit(int limit) => Math.Clamp(limit, 1, ChatLimits.MessagePageSize);
 }

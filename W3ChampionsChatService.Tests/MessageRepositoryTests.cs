@@ -233,4 +233,37 @@ public class MessageRepositoryTests : IntegrationTestBase
 
         Assert.AreEqual(ChatLimits.MessagePageSize, page.Count);
     }
+
+    [Test]
+    public async Task LoadPageBefore_ClampsLimitToMinimumOne()
+    {
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 5; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq));
+        }
+
+        // A limit of 0 would pass straight through to MongoDB.Driver's .Limit(0) — which means
+        // "no limit" and returns every matching document — unless the floor clamps it to 1 first.
+        var page = await repo.LoadPageBefore("chan1", "Peter#123", null, 0);
+
+        Assert.AreEqual(1, page.Count);
+    }
+
+    [Test]
+    public async Task LoadPageAround_TargetNearChannelStart_ReturnsAvailableWindowNoThrow()
+    {
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 5; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq));
+        }
+
+        // Requested window (half=10 before/after) is far larger than the available history;
+        // the window should simply shrink to what exists, not throw or gap.
+        var page = await repo.LoadPageAround("chan1", "Peter#123", 2, 20);
+
+        CollectionAssert.AreEqual(new[] { 1L, 2L, 3L, 4L, 5L }, page.Select(m => m.Seq).ToArray());
+        Assert.AreEqual(5, page.Select(m => m.Id).Distinct().Count(), "no duplicate messages in the window");
+    }
 }
