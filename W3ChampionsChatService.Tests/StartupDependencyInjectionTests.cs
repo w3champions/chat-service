@@ -1,7 +1,15 @@
+using System.Linq;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using NUnit.Framework;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -59,5 +67,26 @@ public class StartupDependencyInjectionTests
         var repo = provider.GetRequiredService<IMuteRepository>();
         Assert.IsInstanceOf<MuteRepository>(repo,
             "IMuteRepository must resolve to the concrete MuteRepository");
+    }
+
+    [Test]
+    public void ChatDomainRepositories_AndHostedServices_Resolve()
+    {
+        using var provider = BuildProvider();
+
+        Assert.IsNotNull(provider.GetRequiredService<ChannelRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<MembershipRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<MessageRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<UserDirectoryRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<UserSettingsRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<MentionInboxRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<PublicChannelSeeder>());
+        Assert.IsNotNull(provider.GetRequiredService<CleanupJobs>());
+
+        var hostedServices = provider.GetServices<IHostedService>().ToList();
+        Assert.IsTrue(hostedServices.Any(s => s is ChatDomainBootstrap),
+            "index creation + catalog seeding must run at startup");
+        Assert.IsTrue(hostedServices.Any(s => s is WeeklyCleanupService),
+            "weekly cleanup must be scheduled");
     }
 }

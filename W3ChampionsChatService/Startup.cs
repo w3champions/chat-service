@@ -7,9 +7,15 @@ using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService;
 
@@ -35,6 +41,19 @@ public class Startup
         services.AddTransient<IMuteRepository, MuteRepository>();
         services.AddTransient<UserHasPermissionFilter>();
         services.AddTransient<ChatHubPermissionFilter>();
+
+        // C1 chat domain foundation (additive — old hub keeps running on ChatHistory)
+        services.AddTransient<ChannelRepository>();
+        services.AddTransient<MembershipRepository>();
+        services.AddTransient<MessageRepository>();
+        services.AddTransient<UserDirectoryRepository>();
+        services.AddTransient<UserSettingsRepository>();
+        services.AddTransient<MentionInboxRepository>();
+        services.AddTransient<PublicChannelSeeder>();
+        services.AddTransient<CleanupJobs>();
+        services.AddHostedService<ChatDomainBootstrap>();   // indexes + catalog seeding at boot
+        services.AddHostedService<WeeklyCleanupService>();  // weekly GC + membership pruning
+
         services.AddHttpContextAccessor();
 
         services.AddSingleton<ConnectionMapping>();
