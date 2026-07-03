@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -30,7 +31,7 @@ public class PublicChannelSeederTests : IntegrationTestBase
 
         await seeder.SeedPublicChannels();
         var lounge = (await repo.LoadAllOfType(ChannelType.Public)).Single(c => c.Name == "W3C Lounge");
-        await repo.AllocateSeq(lounge.Id); // simulate live traffic between restarts
+        await repo.AllocateSeq(lounge.Id, DateTime.UtcNow); // simulate live traffic between restarts
 
         await seeder.SeedPublicChannels(); // "restart"
 

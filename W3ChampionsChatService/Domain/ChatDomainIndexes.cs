@@ -40,6 +40,18 @@ public static class ChatDomainIndexes
                     PartialFilterExpression = Builders<ChatChannel>.Filter.Eq(c => c.Type, ChannelType.Dm),
                 }),
             new CreateIndexModel<ChatChannel>(
+                Builders<ChatChannel>.IndexKeys.Ascending(c => c.Type).Ascending(c => c.NormalizedName),
+                new CreateIndexOptions<ChatChannel>
+                {
+                    Name = "ux_type_normalizedName",
+                    Unique = true,
+                    // name-joinable types only (Public + SemiPublic) — the two types that ever
+                    // populate NormalizedName; System/Dm/GroupDm use SystemRef/PairKey instead
+                    // and must stay unaffected by this uniqueness constraint.
+                    PartialFilterExpression = Builders<ChatChannel>.Filter.In(
+                        c => c.Type, [ChannelType.Public, ChannelType.SemiPublic]),
+                }),
+            new CreateIndexModel<ChatChannel>(
                 Builders<ChatChannel>.IndexKeys.Ascending(c => c.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
         ]);

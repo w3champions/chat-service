@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Driver;
 using NUnit.Framework;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Memberships;
 
@@ -68,5 +69,57 @@ public class MembershipRepositoryTests : IntegrationTestBase
 
         var byUser = indexes.Single(i => i["name"] == "ix_battleTag");
         Assert.AreEqual(1, byUser["key"]["BattleTag"].ToInt32());
+    }
+
+    [Test]
+    public async Task UpdateLastReadSeq_IsMonotonicMax()
+    {
+        var repo = new MembershipRepository(MongoClient);
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow, LastReadSeq = 5 });
+
+        await repo.UpdateLastReadSeq("chan1", "Peter#123", 10);
+        Assert.AreEqual(10L, (await repo.Load("chan1", "Peter#123")).LastReadSeq);
+
+        await repo.UpdateLastReadSeq("chan1", "Peter#123", 3); // lower — must NOT regress
+        Assert.AreEqual(10L, (await repo.Load("chan1", "Peter#123")).LastReadSeq);
+
+        await repo.UpdateLastReadSeq("chan1", "Peter#123", 15);
+        Assert.AreEqual(15L, (await repo.Load("chan1", "Peter#123")).LastReadSeq);
+    }
+
+    [Test]
+    public async Task SetNotificationLevel_Persists()
+    {
+        var repo = new MembershipRepository(MongoClient);
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        Assert.AreEqual(NotificationLevel.All, (await repo.Load("chan1", "Peter#123")).NotificationLevel);
+
+        await repo.SetNotificationLevel("chan1", "Peter#123", NotificationLevel.Mentions);
+
+        Assert.AreEqual(NotificationLevel.Mentions, (await repo.Load("chan1", "Peter#123")).NotificationLevel);
+    }
+
+    [Test]
+    public async Task CountNameJoinableMembershipsForUser_CountsOnlyPublicAndSemiPublic()
+    {
+        var channelRepo = new ChannelRepository(MongoClient);
+        var pub = new ChatChannel { Type = ChannelType.Public, Name = "Pub", NormalizedName = "pub" };
+        var semi = new ChatChannel { Type = ChannelType.SemiPublic, Name = "Semi", NormalizedName = "semi" };
+        var sys = new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, SystemRef = "m1" };
+        var dm = new ChatChannel { Type = ChannelType.Dm, PairKey = DmPairKey.For("Peter#123", "Wolf#456") };
+        await channelRepo.Insert(pub);
+        await channelRepo.Insert(semi);
+        await channelRepo.Insert(sys);
+        await channelRepo.Insert(dm);
+
+        var membershipRepo = new MembershipRepository(MongoClient);
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = pub.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = semi.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = sys.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = dm.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+
+        var count = await membershipRepo.CountNameJoinableMembershipsForUser("Peter#123");
+
+        Assert.AreEqual(2, count);
     }
 }

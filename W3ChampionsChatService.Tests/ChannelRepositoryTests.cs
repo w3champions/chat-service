@@ -92,9 +92,9 @@ public class ChannelRepositoryTests : IntegrationTestBase
         var channel = new ChatChannel { Type = ChannelType.Public, Name = "Seq", NormalizedName = "seq" };
         await repo.Insert(channel);
 
-        Assert.AreEqual(1L, await repo.AllocateSeq(channel.Id));
-        Assert.AreEqual(2L, await repo.AllocateSeq(channel.Id));
-        Assert.AreEqual(3L, await repo.AllocateSeq(channel.Id));
+        Assert.AreEqual(1L, await repo.AllocateSeq(channel.Id, DateTime.UtcNow));
+        Assert.AreEqual(2L, await repo.AllocateSeq(channel.Id, DateTime.UtcNow));
+        Assert.AreEqual(3L, await repo.AllocateSeq(channel.Id, DateTime.UtcNow));
     }
 
     [Test]
@@ -104,7 +104,7 @@ public class ChannelRepositoryTests : IntegrationTestBase
         var channel = new ChatChannel { Type = ChannelType.Public, Name = "Seq", NormalizedName = "seq" };
         await repo.Insert(channel);
 
-        var tasks = Enumerable.Range(0, 100).Select(_ => Task.Run(() => repo.AllocateSeq(channel.Id)));
+        var tasks = Enumerable.Range(0, 100).Select(_ => Task.Run(() => repo.AllocateSeq(channel.Id, DateTime.UtcNow)));
         var seqs = await Task.WhenAll(tasks);
 
         // 100 parallel allocations: no duplicates, no gaps, counter lands on exactly 100
@@ -116,6 +116,130 @@ public class ChannelRepositoryTests : IntegrationTestBase
     public void AllocateSeq_UnknownChannel_Throws()
     {
         var repo = new ChannelRepository(MongoClient);
-        Assert.ThrowsAsync<InvalidOperationException>(() => repo.AllocateSeq("does-not-exist"));
+        Assert.ThrowsAsync<InvalidOperationException>(() => repo.AllocateSeq("does-not-exist", DateTime.UtcNow));
+    }
+
+    [Test]
+    public async Task AllocateSeq_AlsoStampsLastMessageAt()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Public, Name = "Seq", NormalizedName = "seq" };
+        await repo.Insert(channel);
+        Assert.IsNull(channel.LastMessageAt);
+
+        var t1 = new DateTime(2026, 7, 3, 12, 0, 0, DateTimeKind.Utc);
+        await repo.AllocateSeq(channel.Id, t1);
+        var afterFirst = await repo.Load(channel.Id);
+        Assert.IsTrue((afterFirst.LastMessageAt.Value - t1).Duration() < TimeSpan.FromSeconds(1));
+
+        var t2 = t1.AddMinutes(5);
+        await repo.AllocateSeq(channel.Id, t2);
+        var afterSecond = await repo.Load(channel.Id);
+        Assert.IsTrue((afterSecond.LastMessageAt.Value - t2).Duration() < TimeSpan.FromSeconds(1));
+    }
+
+    [Test]
+    public async Task FindOrCreateSemiPublic_CreatesOnFirstJoin_ReturnsExistingAfter()
+    {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        var repo = new ChannelRepository(MongoClient);
+        var now = DateTime.UtcNow;
+
+        var created = await repo.FindOrCreateSemiPublic("Clan War Room", now);
+
+        Assert.AreEqual(ChannelType.SemiPublic, created.Type);
+        Assert.AreEqual("clan war room", created.NormalizedName);
+        Assert.AreEqual("Clan War Room", created.Name);
+        Assert.AreEqual(0L, created.LastSeq);
+        Assert.IsTrue((created.LastMessageAt.Value - now).Duration() < TimeSpan.FromSeconds(1));
+
+        var again = await repo.FindOrCreateSemiPublic("clan war room", now.AddMinutes(1)); // different case/time
+
+        Assert.AreEqual(created.Id, again.Id, "second call must return the SAME channel, not create a new one");
+        var all = await repo.LoadAllOfType(ChannelType.SemiPublic);
+        Assert.AreEqual(1, all.Count);
+    }
+
+    [Test]
+    public async Task FindOrCreateSemiPublic_ConcurrentCalls_YieldOneChannel()
+    {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        var repo = new ChannelRepository(MongoClient);
+        var now = DateTime.UtcNow;
+
+        var tasks = Enumerable.Range(0, 8).Select(_ => Task.Run(() => repo.FindOrCreateSemiPublic("Race Room", now)));
+        var results = await Task.WhenAll(tasks);
+
+        var distinctIds = results.Select(c => c.Id).Distinct().ToList();
+        Assert.AreEqual(1, distinctIds.Count, "all 8 concurrent find-or-creates must resolve to exactly one channel");
+
+        var all = await repo.LoadAllOfType(ChannelType.SemiPublic);
+        Assert.AreEqual(1, all.Count);
+    }
+
+    [Test]
+    public async Task Channels_UniqueIndex_TypeNormalizedName_ForNameJoinableTypes()
+    {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient); // idempotent — second run must not throw
+
+        var db = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
+        var indexes = await (await db.GetCollection<ChatChannel>(ChatCollections.Channels).Indexes.ListAsync()).ToListAsync();
+        var index = indexes.Single(i => i["name"] == "ux_type_normalizedName");
+        Assert.IsTrue(index["unique"].AsBoolean);
+        Assert.AreEqual(1, index["key"]["Type"].ToInt32());
+        Assert.AreEqual(1, index["key"]["NormalizedName"].ToInt32());
+
+        var repo = new ChannelRepository(MongoClient);
+
+        await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Dup", NormalizedName = "dup" });
+        Assert.ThrowsAsync<MongoWriteException>(
+            () => repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Dup2", NormalizedName = "dup" }));
+
+        await repo.Insert(new ChatChannel { Type = ChannelType.SemiPublic, Name = "SemiDup", NormalizedName = "semidup" });
+        Assert.ThrowsAsync<MongoWriteException>(
+            () => repo.Insert(new ChatChannel { Type = ChannelType.SemiPublic, Name = "SemiDup2", NormalizedName = "semidup" }));
+
+        // same normalized name across DIFFERENT name-joinable types is fine — compound key
+        await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "cross", NormalizedName = "cross" });
+        await repo.Insert(new ChatChannel { Type = ChannelType.SemiPublic, Name = "cross", NormalizedName = "cross" });
+
+        // non-name-joinable types are excluded by the partial filter — proves the partial
+        // filter (not the base field) drives uniqueness (System channels don't set
+        // NormalizedName in practice; this exercises the filter boundary directly)
+        await repo.Insert(new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, SystemRef = "m1", NormalizedName = "dup" });
+        await repo.Insert(new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, SystemRef = "m2", NormalizedName = "dup" });
+    }
+
+    [Test]
+    public async Task LoadByIds_ReturnsRequestedChannels()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var a = new ChatChannel { Type = ChannelType.Public, Name = "A", NormalizedName = "a" };
+        var b = new ChatChannel { Type = ChannelType.Public, Name = "B", NormalizedName = "b" };
+        var c = new ChatChannel { Type = ChannelType.Public, Name = "C", NormalizedName = "c" };
+        await repo.Insert(a);
+        await repo.Insert(b);
+        await repo.Insert(c);
+
+        var loaded = await repo.LoadByIds(new[] { a.Id, c.Id });
+
+        Assert.AreEqual(2, loaded.Count);
+        CollectionAssert.AreEquivalent(new[] { a.Id, c.Id }, loaded.Select(x => x.Id).ToList());
+    }
+
+    [Test]
+    public async Task LoadAnyByNormalizedName_FindsAcrossTypes()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Public One", NormalizedName = "public one" });
+        var semi = new ChatChannel { Type = ChannelType.SemiPublic, Name = "Semi One", NormalizedName = "semi one" };
+        await repo.Insert(semi);
+
+        var found = await repo.LoadAnyByNormalizedName("semi one");
+
+        Assert.IsNotNull(found);
+        Assert.AreEqual(semi.Id, found.Id);
+        Assert.AreEqual(ChannelType.SemiPublic, found.Type);
     }
 }
