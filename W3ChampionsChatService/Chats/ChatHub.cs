@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
@@ -16,7 +17,7 @@ using Serilog;
 [assembly: InternalsVisibleTo("W3ChampionsChatService.Tests")]
 namespace W3ChampionsChatService.Chats;
 
-public class ChatHub(
+public partial class ChatHub(
     IChatAuthenticationService authenticationService,
     IMuteRepository muteRepository,
     SettingsRepository settingsRepository,
@@ -30,7 +31,10 @@ public class ChatHub(
     FocusRegistry focusRegistry,
     OnlineMemberRegistry onlineMemberRegistry,
     MessageRateLimiter messageRateLimiter,
-    TimeProvider timeProvider) : Hub
+    TimeProvider timeProvider,
+    // C3 (Task 9): resolves a channel for the FocusChannel NotFound-vs-NotMember split (cold path,
+    // only reached when the caller is NOT already a member per OnlineMemberRegistry).
+    ChannelRepository channelRepository) : Hub
 {
     // No longer read after Task 8 moved identity→ChatUser resolution into SessionStateAssembler
     // (LoginAsAuthenticated, the last remaining reader, is no longer called from connect). Retained as
@@ -52,6 +56,7 @@ public class ChatHub(
     private readonly OnlineMemberRegistry _onlineMemberRegistry = onlineMemberRegistry;
     private readonly MessageRateLimiter _messageRateLimiter = messageRateLimiter;
     private readonly TimeProvider _timeProvider = timeProvider;
+    private readonly ChannelRepository _channelRepository = channelRepository;
 
     // Maximum accepted chat message length (after trim). Longer messages are rejected gracefully.
     private const int MaxMessageLength = 1024;

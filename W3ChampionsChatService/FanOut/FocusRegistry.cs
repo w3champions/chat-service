@@ -73,6 +73,22 @@ public class FocusRegistry
         }
     }
 
+    /// <summary>
+    /// Snapshot of the channelIds <paramref name="connectionId"/> currently has focused. The hub
+    /// (Task 9) reads this BEFORE calling <see cref="Focus"/> to enforce the focused-set cap
+    /// (<see cref="Domain.ChatLimits.MaxFocusedChannels"/>) and to detect an idempotent re-focus (a
+    /// channel already in this set never counts as a NEW one against the cap).
+    /// </summary>
+    public IReadOnlyCollection<string> GetFocusedChannels(string connectionId)
+    {
+        lock (_lock)
+        {
+            return _focusedChannelsByConnection.TryGetValue(connectionId, out var channels)
+                ? channels.ToList()
+                : Array.Empty<string>();
+        }
+    }
+
     /// <summary>Snapshot of the connectionIds currently focused on <paramref name="channelId"/>.</summary>
     public IReadOnlyCollection<string> GetFocusedConnections(string channelId)
     {

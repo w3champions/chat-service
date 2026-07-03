@@ -118,6 +118,45 @@ public class FanOutRegistryTests
     }
 
     [Test]
+    public void GetFocusedChannels_ReturnsDistinctChannelIds_ForThatConnectionOnly()
+    {
+        _focusRegistry.Focus("conn-1", "channel-a", "peter#123");
+        _focusRegistry.Focus("conn-1", "channel-b", "peter#123");
+        _focusRegistry.Focus("conn-2", "channel-c", "alice#456");
+
+        var channels = _focusRegistry.GetFocusedChannels("conn-1");
+
+        Assert.That(channels, Is.EquivalentTo(new[] { "channel-a", "channel-b" }),
+            "Must return only conn-1's own focused channels, never another connection's");
+    }
+
+    [Test]
+    public void GetFocusedChannels_Refocus_DoesNotDuplicate()
+    {
+        _focusRegistry.Focus("conn-1", "channel-a", "peter#123");
+        _focusRegistry.Focus("conn-1", "channel-a", "peter#123");
+
+        Assert.That(_focusRegistry.GetFocusedChannels("conn-1"), Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public void GetFocusedChannels_UnknownConnection_ReturnsEmpty()
+    {
+        Assert.That(_focusRegistry.GetFocusedChannels("conn-unknown"), Is.Empty);
+    }
+
+    [Test]
+    public void GetFocusedChannels_AfterUnfocus_NoLongerIncludesThatChannel()
+    {
+        _focusRegistry.Focus("conn-1", "channel-a", "peter#123");
+        _focusRegistry.Focus("conn-1", "channel-b", "peter#123");
+
+        _focusRegistry.Unfocus("conn-1", "channel-a");
+
+        Assert.That(_focusRegistry.GetFocusedChannels("conn-1"), Is.EquivalentTo(new[] { "channel-b" }));
+    }
+
+    [Test]
     public void RemoveConnection_ClearsAllEntries()
     {
         _focusRegistry.Focus("conn-1", "channel-a", "peter#123");

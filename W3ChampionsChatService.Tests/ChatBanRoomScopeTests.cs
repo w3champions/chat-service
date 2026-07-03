@@ -78,7 +78,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             new FocusRegistry(),
             onlineMemberRegistry,
             new MessageRateLimiter(),
-            TimeProvider.System);
+            TimeProvider.System,
+            channelRepository);
 
         _lastCallerMethod = null;
         _lastCallerArgs = null;
@@ -1123,7 +1124,8 @@ public class ChatBanRoomScopeTests : IntegrationTestBase
             new FocusRegistry(),
             onlineMemberRegistry,
             new MessageRateLimiter(),
-            TimeProvider.System)
+            TimeProvider.System,
+            channelRepository)
         {
             Clients = _clients.Object,
             Context = _hubCallerContext.Object,

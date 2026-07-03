@@ -70,7 +70,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             new FocusRegistry(),
             onlineMemberRegistry,
             new MessageRateLimiter(),
-            TimeProvider.System);
+            TimeProvider.System,
+            channelRepository);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

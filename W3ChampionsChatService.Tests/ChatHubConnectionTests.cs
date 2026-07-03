@@ -119,7 +119,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
-            TimeProvider.System);
+            TimeProvider.System,
+            _channelRepository);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

@@ -75,7 +75,8 @@ public class MuteReconciliationTests : IntegrationTestBase
             new FocusRegistry(),
             onlineMemberRegistry,
             new MessageRateLimiter(),
-            TimeProvider.System);
+            TimeProvider.System,
+            channelRepository);
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();

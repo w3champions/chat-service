@@ -74,7 +74,8 @@ public class ChatTests : IntegrationTestBase
             new FocusRegistry(),
             onlineMemberRegistry,
             new MessageRateLimiter(),
-            TimeProvider.System);
+            TimeProvider.System,
+            channelRepository);
 
         // Setup message capturing proxies
         _capturedCallerMessage = null;
