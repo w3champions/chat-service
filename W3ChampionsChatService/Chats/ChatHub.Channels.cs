@@ -229,12 +229,14 @@ public partial class ChatHub
 
     /// <summary>
     /// Leaves a channel: deletes the membership row, drops the caller's <see cref="FanOut.OnlineMemberRegistry"/>
-    /// entry, and unfocuses it in <see cref="FanOut.FocusRegistry"/>. Idempotent and unconditional on
-    /// membership state — leaving a channel the caller was never a member of (or re-leaving one already
-    /// left) is still <see cref="ChatResultCode.Ok"/>, mirroring <see cref="UnfocusChannel"/>'s
-    /// no-op-if-absent contract. Fail-closed on identity, same as <see cref="JoinChannel"/> and
-    /// <see cref="FocusChannel"/>: an unregistered connection has no battleTag to delete a membership
-    /// under.
+    /// entry, and unfocuses it in <see cref="FanOut.FocusRegistry"/> — routing that roster change through the
+    /// batched <c>ViewersChanged</c> accumulator first, exactly like <see cref="UnfocusChannel"/> does, so a
+    /// focused viewer who explicitly leaves while staying connected still emits a <c>left</c> delta (no phantom
+    /// viewer). Idempotent and unconditional on membership state — leaving a channel the caller was never a
+    /// member of (or re-leaving one already left) is still <see cref="ChatResultCode.Ok"/>, mirroring
+    /// <see cref="UnfocusChannel"/>'s no-op-if-absent contract. Fail-closed on identity, same as
+    /// <see cref="JoinChannel"/> and <see cref="FocusChannel"/>: an unregistered connection has no battleTag to
+    /// delete a membership under.
     /// </summary>
     public async Task<ChannelOperationResult> LeaveChannel(string channelId)
     {
@@ -247,6 +249,14 @@ public partial class ChatHub
 
         await _membershipRepository.Delete(channelId, battleTag);
         _onlineMemberRegistry.Leave(channelId, Context.ConnectionId);
+
+        // C3 (Task 14): route the viewer-roster change into the batched ViewersChanged accumulator BEFORE
+        // the FocusRegistry mutation, so its pre-window baseline reflects this battleTag as it was BEFORE
+        // the leave (VIEWING while still focused). Without this, an explicit leave while staying connected
+        // leaves a phantom viewer in every other viewer's roster (no `left` ever emitted). Mirrors
+        // UnfocusChannel; ordering is load-bearing — recording AFTER the unfocus would invert the delta.
+        _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+
         _focusRegistry.Unfocus(Context.ConnectionId, channelId);
 
         return new ChannelOperationResult(ChatResultCode.Ok);

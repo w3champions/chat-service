@@ -468,4 +468,41 @@ public class ViewersAccumulatorTests : IntegrationTestBase
             "a genuine stop-viewing (no same-window reconnect-refocus) MUST still be reported as a leave");
         Assert.IsFalse(Contains(charlieBatches.Last().Joined, BattleTagB));
     }
+
+    // ---- HUB-LEVEL: explicit LeaveChannel while staying connected ----------------------------------
+
+    [Test]
+    public async Task LeaveChannel_WhileConnected_EmitsLeaveToOtherViewers()
+    {
+        // conn-charlie is a stable observer; conn-leaver (bravo) is an established, focused viewer who
+        // then explicitly LeaveChannels while STAYING connected — a genuine stop-viewing that MUST still
+        // be reported to the remaining viewer. Without LeaveChannel routing its roster change through the
+        // accumulator (RecordChange BEFORE FocusRegistry.Unfocus), bravo vanishes from the roster with NO
+        // `left` delta, leaving charlie's client showing a phantom viewer indefinitely.
+        Register("conn-charlie", BattleTagC);
+        SeedMembership("conn-charlie", BattleTagC);
+        Register("conn-leaver", BattleTagB);
+        SeedMembership("conn-leaver", BattleTagB);
+
+        var charlieHub = BuildHub("conn-charlie");
+        var leaverHub = BuildHub("conn-leaver");
+        await charlieHub.FocusChannel(ChannelId);
+        await leaverHub.FocusChannel(ChannelId);
+
+        // Flush so bravo is an ESTABLISHED viewer at the next window's baseline (a prior batch already
+        // told everyone bravo joined).
+        await _accumulator.FlushDue(T0 + Flush);
+
+        // bravo explicitly leaves the channel while STAYING connected (no displacement, no disconnect).
+        await leaverHub.LeaveChannel(ChannelId);
+
+        var before = ViewersChangedFor(_harness, "conn-charlie").Count;
+        await _accumulator.FlushDue(T0.AddSeconds(10));
+
+        var charlieBatches = ViewersChangedFor(_harness, "conn-charlie");
+        Assert.AreEqual(before + 1, charlieBatches.Count, "the remaining viewer receives one batch for the leave");
+        Assert.IsTrue(Contains(charlieBatches.Last().Left, BattleTagB),
+            "an explicit LeaveChannel while staying connected MUST be reported as a leave");
+        Assert.IsFalse(Contains(charlieBatches.Last().Joined, BattleTagB));
+    }
 }
