@@ -64,9 +64,16 @@ public class SessionStateAssembler(
             ? Array.Empty<ChatChannel>()
             : publicCatalog;
 
+        // Channel-backed memberships only (row exists AND the channel it points at still exists) —
+        // the single filtered set both the DTO's Channels list and the OnlineMemberRegistry seed are
+        // built from, so a membership orphaned by a deleted channel never fans out to a channel with
+        // no row even though it doesn't reach the client either.
+        var channelBackedMemberships = memberships
+            .Where(m => channelsById.ContainsKey(m.ChannelId))
+            .ToList();
+
         var dto = new SessionStateDto(
-            Channels: memberships
-                .Where(m => channelsById.ContainsKey(m.ChannelId))
+            Channels: channelBackedMemberships
                 .Select(m => ToChannelDto(channelsById[m.ChannelId], m))
                 .ToList(),
             PublicCatalog: effectivePublicCatalog,
@@ -75,7 +82,7 @@ public class SessionStateAssembler(
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
 
-        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, memberships);
+        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, channelBackedMemberships);
         SeedLegacyMuteCache(connectionId, chatUser, muteStatus, mutedPlayer);
 
         return (dto, muteStatus);
@@ -126,11 +133,14 @@ public class SessionStateAssembler(
     private static MuteStateDto ToMuteStateDto(MuteStatus status, LoungeMute mute) =>
         status == MuteStatus.Full ? new MuteStateDto(mute.endDate) : null;
 
-    private void SeedOnlineMemberRegistry(string connectionId, string battleTag, List<ChannelMembership> memberships)
+    private void SeedOnlineMemberRegistry(string connectionId, string battleTag, List<ChannelMembership> channelBackedMemberships)
     {
-        // Materialized (ToList) before crossing into the registry's locked Seed — Seed enumerates
-        // its argument while holding the lock (FanOut/OnlineMemberRegistry.cs carry-forward note).
-        var seed = memberships
+        // channelBackedMemberships is already filtered to rows whose channel exists (same filter the
+        // DTO's Channels list uses) — the registry's channel set must match the DTO's exactly, so
+        // nothing ever fans out to a channel with no row. Materialized (ToList) before crossing into
+        // the registry's locked Seed — Seed enumerates its argument while holding the lock
+        // (FanOut/OnlineMemberRegistry.cs carry-forward note).
+        var seed = channelBackedMemberships
             .Select(m => (m.ChannelId, new MemberState(battleTag, m.NotificationLevel, m.LastReadSeq)))
             .ToList();
         onlineMemberRegistry.Seed(connectionId, seed);

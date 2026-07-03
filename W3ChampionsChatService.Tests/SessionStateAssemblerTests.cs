@@ -220,6 +220,16 @@ public class SessionStateAssemblerTests : IntegrationTestBase
 
         Assert.AreEqual(MuteStatus.Shadow, shadowStatus);
         Assert.IsNull(shadowDto.MuteState, "A shadow ban must NEVER surface to the client — muteState must be null");
+
+        // Invisible in the DTO must NOT mean invisible server-side: the legacy mute cache
+        // (ConnectionMapping, consulted by the real message-send enforcement path) must still carry
+        // the REAL Shadow status/endDate for this connection.
+        var persistedShadow = await _muteRepository.GetMutedPlayer(shadowIdentity.BattleTag);
+        Assert.IsTrue(_connectionMapping.TryGetMute("conn-shadow", out var cachedShadow),
+            "AssembleAndSeed must seed the legacy mute cache even for a shadow ban");
+        Assert.AreEqual(MuteStatus.Shadow, cachedShadow.Status,
+            "The legacy mute cache must carry the real Shadow status even though the DTO hides it");
+        Assert.AreEqual(persistedShadow.endDate, cachedShadow.EndDate);
     }
 
     [Test]
