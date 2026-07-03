@@ -249,6 +249,31 @@ public class ChatHubMembershipTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task JoinChannel_AtCap_NewName_ReturnsPermissionDenied_NoOrphanChannelCreated()
+    {
+        // A user already at the membership cap joins a brand-new (not-found) name: the cap must be
+        // checked BEFORE the creation throttle / actual channel creation, so this returns a
+        // deterministic PermissionDenied with NO orphan SemiPublic channel persisted and NO
+        // creation-throttle token consumed.
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.MaxPublicMembershipsPerUser; i++)
+        {
+            var channel = await CreateChannel($"cap3-chan-{i}");
+            await DirectlyJoin(channel.Id, BattleTag);
+        }
+
+        var result = await hub.JoinChannel("a-brand-new-unique-name");
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code,
+            "A capped user joining a brand-new name must be denied before any channel is created");
+
+        var orphan = await _channelRepository.LoadAnyByNormalizedName(ChannelNames.Normalize("a-brand-new-unique-name"));
+        Assert.IsNull(orphan, "No orphan SemiPublic channel must have been created for a capped user");
+    }
+
+    [Test]
     public async Task JoinChannel_SemiPublicCreation_SixthInHour_ReturnsThrottled()
     {
         RegisterSession("conn-1", BattleTag);

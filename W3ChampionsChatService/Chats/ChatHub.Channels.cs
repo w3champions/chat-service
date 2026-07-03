@@ -106,20 +106,27 @@ public partial class ChatHub
     /// <item><b>System / Dm / GroupDm</b> (any ACL-governed, non-name-joinable type) — denied. A name
     /// collision with an ACL channel (e.g. a live match's System channel) must NEVER fall through to
     /// implicit creation.</item>
-    /// <item><b>No match</b> — implicit semiPublic creation: the creation throttle
-    /// (<see cref="FanOut.ChannelCreationRateLimiter"/>, keyed by battleTag) gates the ACTUAL create;
-    /// over the limit returns <see cref="ChatResultCode.Throttled"/> with the window's remaining
-    /// seconds. Only genuine creations are metered — a join of an existing channel never touches the
-    /// throttle.</item>
+    /// <item><b>No match</b> — falls through to the cap check and (if not capped) implicit creation
+    /// below. The channel is NOT created yet at this point.</item>
     /// </list>
     /// </item>
-    /// <item>Idempotent already-member short-circuit: an existing membership returns
+    /// <item>Idempotent already-member short-circuit (found-channel path only, since the not-found path
+    /// can never have an existing membership): an existing membership returns
     /// <see cref="ChatResultCode.Ok"/> with the existing channel + membership, and does NOT count
-    /// against the cap below (re-joining a channel you're already in is free).</item>
+    /// against the cap below — a member already at the cap can still re-join.</item>
     /// <item>Membership cap (<see cref="ChatLimits.MaxPublicMembershipsPerUser"/>, counting only
     /// name-joinable Public+SemiPublic memberships via
-    /// <see cref="Memberships.MembershipRepository.CountNameJoinableMembershipsForUser"/>): only
-    /// evaluated for a genuinely NEW membership, since idempotent re-joins already returned above.</item>
+    /// <see cref="Memberships.MembershipRepository.CountNameJoinableMembershipsForUser"/>): checked
+    /// BEFORE the creation throttle and BEFORE any channel is created, for a genuinely NEW membership
+    /// on EITHER path (an existing channel the caller isn't in yet, or a not-found name). This ordering
+    /// is deliberate: a capped user joining a brand-new name must get a deterministic
+    /// <see cref="ChatResultCode.PermissionDenied"/> with no orphan SemiPublic channel persisted and no
+    /// creation-throttle token consumed.</item>
+    /// <item>Not-found path only: implicit semiPublic creation, now that the cap has cleared. The
+    /// creation throttle (<see cref="FanOut.ChannelCreationRateLimiter"/>, keyed by battleTag) gates the
+    /// ACTUAL create; over the limit returns <see cref="ChatResultCode.Throttled"/> with the window's
+    /// remaining seconds. Only genuine creations are metered — joining an existing channel never
+    /// touches the throttle.</item>
     /// <item>Create the membership with <see cref="NotificationLevel.Mentions"/> — an EXPLICIT override
     /// of <see cref="ChannelMembership.NotificationLevel"/>'s model default (<c>All</c>) — insert it,
     /// seed <see cref="FanOut.OnlineMemberRegistry"/> for this connection, and return Ok.</item>
@@ -138,6 +145,43 @@ public partial class ChatHub
 
         var channel = await _channelRepository.LoadAnyByNormalizedName(normalizedName);
 
+        if (channel != null)
+        {
+            if (channel.Type == ChannelType.Public)
+            {
+                // Full-ban gate: carries LoginAsAuthenticated's room-scope semantics — a full-banned
+                // user cannot join public channels. SemiPublic is exempt (falls through below).
+                if (_connections.GetEffectiveMuteStatus(Context.ConnectionId, now) == MuteStatus.Full)
+                {
+                    return new JoinChannelResult(ChatResultCode.PermissionDenied);
+                }
+            }
+            else if (channel.Type != ChannelType.SemiPublic)
+            {
+                // System / Dm / GroupDm — ACL-governed, not joinable by name. NOT an implicit-create
+                // case: a name collision with an existing ACL channel must be rejected outright.
+                return new JoinChannelResult(ChatResultCode.PermissionDenied);
+            }
+
+            var existingMembership = await _membershipRepository.Load(channel.Id, battleTag);
+            if (existingMembership != null)
+            {
+                // Idempotent: already a member. Does not count against the cap below — a member at cap
+                // can still re-join.
+                return new JoinChannelResult(ChatResultCode.Ok, Channel: channel, Membership: existingMembership);
+            }
+        }
+
+        // Membership cap: checked BEFORE the creation throttle / actual channel creation, for a
+        // genuinely new membership on EITHER path (existing channel not yet joined, or not-found name).
+        // A capped user joining a brand-new name must get a deterministic PermissionDenied with no
+        // orphan channel created and no throttle token spent.
+        var membershipCount = await _membershipRepository.CountNameJoinableMembershipsForUser(battleTag);
+        if (membershipCount >= ChatLimits.MaxPublicMembershipsPerUser)
+        {
+            return new JoinChannelResult(ChatResultCode.PermissionDenied);
+        }
+
         if (channel == null)
         {
             // Implicit semiPublic creation — throttle ACTUAL creations only (per battleTag).
@@ -148,34 +192,6 @@ public partial class ChatHub
             }
 
             channel = await _channelRepository.FindOrCreateSemiPublic(name, now);
-        }
-        else if (channel.Type == ChannelType.Public)
-        {
-            // Full-ban gate: carries LoginAsAuthenticated's room-scope semantics — a full-banned user
-            // cannot join public channels. SemiPublic is exempt (handled by falling through below).
-            if (_connections.GetEffectiveMuteStatus(Context.ConnectionId, now) == MuteStatus.Full)
-            {
-                return new JoinChannelResult(ChatResultCode.PermissionDenied);
-            }
-        }
-        else if (channel.Type != ChannelType.SemiPublic)
-        {
-            // System / Dm / GroupDm — ACL-governed, not joinable by name. NOT an implicit-create case:
-            // a name collision with an existing ACL channel must be rejected outright.
-            return new JoinChannelResult(ChatResultCode.PermissionDenied);
-        }
-
-        var existingMembership = await _membershipRepository.Load(channel.Id, battleTag);
-        if (existingMembership != null)
-        {
-            // Idempotent: already a member. Does not count against the cap below.
-            return new JoinChannelResult(ChatResultCode.Ok, Channel: channel, Membership: existingMembership);
-        }
-
-        var membershipCount = await _membershipRepository.CountNameJoinableMembershipsForUser(battleTag);
-        if (membershipCount >= ChatLimits.MaxPublicMembershipsPerUser)
-        {
-            return new JoinChannelResult(ChatResultCode.PermissionDenied);
         }
 
         var membership = new ChannelMembership
