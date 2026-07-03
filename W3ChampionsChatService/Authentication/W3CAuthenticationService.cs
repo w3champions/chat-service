@@ -93,8 +93,8 @@ public class W3CUserAuthentication
         }
     }
 
-    public string BattleTag { get; set; }
-    public string Name { get; set; }
-    public bool IsAdmin { get; set; }
-    public HashSet<EPermission> Permissions { get; set; } = new HashSet<EPermission>();
+    public string BattleTag { get; init; }
+    public string Name { get; init; }
+    public bool IsAdmin { get; init; }
+    public IReadOnlySet<EPermission> Permissions { get; init; } = new HashSet<EPermission>();
 }
