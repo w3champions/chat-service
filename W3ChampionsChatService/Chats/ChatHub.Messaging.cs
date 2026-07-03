@@ -242,6 +242,86 @@ public partial class ChatHub
     }
 
     /// <summary>
+    /// C3 (Task 17): advances the caller's per-channel read cursor in BOTH the durable Mongo
+    /// membership row (drives unread on reconnect/SessionState —
+    /// <see cref="Memberships.MembershipRepository.UpdateLastReadSeq"/>) and the in-memory
+    /// <see cref="FanOut.OnlineMemberRegistry"/> (drives the live <see cref="FanOut.ActivityCoalescer"/>
+    /// unread-suppression re-check at emit time). The resolution order is honored EXACTLY:
+    /// <list type="number">
+    /// <item>Fail-closed identity: an unregistered connection (never authenticated, or its session was
+    /// displaced/torn down) → <see cref="ChatResultCode.PermissionDenied"/> — there is no identity to
+    /// mark a channel read under.</item>
+    /// <item>Membership via <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (hot path, zero DB, O(1)
+    /// reverse-index lookup — mirrors <see cref="SendMessage(string, string)"/>'s step 3) →
+    /// <see cref="ChatResultCode.NotMember"/> if the caller isn't a member.</item>
+    /// <item>Channel load (needed for the clamp ceiling below); missing → <see cref="ChatResultCode.NotFound"/>
+    /// — the member-of-a-deleted-channel edge. Defensive/beyond this task's named tests, but kept
+    /// consistent with the SAME edge handled by <see cref="GetMessages"/> and <see cref="FocusChannel"/>.</item>
+    /// <item>Clamp: <c>Math.Min(seq, channel.LastSeq)</c> — a client must never mark a channel read
+    /// past its actual last message, or unread would go negative and mask future messages.</item>
+    /// <item>Advance BOTH stores with the CLAMPED value (dual-store monotonic invariant below), then
+    /// return <see cref="ChatResultCode.Ok"/>.</item>
+    /// </list>
+    /// <para>
+    /// DUAL-STORE MONOTONIC INVARIANT: <see cref="Memberships.MembershipRepository.UpdateLastReadSeq"/>
+    /// is already a Mongo <c>$max</c> — a lower/stale seq is silently a DB no-op. The registry's plain
+    /// <see cref="FanOut.OnlineMemberRegistry.SetLastReadSeq"/>, by contrast, is an unconditional
+    /// overwrite (kept exactly as-is — its own contract, its own <c>FanOutRegistryTests</c> coverage).
+    /// Calling THAT here would let a stale/out-of-order MarkRead regress the in-memory registry BELOW
+    /// the durable DB cursor even though the DB itself never moved — the two stores would diverge, and
+    /// <see cref="FanOut.ActivityCoalescer"/>'s emit-time unread recompute (which reads ONLY the
+    /// registry) would over-count unread and wrongly re-suppress an already-caught-up member. So this
+    /// method calls the registry's dedicated monotonic sibling,
+    /// <see cref="FanOut.OnlineMemberRegistry.AdvanceLastReadSeq"/> — same no-op-if-absent contract,
+    /// <c>Math.Max</c> instead of overwrite — keeping BOTH stores monotonic together.
+    /// </para>
+    /// <para>
+    /// NO SERVER-SIDE THROTTLE (deliberate): spec §13's 5s <see cref="ChatLimits.MarkReadThrottle"/> is
+    /// the pinned CLIENT coalescing contract (spec §7, "Client coalesces…") — the CLIENT debounces its
+    /// own MarkRead calls; the server does not hard-enforce it here. A hard server-side reject would
+    /// break the client's legitimate final-flush-on-unfocus (a MarkRead that must go through even if it
+    /// lands &lt;5s after the previous one), and blanket per-connection method abuse is already the
+    /// SignalR-level rate limiter's job, not this method's.
+    /// </para>
+    /// </summary>
+    public async Task<ChannelOperationResult> MarkRead(string channelId, long seq)
+    {
+        // 1. Fail-closed: no live session → no identity to mark a channel read under.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        var connectionId = Context.ConnectionId;
+
+        // 2. Membership (hot path, zero DB, O(1) reverse-index lookup).
+        if (!_onlineMemberRegistry.IsMember(connectionId, channelId))
+        {
+            return new ChannelOperationResult(ChatResultCode.NotMember);
+        }
+
+        // 3. Load the channel — needed for the clamp ceiling. A member whose channel doc is gone
+        // (deleted) → NotFound, mirroring SendMessage/GetMessages/FocusChannel's same edge.
+        var channel = await _channelRepository.Load(channelId);
+        if (channel == null)
+        {
+            return new ChannelOperationResult(ChatResultCode.NotFound);
+        }
+
+        // 4. Clamp: never mark read past the channel's actual last message.
+        var clamped = Math.Min(seq, channel.LastSeq);
+        var battleTag = session.Identity.BattleTag;
+
+        // 5. Advance BOTH stores with the SAME clamped value — see the dual-store monotonic invariant
+        // in the doc comment above for why AdvanceLastReadSeq (not SetLastReadSeq) is used here.
+        await _membershipRepository.UpdateLastReadSeq(channelId, battleTag, clamped);
+        _onlineMemberRegistry.AdvanceLastReadSeq(channelId, connectionId, clamped);
+
+        // 6. Typed ack.
+        return new ChannelOperationResult(ChatResultCode.Ok);
+    }
+
+    /// <summary>
     /// The send-time sender snapshot { battleTag, name, flair } from the connect-time cached
     /// <see cref="ChatUser"/> (no wb round-trip). Falls back to the session identity (no flair) only if
     /// the cached ChatUser is unexpectedly absent — a should-never-happen inconsistency the connect

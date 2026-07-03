@@ -89,7 +89,10 @@ public class OnlineMemberRegistry
 
     /// <summary>
     /// Updates the last-read sequence for an existing (channelId, connectionId) entry only.
-    /// No-op if the connection has no membership entry for that channel.
+    /// No-op if the connection has no membership entry for that channel. PLAIN OVERWRITE — NOT
+    /// monotonic. Kept exactly as-is (existing contract, existing <c>FanOutRegistryTests</c>
+    /// coverage); callers that must never regress the cursor (e.g. <c>ChatHub.MarkRead</c>, Task 17)
+    /// use <see cref="AdvanceLastReadSeq"/> instead.
     /// </summary>
     public void SetLastReadSeq(string channelId, string connectionId, long seq)
     {
@@ -98,6 +101,33 @@ public class OnlineMemberRegistry
             if (TryGetNoLock(channelId, connectionId, out var current))
             {
                 _membersByChannel[channelId][connectionId] = current with { LastReadSeq = seq };
+            }
+        }
+    }
+
+    /// <summary>
+    /// Monotonic (max) advance of the last-read sequence for an existing (channelId, connectionId)
+    /// entry only — no-op if the connection has no membership entry for that channel. Same
+    /// no-op-if-absent/lock discipline as <see cref="SetLastReadSeq"/>, but takes
+    /// <c>Math.Max(current.LastReadSeq, seq)</c> instead of a plain overwrite, so a lower/stale/
+    /// out-of-order seq never regresses the tracked cursor.
+    /// <para>
+    /// <c>ChatHub.MarkRead</c> (Task 17) calls THIS, not <see cref="SetLastReadSeq"/>: the durable
+    /// Mongo counterpart (<see cref="Memberships.MembershipRepository.UpdateLastReadSeq"/>) is
+    /// already a <c>$max</c>, so a stale MarkRead is a DB no-op. If the hub instead called the plain
+    /// overwrite here, that same stale call would still regress the IN-MEMORY registry below the
+    /// durable cursor — the two stores would diverge, and <see cref="ActivityCoalescer"/>'s emit-time
+    /// unread recompute (which reads ONLY this registry) would over-count unread and wrongly
+    /// re-suppress an already-caught-up member. This method keeps both stores monotonic together.
+    /// </para>
+    /// </summary>
+    public void AdvanceLastReadSeq(string channelId, string connectionId, long seq)
+    {
+        lock (_lock)
+        {
+            if (TryGetNoLock(channelId, connectionId, out var current))
+            {
+                _membersByChannel[channelId][connectionId] = current with { LastReadSeq = Math.Max(current.LastReadSeq, seq) };
             }
         }
     }
