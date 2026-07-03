@@ -12,8 +12,8 @@ namespace W3ChampionsChatService.Chats;
 /// C3 (Task 11): the durable send pipeline. <see cref="SendMessage(string, string)"/> is the NEW
 /// two-arg overload (channelId + content) that validates, rate-limits, mute-gates, DURABLY persists
 /// (per-channel seq + expiry), fires the fan-out seam, and returns a typed <see cref="SendMessageResult"/>.
-/// It coexists with the legacy single-arg <c>SendMessage(string)</c> in ChatHub.cs until Task 19
-/// deletes the old one.
+/// It is the sole <c>SendMessage</c> method on <see cref="ChatHub"/> — Task 19 removed the legacy
+/// single-arg <c>SendMessage(string)</c> overload it used to coexist with.
 /// <para>
 /// C3 (Task 16): <see cref="GetMessages"/> — the read-side companion. PULL-ONLY: every result comes
 /// back through this method's own typed <see cref="GetMessagesResult"/>; it NEVER pushes a SignalR
