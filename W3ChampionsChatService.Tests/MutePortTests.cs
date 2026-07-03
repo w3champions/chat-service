@@ -188,7 +188,14 @@ public class MutePortTests : IntegrationTestBase
 
     // Connect hub: capturing clients + the real Context.GetHttpContext() ticket path + abort capture, so
     // the connect no-abort pin can assert on the ordered (target, method) send/abort stream.
-    private ChatHub BuildConnectHub(string connectionId, string accessToken)
+    private ChatHub BuildConnectHub(string connectionId, string accessToken) =>
+        BuildConnectHub(connectionId, accessToken, _assembler);
+
+    // Connect hub variant whose assembler is backed by a caller-supplied instance — used by the zero-DB
+    // proofs to connect through the REAL ceremony against a CountingMuteRepository-backed assembler, so
+    // the sole live mute-repository read (the connect-time resolve) is proven wired before the hot path
+    // is exercised.
+    private ChatHub BuildConnectHub(string connectionId, string accessToken, SessionStateAssembler assembler)
     {
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -200,7 +207,7 @@ public class MutePortTests : IntegrationTestBase
         context.Setup(c => c.Features).Returns(BuildFeatures(accessToken));
         context.Setup(c => c.Abort()).Callback(() => _connectSends.Add((connectionId, "ABORT")));
 
-        return NewHub(_assembler, ViewersAccumulatorTestFactory.CreateIgnored(), clients.Object, context.Object);
+        return NewHub(assembler, ViewersAccumulatorTestFactory.CreateIgnored(), clients.Object, context.Object);
     }
 
     private ISingleClientProxy CapturingSingle(string target)
@@ -303,6 +310,14 @@ public class MutePortTests : IntegrationTestBase
     public async Task Connect_FullBan_NeverAborts()
     {
         await AddFullBanToDb(BattleTag);
+        // TICKET CLOCK — deliberately the REAL wall clock, NOT the FakeTimeProvider: OnConnectedAsync
+        // consumes the ticket against DateTime.UtcNow (ChatHub.cs:89 — a documented seam decoupled from
+        // the injected TimeProvider, since the REST mint side has no access to this hub's clock), and
+        // TicketStore only expires on `consume_now > mint_now + TicketTtl` with NO lower bound. Minting
+        // with a FIXED fake time (e.g. FixedNow) would therefore make this pass only while real UTC stays
+        // below that fixed instant + 60s and turn into a wall-clock time-bomb; matching mint to the same
+        // real clock the consume uses is what keeps it deterministic. (Mute EXPIRY below rides the fake
+        // clock — those are two different clocks, by design.)
         var ticket = _ticketStore.Mint(Identity(BattleTag), DateTime.UtcNow);
         var hub = BuildConnectHub("conn-ban", ticket);
 
@@ -509,20 +524,42 @@ public class MutePortTests : IntegrationTestBase
 
     // ── Zero-DB proofs (CountingMuteRepository) ───────────────────────────────────
 
+    // FALSIFIABILITY (legacy `count==1 after login, still 1 after send/join` shape): each zero-DB proof
+    // CONNECTS through the real OnConnectedAsync ceremony against a CountingMuteRepository-backed
+    // assembler — the sole live mute-repository read — asserts the spy fired exactly once (so it is
+    // proven wired), THEN exercises the send/join hot path and asserts the count is UNCHANGED. If the hot
+    // path ever started reading the repo the count would climb to 2 and the assertion would FAIL — which
+    // is exactly the guarantee a direct cache-seed + `count==0` proof cannot make (its spy never fires).
+
     [Test]
     // LEGACY: ChatBanRoomScopeTests.SendMessage_UnmutedUser_InPublicRoom_MakesZeroMuteRepositoryCalls @778aec9
     public async Task Send_UnmutedUser_PublicChannel_ZeroMuteRepositoryCalls()
     {
         var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
-        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.None);
+        // Persist a membership so the connect ceremony seeds this user as an online member of the channel
+        // (the send's zero-DB "IS a member" signal), reached from the same LoadForUser the assembler runs.
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = BattleTag,
+            NotificationLevel = NotificationLevel.Mentions,
+            JoinedAt = Now,
+        });
         var countingRepo = new CountingMuteRepository(MongoClient);
-        var hub = BuildCountingHub("conn-1", countingRepo);
+        // Real wall clock for the mint — see Connect_FullBan_NeverAborts: the ticket is consumed against
+        // DateTime.UtcNow (ChatHub's deliberate seam), so mint MUST use the same real clock, not FixedNow.
+        var ticket = _ticketStore.Mint(Identity(BattleTag), DateTime.UtcNow);
+        var hub = BuildConnectHub("conn-1", ticket, NewAssembler(countingRepo));
+
+        await hub.OnConnectedAsync();
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "The connect ceremony performs exactly ONE mute-repository read — the spy is live and wired through the assembler");
 
         var result = await hub.SendMessage(channel.Id, "hello world");
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "An unmuted member's public send is accepted");
-        Assert.AreEqual(0, countingRepo.GetMutedPlayerCallCount,
-            "SendMessage must make ZERO mute-repository reads on the hot path (cache-only enforcement)");
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "SendMessage must make ZERO FURTHER mute-repository reads on the hot path (cache-only enforcement)");
     }
 
     [Test]
@@ -530,15 +567,29 @@ public class MutePortTests : IntegrationTestBase
     public async Task Send_FullMuted_EnforcedWithZeroMuteRepositoryCalls()
     {
         var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
-        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Full, muteEnd: Now.AddDays(1));
+        // Member of the public channel from before the ban landed (kept on a full-ban connect), so the
+        // send reaches the mute gate. The DB full ban makes the connect resolve Full and seed the cache.
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = BattleTag,
+            NotificationLevel = NotificationLevel.Mentions,
+            JoinedAt = Now,
+        });
+        await AddFullBanToDb(BattleTag);
         var countingRepo = new CountingMuteRepository(MongoClient);
-        var hub = BuildCountingHub("conn-1", countingRepo);
+        var ticket = _ticketStore.Mint(Identity(BattleTag), DateTime.UtcNow);
+        var hub = BuildConnectHub("conn-1", ticket, NewAssembler(countingRepo));
+
+        await hub.OnConnectedAsync();
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "The connect ceremony resolves the ban with exactly ONE mute-repository read — the spy is live and wired");
 
         var result = await hub.SendMessage(channel.Id, "should be rejected");
 
         Assert.AreEqual(ChatResultCode.Muted, result.Code, "A cached full ban rejects the public send");
-        Assert.AreEqual(0, countingRepo.GetMutedPlayerCallCount,
-            "The full-mute enforcement must read the per-connection cache ONLY — zero mute-repository reads");
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "The full-mute enforcement must read the per-connection cache ONLY — zero FURTHER mute-repository reads");
     }
 
     [Test]
@@ -546,16 +597,19 @@ public class MutePortTests : IntegrationTestBase
     public async Task JoinChannel_MuteGate_ZeroMuteRepositoryCalls()
     {
         await CreateChannel("W3C Lounge", ChannelType.Public);
-        RegisterSession("conn-1", BattleTag);
-        _connectionMapping.SetMute("conn-1", MuteStatus.None, DateTime.MinValue);
         var countingRepo = new CountingMuteRepository(MongoClient);
-        var hub = BuildCountingHub("conn-1", countingRepo);
+        var ticket = _ticketStore.Mint(Identity(BattleTag), DateTime.UtcNow);
+        var hub = BuildConnectHub("conn-1", ticket, NewAssembler(countingRepo));
+
+        await hub.OnConnectedAsync();
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "The connect ceremony performs exactly ONE mute-repository read — the spy is live and wired through the assembler");
 
         var result = await hub.JoinChannel("W3C Lounge");
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "An unmuted user joins the public channel");
-        Assert.AreEqual(0, countingRepo.GetMutedPlayerCallCount,
-            "The JoinChannel full-ban gate must read the per-connection cache ONLY — zero mute-repository reads");
+        Assert.AreEqual(1, countingRepo.GetMutedPlayerCallCount,
+            "The JoinChannel full-ban gate must read the per-connection cache ONLY — zero FURTHER mute-repository reads");
     }
 
     [Test]
