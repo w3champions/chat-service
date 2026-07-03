@@ -86,6 +86,28 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void ISessionRegistry_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<ISessionRegistry>();
+        var second = provider.GetRequiredService<ISessionRegistry>();
+
+        Assert.AreSame(first, second,
+            "ISessionRegistry MUST be a singleton — the connect/disconnect (hub) and permission-resolution (filter) paths must share the SAME in-memory session state");
+    }
+
+    [Test]
+    public void ISessionRegistry_ResolvesToSessionRegistry()
+    {
+        using var provider = BuildProvider();
+
+        var registry = provider.GetRequiredService<ISessionRegistry>();
+        Assert.IsInstanceOf<SessionRegistry>(registry,
+            "ISessionRegistry must resolve to the concrete SessionRegistry");
+    }
+
+    [Test]
     public void AuthSessionControllerDependencies_Resolve()
     {
         using var provider = BuildProvider();

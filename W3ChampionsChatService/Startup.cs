@@ -61,6 +61,10 @@ public class Startup
         // break the mint→connect handoff and the rate windows.
         services.AddSingleton<ITicketStore, TicketStore>();
         services.AddSingleton<MintRateLimiter>();
+        // Authoritative battleTag→connection map (one active connection per battleTag). Singleton:
+        // the connect/disconnect (Task 6 hub) and permission-resolution (Task 7 filter) paths must
+        // share the SAME in-memory session state.
+        services.AddSingleton<ISessionRegistry, SessionRegistry>();
 
         services.AddHttpContextAccessor();
 
