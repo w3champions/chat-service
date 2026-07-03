@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Memberships;
 
 namespace W3ChampionsChatService.Domain;
 
@@ -18,7 +19,8 @@ public static class ChatDomainIndexes
     {
         var db = mongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
         await EnsureChannelIndexes(db);
-        // Tasks 4/5/7 extend: memberships, messages, mention_inbox
+        await EnsureMembershipIndexes(db);
+        // Tasks 5/7 extend: messages, mention_inbox
     }
 
     private static async Task EnsureChannelIndexes(IMongoDatabase db)
@@ -37,6 +39,20 @@ public static class ChatDomainIndexes
             new CreateIndexModel<ChatChannel>(
                 Builders<ChatChannel>.IndexKeys.Ascending(c => c.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
+        ]);
+    }
+
+    private static async Task EnsureMembershipIndexes(IMongoDatabase db)
+    {
+        var memberships = db.GetCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+        await memberships.Indexes.CreateManyAsync(
+        [
+            new CreateIndexModel<ChannelMembership>(
+                Builders<ChannelMembership>.IndexKeys.Ascending(m => m.ChannelId).Ascending(m => m.BattleTag),
+                new CreateIndexOptions { Name = "ux_channelId_battleTag", Unique = true }),
+            new CreateIndexModel<ChannelMembership>(
+                Builders<ChannelMembership>.IndexKeys.Ascending(m => m.BattleTag),
+                new CreateIndexOptions { Name = "ix_battleTag" }),
         ]);
     }
 }
