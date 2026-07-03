@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Bson;
@@ -82,5 +83,39 @@ public class ChannelRepositoryTests : IntegrationTestBase
         // two public channels without PairKey are fine (partial index only covers Type == Dm)
         await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "A", NormalizedName = "a" });
         await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "B", NormalizedName = "b" });
+    }
+
+    [Test]
+    public async Task AllocateSeq_ReturnsSequentialValues()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Public, Name = "Seq", NormalizedName = "seq" };
+        await repo.Insert(channel);
+
+        Assert.AreEqual(1L, await repo.AllocateSeq(channel.Id));
+        Assert.AreEqual(2L, await repo.AllocateSeq(channel.Id));
+        Assert.AreEqual(3L, await repo.AllocateSeq(channel.Id));
+    }
+
+    [Test]
+    public async Task AllocateSeq_IsStrictlyMonotonic_UnderConcurrentAllocation()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Public, Name = "Seq", NormalizedName = "seq" };
+        await repo.Insert(channel);
+
+        var tasks = Enumerable.Range(0, 100).Select(_ => Task.Run(() => repo.AllocateSeq(channel.Id)));
+        var seqs = await Task.WhenAll(tasks);
+
+        // 100 parallel allocations: no duplicates, no gaps, counter lands on exactly 100
+        CollectionAssert.AreEquivalent(Enumerable.Range(1, 100).Select(i => (long)i).ToList(), seqs);
+        Assert.AreEqual(100L, (await repo.Load(channel.Id)).LastSeq);
+    }
+
+    [Test]
+    public void AllocateSeq_UnknownChannel_Throws()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        Assert.ThrowsAsync<InvalidOperationException>(() => repo.AllocateSeq("does-not-exist"));
     }
 }
