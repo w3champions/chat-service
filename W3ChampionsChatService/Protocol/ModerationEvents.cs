@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Protocol;
 
@@ -9,10 +11,9 @@ namespace W3ChampionsChatService.Protocol;
 /// but the NEW client model is per-channel, so this shape carries the channel alongside the message
 /// id.
 /// <para>
-/// SHAPE-ONLY (C3 Task 18, contract completeness): defined here so C4–C7 share one payload shape for
-/// <see cref="ChatEvents.MessageDeleted"/>, but C3 provides no emit helper and no caller — C4 owns
-/// the trigger when it ports the legacy moderation deletes onto <see cref="ChatEvents.MessageDeleted"/>,
-/// and MAY refine this shape at that point (e.g. if the moderation flow needs more than the bare id).
+/// FINAL (C4 Task 1, confirming C3 Task 18's channel-scoped payload): this shape is the one C4–C7
+/// emit through <see cref="ChatEvents.MessageDeleted"/>. C4's refinement over the legacy trio is
+/// DELIVERY — who receives the push and when (later C4 tasks 3/4) — not this payload shape.
 /// </para>
 /// </summary>
 public record MessageDeletedDto(string ChannelId, string MessageId);
@@ -27,10 +28,44 @@ public record MessageDeletedDto(string ChannelId, string MessageId);
 /// the channel alongside the message ids for the same per-channel-client-model reason as
 /// <see cref="MessageDeletedDto"/>.
 /// <para>
-/// SHAPE-ONLY (C3 Task 18, contract completeness): defined here so C4–C7 share one payload shape for
-/// <see cref="ChatEvents.BulkMessagesDeleted"/>, but C3 provides no emit helper and no caller — C4
-/// owns the trigger when it ports the legacy moderation deletes onto
-/// <see cref="ChatEvents.BulkMessagesDeleted"/>, and MAY refine this shape at that point.
+/// FINAL (C4 Task 1, confirming C3 Task 18's channel-scoped payload): this shape is the one C4–C7
+/// emit through <see cref="ChatEvents.BulkMessagesDeleted"/>. C4's refinement over the legacy trio is
+/// DELIVERY — who receives the push and when (later C4 tasks 3/4) — not this payload shape.
 /// </para>
 /// </summary>
 public record BulkMessagesDeletedDto(string ChannelId, IReadOnlyList<string> MessageIds);
+
+/// <summary>
+/// REST moderator-read projection of a <see cref="ChannelMessage"/> (D3): unlike
+/// <see cref="MessageDto.ForModerator"/> (the hub-facing projection, which reuses the shared
+/// <see cref="MessageSender"/> snapshot), this DTO flattens the sender fields for the REST moderation
+/// surface and additionally exposes WHO deleted a row and WHEN — ban <c>reason</c>/<c>author</c> are
+/// NOT message fields and must never appear here.
+/// </summary>
+public record ModerationMessageDto(
+    string Id,
+    string ChannelId,
+    long Seq,
+    string SenderBattleTag,
+    string SenderName,
+    string Content,
+    DateTime SentAt,
+    bool Deleted,
+    string DeletedBy,
+    DateTime? DeletedAt,
+    bool Shadow)
+{
+    public static ModerationMessageDto FromChannelMessage(string channelId, ChannelMessage message) =>
+        new(
+            Id: message.Id,
+            ChannelId: channelId,
+            Seq: message.Seq,
+            SenderBattleTag: message.Sender.BattleTag,
+            SenderName: message.Sender.Name,
+            Content: message.Content,
+            SentAt: message.SentAt,
+            Deleted: message.Deleted != null,
+            DeletedBy: message.Deleted?.By,
+            DeletedAt: message.Deleted?.At,
+            Shadow: message.Shadow);
+}

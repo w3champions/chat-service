@@ -44,4 +44,21 @@ public record MessageDto(
             SentAt: message.SentAt,
             Deleted: false,
             Shadow: false);
+
+    /// <summary>
+    /// C4 (D3) moderator-facing projection: unlike <see cref="ForUserDelivery"/>, this exposes the
+    /// REAL <see cref="Deleted"/>/<see cref="Shadow"/> flags — a moderator legitimately needs to see
+    /// which rows are soft-deleted or shadow-banned rather than have the illusion applied. Feeds the
+    /// moderator paging/read paths (later C4 tasks); never used for user-facing delivery.
+    /// </summary>
+    public static MessageDto ForModerator(string channelId, ChannelMessage message) =>
+        new(
+            Id: message.Id,
+            ChannelId: channelId,
+            Seq: message.Seq,
+            Sender: message.Sender,
+            Content: message.Content,
+            SentAt: message.SentAt,
+            Deleted: message.Deleted != null,
+            Shadow: message.Shadow);
 }

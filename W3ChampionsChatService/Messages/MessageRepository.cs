@@ -6,6 +6,9 @@ using W3ChampionsChatService.Domain;
 
 namespace W3ChampionsChatService.Messages;
 
+/// <summary>(Id, ChannelId) projection for a moderator bulk-purge target list (D6, consumed by a later C4 task).</summary>
+public record PurgeTarget(string Id, string ChannelId);
+
 public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
 {
     private IMongoCollection<ChannelMessage> Messages =>
@@ -44,15 +47,81 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt }));
 
     /// <summary>
+    /// D6 bulk soft delete (a later C4 task's moderator purge): sets deleted{by,at} in ONE write on
+    /// every id in <paramref name="messageIds"/>. Documents not in the id list, and every OTHER field
+    /// on the matched documents (notably ExpiresAt/TTL), are left untouched — physical removal stays
+    /// TTL-only, exactly like the single-message <see cref="MarkDeleted"/>.
+    /// </summary>
+    public Task MarkDeletedMany(IReadOnlyCollection<string> messageIds, string deletedBy, DateTime deletedAt) =>
+        Messages.UpdateManyAsync(
+            Builders<ChannelMessage>.Filter.In(m => m.Id, messageIds),
+            Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt }));
+
+    /// <summary>
+    /// D6 purge query (a later C4 task's moderator purge): every NON-deleted row sent by
+    /// <paramref name="battleTag"/>, projected to just (Id, ChannelId) — already-deleted rows are
+    /// excluded so re-running a purge is idempotent. Runs under
+    /// <see cref="ChatDomainIndexes.SenderCaseInsensitiveCollation"/> so a mixed-case argument still
+    /// matches the stored sender casing — fixing the legacy case-SENSITIVE bug in
+    /// <c>Chats/History.cs</c>'s <c>DeleteMessagesFromUser</c> (plain <c>==</c> comparison). The
+    /// collation MUST match <c>ix_sender_ci_sentAt</c> exactly or Mongo silently collection-scans
+    /// instead of using it.
+    /// </summary>
+    public Task<List<PurgeTarget>> LoadPurgeableBySender(string battleTag)
+    {
+        var filterBuilder = Builders<ChannelMessage>.Filter;
+        var filter = filterBuilder.And(
+            filterBuilder.Eq(m => m.Sender.BattleTag, battleTag),
+            filterBuilder.Eq(m => m.Deleted, null));
+
+        return Messages
+            .Find(filter, new FindOptions { Collation = ChatDomainIndexes.SenderCaseInsensitiveCollation })
+            .Project(m => new PurgeTarget(m.Id, m.ChannelId))
+            .ToListAsync();
+    }
+
+    /// <summary>
+    /// D7 (consumed by a later C4 task's unread math): count of rows in <paramref name="channelId"/>
+    /// visible to <paramref name="viewerBattleTag"/> (same rule as <see cref="UserVisible"/>) with
+    /// <c>Seq &gt; afterSeq</c>. The filter leads with ChannelId equality + a Seq range so the
+    /// count is an INDEXED RANGE COUNT bounded by <c>ux_channelId_seq</c> — never a full-collection
+    /// scan.
+    /// </summary>
+    public Task<long> CountUserVisibleAfter(string channelId, string viewerBattleTag, long afterSeq)
+    {
+        var filterBuilder = Builders<ChannelMessage>.Filter;
+        var filter = filterBuilder.And(
+            filterBuilder.Eq(m => m.ChannelId, channelId),
+            filterBuilder.Gt(m => m.Seq, afterSeq),
+            filterBuilder.Eq(m => m.Deleted, null),
+            filterBuilder.Or(
+                filterBuilder.Eq(m => m.Shadow, false),
+                filterBuilder.Eq(m => m.Sender.BattleTag, viewerBattleTag)));
+
+        return Messages.CountDocumentsAsync(filter);
+    }
+
+    /// <summary>
     /// Newest-first page strictly older than <paramref name="beforeSeq"/> (null = latest page),
     /// returned in ascending seq order. Seq-anchored: paging with the previous page's minimum seq
     /// is immune to concurrent appends — a later insert can never gap or dupe an already-fetched page.
     /// </summary>
-    public async Task<List<ChannelMessage>> LoadPageBefore(string channelId, string viewerBattleTag, long? beforeSeq, int limit)
+    public Task<List<ChannelMessage>> LoadPageBefore(string channelId, string viewerBattleTag, long? beforeSeq, int limit) =>
+        LoadPageBeforeCore(UserVisible(channelId, viewerBattleTag), beforeSeq, limit);
+
+    /// <summary>
+    /// Moderator counterpart of <see cref="LoadPageBefore"/> (D3/D6, consumed by later C4 tasks):
+    /// same seq-anchored shape and clamp, but channel-filter only — deleted and shadow rows come
+    /// back with their flags intact instead of being excluded by <see cref="UserVisible"/>.
+    /// </summary>
+    public Task<List<ChannelMessage>> LoadPageBeforeForModerator(string channelId, long? beforeSeq, int limit) =>
+        LoadPageBeforeCore(Builders<ChannelMessage>.Filter.Eq(m => m.ChannelId, channelId), beforeSeq, limit);
+
+    private async Task<List<ChannelMessage>> LoadPageBeforeCore(FilterDefinition<ChannelMessage> baseFilter, long? beforeSeq, int limit)
     {
         var effectiveLimit = ClampLimit(limit);
         var filterBuilder = Builders<ChannelMessage>.Filter;
-        var filter = UserVisible(channelId, viewerBattleTag);
+        var filter = baseFilter;
         if (beforeSeq.HasValue)
         {
             filter = filterBuilder.And(filter, filterBuilder.Lt(m => m.Seq, beforeSeq.Value));
@@ -67,12 +136,22 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// Window centered on <paramref name="aroundSeq"/>: up to limit/2 messages strictly before it,
     /// plus the target (if visible) and up to limit/2 after — two queries, merged ascending.
     /// </summary>
-    public async Task<List<ChannelMessage>> LoadPageAround(string channelId, string viewerBattleTag, long aroundSeq, int limit)
+    public Task<List<ChannelMessage>> LoadPageAround(string channelId, string viewerBattleTag, long aroundSeq, int limit) =>
+        LoadPageAroundCore(UserVisible(channelId, viewerBattleTag), aroundSeq, limit);
+
+    /// <summary>
+    /// Moderator counterpart of <see cref="LoadPageAround"/> (D3/D6, consumed by later C4 tasks):
+    /// same seq-anchored shape and clamp, but channel-filter only — deleted and shadow rows come
+    /// back with their flags intact instead of being excluded by <see cref="UserVisible"/>.
+    /// </summary>
+    public Task<List<ChannelMessage>> LoadPageAroundForModerator(string channelId, long aroundSeq, int limit) =>
+        LoadPageAroundCore(Builders<ChannelMessage>.Filter.Eq(m => m.ChannelId, channelId), aroundSeq, limit);
+
+    private async Task<List<ChannelMessage>> LoadPageAroundCore(FilterDefinition<ChannelMessage> baseFilter, long aroundSeq, int limit)
     {
         var effectiveLimit = ClampLimit(limit);
         var half = effectiveLimit / 2;
         var filterBuilder = Builders<ChannelMessage>.Filter;
-        var baseFilter = UserVisible(channelId, viewerBattleTag);
 
         var before = new List<ChannelMessage>();
         if (half > 0)

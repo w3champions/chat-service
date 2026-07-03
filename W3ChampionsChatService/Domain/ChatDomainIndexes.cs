@@ -17,6 +17,14 @@ namespace W3ChampionsChatService.Domain;
 /// </summary>
 public static class ChatDomainIndexes
 {
+    /// <summary>
+    /// C4 (D6): the collation the case-insensitive sender index is BUILT with. Purge-related repo
+    /// queries (<see cref="Messages.MessageRepository.LoadPurgeableBySender"/>) MUST use this exact
+    /// collation, or Mongo silently falls back to a collection scan instead of using the index.
+    /// Strength 2 (secondary) ignores case but is still diacritic-sensitive.
+    /// </summary>
+    public static readonly Collation SenderCaseInsensitiveCollation = new(locale: "en", strength: CollationStrength.Secondary);
+
     public static async Task EnsureAllAsync(MongoClient mongoClient)
     {
         var db = mongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
@@ -74,19 +82,41 @@ public static class ChatDomainIndexes
     private static async Task EnsureMessageIndexes(IMongoDatabase db)
     {
         var messages = db.GetCollection<ChannelMessage>(ChatCollections.Messages);
+
+        // D6: best-effort drop of the superseded case-SENSITIVE index. Safe on a fresh database
+        // (nothing to drop — swallow IndexNotFound) and on an already-migrated one (same reason);
+        // only a pre-migration database that still carries the old name actually loses it here.
+        try
+        {
+            await messages.Indexes.DropOneAsync("ix_sender_sentAt");
+        }
+        catch (MongoCommandException ex) when (IsIndexNotFound(ex))
+        {
+            // no-op: nothing to drop
+        }
+
         await messages.Indexes.CreateManyAsync(
         [
             new CreateIndexModel<ChannelMessage>(
                 Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ChannelId).Ascending(m => m.Seq),
                 new CreateIndexOptions { Name = "ux_channelId_seq", Unique = true }),
+            // D6: replaces ix_sender_sentAt. Collated case-insensitively so a mixed-case purge
+            // argument (LoadPurgeableBySender) matches the stored sender casing — fixing the legacy
+            // case-SENSITIVE bug in Chats/History.cs's DeleteMessagesFromUser (`==` comparison).
             new CreateIndexModel<ChannelMessage>(
                 Builders<ChannelMessage>.IndexKeys.Ascending(m => m.Sender.BattleTag).Ascending(m => m.SentAt),
-                new CreateIndexOptions { Name = "ix_sender_sentAt" }),
+                new CreateIndexOptions
+                {
+                    Name = "ix_sender_ci_sentAt",
+                    Collation = SenderCaseInsensitiveCollation,
+                }),
             new CreateIndexModel<ChannelMessage>(
                 Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
         ]);
     }
+
+    private static bool IsIndexNotFound(MongoCommandException ex) => ex.CodeName == "IndexNotFound";
 
     private static async Task EnsureMentionInboxIndexes(IMongoDatabase db)
     {

@@ -40,3 +40,8 @@ public record GetMessagesResult(
 public record ChannelOperationResult(
     ChatResultCode Code,
     double? RetryAfterSeconds = null);
+
+/// <summary>PurgeMessagesFromUser (D6, later C4 task) — count of soft-deleted rows for audit/UI feedback.</summary>
+public record PurgeMessagesResult(
+    ChatResultCode Code,
+    int MessagesDeleted);

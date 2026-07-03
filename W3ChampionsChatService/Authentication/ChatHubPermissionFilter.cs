@@ -49,8 +49,7 @@ public class ChatHubPermissionFilter(ISessionRegistry sessionRegistry) : IHubFil
         // ConnectionId from the in-memory registry. No JWT ever reaches hub invocations anymore. The
         // registry is fail-closed: an unregistered or displaced-stale connection resolves to no session.
         if (!_sessionRegistry.TryGetByConnectionId(invocationContext.Context.ConnectionId, out var session)
-            || !session.Identity.IsAdmin
-            || !session.Identity.Permissions.Contains(permissionAttribute.Permission))
+            || !session.HasPermission(permissionAttribute.Permission))
         {
             // session is null on the no-session branch (TryGetByConnectionId returned false) → "<unregistered>".
             // When a session WAS resolved (registered-but-under-privileged reject), the caller's battleTag is

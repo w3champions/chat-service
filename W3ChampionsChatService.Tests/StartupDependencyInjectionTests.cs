@@ -274,6 +274,22 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void MentionInboxCleaner_IsRegisteredSingleton_NoOp()
+    {
+        // C4 Task 1 (D10): the ONLY coordination point between C4 (moderation deletes/purges) and C6
+        // (mention inbox) — C4 calls IMentionInboxCleaner, C6 swaps this registration for the real
+        // implementation later. Task 1 registers the no-op only; nothing calls it yet.
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<IMentionInboxCleaner>();
+        var second = provider.GetRequiredService<IMentionInboxCleaner>();
+
+        Assert.IsInstanceOf<NoOpMentionInboxCleaner>(first,
+            "IMentionInboxCleaner must resolve to the no-op placeholder until C6 swaps the registration");
+        Assert.AreSame(first, second, "IMentionInboxCleaner MUST be a singleton");
+    }
+
+    [Test]
     public void SignalR_MaximumReceiveMessageSize_IsPinnedBelowDefault()
     {
         using var provider = BuildProvider();

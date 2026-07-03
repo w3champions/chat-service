@@ -68,6 +68,12 @@ public class Startup
         services.AddHostedService<ChatDomainBootstrap>();   // indexes + catalog seeding at boot
         services.AddHostedService<WeeklyCleanupService>();  // weekly GC + membership pruning
 
+        // C4 Task 1 (D10): the ONLY coordination point between moderation deletes/purges (later C4
+        // tasks) and the mention inbox (C6). Singleton is cosmetic here (the no-op holds no state) but
+        // matches what C6's eventual real implementation will need if it caches anything. C6 swaps this
+        // registration for its real implementation later — do not add a second registration.
+        services.AddSingleton<IMentionInboxCleaner, NoOpMentionInboxCleaner>();
+
         // C2 auth v2
         // Singletons: both hold in-memory state that the mint (REST AuthSessionController) and
         // connect (Task 6 hub) paths must share — a per-request/transient instance would silently

@@ -20,4 +20,12 @@ public class ChatSession
     /// connection; null-tolerated in unit tests, which never need to abort a real connection.
     /// </summary>
     public HubCallerContext Context { get; init; }
+
+    /// <summary>
+    /// C4 (D2): exactly the authorization conjunct <see cref="Authentication.ChatHubPermissionFilter"/>
+    /// enforces on attributed hub methods — <c>IsAdmin AND Permissions.Contains(permission)</c> — lifted
+    /// onto the session so moderator code paths outside the hub-filter pipeline (later C4 tasks) can ask
+    /// the same question instead of re-deriving it. NEVER serialized.
+    /// </summary>
+    public bool HasPermission(EPermission permission) => Identity.IsAdmin && Identity.Permissions.Contains(permission);
 }

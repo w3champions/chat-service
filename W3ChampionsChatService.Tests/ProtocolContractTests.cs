@@ -134,4 +134,121 @@ public class ProtocolContractTests
         Assert.AreEqual(ChatResultCode.NotMember, result.Code);
         Assert.IsNull(result.RetryAfterSeconds);
     }
+
+    // ── C4 Task 1 (D3/D6) — moderator projections + purge result shape pins ───────────────
+
+    [Test]
+    public void MessageDto_ForModerator_PreservesFlags()
+    {
+        var deletedMessage = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = "chan1",
+            Seq = 2,
+            Sender = new MessageSender { BattleTag = "Peter#123", Name = "Peter" },
+            Content = "hello",
+            SentAt = DateTime.UtcNow,
+            Deleted = new MessageDeletion { By = "Mod#1", At = DateTime.UtcNow },
+        };
+        var shadowMessage = new ChannelMessage
+        {
+            Id = "m2",
+            ChannelId = "chan1",
+            Seq = 3,
+            Sender = new MessageSender { BattleTag = "Wolf#456", Name = "Wolf" },
+            Content = "hi",
+            SentAt = DateTime.UtcNow,
+            Shadow = true,
+        };
+
+        var deletedDto = MessageDto.ForModerator("chan1", deletedMessage);
+        var shadowDto = MessageDto.ForModerator("chan1", shadowMessage);
+
+        Assert.IsTrue(deletedDto.Deleted, "a moderator projection must expose the real Deleted flag");
+        Assert.IsFalse(deletedDto.Shadow);
+        Assert.IsFalse(shadowDto.Deleted);
+        Assert.IsTrue(shadowDto.Shadow, "a moderator projection must expose the real Shadow flag");
+    }
+
+    [Test]
+    public void MessageDto_ForUserDelivery_StillForcesFlagsFalse_RegressionAgainstForModerator()
+    {
+        // Regression pair for the test above: ForUserDelivery must NEVER be weakened by adding
+        // ForModerator — the shadow-illusion (C3-plan.md decision 7) still forces both flags false.
+        var deletedShadowMessage = new ChannelMessage
+        {
+            Id = "m3",
+            ChannelId = "chan1",
+            Seq = 4,
+            Sender = new MessageSender { BattleTag = "Peter#123", Name = "Peter" },
+            Content = "hello",
+            SentAt = DateTime.UtcNow,
+            Deleted = new MessageDeletion { By = "Mod#1", At = DateTime.UtcNow },
+            Shadow = true,
+        };
+
+        var dto = MessageDto.ForUserDelivery("chan1", deletedShadowMessage);
+
+        Assert.IsFalse(dto.Deleted);
+        Assert.IsFalse(dto.Shadow);
+    }
+
+    [Test]
+    public void ModerationMessageDto_FromChannelMessage_MapsDeletionFields()
+    {
+        var deletedAt = DateTime.UtcNow;
+        var message = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = "chan1",
+            Seq = 5,
+            Sender = new MessageSender { BattleTag = "Peter#123", Name = "Peter" },
+            Content = "hello",
+            SentAt = DateTime.UtcNow,
+            Deleted = new MessageDeletion { By = "Mod#1", At = deletedAt },
+            Shadow = false,
+        };
+
+        var dto = ModerationMessageDto.FromChannelMessage("chan1", message);
+
+        Assert.AreEqual("m1", dto.Id);
+        Assert.AreEqual("chan1", dto.ChannelId);
+        Assert.AreEqual(5, dto.Seq);
+        Assert.AreEqual("Peter#123", dto.SenderBattleTag);
+        Assert.AreEqual("Peter", dto.SenderName);
+        Assert.AreEqual("hello", dto.Content);
+        Assert.IsTrue(dto.Deleted);
+        Assert.AreEqual("Mod#1", dto.DeletedBy);
+        Assert.AreEqual(deletedAt, dto.DeletedAt);
+        Assert.IsFalse(dto.Shadow);
+    }
+
+    [Test]
+    public void ModerationMessageDto_FromChannelMessage_NotDeleted_NullDeletionFields()
+    {
+        var message = new ChannelMessage
+        {
+            Id = "m2",
+            ChannelId = "chan1",
+            Seq = 6,
+            Sender = new MessageSender { BattleTag = "Peter#123", Name = "Peter" },
+            Content = "hello",
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = ModerationMessageDto.FromChannelMessage("chan1", message);
+
+        Assert.IsFalse(dto.Deleted);
+        Assert.IsNull(dto.DeletedBy);
+        Assert.IsNull(dto.DeletedAt);
+    }
+
+    [Test]
+    public void PurgeMessagesResult_CarriesCodeAndDeletedCount()
+    {
+        var result = new PurgeMessagesResult(ChatResultCode.Ok, MessagesDeleted: 3);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(3, result.MessagesDeleted);
+    }
 }
