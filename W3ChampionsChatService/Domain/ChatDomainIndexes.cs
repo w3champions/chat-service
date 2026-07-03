@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Domain;
 
@@ -20,7 +21,8 @@ public static class ChatDomainIndexes
         var db = mongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
         await EnsureChannelIndexes(db);
         await EnsureMembershipIndexes(db);
-        // Tasks 5/7 extend: messages, mention_inbox
+        await EnsureMessageIndexes(db);
+        // Task 7 extends: mention_inbox
     }
 
     private static async Task EnsureChannelIndexes(IMongoDatabase db)
@@ -53,6 +55,23 @@ public static class ChatDomainIndexes
             new CreateIndexModel<ChannelMembership>(
                 Builders<ChannelMembership>.IndexKeys.Ascending(m => m.BattleTag),
                 new CreateIndexOptions { Name = "ix_battleTag" }),
+        ]);
+    }
+
+    private static async Task EnsureMessageIndexes(IMongoDatabase db)
+    {
+        var messages = db.GetCollection<ChannelMessage>(ChatCollections.Messages);
+        await messages.Indexes.CreateManyAsync(
+        [
+            new CreateIndexModel<ChannelMessage>(
+                Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ChannelId).Ascending(m => m.Seq),
+                new CreateIndexOptions { Name = "ux_channelId_seq", Unique = true }),
+            new CreateIndexModel<ChannelMessage>(
+                Builders<ChannelMessage>.IndexKeys.Ascending(m => m.Sender.BattleTag).Ascending(m => m.SentAt),
+                new CreateIndexOptions { Name = "ix_sender_sentAt" }),
+            new CreateIndexModel<ChannelMessage>(
+                Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ExpiresAt),
+                new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
         ]);
     }
 }
