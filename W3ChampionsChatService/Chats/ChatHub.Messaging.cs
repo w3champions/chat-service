@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Domain;
@@ -13,6 +14,12 @@ namespace W3ChampionsChatService.Chats;
 /// (per-channel seq + expiry), fires the fan-out seam, and returns a typed <see cref="SendMessageResult"/>.
 /// It coexists with the legacy single-arg <c>SendMessage(string)</c> in ChatHub.cs until Task 19
 /// deletes the old one.
+/// <para>
+/// C3 (Task 16): <see cref="GetMessages"/> — the read-side companion. PULL-ONLY: every result comes
+/// back through this method's own typed <see cref="GetMessagesResult"/>; it NEVER pushes a SignalR
+/// event (hard guardrail — a live-connected caller who wants updates uses <c>FocusChannel</c> +
+/// <c>MessageReceived</c>, not this method).
+/// </para>
 /// </summary>
 public partial class ChatHub
 {
@@ -160,6 +167,78 @@ public partial class ChatHub
 
         // 9. Typed ack.
         return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq);
+    }
+
+    /// <summary>
+    /// C3 (Task 16): pull-only history paging — the caller receives history ONLY through this method's
+    /// own typed <see cref="GetMessagesResult"/>. GetMessages NEVER pushes a SignalR event (hard
+    /// guardrail); it is the read-side companion to <see cref="SendMessage(string, string)"/>'s write
+    /// pipeline. The resolution order mirrors <see cref="FocusChannel"/>'s NotFound-vs-NotMember split
+    /// EXACTLY, and is honored in this order:
+    /// <list type="number">
+    /// <item>Fail-closed identity: an unregistered connection (never authenticated, or its session was
+    /// displaced/torn down) → <see cref="ChatResultCode.PermissionDenied"/> — there is no identity to
+    /// page history under.</item>
+    /// <item>Malformed-arg guard, BEFORE any DB work: <paramref name="beforeSeq"/> and
+    /// <paramref name="aroundSeq"/> are mutually exclusive paging modes. A caller supplying BOTH is a
+    /// client programming error, not a user-facing rejection, so it throws <see cref="HubException"/>
+    /// (decision 5's client-error mapping — the same graceful-throw style as
+    /// <see cref="Authentication.ChatHubPermissionFilter"/>) rather than a typed result code.</item>
+    /// <item>Membership: the hot path reads <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (zero
+    /// DB) and, if the caller is a member, pages directly — no channel load. A non-member falls to the
+    /// cold path: a single <see cref="Channels.ChannelRepository.Load"/> distinguishes "no such
+    /// channel" (<see cref="ChatResultCode.NotFound"/>) from "channel exists, caller just isn't in it"
+    /// (<see cref="ChatResultCode.NotMember"/>).</item>
+    /// <item>Page: <paramref name="aroundSeq"/> set → <see cref="Messages.MessageRepository.LoadPageAround"/>;
+    /// otherwise → <see cref="Messages.MessageRepository.LoadPageBefore"/> (a null
+    /// <paramref name="beforeSeq"/> means the latest page). Both repo methods already apply
+    /// <see cref="Messages.MessageRepository.UserVisible"/> (soft-deleted excluded; other authors'
+    /// shadow messages excluded; the viewer's OWN shadow messages included) and clamp
+    /// <paramref name="limit"/> to <see cref="ChatLimits.MessagePageSize"/> — this method passes
+    /// <paramref name="limit"/> straight through and does NOT re-filter or re-clamp.</item>
+    /// <item>Map each result to <see cref="MessageDto.ForUserDelivery"/> — the SAME forced-false
+    /// deleted/shadow projection <see cref="FanOut.FanOutEngine"/> uses on the push path, so the
+    /// shadow illusion (C3-plan.md decision 7) can never drift between the read path and the push
+    /// path — and return <see cref="ChatResultCode.Ok"/>.</item>
+    /// </list>
+    /// </summary>
+    public async Task<GetMessagesResult> GetMessages(string channelId, long? beforeSeq, long? aroundSeq, int limit)
+    {
+        // 1. Fail-closed: no live session → no identity to page history under.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new GetMessagesResult(ChatResultCode.PermissionDenied);
+        }
+
+        // 2. Malformed-arg guard, before any DB work: beforeSeq/aroundSeq are mutually exclusive
+        // paging modes. Supplying both is a client bug — a graceful HubException, not a typed result.
+        if (beforeSeq.HasValue && aroundSeq.HasValue)
+        {
+            throw new HubException("GetMessages: beforeSeq and aroundSeq are mutually exclusive — supply at most one.");
+        }
+
+        var connectionId = Context.ConnectionId;
+        var battleTag = session.Identity.BattleTag;
+
+        // 3. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
+        // distinguishes NotFound from NotMember — mirrors FocusChannel's cold path exactly.
+        if (!_onlineMemberRegistry.IsMember(connectionId, channelId))
+        {
+            var channel = await _channelRepository.Load(channelId);
+            return channel == null
+                ? new GetMessagesResult(ChatResultCode.NotFound)
+                : new GetMessagesResult(ChatResultCode.NotMember);
+        }
+
+        // 4. Page. The repo already applies UserVisible filtering and clamps the limit — passed
+        // straight through, no re-filtering/re-clamping here.
+        var page = aroundSeq.HasValue
+            ? await _messageRepository.LoadPageAround(channelId, battleTag, aroundSeq.Value, limit)
+            : await _messageRepository.LoadPageBefore(channelId, battleTag, beforeSeq, limit);
+
+        // 5. Map to the wire projection — the SAME forced-false illusion FanOutEngine uses for push.
+        var messages = page.Select(m => MessageDto.ForUserDelivery(channelId, m)).ToList();
+        return new GetMessagesResult(ChatResultCode.Ok, messages);
     }
 
     /// <summary>

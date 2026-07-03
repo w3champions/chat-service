@@ -89,19 +89,11 @@ public class FanOutEngine(
     /// </summary>
     public async Task OnMessagePersisted(ChatChannel channel, ChannelMessage message, string senderConnectionId, bool isShadow, DateTime now)
     {
-        // Build the user-facing projection. deleted/shadow are ALWAYS false for user-facing delivery:
-        // they are C4 moderator-rendering slots, and forcing false — even on a shadow author's OWN echo
-        // — is the load-bearing illusion that keeps a shadow-banned author from learning they are muted
-        // (C3-plan.md decision 7).
-        var dto = new MessageDto(
-            Id: message.Id,
-            ChannelId: channel.Id,
-            Seq: message.Seq,
-            Sender: message.Sender,
-            Content: message.Content,
-            SentAt: message.SentAt,
-            Deleted: false,
-            Shadow: false);
+        // The user-facing projection — shared with the pull path (ChatHub.GetMessages, Task 16) via
+        // MessageDto.ForUserDelivery, so the deleted/shadow illusion (C3-plan.md decision 7) can never
+        // drift between push and pull. See that factory's doc comment for why deleted/shadow are
+        // ALWAYS forced false, even on a shadow author's OWN echo.
+        var dto = MessageDto.ForUserDelivery(channel.Id, message);
 
         // The ONLY delivery targets: connections currently focused on this channel. Iterating this set
         // (never the membership roster) is what enforces the "no full payloads to unfocused" guardrail.
