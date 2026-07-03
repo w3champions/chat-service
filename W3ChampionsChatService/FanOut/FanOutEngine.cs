@@ -267,6 +267,51 @@ public class FanOutEngine(
     }
 
     /// <summary>
+    /// C4 (Task 3, D4): the moderation removal emit helper. Delivers the FINAL channel-scoped
+    /// <see cref="MessageDeletedDto"/> to the channel's FOCUSED connections, EXCLUDING
+    /// <paramref name="excludedConnectionIds"/> — the hub passes the moderated author's own connection
+    /// ids there, preserving the legacy <c>AllExcept(author)</c> semantics (the moderated user is not
+    /// tipped off live; their own copy vanishes on next reload since <c>UserVisible</c> excludes
+    /// deleted rows). A focused MODERATOR receives the SAME event (it is not in the excluded set) and
+    /// branches client-side on its own permission to render a flag rather than remove.
+    /// <list type="bullet">
+    /// <item>Targets the FOCUSED connections only (via <see cref="FocusRegistry.GetFocusedConnections"/>):
+    /// unfocused members never received the message (pull-only history already excludes a deleted row),
+    /// so they get no removal push.</item>
+    /// <item>Per-recipient fault isolation mirrors <see cref="OnMessagePersisted"/>: a single recipient's
+    /// torn-down connection cannot abort delivery to the remaining focused viewers and must NEVER
+    /// propagate out — the hub has already durably soft-deleted the message and logged its audit line;
+    /// live removal delivery is best-effort.</item>
+    /// </list>
+    /// </summary>
+    public async Task PushMessageDeleted(string channelId, string messageId, IReadOnlyCollection<string> excludedConnectionIds)
+    {
+        var excluded = new HashSet<string>(excludedConnectionIds);
+        var dto = new MessageDeletedDto(channelId, messageId);
+
+        foreach (var connectionId in _focusRegistry.GetFocusedConnections(channelId))
+        {
+            // Legacy AllExcept(author) semantics: the moderated author's own connections are skipped.
+            if (excluded.Contains(connectionId))
+            {
+                continue;
+            }
+
+            // Fault isolation (mirrors OnMessagePersisted): live delivery is best-effort — a missed
+            // recipient's copy vanishes on its next GetMessages/reconnect anyway. One recipient's
+            // torn-down connection must not abort the rest, and must never propagate out of here.
+            try
+            {
+                await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.MessageDeleted, dto);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Fan-out send of MessageDeleted failed for connection {ConnectionId} on channel {ChannelId} — skipping, other recipients unaffected", connectionId, channelId);
+            }
+        }
+    }
+
+    /// <summary>
     /// Disconnect hook: drops the closing connection's coalescing window state from the
     /// <see cref="ActivityCoalescer"/>. The hub already delegates all fan-out to this engine and holds
     /// no reference to the coalescer directly, so it routes the coalescer's per-connection teardown

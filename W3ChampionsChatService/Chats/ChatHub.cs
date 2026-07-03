@@ -5,8 +5,10 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
@@ -50,7 +52,12 @@ public partial class ChatHub(
     // the corresponding FocusRegistry mutation, so the accumulator captures each battleTag's
     // pre-window viewing baseline as it was BEFORE the change. Singleton (Startup) — it holds the
     // per-channel accumulation window every route writes and the flush hosted service (Task 15) drains.
-    ViewersAccumulator viewersAccumulator) : Hub
+    ViewersAccumulator viewersAccumulator,
+    // C4 (Task 3, D10): the mention-inbox cleanup hook — DeleteMessage is its FIRST caller. This is the
+    // ONLY constructor change this task: the durable soft-delete purges any mention-inbox entries that
+    // reference a deleted message, without C4 reaching into C6's inbox internals. Resolves to
+    // NoOpMentionInboxCleaner until C6 swaps the DI registration (see IMentionInboxCleaner).
+    IMentionInboxCleaner mentionInboxCleaner) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly ChatHistory _chatHistory = chatHistory;
@@ -75,6 +82,8 @@ public partial class ChatHub(
     private readonly FanOutEngine _fanOutEngine = fanOutEngine;
     // C3 (Task 14): the batched ViewersChanged sink — see the constructor param doc comment above.
     private readonly ViewersAccumulator _viewersAccumulator = viewersAccumulator;
+    // C4 (Task 3): the mention-inbox cleanup hook called by the durable DeleteMessage pipeline.
+    private readonly IMentionInboxCleaner _mentionInboxCleaner = mentionInboxCleaner;
 
     public override async Task OnConnectedAsync()
     {
@@ -202,22 +211,90 @@ public partial class ChatHub(
         await base.OnDisconnectedAsync(exception);
     }
 
+    /// <summary>
+    /// C4 (Task 3, D5): durable moderation soft-delete of a single message. The
+    /// <see cref="UserHasPermission"/> attribute + <see cref="ChatHubPermissionFilter"/> already gate
+    /// this on <see cref="EPermission.Moderation"/>; the pipeline below is honored in EXACTLY this
+    /// order, every rejection a typed <see cref="ChannelOperationResult"/> (never a silent drop):
+    /// <list type="number">
+    /// <item>Fail-closed moderator resolution via <see cref="ISessionRegistry.TryGetByConnectionId"/> —
+    /// no live session → <see cref="ChatResultCode.PermissionDenied"/> (there is no identity to attribute
+    /// the delete to).</item>
+    /// <item><see cref="Messages.MessageRepository.Load"/>; missing → <see cref="ChatResultCode.NotFound"/>.</item>
+    /// <item>Resolve the message's channel and enforce the PRIVACY WALL: a <see cref="ChannelType.Dm"/>/
+    /// <see cref="ChannelType.GroupDm"/> channel (or a vanished channel) → <see cref="ChatResultCode.PermissionDenied"/>,
+    /// nothing deleted — a moderator never touches private content (single-delete gets the same scope
+    /// wall as purge).</item>
+    /// <item>Idempotency: an ALREADY soft-deleted message (<c>Deleted != null</c>) →
+    /// <see cref="ChatResultCode.Ok"/> with NO event, NO cleanup, NO re-mark (the original deletion
+    /// attribution is preserved).</item>
+    /// <item>Soft-delete only — <see cref="Messages.MessageRepository.MarkDeleted"/> sets
+    /// <c>deleted{by,at}</c>; the row (and its <c>ExpiresAt</c>/TTL) survives, physical removal stays
+    /// TTL-only (NEVER a hard delete).</item>
+    /// <item>Mention-inbox cleanup (D10) <see cref="IMentionInboxCleaner.RemoveForMessages"/> — done
+    /// AFTER MarkDeleted and BEFORE the event so the inbox is cleaned even if fan-out hiccups.
+    /// DeleteMessage is this hook's first caller.</item>
+    /// <item>Deliver the FINAL channel-scoped <see cref="MessageDeletedDto"/> (D4) to the channel's
+    /// FOCUSED viewers, EXCLUDING the moderated author's own connections (legacy <c>AllExcept(author)</c>
+    /// semantics) — a focused moderator receives the SAME event and flags client-side.</item>
+    /// <item>Audit <see cref="Log.Information"/> (ports the legacy audit line: moderator battleTag +
+    /// message id + channel id) and return <see cref="ChatResultCode.Ok"/>.</item>
+    /// </list>
+    /// </summary>
     [UserHasPermission(EPermission.Moderation)]
-    public async Task DeleteMessage(string messageId)
+    public async Task<ChannelOperationResult> DeleteMessage(string messageId)
     {
-        var deletedMessage = _chatHistory.DeleteMessage(messageId);
-        if (deletedMessage != null)
+        // 1. Fail-closed: no live session → no moderator identity to attribute the delete to.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
         {
-            var adminUser = _connections.GetUser(Context.ConnectionId);
-            Log.Information("Deleted message '{MessageContent}' from {MessageSender} by request of {AdminUserName}", deletedMessage.Message, deletedMessage.User.BattleTag, adminUser.BattleTag);
-
-            var authorConnectionIds = _connections.GetConnectionIdsForUser(deletedMessage.User.BattleTag);
-            // NOTE (C4 hand-off): this event NAME now matches the new pinned ChatEvents.MessageDeleted,
-            // but the payload below is still the LEGACY bare message-id string — the pinned shape is
-            // MessageDeletedDto{ChannelId, MessageId} (Protocol/ModerationEvents.cs). Do not mistake the
-            // matching name for "already ported" — C4 owns porting this legacy trio onto the new DTO shape.
-            await Clients.AllExcept(authorConnectionIds).SendAsync("MessageDeleted", deletedMessage.Id);
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }
+        var moderatorBattleTag = session.Identity.BattleTag;
+
+        // 2. Load the target message; missing → NotFound.
+        var message = await _messageRepository.Load(messageId);
+        if (message == null)
+        {
+            return new ChannelOperationResult(ChatResultCode.NotFound);
+        }
+
+        // 3. Privacy wall (D5): a moderator never touches DM/GroupDm content. Resolve the channel and
+        // reject Dm/GroupDm — nothing is deleted. A vanished channel is likewise rejected fail-closed
+        // (we cannot prove it is NOT private), so no delete slips past the wall on a data-integrity edge.
+        var channel = await _channelRepository.Load(message.ChannelId);
+        if (channel == null || channel.Type == ChannelType.Dm || channel.Type == ChannelType.GroupDm)
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        // 4. Idempotent: an already soft-deleted message is a no-op — Ok, but NO event, NO cleanup, and
+        // the original deletion attribution is left untouched (do NOT re-mark under the new moderator).
+        if (message.Deleted != null)
+        {
+            return new ChannelOperationResult(ChatResultCode.Ok);
+        }
+
+        // 5. Soft-delete only (NEVER a hard delete): sets deleted{by,at}; the row and its ExpiresAt/TTL
+        // survive. `now` comes from the SAME injected TimeProvider the rest of the hub uses.
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        await _messageRepository.MarkDeleted(messageId, moderatorBattleTag, now);
+
+        // 6. Mention-inbox cleanup (D10) BEFORE the event, so the inbox is purged even if fan-out
+        // hiccups. DeleteMessage is the first caller of this C4/C6 coordination surface.
+        await _mentionInboxCleaner.RemoveForMessages(new[] { messageId });
+
+        // 7. Deliver the channel-scoped removal (D4) to the channel's focused viewers, EXCLUDING the
+        // moderated author's own connections (preserving legacy AllExcept(author) semantics — the
+        // moderated user is not tipped off live; their copy vanishes on next reload since UserVisible
+        // excludes deleted rows). A focused moderator is NOT excluded and receives the same event.
+        var authorConnectionIds = _connections.GetConnectionIdsForUser(message.Sender.BattleTag);
+        await _fanOutEngine.PushMessageDeleted(channel.Id, messageId, authorConnectionIds);
+
+        // 8. Moderation audit (ports the legacy audit line) + typed ack.
+        Log.Information(
+            "Moderator {ModeratorBattleTag} soft-deleted message {MessageId} in channel {ChannelId}",
+            moderatorBattleTag, messageId, channel.Id);
+        return new ChannelOperationResult(ChatResultCode.Ok);
     }
 
     [UserHasPermission(EPermission.Moderation)]
