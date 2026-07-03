@@ -29,4 +29,13 @@ public class ChatLimitsTests
         Assert.AreEqual(TimeSpan.FromSeconds(5), ChatLimits.ViewersChangedFlush);
         Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.TicketTtl);
     }
+
+    [Test]
+    public void MintRateLimitConstants_MatchC2PlanDecision3()
+    {
+        // C2 plan decision 3 — NOT spec §13; hard-coded, adjust here only.
+        Assert.AreEqual(10, ChatLimits.TicketMintPerBattleTagLimit);
+        Assert.AreEqual(30, ChatLimits.TicketMintPerIpLimit);
+        Assert.AreEqual(TimeSpan.FromMinutes(1), ChatLimits.TicketMintWindow);
+    }
 }

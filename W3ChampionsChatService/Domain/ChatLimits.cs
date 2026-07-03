@@ -57,4 +57,11 @@ public static class ChatLimits
 
     /// <summary>Auth ticket TTL (one-time).</summary>
     public static readonly TimeSpan TicketTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>Ticket mint rate limit (C2): fixed window per validated battleTag and per source IP.
+    /// Values are a C2 plan decision (not spec §13): 10/min per battleTag tolerates reconnect
+    /// flapping; 30/min per IP tolerates NAT'd LAN venues.</summary>
+    public const int TicketMintPerBattleTagLimit = 10;
+    public const int TicketMintPerIpLimit = 30;
+    public static readonly TimeSpan TicketMintWindow = TimeSpan.FromMinutes(1);
 }
