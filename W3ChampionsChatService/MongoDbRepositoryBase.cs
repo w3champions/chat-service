@@ -10,7 +10,8 @@ namespace W3ChampionsChatService;
 public class MongoDbRepositoryBase(MongoClient mongoClient)
 {
     private readonly MongoClient _mongoClient = mongoClient;
-    private readonly string _databaseName = "W3Champions-Chat-Service";
+    public const string DatabaseName = "W3Champions-Chat-Service";
+    private readonly string _databaseName = DatabaseName;
 
     protected IMongoDatabase CreateClient()
     {
