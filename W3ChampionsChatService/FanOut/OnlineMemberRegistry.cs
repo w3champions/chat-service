@@ -114,6 +114,22 @@ public class OnlineMemberRegistry
     }
 
     /// <summary>
+    /// O(1) membership test for <paramref name="connectionId"/> in <paramref name="channelId"/> — reads
+    /// the <c>_channelsByConnection</c> reverse index only, so it never allocates or copies a channel's
+    /// roster. Exists for hot paths (e.g. <c>ChatHub.SendMessage</c>) that must reject a non-member
+    /// BEFORE doing any heavier work (rate limiting, a DB load): an O(members) <see cref="GetMembers"/>
+    /// copy under the shared lock on every call is exactly the amplification a throttled caller looping
+    /// the hot path would exploit.
+    /// </summary>
+    public bool IsMember(string connectionId, string channelId)
+    {
+        lock (_lock)
+        {
+            return _channelsByConnection.TryGetValue(connectionId, out var channels) && channels.Contains(channelId);
+        }
+    }
+
+    /// <summary>
     /// Drops every membership entry for <paramref name="connectionId"/> across all channels (and the
     /// reverse-index footprint). Called on disconnect. No-op for a connection with no entries.
     /// </summary>

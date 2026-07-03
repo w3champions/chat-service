@@ -1,5 +1,4 @@
 using System;
-using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Domain;
@@ -28,14 +27,17 @@ public partial class ChatHub
     /// <item>Trim + length: empty-after-trim OR over <see cref="ChatLimits.MaxMessageLength"/> →
     /// <see cref="ChatResultCode.TooLong"/> (empty→TooLong is a pinned plan decision — the enum has no
     /// InvalidContent value).</item>
-    /// <item>Membership via <see cref="FanOut.OnlineMemberRegistry"/> (seeded at connect, zero DB) →
-    /// <see cref="ChatResultCode.NotMember"/> if the caller isn't a member.</item>
+    /// <item>Membership via <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (seeded at connect, zero
+    /// DB, O(1) reverse-index lookup — no roster copy) → <see cref="ChatResultCode.NotMember"/> if the
+    /// caller isn't a member.</item>
+    /// <item>Rate limit (<see cref="FanOut.MessageRateLimiter"/>), BEFORE the channel load (security-
+    /// review fix: a throttled member must be rejected before any DB read, so a hard-throttled caller
+    /// looping SendMessage cannot amplify Mongo reads): not allowed → <see cref="ChatResultCode.Throttled"/>
+    /// with the retry-after. On the SINGLE decision that escalates into hard auto-throttle
+    /// (<see cref="FanOut.RateLimitDecision.JustAutoThrottled"/>), push exactly one
+    /// <see cref="ChatEvents.ThrottleNotice"/> to the caller.</item>
     /// <item>Channel load; missing → <see cref="ChatResultCode.NotFound"/> (the member-of-a-deleted-
     /// channel edge).</item>
-    /// <item>Rate limit (<see cref="FanOut.MessageRateLimiter"/>): not allowed →
-    /// <see cref="ChatResultCode.Throttled"/> with the retry-after. On the SINGLE decision that
-    /// escalates into hard auto-throttle (<see cref="FanOut.RateLimitDecision.JustAutoThrottled"/>),
-    /// push exactly one <see cref="ChatEvents.ThrottleNotice"/> to the caller.</item>
     /// <item>Mute gate — PUBLIC channels ONLY (guardrail: semiPublic/system/dm are exempt, preserving
     /// the legacy mute-scope). Reads <see cref="ConnectionMapping.GetEffectiveMuteStatus"/> (cache-only,
     /// zero DB): <see cref="MuteStatus.Full"/> → <see cref="ChatResultCode.Muted"/>;
@@ -67,7 +69,6 @@ public partial class ChatHub
         }
 
         var connectionId = Context.ConnectionId;
-        var battleTag = session.Identity.BattleTag;
 
         // 2. Trim + length. Empty-after-trim maps to TooLong by pinned plan decision.
         content = content?.Trim();
@@ -76,24 +77,17 @@ public partial class ChatHub
             return new SendMessageResult(ChatResultCode.TooLong);
         }
 
-        // 3. Membership (hot path, zero DB) — mirrors FocusChannel's case-insensitive registry check.
-        var isMember = _onlineMemberRegistry.GetMembers(channelId)
-            .Any(m => string.Equals(m.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase));
-        if (!isMember)
+        // 3. Membership (hot path, zero DB, O(1) reverse-index lookup — no roster copy under the lock).
+        if (!_onlineMemberRegistry.IsMember(connectionId, channelId))
         {
             return new SendMessageResult(ChatResultCode.NotMember);
         }
 
-        // 4. Load the channel — a member whose channel doc is gone (deleted) → NotFound.
-        var channel = await _channelRepository.Load(channelId);
-        if (channel == null)
-        {
-            return new SendMessageResult(ChatResultCode.NotFound);
-        }
-
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        // 5. Rate limit. JustAutoThrottled (only ever true on a denial) → push exactly one ThrottleNotice.
+        // 4. Rate limit BEFORE the channel load (security-review fix): reject a throttled member before
+        // paying for a DB read. JustAutoThrottled (only ever true on a denial) → push exactly one
+        // ThrottleNotice. TryAcquire only needs connectionId + channelId, both already in hand.
         var decision = _messageRateLimiter.TryAcquire(connectionId, channelId, now);
         if (decision.JustAutoThrottled)
         {
@@ -102,6 +96,13 @@ public partial class ChatHub
         if (!decision.Allowed)
         {
             return new SendMessageResult(ChatResultCode.Throttled, decision.RetryAfterSeconds);
+        }
+
+        // 5. Load the channel — a member whose channel doc is gone (deleted) → NotFound.
+        var channel = await _channelRepository.Load(channelId);
+        if (channel == null)
+        {
+            return new SendMessageResult(ChatResultCode.NotFound);
         }
 
         // 6. Mute gate — PUBLIC channels ONLY (guardrail: never gate semiPublic/system/dm).

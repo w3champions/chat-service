@@ -284,6 +284,19 @@ public class FanOutRegistryTests
     }
 
     [Test]
+    public void IsMember_TrueForSeededChannel_FalseOtherwise()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+
+        Assert.IsTrue(_memberRegistry.IsMember("conn-1", "channel-a"),
+            "A seeded (connectionId, channelId) pair must report membership via the O(1) reverse-index lookup");
+        Assert.IsFalse(_memberRegistry.IsMember("conn-1", "channel-b"),
+            "The same connection has no entry for a different channel");
+        Assert.IsFalse(_memberRegistry.IsMember("conn-unknown", "channel-a"),
+            "An unknown connectionId must not report membership");
+    }
+
+    [Test]
     public void GetMembers_ReturnsSnapshot_NotLiveInternalCollection()
     {
         _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
