@@ -16,13 +16,16 @@ namespace W3ChampionsChatService.Protocol;
 /// </para>
 /// <see cref="PublicCatalog"/> is always present (decision 1: client fallback) EXCEPT on a FULL-ban
 /// connect, where the assembler filters it to empty (the full-ban room-scope rule — a full-banned
-/// user's public rooms stay hidden). <see cref="PendingDmRequests"/>/<see cref="MentionUnreadCount"/>
-/// are C3 stubs — always empty/zero until the DM and mention-inbox features land.
+/// user's public rooms stay hidden). <see cref="PendingDmRequests"/> is the C5 T6 request tray — one
+/// entry per PENDING 1:1 Dm the connecting user is the RECIPIENT of (never the initiator's own outgoing
+/// requests), minus any the recipient has decline-suppressed within the 24h window; the same
+/// pending-recipient channels ALSO ride <see cref="Channels"/> (D4 dual-listing). <see cref="MentionUnreadCount"/>
+/// remains a C3 stub (zero) until the mention-inbox feature lands.
 /// </summary>
 public record SessionStateDto(
     IReadOnlyList<ChannelDto> Channels,
     IReadOnlyList<ChatChannel> PublicCatalog,
-    IReadOnlyList<object> PendingDmRequests,
+    IReadOnlyList<PendingDmRequestDto> PendingDmRequests,
     int MentionUnreadCount,
     OwnProfileDto OwnProfile,
     MuteStateDto MuteState);

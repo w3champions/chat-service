@@ -112,6 +112,23 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             Deleted = deleted ? new MessageDeletion { By = "admin#1", At = DateTime.UtcNow } : null,
         });
 
+    // Inserts a 1:1 Dm shell directly (no NormalizedName — Dm channels carry none) with the pair-key,
+    // request state, and initiator the tray keys on. RequestedAt drives the tray entry's timestamp.
+    private async Task<ChatChannel> InsertDmChannel(string initiator, string recipient, DmRequestState state, DateTime requestedAt)
+    {
+        var channel = new ChatChannel
+        {
+            Type = ChannelType.Dm,
+            PairKey = DmPairKey.For(initiator, recipient),
+            RequestState = state,
+            RequestInitiatedBy = initiator,
+            LastSeq = 1,
+            LastMessageAt = requestedAt,
+        };
+        await _channelRepository.Insert(channel);
+        return channel;
+    }
+
     private Task FullBan(string battleTag, DateTime endDate) =>
         _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
@@ -299,6 +316,88 @@ public class SessionStateAssemblerTests : IntegrationTestBase
 
         Assert.IsEmpty(dto.PendingDmRequests);
         Assert.AreEqual(0, dto.MentionUnreadCount);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C5 T6 — the PendingDmRequests tray. Built from the ALREADY-LOADED memberships + channels (zero
+    // extra Mongo reads): a Dm && Pending && RequestInitiatedBy != viewer && not decline-suppressed
+    // ⇒ one PendingDmRequestDto. Pending-recipient channels stay in Channels too (D4 dual-listing).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task SessionState_Tray_PendingListedForRecipient_NotForInitiator()
+    {
+        const string initiator = "Peter#123";
+        const string recipient = "Wolf#456";
+        var requestedAt = new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc);
+        var channel = await InsertDmChannel(initiator, recipient, DmRequestState.Pending, requestedAt);
+        await InsertMembership(channel.Id, initiator, lastReadSeq: 0);
+        await InsertMembership(channel.Id, recipient, lastReadSeq: 0);
+
+        // The RECIPIENT sees the request in their tray (it names the initiator, RequestedAt = LastMessageAt).
+        var (recipientDto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt);
+        Assert.AreEqual(1, recipientDto.PendingDmRequests.Count);
+        Assert.AreEqual(channel.Id, recipientDto.PendingDmRequests[0].ChannelId);
+        Assert.AreEqual(initiator, recipientDto.PendingDmRequests[0].FromBattleTag);
+        Assert.AreEqual(requestedAt, recipientDto.PendingDmRequests[0].RequestedAt);
+
+        // The INITIATOR never sees their OWN outgoing request in the tray (it is not a request TO them).
+        var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt);
+        Assert.IsEmpty(initiatorDto.PendingDmRequests, "the initiator never sees their own outgoing request in the tray");
+    }
+
+    [Test]
+    public async Task PendingChannel_AppearsInChannelsList_ForBothParties()
+    {
+        const string initiator = "Peter#123";
+        const string recipient = "Wolf#456";
+        var requestedAt = new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc);
+        var channel = await InsertDmChannel(initiator, recipient, DmRequestState.Pending, requestedAt);
+        await InsertMembership(channel.Id, initiator, lastReadSeq: 0);
+        await InsertMembership(channel.Id, recipient, lastReadSeq: 0);
+
+        var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt);
+        var (recipientDto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt);
+
+        // D4 dual-listing: the pending DM is a normal channel for BOTH parties (needed so FocusChannel /
+        // GetMessages / registry membership work), in addition to riding the recipient's tray.
+        Assert.IsTrue(initiatorDto.Channels.Any(c => c.Channel.Id == channel.Id), "the pending DM appears in the initiator's Channels");
+        Assert.IsTrue(recipientDto.Channels.Any(c => c.Channel.Id == channel.Id), "the pending DM appears in the recipient's Channels");
+        // Both parties may see the consent metadata (D3 — RequestInitiatedBy is safe to expose).
+        var recipientChannel = recipientDto.Channels.Single(c => c.Channel.Id == channel.Id);
+        Assert.AreEqual(DmRequestState.Pending, recipientChannel.Channel.RequestState);
+        Assert.AreEqual(initiator, recipientChannel.Channel.RequestInitiatedBy);
+    }
+
+    [Test]
+    public async Task SessionState_Tray_ExcludesDeclineSuppressed_ReappearsAfterWindow()
+    {
+        const string initiator = "Peter#123";
+        const string recipient = "Wolf#456";
+        var now = new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc);
+        var channel = await InsertDmChannel(initiator, recipient, DmRequestState.Pending, now);
+        await InsertMembership(channel.Id, initiator, lastReadSeq: 0);
+        // The recipient declined — DeclinedUntil is 24h out. (DeclinedUntil never leaves this row — D3.)
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = recipient,
+            LastReadSeq = 0,
+            NotificationLevel = NotificationLevel.All,
+            Role = MembershipRole.Member,
+            JoinedAt = now,
+            DeclinedUntil = now.AddHours(24),
+        });
+
+        // Inside the window: suppressed from the tray (but still in Channels).
+        var (inside, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-1", now.AddHours(1));
+        Assert.IsEmpty(inside.PendingDmRequests, "a decline-suppressed request is hidden from the tray inside the window");
+        Assert.IsTrue(inside.Channels.Any(c => c.Channel.Id == channel.Id), "the decline-suppressed DM stays a normal channel");
+
+        // After the window (DeclinedUntil <= now): reappears in the tray.
+        var (after, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-2", now.AddHours(25));
+        Assert.AreEqual(1, after.PendingDmRequests.Count, "the request reappears in the tray once the decline window elapses");
+        Assert.AreEqual(channel.Id, after.PendingDmRequests[0].ChannelId);
     }
 
     [Test]

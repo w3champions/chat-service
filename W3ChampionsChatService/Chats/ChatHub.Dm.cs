@@ -192,6 +192,132 @@ public partial class ChatHub
         return new ChannelOperationResult(ChatResultCode.Ok);
     }
 
+    // ================================================================================================
+    // C5 (Task 6): the consent state machine's user-facing half — AcceptRequest / DeclineRequest. Both
+    // are RECIPIENT-only actions on a 1:1 Dm request; they share the same fail-closed guard cluster and
+    // differ ONLY in their terminal effect (accept flips the channel + frees the slot; decline stamps a
+    // per-recipient suppression window and is otherwise a NO-OP invisible to the sender).
+    // ================================================================================================
+
+    /// <summary>
+    /// The RECIPIENT accepts a pending 1:1 Dm request, flipping it to <see cref="DmRequestState.Accepted"/>
+    /// PERMANENTLY ("normal forever", §4). Every reject is a typed <see cref="ChannelOperationResult"/>:
+    /// <list type="number">
+    /// <item>Fail-closed identity: no live session → <see cref="ChatResultCode.PermissionDenied"/>.</item>
+    /// <item>Load the channel; missing → <see cref="ChatResultCode.NotFound"/>.</item>
+    /// <item>Guard cluster (all collapse to <see cref="ChatResultCode.PermissionDenied"/>): the channel
+    /// must be a <see cref="ChannelType.Dm"/>, the caller must be a member (hot-path zero-DB
+    /// <see cref="FanOut.OnlineMemberRegistry.IsMember"/> gate, mirroring <c>SendMessage</c> step 3), and
+    /// the caller must NOT be <see cref="ChatChannel.RequestInitiatedBy"/> (only the recipient can accept
+    /// — an initiator accepting their own outgoing request is rejected).</item>
+    /// <item>Idempotent: an already-<see cref="DmRequestState.Accepted"/> conversation returns
+    /// <see cref="ChatResultCode.Ok"/> unchanged (accept is safe to replay).</item>
+    /// <item>Otherwise <see cref="AcceptPendingCore"/> (the shared T4 transition: conditional
+    /// <see cref="Channels.ChannelRepository.SetRequestAccepted"/> flip + +1y shell expiry, clear the
+    /// recipient's own <see cref="Memberships.ChannelMembership.DeclinedUntil"/>, and free the initiator's
+    /// stranger-initiation slot via <see cref="FanOut.DmInitiationTracker.MarkAccepted"/>) → Ok.</item>
+    /// </list>
+    /// NO event is pushed to the initiator: they observe the acceptance via <see cref="ChatChannel.RequestState"/>
+    /// on their next SessionState (or simply by receiving the recipient's replies) — nothing beyond that is
+    /// pinned, so nothing is emitted.
+    /// </summary>
+    public async Task<ChannelOperationResult> AcceptRequest(string channelId)
+    {
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        var caller = session.Identity.BattleTag;
+
+        var channel = await _channelRepository.Load(channelId);
+        if (channel == null)
+        {
+            return new ChannelOperationResult(ChatResultCode.NotFound);
+        }
+
+        if (!IsConsentActionAllowed(channel, channelId, caller))
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        // Idempotent: re-accepting an already-accepted conversation is a no-op Ok (accept-race safe too —
+        // AcceptPendingCore's conditional flip only takes effect once, but short-circuiting here also
+        // skips a needless write attempt when the state is already known-accepted).
+        if (channel.RequestState == DmRequestState.Accepted)
+        {
+            return new ChannelOperationResult(ChatResultCode.Ok);
+        }
+
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        await AcceptPendingCore(channelId, channel.RequestInitiatedBy, caller, now);
+        return new ChannelOperationResult(ChatResultCode.Ok);
+    }
+
+    /// <summary>
+    /// The RECIPIENT declines a pending 1:1 Dm request — a SOFT + TEMPORAL suppression, NEVER a state
+    /// change. Shares <see cref="AcceptRequest"/>'s exact guard cluster (fail-closed session; NotFound on a
+    /// missing channel; Dm + member + not-the-initiator else <see cref="ChatResultCode.PermissionDenied"/>),
+    /// then additionally requires the request to still be <see cref="DmRequestState.Pending"/> — an
+    /// already-<see cref="DmRequestState.Accepted"/> conversation cannot be declined
+    /// (<see cref="ChatResultCode.PermissionDenied"/>; accepted = "normal forever").
+    /// <para>
+    /// The ONLY write decline ever performs is stamping the caller's OWN membership
+    /// <see cref="Memberships.ChannelMembership.DeclinedUntil"/> to <c>now + <see cref="ChatLimits.DmDeclineSuppression"/></c>
+    /// (24h). ABSOLUTELY NOTHING ELSE HAPPENS: no channel-doc write (the channel stays byte-identical, still
+    /// Pending — so the sender's wire view is unchanged), no event to ANYONE (least of all the initiator —
+    /// the sender must never learn they were declined), and no tracker change (a declined initiation STILL
+    /// counts toward the 8h stranger-initiation cap — pinned). This method IS the marquee decline-invisibility
+    /// property: the sender observes an identical result/event/SessionState surface whether the recipient
+    /// declines or does nothing.
+    /// </para>
+    /// </summary>
+    public async Task<ChannelOperationResult> DeclineRequest(string channelId)
+    {
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        var caller = session.Identity.BattleTag;
+
+        var channel = await _channelRepository.Load(channelId);
+        if (channel == null)
+        {
+            return new ChannelOperationResult(ChatResultCode.NotFound);
+        }
+
+        if (!IsConsentActionAllowed(channel, channelId, caller))
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        // Decline is only meaningful on a still-Pending request — the ONE guard that differs from accept.
+        // An accepted conversation is "normal forever" and cannot be declined.
+        if (channel.RequestState != DmRequestState.Pending)
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
+
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        // The SOLE effect: the recipient's own membership suppression window. No channel write, no event,
+        // no tracker change — byte-invisible to the sender (D3).
+        await _membershipRepository.SetDeclinedUntil(channelId, caller, now + ChatLimits.DmDeclineSuppression);
+        return new ChannelOperationResult(ChatResultCode.Ok);
+    }
+
+    /// <summary>
+    /// The shared RECIPIENT-only guard cluster for <see cref="AcceptRequest"/> / <see cref="DeclineRequest"/>
+    /// (all failures map to <see cref="ChatResultCode.PermissionDenied"/> at the call site): the channel must
+    /// be a <see cref="ChannelType.Dm"/>, the caller must be a member of it (hot-path zero-DB registry gate),
+    /// and the caller must NOT be the request initiator (only the recipient can accept/decline). Never leaks
+    /// pending-vs-declined state — it depends only on channel type, membership, and who wrote first.
+    /// </summary>
+    private bool IsConsentActionAllowed(ChatChannel channel, string channelId, string caller) =>
+        channel.Type == ChannelType.Dm
+        && _onlineMemberRegistry.IsMember(Context.ConnectionId, channelId)
+        && !string.Equals(caller, channel.RequestInitiatedBy, StringComparison.OrdinalIgnoreCase);
+
     /// <summary>
     /// Ensures the CALLER's own membership exists for <paramref name="channelId"/> (idempotent
     /// <see cref="MembershipRepository.InsertIfAbsent"/> — a re-open returns the existing row untouched)

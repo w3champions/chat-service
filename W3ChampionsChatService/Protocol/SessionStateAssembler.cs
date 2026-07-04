@@ -87,7 +87,7 @@ public class SessionStateAssembler(
         var dto = new SessionStateDto(
             Channels: channelDtos,
             PublicCatalog: effectivePublicCatalog,
-            PendingDmRequests: Array.Empty<object>(),
+            PendingDmRequests: BuildPendingDmTray(channelBackedMemberships, channelsById, identity.BattleTag, now),
             MentionUnreadCount: 0,
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
@@ -131,6 +131,59 @@ public class SessionStateAssembler(
             MembershipDto.From(membership),
             unreadCount,
             unreadCount > 0);
+    }
+
+    /// <summary>
+    /// C5 T6 — the pending-Dm-request tray (spec §11 SessionState slot). Built ENTIRELY from the
+    /// already-loaded <paramref name="channelBackedMemberships"/> + <paramref name="channelsById"/> (zero
+    /// extra Mongo reads): the connecting viewer sees one <see cref="PendingDmRequestDto"/> per channel that
+    /// is a <see cref="ChannelType.Dm"/> whose <see cref="ChatChannel.RequestState"/> is
+    /// <see cref="DmRequestState.Pending"/>, was initiated by SOMEONE ELSE (<see cref="ChatChannel.RequestInitiatedBy"/>
+    /// != the viewer, case-insensitive — the viewer's OWN outgoing requests never appear here), and is NOT
+    /// currently decline-suppressed (the viewer's own membership <see cref="ChannelMembership.DeclinedUntil"/>
+    /// is null or already elapsed — D3's soft+temporal decline: still Pending on the channel doc, hidden from
+    /// the tray for the 24h window). <see cref="PendingDmRequestDto.RequestedAt"/> is the channel's last
+    /// message time, falling back to the membership's join time for a shell with no message yet. The same
+    /// pending-recipient channels ALSO remain in the DTO's <see cref="SessionStateDto.Channels"/> (D4
+    /// dual-listing) — this tray is additive, never a filter on that list.
+    /// </summary>
+    private static IReadOnlyList<PendingDmRequestDto> BuildPendingDmTray(
+        List<ChannelMembership> channelBackedMemberships,
+        IReadOnlyDictionary<string, ChatChannel> channelsById,
+        string viewerBattleTag,
+        DateTime now)
+    {
+        var tray = new List<PendingDmRequestDto>();
+        foreach (var membership in channelBackedMemberships)
+        {
+            var channel = channelsById[membership.ChannelId];
+            if (channel.Type != ChannelType.Dm || channel.RequestState != DmRequestState.Pending)
+            {
+                continue;
+            }
+
+            // The viewer is the RECIPIENT of the request, never its initiator (they wrote first — it is not
+            // a request TO them). RequestInitiatedBy is stored JWT-cased on the channel doc, so compare
+            // case-insensitively against the viewer's identity.
+            if (string.Equals(channel.RequestInitiatedBy, viewerBattleTag, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            // Decline suppression: hide while the recipient's own 24h window is still active. The window
+            // lives ONLY on this membership row (never the channel doc, never serialized) — D3.
+            if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
+            {
+                continue;
+            }
+
+            tray.Add(new PendingDmRequestDto(
+                channel.Id,
+                channel.RequestInitiatedBy,
+                channel.LastMessageAt ?? membership.JoinedAt));
+        }
+
+        return tray;
     }
 
     private static OwnProfileDto ToOwnProfileDto(W3CUserAuthentication identity, ChatUser chatUser)

@@ -96,6 +96,10 @@ public class OldProtocolRemovedTests
             // tasks extend this set further (accept/decline, group create/manage); extend, never weaken.
             "OpenDm",
             "SetDmPrivacy",
+            // New protocol (C5 T6): the consent state machine's user-facing half — AcceptRequest/
+            // DeclineRequest (ChatHub.Dm.cs). Recipient-only; both return ChannelOperationResult.
+            "AcceptRequest",
+            "DeclineRequest",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",
