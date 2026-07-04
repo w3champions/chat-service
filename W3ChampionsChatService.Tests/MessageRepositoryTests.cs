@@ -492,4 +492,61 @@ public class MessageRepositoryTests : IntegrationTestBase
         Assert.IsNotNull(loaded.ExpiresAt, "moderation must never touch the TTL field — physical removal stays TTL-only");
         Assert.IsTrue((loaded.ExpiresAt.Value - target.ExpiresAt.Value).Duration() < TimeSpan.FromSeconds(1));
     }
+
+    // ── C4 Task 4 directive (a) — conditional soft-delete (closes the double-delete TOCTOU) ──────
+
+    [Test]
+    public async Task MarkDeleted_ReturnsTrue_WhenItModifiesARow()
+    {
+        var repo = new MessageRepository(MongoClient);
+        var message = NewMessage("chan1", 1, "Peter#123");
+        await repo.Insert(message);
+
+        var modified = await repo.MarkDeleted(message.Id, "Mod#1", DateTime.UtcNow);
+
+        Assert.IsTrue(modified, "a fresh soft-delete must report it modified the row");
+    }
+
+    [Test]
+    public async Task MarkDeleted_ReturnsFalse_WhenAlreadyDeleted_PreservesOriginalAttribution()
+    {
+        // Directive (a): the write is now conditional on Deleted == null, so a concurrent double-delete
+        // can never overwrite the FIRST moderator's attribution (or re-fire downstream side-effects).
+        var repo = new MessageRepository(MongoClient);
+        var message = NewMessage("chan1", 1, "Peter#123");
+        await repo.Insert(message);
+        var firstAt = new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc);
+        await repo.MarkDeleted(message.Id, "FirstMod#1", firstAt);
+
+        var modified = await repo.MarkDeleted(message.Id, "SecondMod#2", DateTime.UtcNow);
+
+        Assert.IsFalse(modified, "a second delete of an already-deleted row must report no modification");
+        var reloaded = await repo.Load(message.Id);
+        Assert.AreEqual("FirstMod#1", reloaded.Deleted.By, "the first moderator's attribution must be preserved");
+        Assert.AreEqual(firstAt, reloaded.Deleted.At);
+    }
+
+    [Test]
+    public async Task MarkDeletedMany_SkipsAlreadyDeleted_ReturnsNewlyModifiedCount()
+    {
+        // Directive (a): the bulk write filters Deleted == null, so a re-purge only newly-deletes and
+        // the returned count reflects the ACTUAL modifications (the count the audit/UI is based on).
+        var repo = new MessageRepository(MongoClient);
+        var fresh1 = NewMessage("chan1", 1, "Peter#123");
+        var fresh2 = NewMessage("chan1", 2, "Peter#123");
+        var alreadyDeleted = NewMessage("chan1", 3, "Peter#123");
+        await repo.Insert(fresh1);
+        await repo.Insert(fresh2);
+        await repo.Insert(alreadyDeleted);
+        var firstAt = new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc);
+        await repo.MarkDeleted(alreadyDeleted.Id, "FirstMod#1", firstAt);
+
+        var modifiedCount = await repo.MarkDeletedMany(
+            [fresh1.Id, fresh2.Id, alreadyDeleted.Id], "Mod#2", DateTime.UtcNow);
+
+        Assert.AreEqual(2, modifiedCount, "only the two non-deleted rows are newly soft-deleted");
+        var reloadedAlready = await repo.Load(alreadyDeleted.Id);
+        Assert.AreEqual("FirstMod#1", reloadedAlready.Deleted.By, "the already-deleted row keeps its original attribution");
+        Assert.AreEqual(firstAt, reloadedAlready.Deleted.At);
+    }
 }

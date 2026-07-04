@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
@@ -269,5 +270,76 @@ public class FanOutEngineTests
         Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.MessageDeleted));
         // ...but the OTHER focused connection still received its removal push.
         Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.MessageDeleted));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C4 (Task 4) PushBulkMessagesDeleted — the moderator-purge removal emit helper (D6). Mirrors
+    // PushMessageDeleted exactly, but carries a BATCH of message ids as a channel-scoped
+    // BulkMessagesDeletedDto to the channel's FOCUSED connections, MINUS the excluded set (the purge
+    // target's own connections, computed by the hub). Focused-only targeting + per-recipient fault
+    // isolation; a channel with no focused viewers emits nothing.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PushBulkMessagesDeleted_DeliversChannelScopedDto_ToFocusedConnections_ExceptExcluded()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The purge target AND a viewer are both focused on the channel; a third connection is a member
+        // but NOT focused (absent from the focused index entirely).
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
+        var engine = NewEngine(harness, focusRegistry);
+
+        var messageIds = new[] { "message-1", "message-2" };
+        await engine.PushBulkMessagesDeleted(ChannelId, messageIds, new[] { AuthorConnection });
+
+        // The focused viewer receives exactly one channel-scoped BulkMessagesDeletedDto with all ids.
+        Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.BulkMessagesDeleted));
+        var dto = harness.PayloadFor(OtherFocusedConnection, ChatEvents.BulkMessagesDeleted) as BulkMessagesDeletedDto;
+        Assert.IsNotNull(dto, "a focused viewer must receive a BulkMessagesDeletedDto payload");
+        Assert.AreEqual(ChannelId, dto.ChannelId);
+        CollectionAssert.AreEqual(messageIds, dto.MessageIds.ToArray());
+
+        // The excluded (target) connection is skipped — the purged user is not tipped off live.
+        Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.BulkMessagesDeleted));
+        // An unfocused connection never receives the removal (it never received the messages either).
+        Assert.AreEqual(0, harness.SignalCount(UnfocusedMemberConnection, ChatEvents.BulkMessagesDeleted));
+    }
+
+    [Test]
+    public async Task PushBulkMessagesDeleted_NoFocusedViewers_EmitsNothing()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // Nobody is focused on the channel — the purge produced eligible ids here but no live viewer.
+        var engine = NewEngine(harness, focusRegistry);
+
+        await engine.PushBulkMessagesDeleted(ChannelId, new[] { "message-1" }, Array.Empty<string>());
+
+        Assert.IsEmpty(harness.AllSignals, "a channel with no focused viewers must emit no BulkMessagesDeleted event");
+    }
+
+    [Test]
+    public async Task PushBulkMessagesDeleted_OneRecipientSendThrows_OthersStillReceive_NoExceptionPropagates()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // Two focused connections, neither excluded — isolates the fault-tolerance behavior.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
+        var engine = NewEngine(harness, focusRegistry);
+
+        // AuthorConnection's SendAsync faults (e.g. its connection was torn down mid-loop).
+        harness.ThrowOnSend(AuthorConnection);
+
+        // Must not throw: a single recipient's failed send is fault-isolated inside PushBulkMessagesDeleted,
+        // never propagating up to the hub's already-committed bulk soft-delete + audit.
+        await engine.PushBulkMessagesDeleted(ChannelId, new[] { "message-1" }, Array.Empty<string>());
+
+        // The failing connection recorded no signal...
+        Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.BulkMessagesDeleted));
+        // ...but the OTHER focused connection still received its removal push.
+        Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.BulkMessagesDeleted));
     }
 }

@@ -378,81 +378,418 @@ public class ChatHubDeletionTests : IntegrationTestBase
         Assert.IsEmpty(_mentionCleaner.Calls);
     }
 
-    // -------------------------------------------------------------------------------------------------
-    // LEGACY (untouched by Task 3): the PurgeMessagesFromUser section is rewritten by Task 4; the
-    // ChatHistory-direct cluster is dropped by Task 7. Both still drive the legacy in-memory ChatHistory
-    // + Clients.AllExcept path and are left verbatim below.
-    // -------------------------------------------------------------------------------------------------
-
     [Test]
-    [TestCase(true, Description = "Target user is connected - should exclude them from notification")]
-    [TestCase(false, Description = "Target user is not connected - should send to all")]
-    public async Task PurgeMessagesFromUser_ExistingUser_DeletesAllMessagesAndNotifiesCorrectClients(bool targetUserIsConnected)
+    public async Task DeleteMessage_VanishedChannel_ReturnsPermissionDenied_NothingDeleted()
     {
-        // Arrange
-        var targetUser = new ChatUser("target#123", false, "Target", new ProfilePicture(), null, null);
-        var otherUser = new ChatUser("other#456", false, "Other", new ProfilePicture(), null, null);
-
-        var message1 = new ChatMessage(targetUser, "Message 1");
-        var message2 = new ChatMessage(otherUser, "Message 2");
-        var message3 = new ChatMessage(targetUser, "Message 3");
-
-        _chatHistory.AddMessage("W3C Lounge", message1);
-        _chatHistory.AddMessage("W3C Lounge", message2);
-        _chatHistory.AddMessage("room2", message3);
-
-        if (targetUserIsConnected)
+        // C4 (Task 4) directive (c): a message whose ChannelId resolves to NO channel doc is rejected
+        // fail-closed — we cannot prove the channel is not private, so no delete slips past the privacy
+        // wall on a data-integrity edge (same treatment as the DM/GroupDm wall above). Inserted directly
+        // (not via SeedMessage, which would AllocateSeq against a non-existent channel and throw).
+        var message = new ChannelMessage
         {
-            _connectionMapping.Add("TargetConnectionId", "W3C Lounge", targetUser);
-        }
+            ChannelId = "vanished-channel-id",
+            Seq = 1,
+            Sender = new MessageSender { BattleTag = AuthorBattleTag, Name = "Sender" },
+            Content = "orphaned by a vanished channel",
+            SentAt = DateTime.UtcNow,
+        };
+        await _messageRepository.Insert(message);
+        _focusRegistry.Focus("viewer-conn", message.ChannelId, "viewer#1");
 
-        // Act
-        await _chatHub.PurgeMessagesFromUser("target#123");
+        var result = await _chatHub.DeleteMessage(message.Id);
 
-        // Assert
-        var loungeMessages = _chatHistory.GetMessages("W3C Lounge");
-        var room2Messages = _chatHistory.GetMessages("room2");
-
-        Assert.AreEqual(1, loungeMessages.Count, "Only other user's message should remain in lounge");
-        Assert.AreEqual("other#456", loungeMessages[0].User.BattleTag);
-        Assert.AreEqual(0, room2Messages.Count, "Target user's message should be deleted from room2");
-
-        // Verify AllExcept was called with correct exclusion list
-        var expectedExcludedIds = targetUserIsConnected ? new[] { "TargetConnectionId" } : new string[0];
-        _clients.Verify(c => c.AllExcept(
-            It.Is<System.Collections.Generic.IReadOnlyList<string>>(list =>
-                list.Count == expectedExcludedIds.Length &&
-                expectedExcludedIds.All(id => list.Contains(id)))),
-            Times.Once);
-
-        _mockAllExceptProxy.Verify(p => p.SendCoreAsync("BulkMessageDeleted",
-            It.Is<object[]>(args => args.Length == 1 &&
-                args[0] != null &&
-                args[0].GetType() == typeof(System.Collections.Generic.List<string>)),
-            default), Times.Once);
-
-        // Verify All proxy was NOT called (since we now always use AllExcept)
-        _mockAllProxy.Verify(p => p.SendCoreAsync("BulkMessageDeleted", It.IsAny<object[]>(), default),
-            Times.Never);
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNull(reloaded.Deleted, "a message whose channel cannot be resolved must never be soft-deleted");
+        Assert.IsEmpty(_pushHarness.AllSignals);
+        Assert.IsEmpty(_mentionCleaner.Calls);
     }
 
     [Test]
-    public async Task PurgeMessagesFromUser_UserWithNoMessages_DoesNotNotifyClients()
+    public async Task DeleteMessage_CleanerThrows_SoftDeleteAndAuditSurvive_BeforeThePropagation()
     {
-        // Arrange
-        var user = new ChatUser("other#456", false, "Other", new ProfilePicture(), null, null);
-        var message = new ChatMessage(user, "Message");
-        _chatHistory.AddMessage("W3C Lounge", message);
+        // Directive (b) rationale, locked in: the durable soft-delete AND the audit run BEFORE the mention
+        // cleaner, so a throwing cleaner (as a real C6 impl may be) can never leave a committed moderation
+        // action un-logged. The cleaner faults AFTER the commit+audit, so the call surfaces the exception —
+        // but the row is already soft-deleted and the audit line already written.
+        var channel = await CreateChannel();
+        var message = await SeedMessage(channel.Id, AuthorBattleTag, "audited then cleaner throws");
+        _mentionCleaner.ThrowAfterCapture = true;
 
-        // Act
-        await _chatHub.PurgeMessagesFromUser("nonexistent#123");
+        var captured = new List<string>();
+        var sink = new DelegatingLogSink(evt => captured.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        var testLogger = new Serilog.LoggerConfiguration().MinimumLevel.Information().WriteTo.Sink(sink).CreateLogger();
+        Serilog.Log.Logger = testLogger;
+        try
+        {
+            Assert.ThrowsAsync<InvalidOperationException>(() => _chatHub.DeleteMessage(message.Id));
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            testLogger.Dispose();
+        }
 
-        // Assert
-        var messages = _chatHistory.GetMessages("W3C Lounge");
-        Assert.AreEqual(1, messages.Count, "Original message should remain");
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNotNull(reloaded.Deleted, "the soft-delete commits BEFORE the cleaner runs");
+        Assert.AreEqual(ModeratorBattleTag, reloaded.Deleted.By);
+        Assert.IsTrue(
+            captured.Any(l => l.Contains(ModeratorBattleTag) && l.Contains(message.Id) && l.Contains(channel.Id)),
+            "the audit line is logged BEFORE the cleaner throws (a committed action is never un-logged)");
+    }
 
-        _mockAllProxy.Verify(p => p.SendCoreAsync("BulkMessageDeleted", It.IsAny<object[]>(), default),
-            Times.Never);
+    // -------------------------------------------------------------------------------------------------
+    // C4 (Task 4) — durable cross-channel PurgeMessagesFromUser (D6). UPGRADE lineage: the legacy
+    // in-memory PurgeMessagesFromUser_ExistingUser_DeletesAllMessagesAndNotifiesCorrectClients (which
+    // drove ChatHistory.DeleteMessagesFromUser + Clients.AllExcept with a bare List<string> under the
+    // SINGULAR "BulkMessageDeleted" string) and PurgeMessagesFromUser_UserWithNoMessages_DoesNotNotifyClients
+    // are superseded here by the durable pipeline: LoadPurgeableBySender (collation-insensitive), the
+    // eligible-channel-type privacy wall (Public / SemiPublic / System+Match ONLY — DM/GroupDm/Clan/Lobby
+    // and unresolvable channels excluded), the conditional bulk soft-delete (MarkDeletedMany), the
+    // per-channel BulkMessagesDeletedDto delivered to FOCUSED viewers minus the target's connections,
+    // the mention-inbox cleanup hook, and a PurgeMessagesResult(Ok, n) carrying the actual modified count.
+    // The ChatHistory-direct cluster below is still dropped by Task 7 and left verbatim.
+    // -------------------------------------------------------------------------------------------------
+
+    private async Task<ChatChannel> CreateSystemChannel(SystemChannelKind kind)
+    {
+        var channel = new ChatChannel { Type = ChannelType.System, SystemKind = kind };
+        await _channelRepository.Insert(channel);
+        return channel;
+    }
+
+    [Test]
+    public async Task Purge_SoftDeletesAcross_Public_SemiPublic_Match_Channels()
+    {
+        var publicChannel = await CreateChannel(ChannelType.Public);
+        var semiPublic = await CreateChannel(ChannelType.SemiPublic);
+        var matchChannel = await CreateSystemChannel(SystemChannelKind.Match);
+        var clanChannel = await CreateSystemChannel(SystemChannelKind.Clan);
+        var lobbyChannel = await CreateSystemChannel(SystemChannelKind.Lobby);
+        var dm = await CreateChannel(ChannelType.Dm);
+        var groupDm = await CreateChannel(ChannelType.GroupDm);
+
+        const string target = "target#123";
+        var inPublic = await SeedMessage(publicChannel.Id, target, "p");
+        var inSemi = await SeedMessage(semiPublic.Id, target, "s");
+        var inMatch = await SeedMessage(matchChannel.Id, target, "m");
+        var inClan = await SeedMessage(clanChannel.Id, target, "c");
+        var inLobby = await SeedMessage(lobbyChannel.Id, target, "l");
+        var inDm = await SeedMessage(dm.Id, target, "d");
+        var inGroupDm = await SeedMessage(groupDm.Id, target, "g");
+
+        var result = await _chatHub.PurgeMessagesFromUser(target);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(3, result.MessagesDeleted, "exactly the three eligible-channel rows are soft-deleted");
+
+        // Soft-deleted ONLY in the three eligible channel types...
+        Assert.IsNotNull((await _messageRepository.Load(inPublic.Id)).Deleted);
+        Assert.IsNotNull((await _messageRepository.Load(inSemi.Id)).Deleted);
+        Assert.IsNotNull((await _messageRepository.Load(inMatch.Id)).Deleted);
+        Assert.AreEqual(ModeratorBattleTag, (await _messageRepository.Load(inPublic.Id)).Deleted.By,
+            "the moderator battleTag is the deletion attribution");
+        // ...and NEVER in clan / lobby / dm / groupDm (the privacy + scope wall).
+        Assert.IsNull((await _messageRepository.Load(inClan.Id)).Deleted);
+        Assert.IsNull((await _messageRepository.Load(inLobby.Id)).Deleted);
+        Assert.IsNull((await _messageRepository.Load(inDm.Id)).Deleted);
+        Assert.IsNull((await _messageRepository.Load(inGroupDm.Id)).Deleted);
+    }
+
+    [Test]
+    public async Task Purge_NeverTouches_Dm_GroupDm_Clan_Lobby()
+    {
+        var dm = await CreateChannel(ChannelType.Dm);
+        var groupDm = await CreateChannel(ChannelType.GroupDm);
+        var clan = await CreateSystemChannel(SystemChannelKind.Clan);
+        var lobby = await CreateSystemChannel(SystemChannelKind.Lobby);
+
+        const string target = "target#123";
+        var inDm = await SeedMessage(dm.Id, target, "d");
+        var inGroupDm = await SeedMessage(groupDm.Id, target, "g");
+        var inClan = await SeedMessage(clan.Id, target, "c");
+        var inLobby = await SeedMessage(lobby.Id, target, "l");
+
+        // Directive (c) purge analog: a message whose ChannelId resolves to NO channel doc is likewise
+        // never deleted (fail-closed — dropped, not deleted). Inserted directly to sidestep AllocateSeq.
+        var orphan = new ChannelMessage
+        {
+            ChannelId = "vanished-channel-id",
+            Seq = 1,
+            Sender = new MessageSender { BattleTag = target, Name = "Target" },
+            Content = "orphaned",
+            SentAt = DateTime.UtcNow,
+        };
+        await _messageRepository.Insert(orphan);
+
+        var result = await _chatHub.PurgeMessagesFromUser(target);
+
+        // The wall: none of these are purgeable, so nothing is deleted and no event fires.
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(0, result.MessagesDeleted);
+        Assert.IsNull((await _messageRepository.Load(inDm.Id)).Deleted, "DM content is never purged");
+        Assert.IsNull((await _messageRepository.Load(inGroupDm.Id)).Deleted, "GroupDm content is never purged");
+        Assert.IsNull((await _messageRepository.Load(inClan.Id)).Deleted, "clan content is never purged");
+        Assert.IsNull((await _messageRepository.Load(inLobby.Id)).Deleted, "lobby content is never purged");
+        Assert.IsNull((await _messageRepository.Load(orphan.Id)).Deleted, "an unresolvable-channel message is never purged");
+        Assert.IsEmpty(_pushHarness.AllSignals);
+        Assert.IsEmpty(_mentionCleaner.Calls);
+    }
+
+    [Test]
+    public async Task Purge_EmitsBulkDto_PerAffectedChannel_ToFocusedViewers_ExceptTargetConnections()
+    {
+        var channelA = await CreateChannel(ChannelType.Public);
+        var channelB = await CreateChannel(ChannelType.SemiPublic);
+        var channelC = await CreateChannel(ChannelType.Public); // eligible deletions but no focused viewers
+
+        const string target = "target#123";
+        var a1 = await SeedMessage(channelA.Id, target, "a1");
+        var a2 = await SeedMessage(channelA.Id, target, "a2");
+        var b1 = await SeedMessage(channelB.Id, target, "b1");
+        await SeedMessage(channelC.Id, target, "c1");
+
+        // The purge target is online and focused on channelA — their own connection is EXCLUDED.
+        const string targetConn = "target-conn";
+        _connectionMapping.RegisterUser(targetConn, new ChatUser(target, false, "Target", new ProfilePicture(), null, null));
+        _focusRegistry.Focus(targetConn, channelA.Id, target);
+
+        // Focused viewers on A and B must RECEIVE the removal for their own channel.
+        const string viewerA = "viewer-a";
+        const string viewerB = "viewer-b";
+        _focusRegistry.Focus(viewerA, channelA.Id, "viewerA#1");
+        _focusRegistry.Focus(viewerB, channelB.Id, "viewerB#1");
+        // channelC has NO focused viewers.
+
+        var result = await _chatHub.PurgeMessagesFromUser(target);
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(4, result.MessagesDeleted);
+
+        // viewerA gets one channel-scoped BulkMessagesDeletedDto for channelA carrying BOTH A ids.
+        Assert.AreEqual(1, _pushHarness.SignalCount(viewerA, ChatEvents.BulkMessagesDeleted));
+        var dtoA = _pushHarness.PayloadFor(viewerA, ChatEvents.BulkMessagesDeleted) as BulkMessagesDeletedDto;
+        Assert.IsNotNull(dtoA);
+        Assert.AreEqual(channelA.Id, dtoA.ChannelId);
+        CollectionAssert.AreEquivalent(new[] { a1.Id, a2.Id }, dtoA.MessageIds.ToArray());
+
+        // viewerB gets one for channelB carrying the B id.
+        Assert.AreEqual(1, _pushHarness.SignalCount(viewerB, ChatEvents.BulkMessagesDeleted));
+        var dtoB = _pushHarness.PayloadFor(viewerB, ChatEvents.BulkMessagesDeleted) as BulkMessagesDeletedDto;
+        Assert.IsNotNull(dtoB);
+        Assert.AreEqual(channelB.Id, dtoB.ChannelId);
+        CollectionAssert.AreEqual(new[] { b1.Id }, dtoB.MessageIds.ToArray());
+
+        // The target's own focused connection is excluded (not tipped off live).
+        Assert.AreEqual(0, _pushHarness.SignalCount(targetConn, ChatEvents.BulkMessagesDeleted));
+        // channelC produced eligible deletions but had no focused viewers → NO event for it anywhere.
+        Assert.IsFalse(
+            _pushHarness.AllSignals.Any(s => (s.Payload as BulkMessagesDeletedDto)?.ChannelId == channelC.Id),
+            "a channel with no focused viewers must emit no BulkMessagesDeleted event");
+    }
+
+    [Test]
+    public async Task Purge_MixedCaseBattleTag_StillPurges()
+    {
+        var channel = await CreateChannel(ChannelType.Public);
+        var message = await SeedMessage(channel.Id, "Target#123", "case test");
+
+        // The moderator supplies a DIFFERENT casing than the stored sender — the collation makes
+        // LoadPurgeableBySender match it end-to-end (fixing the legacy case-SENSITIVE purge bug).
+        var result = await _chatHub.PurgeMessagesFromUser("TARGET#123");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, result.MessagesDeleted);
+        Assert.IsNotNull((await _messageRepository.Load(message.Id)).Deleted,
+            "a mixed-case battleTag must still purge the stored-casing rows");
+    }
+
+    [Test]
+    public async Task Purge_SkipsAlreadyDeleted_Idempotent_Rerun()
+    {
+        var channel = await CreateChannel(ChannelType.Public);
+        await SeedMessage(channel.Id, "target#123", "spam");
+        _focusRegistry.Focus("viewer-conn", channel.Id, "viewer#1");
+
+        var first = await _chatHub.PurgeMessagesFromUser("target#123");
+        Assert.AreEqual(ChatResultCode.Ok, first.Code);
+        Assert.AreEqual(1, first.MessagesDeleted);
+        var signalsAfterFirst = _pushHarness.AllSignals.Count;
+
+        // Re-running finds no non-deleted rows (LoadPurgeableBySender excludes Deleted != null) → Ok + 0,
+        // and emits NO further events (structural idempotency).
+        var second = await _chatHub.PurgeMessagesFromUser("target#123");
+        Assert.AreEqual(ChatResultCode.Ok, second.Code);
+        Assert.AreEqual(0, second.MessagesDeleted, "a re-purge soft-deletes nothing");
+        Assert.AreEqual(signalsAfterFirst, _pushHarness.AllSignals.Count, "the re-purge must emit no additional events");
+    }
+
+    [Test]
+    public async Task Purge_NoMessages_ReturnsOkZero_NoEvents()
+    {
+        // Another user's message exists, but the purge target has none.
+        var channel = await CreateChannel(ChannelType.Public);
+        await SeedMessage(channel.Id, "other#456", "innocent");
+        _focusRegistry.Focus("viewer-conn", channel.Id, "viewer#1");
+
+        var result = await _chatHub.PurgeMessagesFromUser("nonexistent#123");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(0, result.MessagesDeleted);
+        Assert.IsEmpty(_pushHarness.AllSignals, "no eligible messages → no BulkMessagesDeleted events");
+        Assert.IsEmpty(_mentionCleaner.Calls, "no eligible messages → the mention cleaner is never invoked");
+    }
+
+    [Test]
+    public async Task Purge_InvokesMentionInboxCleaner_WithAllDeletedIds()
+    {
+        var channelA = await CreateChannel(ChannelType.Public);
+        var channelB = await CreateChannel(ChannelType.SemiPublic);
+        var dm = await CreateChannel(ChannelType.Dm);
+
+        const string target = "target#123";
+        var a1 = await SeedMessage(channelA.Id, target, "a1");
+        var b1 = await SeedMessage(channelB.Id, target, "b1");
+        await SeedMessage(dm.Id, target, "not purged");
+
+        var result = await _chatHub.PurgeMessagesFromUser(target);
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+
+        Assert.AreEqual(1, _mentionCleaner.Calls.Count, "the cleaner is invoked exactly once with the whole purged batch");
+        CollectionAssert.AreEquivalent(new[] { a1.Id, b1.Id }, _mentionCleaner.Calls[0].ToArray(),
+            "the cleaner must receive exactly the soft-deleted (eligible-channel) ids — never the DM id that was never touched");
+    }
+
+    [Test]
+    public async Task Purge_TargetOwnShadowRows_AlsoDeleted()
+    {
+        var channel = await CreateChannel(ChannelType.Public);
+        var normal = await SeedMessage(channel.Id, "target#123", "normal");
+        var shadow = await SeedMessage(channel.Id, "target#123", "shadow", shadow: true);
+
+        var result = await _chatHub.PurgeMessagesFromUser("target#123");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(2, result.MessagesDeleted, "the target's own shadow rows are purged like any other row");
+        Assert.IsNotNull((await _messageRepository.Load(normal.Id)).Deleted);
+        Assert.IsNotNull((await _messageRepository.Load(shadow.Id)).Deleted, "a shadow row from the target is soft-deleted too");
+    }
+
+    [Test]
+    public async Task Purge_UserReads_ExcludeAcrossChannels_ModeratorReads_Flagged()
+    {
+        var channelA = await CreateChannel(ChannelType.Public);
+        var channelB = await CreateChannel(ChannelType.SemiPublic);
+
+        const string target = "target#123";
+        var survivorA = await SeedMessage(channelA.Id, "other#456", "still here A");
+        var doomedA = await SeedMessage(channelA.Id, target, "purge me A");
+        var doomedB = await SeedMessage(channelB.Id, target, "purge me B");
+
+        // Make the moderator a member of both channels so we can drive the USER read path (UserVisible).
+        _onlineMemberRegistry.Join(channelA.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelB.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0));
+
+        var result = await _chatHub.PurgeMessagesFromUser(target);
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+
+        // USER read (UserVisible) excludes the purged rows across BOTH channels.
+        var readA = await _chatHub.GetMessages(channelA.Id, beforeSeq: null, aroundSeq: null, limit: 50);
+        CollectionAssert.AreEqual(new[] { survivorA.Id }, readA.Messages.Select(m => m.Id).ToArray(),
+            "the user read must exclude the purged message in channel A");
+        var readB = await _chatHub.GetMessages(channelB.Id, beforeSeq: null, aroundSeq: null, limit: 50);
+        Assert.IsEmpty(readB.Messages, "the purged row is excluded from the user read in channel B");
+
+        // MODERATOR read (LoadForModerator) includes the purged rows, flagged with the moderator attribution.
+        var modA = await _messageRepository.LoadForModerator(channelA.Id);
+        var flaggedA = modA.Single(m => m.Id == doomedA.Id);
+        Assert.IsNotNull(flaggedA.Deleted, "the moderator read must include the purged row, flagged");
+        Assert.AreEqual(ModeratorBattleTag, flaggedA.Deleted.By);
+        var modB = await _messageRepository.LoadForModerator(channelB.Id);
+        Assert.IsNotNull(modB.Single(m => m.Id == doomedB.Id).Deleted);
+    }
+
+    [Test]
+    public async Task Purge_LogsModeratorAudit_WithCount()
+    {
+        var channel = await CreateChannel(ChannelType.Public);
+        for (var i = 0; i < 5; i++)
+        {
+            await SeedMessage(channel.Id, "target#123", $"m{i}");
+        }
+
+        var captured = new List<string>();
+        var sink = new DelegatingLogSink(evt => captured.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        var testLogger = new Serilog.LoggerConfiguration()
+            .MinimumLevel.Information()
+            .WriteTo.Sink(sink)
+            .CreateLogger();
+        Serilog.Log.Logger = testLogger;
+        try
+        {
+            var result = await _chatHub.PurgeMessagesFromUser("target#123");
+            Assert.AreEqual(ChatResultCode.Ok, result.Code);
+            Assert.AreEqual(5, result.MessagesDeleted);
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            testLogger.Dispose();
+        }
+
+        Assert.IsTrue(
+            captured.Any(l => l.Contains(ModeratorBattleTag) && l.Contains("target#123") && l.Contains(" 5 ")),
+            "the purge audit line must record the moderator battleTag, the target battleTag, and the count");
+    }
+
+    [Test]
+    public async Task Purge_DocsRemainInMongo_ExpiresAtUntouched()
+    {
+        var channel = await CreateChannel(ChannelType.Public);
+        var expiry = new DateTime(2026, 9, 1, 0, 0, 0, DateTimeKind.Utc);
+        var message = await SeedMessage(channel.Id, "target#123", "ttl test", expiresAt: expiry);
+
+        var result = await _chatHub.PurgeMessagesFromUser("target#123");
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+
+        // Soft-delete only: the doc survives (physical removal stays TTL-only) with ExpiresAt untouched.
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNotNull(reloaded, "the doc must survive — soft-delete only, never a hard delete");
+        Assert.IsNotNull(reloaded.Deleted);
+        Assert.AreEqual(expiry, reloaded.ExpiresAt, "ExpiresAt/TTL must be left untouched by the purge");
+    }
+
+    [Test]
+    public async Task Purge_CleanerThrows_BulkSoftDeleteAndAuditSurvive_BeforeThePropagation()
+    {
+        // Directive (b) rationale, locked in for purge: the conditional bulk soft-delete AND the audit run
+        // BEFORE the mention cleaner, so a throwing cleaner can never leave a committed purge un-logged.
+        var channel = await CreateChannel(ChannelType.Public);
+        var message = await SeedMessage(channel.Id, "target#123", "spam");
+        _mentionCleaner.ThrowAfterCapture = true;
+
+        var captured = new List<string>();
+        var sink = new DelegatingLogSink(evt => captured.Add(evt.RenderMessage()));
+        var originalLogger = Serilog.Log.Logger;
+        var testLogger = new Serilog.LoggerConfiguration().MinimumLevel.Information().WriteTo.Sink(sink).CreateLogger();
+        Serilog.Log.Logger = testLogger;
+        try
+        {
+            Assert.ThrowsAsync<InvalidOperationException>(() => _chatHub.PurgeMessagesFromUser("target#123"));
+        }
+        finally
+        {
+            Serilog.Log.Logger = originalLogger;
+            testLogger.Dispose();
+        }
+
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNotNull(reloaded.Deleted, "the bulk soft-delete commits BEFORE the cleaner runs");
+        Assert.AreEqual(ModeratorBattleTag, reloaded.Deleted.By);
+        Assert.IsTrue(
+            captured.Any(l => l.Contains(ModeratorBattleTag) && l.Contains("target#123")),
+            "the purge audit line is logged BEFORE the cleaner throws (a committed action is never un-logged)");
     }
 
     [Test]
@@ -551,9 +888,21 @@ public class ChatHubDeletionTests : IntegrationTestBase
     {
         public List<IReadOnlyCollection<string>> Calls { get; } = new();
 
+        /// <summary>
+        /// When set, <see cref="RemoveForMessages"/> records the batch and THEN throws — simulating a
+        /// real (C6) cleaner that can fault, so tests can prove the audit-before-side-effects ordering
+        /// (directive (b)): the durable soft-delete + audit must already be committed before the cleaner
+        /// runs, so a throwing cleaner can never leave a committed moderation action un-logged.
+        /// </summary>
+        public bool ThrowAfterCapture { get; set; }
+
         public Task RemoveForMessages(IReadOnlyCollection<string> messageIds)
         {
             Calls.Add(messageIds);
+            if (ThrowAfterCapture)
+            {
+                throw new InvalidOperationException("simulated mention-cleaner failure");
+            }
             return Task.CompletedTask;
         }
     }
