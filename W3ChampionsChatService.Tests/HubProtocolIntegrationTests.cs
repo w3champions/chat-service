@@ -75,8 +75,6 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
     private ViewersAccumulator _viewersAccumulator;
-
-    private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
@@ -106,8 +104,6 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
-
-        _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -152,7 +148,6 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
     {
         var hub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             _reconcileService,
             _ticketStore,
             _sessionRegistry,

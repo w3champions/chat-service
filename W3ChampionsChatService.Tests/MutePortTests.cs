@@ -56,7 +56,6 @@ public class MutePortTests : IntegrationTestBase
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
     private ConnectionMapping _connectionMapping;
-    private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationTestHarness _reconcileHarness;
@@ -91,7 +90,6 @@ public class MutePortTests : IntegrationTestBase
         _time = new FakeTimeProvider(FixedNow);
 
         _connectionMapping = new ConnectionMapping();
-        _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileHarness = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository);
@@ -125,7 +123,6 @@ public class MutePortTests : IntegrationTestBase
     {
         var hub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             _reconcileHarness.Service,
             _ticketStore,
             _sessionRegistry,

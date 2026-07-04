@@ -31,7 +31,6 @@ public class ChatHubDeletionTests : IntegrationTestBase
     private Mock<IHubCallerClients> _clients;
     private Mock<HubCallerContext> _hubCallerContext;
     private ConnectionMapping _connectionMapping;
-    private ChatHistory _chatHistory;
     private Mock<IClientProxy> _mockAllProxy;
     private Mock<IClientProxy> _mockAllExceptProxy;
 
@@ -60,8 +59,6 @@ public class ChatHubDeletionTests : IntegrationTestBase
             .ReturnsAsync(new ChatUser(ModeratorBattleTag, true, "Admin", new ProfilePicture(), null, null));
 
         _connectionMapping = new ConnectionMapping();
-        _chatHistory = new ChatHistory();
-
         _channelRepository = new ChannelRepository(MongoClient);
         _messageRepository = new MessageRepository(MongoClient);
         _onlineMemberRegistry = new OnlineMemberRegistry();
@@ -90,7 +87,6 @@ public class ChatHubDeletionTests : IntegrationTestBase
 
         _chatHub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
             new TicketStore(),
             _sessionRegistry,
@@ -503,7 +499,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
     // and unresolvable channels excluded), the conditional bulk soft-delete (MarkDeletedMany), the
     // per-channel BulkMessagesDeletedDto delivered to FOCUSED viewers minus the target's connections,
     // the mention-inbox cleanup hook, and a PurgeMessagesResult(Ok, n) carrying the actual modified count.
-    // The ChatHistory-direct cluster below is still dropped by Task 7 and left verbatim.
+    // C4 Task 7 dropped the ChatHistory-direct test cluster that used to follow here (ChatHistory/
+    // ChatController/Message.cs are retired) — the durable equivalents above are the regression net.
     // -------------------------------------------------------------------------------------------------
 
     private async Task<ChatChannel> CreateSystemChannel(SystemChannelKind kind)
@@ -871,67 +868,6 @@ public class ChatHubDeletionTests : IntegrationTestBase
         // Allow for small time differences due to test execution time
         var timeDifference = Math.Abs((mute.endDate - endDateTime).TotalSeconds);
         Assert.IsTrue(timeDifference < 10, $"Expected end date to be close to {endDateTime}, but was {mute.endDate}");
-    }
-
-    [Test]
-    [TestCase("test#123", "Test message", "room1", Description = "Delete message from room1")]
-    [TestCase("user#456", "Another message", "room2", Description = "Delete message from room2")]
-    [TestCase("admin#789", "Admin message", "admin-room", Description = "Delete admin message")]
-    public void ChatHistory_DeleteMessage_ReturnsDeletedMessage(string battleTag, string messageText, string room)
-    {
-        // Arrange
-        var user = new ChatUser(battleTag, false, "Test", new ProfilePicture(), null, null);
-        var message = new ChatMessage(user, messageText);
-        _chatHistory.AddMessage(room, message);
-
-        // Act
-        var deletedMessage = _chatHistory.DeleteMessage(message.Id);
-
-        // Assert
-        Assert.IsNotNull(deletedMessage);
-        Assert.AreEqual(message.Id, deletedMessage.Id);
-        Assert.AreEqual(messageText, deletedMessage.Message);
-        Assert.AreEqual(battleTag, deletedMessage.User.BattleTag);
-        Assert.AreEqual(0, _chatHistory.GetMessages(room).Count);
-    }
-
-    [Test]
-    [TestCase("nonexistent-id")]
-    [TestCase("")]
-    [TestCase("invalid-guid")]
-    public void ChatHistory_DeleteMessage_NonExistentMessage_ReturnsNull(string messageId)
-    {
-        // Act
-        var deletedMessage = _chatHistory.DeleteMessage(messageId);
-
-        // Assert
-        Assert.IsNull(deletedMessage);
-    }
-
-    [Test]
-    public void ChatHistory_DeleteMessagesFromUser_ReturnsDeletedMessagesList()
-    {
-        // Arrange
-        var user1 = new ChatUser("test#123", false, "Test1", new ProfilePicture(), null, null);
-        var user2 = new ChatUser("other#456", false, "Test2", new ProfilePicture(), null, null);
-        var message1 = new ChatMessage(user1, "Message 1");
-        var message2 = new ChatMessage(user2, "Message 2");
-        var message3 = new ChatMessage(user1, "Message 3");
-
-        _chatHistory.AddMessage("room1", message1);
-        _chatHistory.AddMessage("room1", message2);
-        _chatHistory.AddMessage("room2", message3);
-
-        // Act
-        var deletedMessages = _chatHistory.DeleteMessagesFromUser("test#123");
-
-        // Assert
-        Assert.AreEqual(2, deletedMessages.Count);
-        Assert.IsTrue(deletedMessages.Any(m => m.Id == message1.Id));
-        Assert.IsTrue(deletedMessages.Any(m => m.Id == message3.Id));
-        Assert.AreEqual(1, _chatHistory.GetMessages("room1").Count);
-        Assert.AreEqual("other#456", _chatHistory.GetMessages("room1")[0].User.BattleTag);
-        Assert.AreEqual(0, _chatHistory.GetMessages("room2").Count);
     }
 
     /// <summary>

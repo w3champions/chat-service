@@ -21,7 +21,6 @@ namespace W3ChampionsChatService.Chats;
 
 public partial class ChatHub(
     ConnectionMapping connections,
-    ChatHistory chatHistory,
     MuteReconciliationService muteReconciliation,
     ITicketStore ticketStore,
     ISessionRegistry sessionRegistry,
@@ -60,7 +59,6 @@ public partial class ChatHub(
     IMentionInboxCleaner mentionInboxCleaner) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
-    private readonly ChatHistory _chatHistory = chatHistory;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly ITicketStore _ticketStore = ticketStore;
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
@@ -222,8 +220,9 @@ public partial class ChatHub(
     /// the delete to).</item>
     /// <item><see cref="Messages.MessageRepository.Load"/>; missing → <see cref="ChatResultCode.NotFound"/>.</item>
     /// <item>Resolve the message's channel and enforce the SHARED moderation scope wall (spec §10 + plan
-    /// D5): single-delete uses the EXACT SAME <see cref="IsPurgeableChannel"/> include-list as the
-    /// cross-channel <see cref="PurgeMessagesFromUser"/> sweep — <see cref="ChannelType.Public"/>,
+    /// D5): single-delete uses the EXACT SAME <see cref="ChannelModeration.IsModeratable"/> include-list as
+    /// the cross-channel <see cref="PurgeMessagesFromUser"/> sweep (C4 Task 7: also shared with the REST
+    /// moderation-history endpoint) — <see cref="ChannelType.Public"/>,
     /// <see cref="ChannelType.SemiPublic"/>, and <see cref="ChannelType.System"/> with
     /// <see cref="SystemChannelKind.Match"/>. Everything else — <see cref="ChannelType.Dm"/>/
     /// <see cref="ChannelType.GroupDm"/>, System+<see cref="SystemChannelKind.Clan"/>/
@@ -269,11 +268,13 @@ public partial class ChatHub(
         }
 
         // 3. Moderation scope wall (spec §10 + plan D5): single-delete shares the SAME include-list as the
-        // cross-channel purge — Public / SemiPublic / System+Match ONLY, via the one IsPurgeableChannel
-        // predicate. So a moderator never touches DM/GroupDm, clan, or lobby content, and any unresolvable
-        // channel is rejected fail-closed (we cannot prove it is in scope). Nothing is deleted on rejection.
+        // cross-channel purge — Public / SemiPublic / System+Match ONLY, via the one
+        // ChannelModeration.IsModeratable predicate (C4 Task 7: also shared with the REST moderation
+        // history endpoint, Messages/ModerationHistoryController.cs). So a moderator never touches
+        // DM/GroupDm, clan, or lobby content, and any unresolvable channel is rejected fail-closed (we
+        // cannot prove it is in scope). Nothing is deleted on rejection.
         var channel = await _channelRepository.Load(message.ChannelId);
-        if (channel == null || !IsPurgeableChannel(channel))
+        if (channel == null || !ChannelModeration.IsModeratable(channel))
         {
             return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }
@@ -368,7 +369,7 @@ public partial class ChatHub(
         // channel is unresolvable (no doc) is absent from eligibleChannelIds → dropped fail-closed.
         var distinctChannelIds = targets.Select(t => t.ChannelId).Distinct().ToList();
         var channels = await _channelRepository.LoadByIds(distinctChannelIds);
-        var eligibleChannelIds = channels.Where(IsPurgeableChannel).Select(c => c.Id).ToHashSet();
+        var eligibleChannelIds = channels.Where(ChannelModeration.IsModeratable).Select(c => c.Id).ToHashSet();
 
         var eligibleTargets = targets.Where(t => eligibleChannelIds.Contains(t.ChannelId)).ToList();
         if (eligibleTargets.Count == 0)
@@ -410,19 +411,6 @@ public partial class ChatHub(
 
         return new PurgeMessagesResult(ChatResultCode.Ok, (int)modifiedCount);
     }
-
-    /// <summary>
-    /// The pinned purge privacy + scope wall (D6): the include-list is EXACTLY three channel shapes —
-    /// <see cref="ChannelType.Public"/>, <see cref="ChannelType.SemiPublic"/>, and
-    /// <see cref="ChannelType.System"/> with <see cref="SystemChannelKind.Match"/>. Everything else
-    /// (DM, GroupDm, System+Clan, System+Lobby) is NOT purgeable — a moderator never touches private or
-    /// out-of-scope content. Kept as a single predicate so the wall can never drift between the
-    /// filter and any future caller.
-    /// </summary>
-    private static bool IsPurgeableChannel(ChatChannel channel) =>
-        channel.Type == ChannelType.Public
-        || channel.Type == ChannelType.SemiPublic
-        || (channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match);
 
     [UserHasPermission(EPermission.Moderation)]
     public async Task BanUser(string battleTag, string reason, bool isShadowBan, string endDate)

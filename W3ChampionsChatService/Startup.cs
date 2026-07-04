@@ -56,7 +56,7 @@ public class Startup
         services.AddTransient<UserHasPermissionFilter>();
         services.AddTransient<ChatHubPermissionFilter>();
 
-        // C1 chat domain foundation (additive — old hub keeps running on ChatHistory)
+        // C1 chat domain foundation
         services.AddTransient<ChannelRepository>();
         services.AddTransient<MembershipRepository>();
         services.AddTransient<MessageRepository>();
@@ -139,7 +139,6 @@ public class Startup
         services.AddSingleton<ChannelCreationRateLimiter>();
 
         services.AddSingleton<ConnectionMapping>();
-        services.AddSingleton<ChatHistory>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();

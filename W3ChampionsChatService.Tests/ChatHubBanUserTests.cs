@@ -64,7 +64,6 @@ public class ChatHubBanUserTests : IntegrationTestBase
 
         _chatHub = new ChatHub(
             _connectionMapping,
-            new ChatHistory(),
             _reconcileHarness.Service,
             new TicketStore(),
             _sessionRegistry,

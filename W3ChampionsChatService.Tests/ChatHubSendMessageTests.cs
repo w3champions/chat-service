@@ -42,7 +42,6 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     private static readonly DateTimeOffset FixedNow = new(2026, 6, 1, 12, 0, 0, TimeSpan.Zero);
 
     private ConnectionMapping _connectionMapping;
-    private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationTestHarness _reconcileHarness;
@@ -74,7 +73,6 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         _time = new FakeTimeProvider(FixedNow);
 
         _connectionMapping = new ConnectionMapping();
-        _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileHarness = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository);
@@ -109,7 +107,6 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     {
         var hub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             _reconcileHarness.Service,
             _ticketStore,
             _sessionRegistry,

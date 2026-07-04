@@ -45,7 +45,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private TicketStore _ticketStore;
     private SessionRegistry _sessionRegistry;
     private ConnectionMapping _connectionMapping;
-    private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
@@ -74,7 +73,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _ticketStore = new TicketStore();
         _sessionRegistry = new SessionRegistry();
         _connectionMapping = new ConnectionMapping();
-        _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -108,7 +106,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
     {
         var hub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             _reconcileService,
             _ticketStore,
             _sessionRegistry,

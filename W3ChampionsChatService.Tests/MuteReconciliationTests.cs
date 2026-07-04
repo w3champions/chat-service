@@ -64,7 +64,6 @@ public class MuteReconciliationTests : IntegrationTestBase
         _sessionRegistry = new SessionRegistry();
         _chatHub = new ChatHub(
             _connectionMapping,
-            new ChatHistory(),
             _harness.Service,
             new TicketStore(),
             _sessionRegistry,

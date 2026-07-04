@@ -36,7 +36,6 @@ public class ChatHubMembershipTests : IntegrationTestBase
     private const string BattleTag = "peter#123";
 
     private ConnectionMapping _connectionMapping;
-    private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
@@ -56,7 +55,6 @@ public class ChatHubMembershipTests : IntegrationTestBase
     public void SetupBeforeEach()
     {
         _connectionMapping = new ConnectionMapping();
-        _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -88,7 +86,6 @@ public class ChatHubMembershipTests : IntegrationTestBase
     {
         var hub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             _reconcileService,
             _ticketStore,
             _sessionRegistry,

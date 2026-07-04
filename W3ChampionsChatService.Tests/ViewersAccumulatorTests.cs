@@ -246,7 +246,6 @@ public class ViewersAccumulatorTests : IntegrationTestBase
     private SessionRegistry _sessionRegistry;
     private MessageRateLimiter _messageRateLimiter;
     private ConnectionMapping _connectionMapping;
-    private ChatHistory _chatHistory;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
@@ -271,7 +270,6 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         _sessionRegistry = new SessionRegistry();
         _messageRateLimiter = new MessageRateLimiter();
         _connectionMapping = new ConnectionMapping();
-        _chatHistory = new ChatHistory();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -299,7 +297,6 @@ public class ViewersAccumulatorTests : IntegrationTestBase
     {
         var hub = new ChatHub(
             _connectionMapping,
-            _chatHistory,
             _reconcileService,
             _ticketStore,
             _sessionRegistry,
