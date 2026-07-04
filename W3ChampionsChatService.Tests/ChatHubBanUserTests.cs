@@ -89,7 +89,10 @@ public class ChatHubBanUserTests : IntegrationTestBase
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
             new DmInitiationTracker(),
-            chatAuthService.Object);
+            chatAuthService.Object,
+            MentionFanOutTestFactory.CreateIgnored(MongoClient),
+            new PresenceInterestRegistry(),
+            new MentionInboxRepository(MongoClient));
 
         _clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

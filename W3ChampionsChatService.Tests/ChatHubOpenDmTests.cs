@@ -128,7 +128,10 @@ public class ChatHubOpenDmTests : IntegrationTestBase
             _relationshipProvider,
             _userSettings,
             _dmInitiationTracker,
-            _authService.Object);
+            _authService.Object,
+            MentionFanOutTestFactory.CreateIgnored(MongoClient),
+            new PresenceInterestRegistry(),
+            new MentionInboxRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);

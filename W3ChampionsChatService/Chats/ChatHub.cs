@@ -78,7 +78,21 @@ public partial class ChatHub(
     // into both AssembleAndSeed (SessionState flair) and the connect-time directory upsert (which needs
     // FreshFromWb to decide whether it may replace the cached Profile) — one wb round-trip serves both,
     // where the pre-D9 path resolved it twice.
-    IChatAuthenticationService chatAuthenticationService) : Hub
+    IChatAuthenticationService chatAuthenticationService,
+    // C6 (Task 5, D3/D4): the mention fan-out. SendMessage's step 7.75 (ChatHub.Messaging.cs) hands it
+    // the validated mention-tag list for each persisted, NON-shadow message; per eligible member it
+    // writes a mention-inbox entry + a targeted MentionNotified push. Singleton (Startup).
+    MentionFanOut mentionFanOut,
+    // C6 (Task 5, D15): the presence-interest index, injected NOW purely so this ctor grows EXACTLY
+    // ONCE — a single sweep of every test construction site (the C5 D19 single-ctor-growth discipline)
+    // instead of two. There is NO T5 consumer: Task 9 is the first to derive/emit presence interest
+    // from it. Singleton (Startup).
+    PresenceInterestRegistry presenceInterestRegistry,
+    // C6 (Task 6): the mention-inbox store backing the read/ack surface (GetMentionInbox /
+    // MarkMentionsRead / MentionUnreadCount), injected now in the SAME single ctor growth. There is NO
+    // T5 consumer — the write path uses MentionFanOut's OWN MentionInboxRepository, not this one; Task 6
+    // is the first reader.
+    MentionInboxRepository mentionInboxRepository) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
@@ -112,6 +126,14 @@ public partial class ChatHub(
     private readonly DmInitiationTracker _dmInitiationTracker = dmInitiationTracker;
     // D9 (C6 Task 3): the hoisted chat-flair resolution — see the constructor param doc comment above.
     private readonly IChatAuthenticationService _chatAuthenticationService = chatAuthenticationService;
+    // C6 (Task 5): the mention fan-out seam consumed by SendMessage's step 7.75 (ChatHub.Messaging.cs).
+    private readonly MentionFanOut _mentionFanOut = mentionFanOut;
+    // C6 (Task 5, D15): injected now, first CONSUMED in Task 9 (presence-interest derivation). No T5
+    // reader — see the ctor param doc comment for why it lands in this single ctor growth.
+    private readonly PresenceInterestRegistry _presenceInterestRegistry = presenceInterestRegistry;
+    // C6 (Task 6): the mention-inbox read/ack store — first CONSUMED in Task 6. No T5 reader — see the
+    // ctor param doc comment (the write path uses MentionFanOut's own repository, not this field).
+    private readonly MentionInboxRepository _mentionInboxRepository = mentionInboxRepository;
 
     public override async Task OnConnectedAsync()
     {

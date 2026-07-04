@@ -253,6 +253,24 @@ public partial class ChatHub
             await MaterializeDmRecipientAndNotify(channel, session.Identity.BattleTag, now);
         }
 
+        // 7.75 Mention fan-out (C6 Task 5, D3/D4). Runs AFTER the Dm recipient is materialized (7.5) — so
+        // a first-message Dm mention of the counterpart finds their just-created membership row — and
+        // BEFORE the C3 fan-out seam (8). SKIPPED ENTIRELY (zero cost) when the message is shadow — a
+        // shadow sender's mentions must notify NOBODY, the shadow illusion (the C3 fan-out below already
+        // routes a shadow message to its author only) — or when there are no validated mention tags (the
+        // common case: `mentionTags` came from the step-5.25 gate, empty for a message with no `<@…>`
+        // markup, so the hot path pays nothing). For each ELIGIBLE target (D3: not the sender; an actual
+        // member of THIS channel — the Dm/GroupDm excerpt PRIVACY WALL; NotificationLevel != None)
+        // NotifyAsync writes a mention-inbox entry (expiry via ExpiryCalculator.ForMentionInboxEntry — the
+        // C1-amendment-1 wiring, 30d and always <= the message TTL) and pushes a targeted MentionNotified.
+        // Per-target fault isolation lives inside NotifyAsync (mirrors FanOutEngine's idiom), so a dead
+        // target socket or a single failed insert never turns this already-persisted send's Ok ack into an
+        // error, nor blocks the other targets.
+        if (!isShadow && mentionTags.Count > 0)
+        {
+            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
+        }
+
         // 8. Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
         // delivery + shadow-author-only routing, then unfocused level-All members are routed to the
         // ActivityCoalescer. `now` is threaded in (not re-read) so the whole send — rate limit, persist,

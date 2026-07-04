@@ -132,6 +132,17 @@ public class Startup
         // routing; the flush machinery + the sibling accumulator singleton stay Task 15's).
         services.AddSingleton<FanOutEngine>();
 
+        // C6 (Task 5, D4/D15): the mention fan-out seam. Singleton — it holds no per-call state and is
+        // shared by every hub invocation (mirrors FanOutEngine); it pushes MentionNotified through its own
+        // IHubContext<ChatHub> and reads/writes the durable membership + mention-inbox stores.
+        services.AddSingleton<MentionFanOut>();
+
+        // C6 (Task 5, D11/D15): the presence-interest index. Registered NOW (with the ctor growth) so
+        // ChatHub resolves; its FIRST consumer is Task 9. Singleton — it will hold the shared in-memory
+        // presence-interest state (connection focus → watched members) every hub invocation mutates; a
+        // transient would fragment it exactly like the other fan-out registries above.
+        services.AddSingleton<PresenceInterestRegistry>();
+
         // Task 15: the single production driver behind the Task 13/14 aggregators. Hosted service — its
         // 1s PeriodicTimer is the ONLY thing that calls FlushDue in production, draining the coalescer
         // (10s) and the accumulator (5s) on the injected TimeProvider clock. Without it the pure,

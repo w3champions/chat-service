@@ -59,6 +59,11 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
+    // C6 Task 5: a REAL MentionFanOut wired to a capture harness so the end-to-end mention tests below
+    // can assert the durable inbox entries (Mongo) AND the targeted MentionNotified pushes (harness).
+    private MentionInboxRepository _mentionInboxRepository;
+    private MentionFanOut _mentionFanOut;
+    private HubPushCaptureHarness _mentionPushHarness;
     private FakeTimeProvider _time;
 
     // Every (method, payload) the hub pushed to Clients.Caller, in order (for the ThrottleNotice assert).
@@ -93,6 +98,13 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         _messageRateLimiter = new MessageRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
+        _mentionPushHarness = new HubPushCaptureHarness();
+        _mentionInboxRepository = new MentionInboxRepository(MongoClient);
+        _mentionFanOut = new MentionFanOut(
+            _mentionPushHarness.HubContext,
+            _sessionRegistry,
+            _membershipRepository,
+            _mentionInboxRepository);
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -125,7 +137,10 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
             new DmInitiationTracker(),
-            _authService.Object);
+            _authService.Object,
+            _mentionFanOut,
+            new PresenceInterestRegistry(),
+            _mentionInboxRepository);
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();
@@ -536,5 +551,148 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         var persisted = await _messageRepository.Load(result.MessageId);
         Assert.IsNotNull(persisted);
         Assert.IsFalse(persisted.Shadow);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C6 Task 5 — mention fan-out (D3/D4), end-to-end through the SendMessage pipeline. These exercise
+    // the step-7.75 call site (validated mention list → MentionFanOut → durable entry + targeted event),
+    // the shadow call-site skip, focus-irrelevance, and the sender-ack fault isolation. The per-rule
+    // eligibility boundary is covered directly in MentionFanOutTests.
+    // ---------------------------------------------------------------------------------------------
+
+    private static string Mention(string tag) => $"<@{tag}>";
+
+    // Directory row → the step-5.25 validation gate resolves the mention (resolvability-only).
+    private Task SeedDirectory(string battleTag) =>
+        _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = battleTag,
+            DisplayBattleTag = battleTag,
+            NormalizedName = battleTag.ToLowerInvariant(),
+            LastSeenAt = Now,
+        });
+
+    // Durable channel_memberships row → the D3c (membership wall) + D3d (level) eligibility source.
+    private Task SeedDurableMembership(string channelId, string battleTag, NotificationLevel level) =>
+        _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channelId,
+            BattleTag = battleTag,
+            NotificationLevel = level,
+            JoinedAt = Now,
+        });
+
+    // A fully-eligible, ONLINE mention target: a live session (GetByBattleTag → live push), directory
+    // resolvability (validation), and a durable membership row (eligibility). NOT focused by default.
+    private async Task SeedMentionTarget(string connectionId, string battleTag, string channelId, NotificationLevel level = NotificationLevel.All)
+    {
+        RegisterSession(connectionId, battleTag);
+        await SeedDirectory(battleTag);
+        await SeedDurableMembership(channelId, battleTag, level);
+    }
+
+    [Test]
+    public async Task Mention_UnfocusedMember_InboxEntryCreated_AndTargetedMentionNotified()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);                    // sender peter#123
+        await SeedMentionTarget("conn-2", "wolf#456", channel.Id);      // mentioned target — NOT focused
+        await SeedMentionTarget("conn-3", "frank#789", channel.Id);     // a THIRD member — focused, NOT mentioned
+        _focusRegistry.Focus("conn-3", channel.Id, "frank#789");
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention("wolf#456")} you around?");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+
+        // Durable entry for the mentioned member (lowercased key), carrying the message ref.
+        var wolfInbox = await _mentionInboxRepository.LoadForUser("wolf#456");
+        Assert.AreEqual(1, wolfInbox.Count, "the mentioned member gets exactly one inbox entry");
+        var entry = wolfInbox[0];
+        Assert.AreEqual(channel.Id, entry.ChannelId);
+        Assert.AreEqual(result.MessageId, entry.MessageId);
+        Assert.AreEqual(result.Seq, entry.Seq);
+        Assert.IsNotNull(entry.ExpiresAt);
+        Assert.That((entry.ExpiresAt.Value - (Now + TimeSpan.FromDays(30))).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
+            "mention entry expiry is CreatedAt + 30d");
+
+        // Targeted event, ONLY to the mentioned member's connection, carrying the entry id.
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
+        var dto = (MentionNotifiedDto)_mentionPushHarness.PayloadFor("conn-2", ChatEvents.MentionNotified);
+        Assert.AreEqual(entry.Id, dto.EntryId, "the event carries the just-inserted entry id (insert-before-push)");
+        Assert.AreEqual(result.MessageId, dto.MessageId);
+        Assert.AreEqual(result.Seq, dto.Seq);
+
+        // The third (focused, un-mentioned) member captures ZERO MentionNotified and has no entry.
+        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-3", ChatEvents.MentionNotified),
+            "a third focused member who was NOT mentioned must capture zero MentionNotified — targeting is exact, never a broadcast");
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("frank#789"));
+    }
+
+    [Test]
+    public async Task Mention_FocusedMember_EntryAndEventStillCreated()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);
+        await SeedMentionTarget("conn-2", "wolf#456", channel.Id);
+        _focusRegistry.Focus("conn-2", channel.Id, "wolf#456");         // the mentioned member IS focused
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, $"look here {Mention("wolf#456")}");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("wolf#456")).Count,
+            "a focused member STILL gets an inbox entry — the server never guesses 'seen' (create-then-client-ack)");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified),
+            "a focused member STILL gets the MentionNotified event — focus does not suppress mentions (unlike C3 activity)");
+    }
+
+    [Test]
+    public async Task ShadowSender_MentionsOthers_NoEntriesNoEvents_MessagePersistedFlagged()
+    {
+        var channel = await CreateChannel("W3C Lounge");
+        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Shadow, muteEnd: Now.AddDays(1));
+        // wolf WOULD be eligible (durable member, online, resolvable) if not for the shadow skip.
+        await SeedMentionTarget("conn-2", "wolf#456", channel.Id);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention("wolf#456")}");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "a shadow sender still gets the Ok illusion");
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsTrue(persisted.Shadow, "the message persists flagged Shadow=true");
+
+        // The shadow guardrail (T7 re-asserts this inside C4's suite): literally zero entries + zero
+        // events for ANYONE — a shadow sender's mentions must break neither the shadow illusion.
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("wolf#456"), "a shadow sender's mention creates NO inbox entry");
+        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified), "and NO MentionNotified");
+        Assert.IsEmpty(_mentionPushHarness.AllSignals, "a shadow message must notify literally nobody");
+    }
+
+    [Test]
+    public async Task Mention_DeadTargetSocket_SenderAckStillOk_OtherTargetsDelivered()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);
+        await SeedMentionTarget("conn-2", "wolf#456", channel.Id);      // this socket throws on push
+        await SeedMentionTarget("conn-3", "frank#789", channel.Id);     // healthy
+        _mentionPushHarness.ThrowOnSend("conn-2");
+        var hub = BuildHub("conn-1");
+
+        // Mention order is wolf then frank (first-occurrence) — wolf's push throws, frank's must still land.
+        var result = await hub.SendMessage(channel.Id, $"{Mention("wolf#456")} {Mention("frank#789")}");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code,
+            "a dead target socket must NOT turn the sender's already-persisted send into an error");
+
+        // wolf: entry created (insert precedes the throwing push), but no captured event.
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("wolf#456")).Count,
+            "the dead-socket target still gets its durable entry (insert-before-push)");
+        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
+        // frank: unaffected — entry + event delivered.
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("frank#789")).Count,
+            "the OTHER target is unaffected by the dead socket — entry delivered");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-3", ChatEvents.MentionNotified),
+            "the OTHER target is unaffected by the dead socket — event delivered");
     }
 }

@@ -232,6 +232,34 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void MentionFanOut_IsSingleton_SharedAcrossResolutions()
+    {
+        // C6 Task 5 (D4/D15): the mention fan-out seam is shared by every hub invocation (it pushes
+        // MentionNotified through its own IHubContext<ChatHub> and reads/writes the durable membership +
+        // mention-inbox stores). Registered alongside — and mirroring — FanOutEngine.
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<MentionFanOut>();
+        var second = provider.GetRequiredService<MentionFanOut>();
+
+        Assert.AreSame(first, second, "MentionFanOut MUST be a singleton (mirrors FanOutEngine)");
+    }
+
+    [Test]
+    public void PresenceInterestRegistry_IsSingleton_SharedAcrossResolutions()
+    {
+        // C6 Task 5 (D11/D15): registered NOW (with the single ctor growth) so the ChatHub graph resolves;
+        // its FIRST consumer is Task 9. Singleton — it will hold the shared in-memory presence-interest
+        // state every hub invocation mutates; a transient would fragment it like the other fan-out registries.
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<PresenceInterestRegistry>();
+        var second = provider.GetRequiredService<PresenceInterestRegistry>();
+
+        Assert.AreSame(first, second, "PresenceInterestRegistry MUST be a singleton");
+    }
+
+    [Test]
     public void ViewersAccumulator_IsSingleton_SharedAcrossResolutions()
     {
         using var provider = BuildProvider();

@@ -104,7 +104,10 @@ public class ChatHubMembershipTests : IntegrationTestBase
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
             new DmInitiationTracker(),
-            _authService.Object);
+            _authService.Object,
+            MentionFanOutTestFactory.CreateIgnored(MongoClient),
+            new PresenceInterestRegistry(),
+            new MentionInboxRepository(MongoClient));
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

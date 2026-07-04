@@ -105,7 +105,10 @@ public class ChatHubDeletionTests : IntegrationTestBase
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
             new DmInitiationTracker(),
-            chatAuthenticationService.Object);
+            chatAuthenticationService.Object,
+            MentionFanOutTestFactory.CreateIgnored(MongoClient),
+            new PresenceInterestRegistry(),
+            new MentionInboxRepository(MongoClient));
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);
