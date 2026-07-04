@@ -93,7 +93,8 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
             _messageRepository,
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)

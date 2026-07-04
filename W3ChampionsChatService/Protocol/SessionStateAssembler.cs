@@ -8,6 +8,7 @@ using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 
@@ -37,7 +38,9 @@ public class SessionStateAssembler(
     MessageRepository messageRepository,
     IMuteRepository muteRepository,
     OnlineMemberRegistry onlineMemberRegistry,
-    ConnectionMapping connectionMapping)
+    ConnectionMapping connectionMapping,
+    // C6 (Task 6, D6): backs the real MentionUnreadCount below (replaces the C3 hardcoded-0 stub).
+    MentionInboxRepository mentionInboxRepository)
 {
     // The only EPermission values the client is ever told about (explicit allow-list — see
     // OwnProfileDto's boundary-privacy doc). Extend deliberately, one at a time, as new
@@ -87,11 +90,16 @@ public class SessionStateAssembler(
             channelDtos.Add(await ToChannelDto(channelsById[membership.ChannelId], membership, identity.BattleTag));
         }
 
+        // C6 (Task 6, D6): the live unread-mention count — CountUnread(ReadAt == null). identity.BattleTag
+        // is passed straight through (JWT-cased); the repository normalizes it to the lowercased
+        // mention-inbox key convention internally (mirrors MembershipRepository's call sites above).
+        var mentionUnreadCount = await mentionInboxRepository.CountUnread(identity.BattleTag);
+
         var dto = new SessionStateDto(
             Channels: channelDtos,
             PublicCatalog: effectivePublicCatalog,
             PendingDmRequests: BuildPendingDmTray(channelBackedMemberships, channelsById, identity.BattleTag, now),
-            MentionUnreadCount: 0,
+            MentionUnreadCount: (int)mentionUnreadCount,
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
 

@@ -111,7 +111,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _messageRepository,
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            _mentionInboxRepository);
     }
 
     private ChatHub BuildHub(string connectionId)

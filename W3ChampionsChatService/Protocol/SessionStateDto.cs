@@ -20,7 +20,9 @@ namespace W3ChampionsChatService.Protocol;
 /// entry per PENDING 1:1 Dm the connecting user is the RECIPIENT of (never the initiator's own outgoing
 /// requests), minus any the recipient has decline-suppressed within the 24h window; the same
 /// pending-recipient channels ALSO ride <see cref="Channels"/> (D4 dual-listing). <see cref="MentionUnreadCount"/>
-/// remains a C3 stub (zero) until the mention-inbox feature lands.
+/// (C6 Task 6, D6) is the live count of the caller's OWN unread <c>mention_inbox</c> entries
+/// (<c>ReadAt == null</c>) — <see cref="SessionStateAssembler"/> reads it via
+/// <see cref="Mentions.MentionInboxRepository.CountUnread"/> on every (re)connect.
 /// </summary>
 public record SessionStateDto(
     IReadOnlyList<ChannelDto> Channels,

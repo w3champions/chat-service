@@ -9,6 +9,7 @@ using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
@@ -30,6 +31,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     private MuteRepository _muteRepository;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private ConnectionMapping _connectionMapping;
+    private MentionInboxRepository _mentionInboxRepository;
     private SessionStateAssembler _assembler;
 
     [SetUp]
@@ -41,6 +43,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         _muteRepository = new MuteRepository(MongoClient);
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _connectionMapping = new ConnectionMapping();
+        _mentionInboxRepository = new MentionInboxRepository(MongoClient);
 
         // D9: AssembleAndSeed no longer resolves the ChatUser itself — the caller (ChatHub, hoisted)
         // hands it the already-resolved chatUser. ChatUserFor below stands in for what the mocked
@@ -51,7 +54,8 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             _messageRepository,
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            _mentionInboxRepository);
     }
 
     private static W3CUserAuthentication Identity(string battleTag, string name = null, bool isAdmin = false, params EPermission[] perms) =>
@@ -582,5 +586,60 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         // (which scans ConnectionMapping's _users map) can now reach this connection.
         var reachable = _connectionMapping.GetConnectionIdsForUser(bannedIdentity.BattleTag);
         Assert.Contains("conn-z", reachable);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C6 T6 (D6): MentionUnreadCount goes from the hardcoded-0 stub to a REAL
+    // CountUnread(ReadAt == null) read off the mention_inbox collection.
+    // ---------------------------------------------------------------------------------------------
+
+    private static MentionInboxEntry NewMentionEntry(string battleTag, DateTime createdAt) => new()
+    {
+        BattleTag = battleTag.ToLowerInvariant(),
+        ChannelId = "chan-1",
+        MessageId = Guid.NewGuid().ToString(),
+        AuthorBattleTag = "author#1",
+        AuthorName = "Author",
+        Excerpt = "hey",
+        CreatedAt = createdAt,
+        ExpiresAt = createdAt.AddDays(30),
+    };
+
+    [Test]
+    public async Task SessionState_MentionUnreadCount_CountsUnreadOnly_ZeroWhenEmpty()
+    {
+        var identity = Identity("Peter#123");
+        var now = DateTime.UtcNow;
+
+        // Nobody's mention inbox has any entries yet — zero, not an exception.
+        var (emptyDto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", now, ChatUserFor(identity));
+        Assert.AreEqual(0, emptyDto.MentionUnreadCount);
+
+        // Two unread + one already-read entry for this SAME viewer — only the unread ones count.
+        await _mentionInboxRepository.Insert(NewMentionEntry(identity.BattleTag, now));
+        await _mentionInboxRepository.Insert(NewMentionEntry(identity.BattleTag, now));
+        var readEntry = NewMentionEntry(identity.BattleTag, now);
+        readEntry.ReadAt = now;
+        await _mentionInboxRepository.Insert(readEntry);
+
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-2", now, ChatUserFor(identity));
+        Assert.AreEqual(2, dto.MentionUnreadCount, "only ReadAt == null entries count toward the unread badge");
+    }
+
+    [Test]
+    public async Task MentionUnreadCount_UsesLowercasedKey()
+    {
+        // The mention-inbox entry is stored LOWERCASED (C6 T5 convention); the connecting identity
+        // carries its ORIGINAL (often mixed/upper) JWT casing. CountUnread must normalize internally
+        // (mirroring MembershipRepository's convention) so the count still finds the stored row.
+        const string storedLower = "peter#123";
+        var identity = Identity("PETER#123");
+        var now = DateTime.UtcNow;
+        await _mentionInboxRepository.Insert(NewMentionEntry(storedLower, now));
+
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", now, ChatUserFor(identity));
+
+        Assert.AreEqual(1, dto.MentionUnreadCount,
+            "CountUnread must normalize the identity's casing to match the lowercased stored key");
     }
 }

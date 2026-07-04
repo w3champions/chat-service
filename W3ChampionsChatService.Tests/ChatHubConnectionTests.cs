@@ -105,7 +105,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
     }
 
     private static W3CUserAuthentication Identity(string battleTag = BattleTag, string name = "peter", bool isAdmin = false) =>

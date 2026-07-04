@@ -102,7 +102,8 @@ public class ChatHubOpenDmTests : IntegrationTestBase
             _messageRepository,
             new MuteRepository(MongoClient),
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)

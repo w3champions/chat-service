@@ -127,7 +127,8 @@ public class ModerationIntegrationTests : IntegrationTestBase
             _messageRepository,
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            _mentionInboxRepository);
 
         // The three fan-out sinks ALL push through the ONE shared harness and read the SHARED registries
         // the hubs mutate, so every push lands in a single ordered capture.

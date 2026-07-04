@@ -79,7 +79,8 @@ public class ChatHubFocusTests : IntegrationTestBase
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)

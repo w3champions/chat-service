@@ -111,6 +111,12 @@ public class OldProtocolRemovedTests
             "RemoveGroupMember",
             "PromoteOwner",
             "RenameGroup",
+            // New protocol (C6 T6): the mention-inbox read/ack surface — GetMentionInbox/
+            // MarkMentionsRead/MarkAllMentionsRead (ChatHub.Mentions.cs). Widens the pinned set,
+            // never weakens it — same precedent as every C5 growth above.
+            "GetMentionInbox",
+            "MarkMentionsRead",
+            "MarkAllMentionsRead",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",

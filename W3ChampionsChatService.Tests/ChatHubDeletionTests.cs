@@ -82,7 +82,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _messageRepository,
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
 
         _chatHub = new ChatHub(
             _connectionMapping,

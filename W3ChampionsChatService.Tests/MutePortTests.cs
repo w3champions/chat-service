@@ -117,7 +117,8 @@ public class MutePortTests : IntegrationTestBase
     // ── Hub construction ─────────────────────────────────────────────────────────
 
     private SessionStateAssembler NewAssembler(IMuteRepository muteRepository) =>
-        new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _onlineMemberRegistry, _connectionMapping);
+        new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _onlineMemberRegistry, _connectionMapping,
+            new MentionInboxRepository(MongoClient));
 
     private ChatHub NewHub(SessionStateAssembler assembler, ViewersAccumulator viewers, IHubCallerClients clients, HubCallerContext context)
     {

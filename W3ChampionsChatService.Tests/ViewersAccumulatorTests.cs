@@ -289,7 +289,8 @@ public class ViewersAccumulatorTests : IntegrationTestBase
             new MessageRepository(MongoClient),
             _muteRepository,
             _onlineMemberRegistry,
-            _connectionMapping);
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)
