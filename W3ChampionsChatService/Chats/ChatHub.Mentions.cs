@@ -147,18 +147,28 @@ public partial class ChatHub
     /// <para>
     /// PRIVATE-LANE SCOPING (<see cref="ChannelType.Dm"/>/<see cref="ChannelType.GroupDm"/> ONLY): every
     /// tier's universe is additionally restricted to the channel's actual DURABLE member set, resolved
-    /// via ONE <see cref="Memberships.MembershipRepository.LoadForChannel"/> read — a non-member is never
-    /// offered as an autocomplete target inside a private conversation (Task 5 already ensures mentioning
-    /// a non-member never actually notifies them; this closes the matching UI-noise gap). Public/
+    /// via <see cref="Memberships.MembershipRepository.LoadForChannel"/> — a non-member is never offered
+    /// as an autocomplete target inside a private conversation (Task 5 already ensures mentioning a
+    /// non-member never actually notifies them; this closes the matching UI-noise gap). Public/
     /// SemiPublic/System search the full, unrestricted universe (no such read is made for them).
+    /// Tier 3 is resolved DIFFERENTLY in a private lane: rather than the generic UNSCOPED
+    /// <see cref="Users.UserDirectoryRepository.SearchByNormalizedPrefix"/> (whose own Mongo-side cap
+    /// could otherwise let unrelated directory noise crowd out a genuine member's row before it is ever
+    /// fetched — a real member must never be starved out of their own private lane's search), the member
+    /// set's directory rows are loaded ONCE up front (<see cref="Users.UserDirectoryRepository.LoadMany"/>)
+    /// and the prefix/90d filters are applied to that already-known, bounded set in memory instead.
     /// </para>
     /// <para>
-    /// ENRICHMENT: the whole assembled (deduped, capped) candidate list is enriched via ONE
-    /// <see cref="Users.UserDirectoryRepository.LoadMany"/> batch read — never a per-candidate lookup,
-    /// never a website-backend call. A candidate with no directory row (or a row with no cached
-    /// <see cref="ChatProfile"/> yet) degrades gracefully: <c>Profile</c> stays null and <c>Name</c> is
-    /// still derived from the candidate's own battleTag (the same <c>tag.Split('#')[0]</c> convention
-    /// <see cref="ChatUser"/> uses) — never an error, never an exclusion.
+    /// ENRICHMENT: the whole assembled (deduped, capped) candidate list is enriched with display name,
+    /// full battleTag, and cached profile. For Public/SemiPublic/System this is ONE additional
+    /// <see cref="Users.UserDirectoryRepository.LoadMany"/> batch read over the final candidate list; for
+    /// a private lane the member-directory snapshot loaded above for tier 3 ALREADY covers every possible
+    /// candidate (every tier is member-scoped there), so no second read is made at all. Either way it is
+    /// never a per-candidate lookup, never a website-backend call. A candidate with no directory row (or
+    /// a row with no cached <see cref="ChatProfile"/> yet) degrades gracefully: <c>Profile</c> stays null
+    /// and <c>Name</c> is still derived from the candidate's own battleTag (the same
+    /// <c>tag.Split('#')[0]</c> convention <see cref="ChatUser"/> uses) — never an error, never an
+    /// exclusion.
     /// </para>
     /// AUTHORIZATION + resolution order:
     /// <list type="number">
@@ -195,11 +205,24 @@ public partial class ChatHub
         // Private-lane scoping (Dm/GroupDm ONLY): the channel's actual durable member set — a small
         // read (2 rows for a Dm, at most ChatLimits.MaxGroupSize for a GroupDm) — restricts every tier
         // below. null (Public/SemiPublic/System) means "unrestricted universe".
+        //
+        // memberDirectoryByTag is loaded HERE, up front, and reused for BOTH tier 3's candidate
+        // generation AND the final enrichment step (below): in a private lane every eventual candidate
+        // is, by construction, a member (memberScope gates every tier), so this ONE snapshot already
+        // covers 100% of the candidate list — no second LoadMany is needed. Doing tier 3 THIS way
+        // (filtering the already-loaded, fully-known member set in memory) — rather than running the
+        // generic UNSCOPED SearchByNormalizedPrefix and hoping a member's row survives its own,
+        // unrelated Mongo-side cap — is load-bearing: an unscoped global query could return 20 rows of
+        // unrelated directory noise before a genuine (but incidentally later-ordered) member's row is
+        // ever fetched, silently starving a real member out of a private lane's own search.
         HashSet<string> memberScope = null;
+        Dictionary<string, UserDirectoryEntry> memberDirectoryByTag = null;
         if (callerState.ChannelType is ChannelType.Dm or ChannelType.GroupDm)
         {
             var memberships = await _membershipRepository.LoadForChannel(channelId);
             memberScope = new HashSet<string>(memberships.Select(m => m.BattleTag), StringComparer.OrdinalIgnoreCase);
+            var memberEntries = await _userDirectory.LoadMany(memberScope);
+            memberDirectoryByTag = memberEntries.ToDictionary(e => e.BattleTag, StringComparer.OrdinalIgnoreCase);
         }
 
         var candidates = new List<(string BattleTag, int Tier)>();
@@ -249,18 +272,35 @@ public partial class ChatHub
         {
             var now = _timeProvider.GetUtcNow().UtcDateTime;
             var minLastSeenAt = now - ChatLimits.MentionCandidateActivityWindow;
-            var directoryMatches = await _userDirectory.SearchByNormalizedPrefix(
-                prefixLower, minLastSeenAt, ChatLimits.MentionSearchMaxResults);
-            AddTier(directoryMatches.Select(e => e.DisplayBattleTag ?? e.BattleTag), 3);
+
+            if (memberDirectoryByTag != null)
+            {
+                // Private lane: filter the ALREADY-LOADED, fully-known member snapshot in memory —
+                // never the generic unscoped global query (see the doc comment above memberScope).
+                var privateMatches = memberDirectoryByTag.Values
+                    .Where(e => e.LastSeenAt >= minLastSeenAt)
+                    .Where(e => (e.NormalizedName ?? string.Empty).StartsWith(prefixLower, StringComparison.Ordinal))
+                    .Select(e => e.DisplayBattleTag ?? e.BattleTag);
+                AddTier(privateMatches, 3);
+            }
+            else
+            {
+                var directoryMatches = await _userDirectory.SearchByNormalizedPrefix(
+                    prefixLower, minLastSeenAt, ChatLimits.MentionSearchMaxResults);
+                AddTier(directoryMatches.Select(e => e.DisplayBattleTag ?? e.BattleTag), 3);
+            }
         }
 
-        // Enrichment: ONE batch directory read across the whole assembled candidate list (skipped
-        // entirely for an empty candidate set — nothing to enrich).
+        // Enrichment: ONE batch directory read across the whole assembled candidate list — except in a
+        // private lane, where memberDirectoryByTag (loaded above) ALREADY covers every possible
+        // candidate (every tier is member-scoped there), so no second LoadMany is made at all.
+        // Skipped entirely for an empty candidate set — nothing to enrich.
         var dtos = new List<MentionCandidateDto>(candidates.Count);
         if (candidates.Count > 0)
         {
-            var directoryByTag = (await _userDirectory.LoadMany(candidates.Select(c => c.BattleTag)))
-                .ToDictionary(e => e.BattleTag, StringComparer.OrdinalIgnoreCase);
+            var directoryByTag = memberDirectoryByTag
+                ?? (await _userDirectory.LoadMany(candidates.Select(c => c.BattleTag)))
+                    .ToDictionary(e => e.BattleTag, StringComparer.OrdinalIgnoreCase);
             dtos.AddRange(candidates.Select(c => BuildCandidateDto(c.BattleTag, c.Tier, directoryByTag)));
         }
 

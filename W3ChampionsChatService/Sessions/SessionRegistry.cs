@@ -23,9 +23,14 @@ public interface ISessionRegistry
     /// <summary>
     /// C6 (Task 8, D10): a snapshot of every currently-registered battleTag — Tier 2 of
     /// <c>SearchMentionCandidates</c> ("online users anywhere", not necessarily viewing the channel
-    /// being searched). Display casing: each entry is the LIVE casing last <see cref="Register"/>ed
-    /// for that battleTag (mirrors <see cref="ChatSession.Identity"/>'s casing), never the lowercased
-    /// Mongo/directory convention. Taken under the same lock as every other read here.
+    /// being searched). Display casing: each entry is SOME live casing this battleTag has connected
+    /// under (never the lowercased Mongo/directory convention) — specifically the casing from the
+    /// FIRST <see cref="Register"/> call since the entry was last fully removed, since
+    /// <c>Dictionary&lt;TKey,TValue&gt;</c>'s indexer only replaces the VALUE for an existing key, never
+    /// the key's own casing. <c>SearchMentionCandidates</c>' enrichment step prefers the directory's
+    /// freshly-upserted <c>DisplayBattleTag</c> over this raw fallback whenever a directory row exists,
+    /// so this staleness only surfaces for an online user with no directory row at all — a narrow edge
+    /// case. Taken under the same lock as every other read here.
     /// </summary>
     IReadOnlyCollection<string> GetOnlineBattleTags();
 }

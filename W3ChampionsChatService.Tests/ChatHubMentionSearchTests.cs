@@ -423,6 +423,40 @@ public class ChatHubMentionSearchTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task Search_DmChannel_MemberNotCrowdedOutByUnrelatedDirectoryNoise()
+    {
+        // Regression (code review finding): tier 3 for a private lane must filter the channel's OWN
+        // (small, fully-known) member set in memory — NEVER run the generic UNSCOPED
+        // SearchByNormalizedPrefix and hope the real member's row survives ITS OWN Mongo-side cap. Seed
+        // far more than ChatLimits.MentionSearchMaxResults unrelated, matching, non-member directory
+        // rows BEFORE the real member's own row — if tier 3 ever ran the unscoped global query, the
+        // member's row could be crowded out of the top-N Mongo returns entirely.
+        const string channelId = "dm-1";
+        const string caller = "caller#1";
+        const string buddy = "aaa-buddy#2"; // actual Dm member, offline but recently active
+
+        RegisterSession("conn-caller", caller);
+        JoinChannel(channelId, "conn-caller", caller, ChannelType.Dm);
+        await SeedMembership(channelId, caller);
+        await SeedMembership(channelId, buddy);
+
+        // Unrelated noise, seeded FIRST, matching the SAME prefix, well over the result cap.
+        for (var i = 0; i < ChatLimits.MentionSearchMaxResults + 10; i++)
+        {
+            await SeedDirectory($"aaa-noise{i}#1", Now.AddDays(-1));
+        }
+
+        // The real member's own row, seeded LAST.
+        await SeedDirectory(buddy, Now.AddDays(-1));
+
+        var hub = BuildHub("conn-caller");
+        var result = await hub.SearchMentionCandidates(channelId, "aaa");
+
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Contain(buddy),
+            "a genuine Dm member must never be crowded out of tier 3 by unrelated directory noise");
+    }
+
+    [Test]
     public async Task Search_GroupDm_SameWall()
     {
         const string channelId = "group-1";
