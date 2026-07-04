@@ -36,6 +36,13 @@ namespace W3ChampionsChatService.FanOut;
 /// SemiPublic/System channel — so the member-change hooks are automatically a no-op for those.</item>
 /// <item><c>_ownTagByConnection</c>: connectionId → its own battleTag, so a connection is never made to
 /// watch its own presence on ANY path (registration or a later membership add).</item>
+/// <item><c>_channelVersion</c>: channelId → a monotonic membership-mutation counter, bumped on EVERY
+/// <see cref="OnMemberAdded"/>/<see cref="OnMemberRemoved"/>/<see cref="RemoveChannel"/> — INDEPENDENT of
+/// whether the channel currently has any watcher. It is the optimistic-concurrency token that closes the
+/// FocusChannel read→commit TOCTOU: a focus reads it (<see cref="GetChannelVersion"/>) BEFORE its Mongo
+/// roster read and commits interest ONLY if it is still unchanged
+/// (<see cref="TryRegisterFocusIfVersionMatches"/>). Lazily created at 0 and NEVER reset — a channel's
+/// version must survive periods with no watchers so an in-flight focus can still detect a mutation.</item>
 /// </list>
 /// </para>
 /// </summary>
@@ -59,6 +66,14 @@ public class PresenceInterestRegistry
     private readonly Dictionary<string, string> _ownTagByConnection =
         new Dictionary<string, string>();
 
+    // channelId -> a monotonically-increasing membership-mutation version, bumped on EVERY OnMemberAdded/
+    // OnMemberRemoved/RemoveChannel — the optimistic-concurrency token that closes the FocusChannel TOCTOU
+    // (see GetChannelVersion / TryRegisterFocusIfVersionMatches). Lazily created at 0, NEVER reset: a
+    // channel's version must survive periods with no watchers so an in-flight focus can still detect that a
+    // mutation raced its roster read even when nobody was watching the channel yet.
+    private readonly Dictionary<string, long> _channelVersion =
+        new Dictionary<string, long>();
+
     private readonly object _lock = new object();
 
     /// <summary>
@@ -75,47 +90,91 @@ public class PresenceInterestRegistry
     {
         lock (_lock)
         {
-            _ownTagByConnection[connectionId] = ownBattleTag;
+            RegisterFocusNoLock(connectionId, channelId, ownBattleTag, memberTags);
+        }
+    }
 
-            // The desired watched-set for THIS channel: every distinct member tag except our own.
-            var desired = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            if (memberTags != null)
+    /// <summary>
+    /// The optimistic-concurrency commit half of the FocusChannel TOCTOU fix (C6 Task 9 review). Registers
+    /// interest EXACTLY as <see cref="RegisterFocus"/> would, but ONLY if the channel's current membership
+    /// version still equals <paramref name="expectedVersion"/> — the value the caller read via
+    /// <see cref="GetChannelVersion"/> BEFORE snapshotting the roster. Returns <c>true</c> on a clean commit;
+    /// <c>false</c> if a concurrent <see cref="OnMemberAdded"/>/<see cref="OnMemberRemoved"/>/
+    /// <see cref="RemoveChannel"/> bumped the version during the caller's read — telling the caller its
+    /// snapshot may be stale and it must re-read and retry. The version check and the register run in ONE
+    /// lock acquisition, so there is NO window between "version matched" and "committed" in which a mutation
+    /// could slip a stale tag past the guard.
+    /// </summary>
+    public bool TryRegisterFocusIfVersionMatches(
+        string connectionId, string channelId, string ownBattleTag, IEnumerable<string> memberTags, long expectedVersion)
+    {
+        lock (_lock)
+        {
+            if (GetChannelVersionNoLock(channelId) != expectedVersion)
             {
-                foreach (var tag in memberTags)
+                return false;
+            }
+            RegisterFocusNoLock(connectionId, channelId, ownBattleTag, memberTags);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Reads the channel's current membership-mutation version (0 if the channel has never been mutated). A
+    /// focus reads this BEFORE snapshotting the roster; <see cref="TryRegisterFocusIfVersionMatches"/>
+    /// re-checks it atomically at commit time. See the <c>_channelVersion</c> field for the full rationale.
+    /// </summary>
+    public long GetChannelVersion(string channelId)
+    {
+        lock (_lock)
+        {
+            return GetChannelVersionNoLock(channelId);
+        }
+    }
+
+    // Body of RegisterFocus — callers already hold _lock (RegisterFocus and TryRegisterFocusIfVersionMatches).
+    private void RegisterFocusNoLock(string connectionId, string channelId, string ownBattleTag, IEnumerable<string> memberTags)
+    {
+        _ownTagByConnection[connectionId] = ownBattleTag;
+
+        // The desired watched-set for THIS channel: every distinct member tag except our own.
+        var desired = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (memberTags != null)
+        {
+            foreach (var tag in memberTags)
+            {
+                if (string.IsNullOrEmpty(tag))
                 {
-                    if (string.IsNullOrEmpty(tag))
-                    {
-                        continue;
-                    }
-                    if (string.Equals(tag, ownBattleTag, StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue; // never watch your own presence
-                    }
-                    desired.Add(tag);
+                    continue;
                 }
-            }
-
-            var byChannel = GetOrCreateChannelMapNoLock(connectionId);
-            byChannel.TryGetValue(channelId, out var previous); // null on a first focus of this channel
-            byChannel[channelId] = desired;
-            AddWatcherNoLock(channelId, connectionId);
-
-            // Newly-desired tags gain a reverse-index entry (HashSet.Add makes this idempotent).
-            foreach (var tag in desired)
-            {
-                AddInterestNoLock(connectionId, tag);
-            }
-
-            // Tags watched via this channel BEFORE but no longer desired (roster shrank on a re-focus):
-            // drop them unless still reachable via another of this connection's focused channels.
-            if (previous != null)
-            {
-                foreach (var tag in previous)
+                if (string.Equals(tag, ownBattleTag, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!desired.Contains(tag))
-                    {
-                        RemoveInterestIfOrphanedNoLock(connectionId, tag);
-                    }
+                    continue; // never watch your own presence
+                }
+                desired.Add(tag);
+            }
+        }
+
+        var byChannel = GetOrCreateChannelMapNoLock(connectionId);
+        byChannel.TryGetValue(channelId, out var previous); // null on a first focus of this channel
+        byChannel[channelId] = desired;
+        AddWatcherNoLock(channelId, connectionId);
+
+        // Newly-desired tags gain a reverse-index entry (HashSet.Add makes this idempotent).
+        foreach (var tag in desired)
+        {
+            AddInterestNoLock(connectionId, tag);
+        }
+
+        // Tags watched via this channel BEFORE but no longer desired (roster shrank on a re-focus):
+        // drop them unless still reachable via another of this connection's focused channels.
+        if (previous != null)
+        {
+            foreach (var tag in previous)
+            {
+                if (!desired.Contains(tag))
+                {
+                    RemoveInterestIfOrphanedNoLock(connectionId, tag);
                 }
             }
         }
@@ -174,6 +233,10 @@ public class PresenceInterestRegistry
         }
         lock (_lock)
         {
+            // Bump the channel's membership version FIRST — before the no-watchers early-return — so an
+            // in-flight FocusChannel detects this mutation even when nobody is watching the channel yet
+            // (the exact TOCTOU condition: the focuser is not yet a watcher). See GetChannelVersion.
+            BumpChannelVersionNoLock(channelId);
             if (!_watchingConnectionsByChannel.TryGetValue(channelId, out var watchers))
             {
                 return;
@@ -209,6 +272,11 @@ public class PresenceInterestRegistry
         }
         lock (_lock)
         {
+            // Bump the channel's membership version FIRST — before the no-watchers early-return — so an
+            // in-flight FocusChannel that snapshotted the roster BEFORE this removal fails its version
+            // re-check and re-reads, instead of committing stale interest in the just-departed tag. This is
+            // the exact leg that closes the review-flagged TOCTOU. See GetChannelVersion.
+            BumpChannelVersionNoLock(channelId);
             if (!_watchingConnectionsByChannel.TryGetValue(channelId, out var watchers))
             {
                 return;
@@ -234,6 +302,11 @@ public class PresenceInterestRegistry
     {
         lock (_lock)
         {
+            // A full channel teardown IS a membership mutation — bump the version FIRST (before the
+            // no-watchers early-return) so an in-flight FocusChannel of this now-deleted channel fails its
+            // version re-check and re-reads an empty roster rather than committing interest through a
+            // channel that no longer exists.
+            BumpChannelVersionNoLock(channelId);
             if (!_watchingConnectionsByChannel.Remove(channelId, out var watchers))
             {
                 return;
@@ -303,6 +376,18 @@ public class PresenceInterestRegistry
     }
 
     // ---- internals (all callers already hold _lock) ------------------------------------------------
+
+    private long GetChannelVersionNoLock(string channelId) =>
+        _channelVersion.TryGetValue(channelId, out var version) ? version : 0;
+
+    // Monotonic per-channel bump — lazily starts at 0, NEVER reset. Every membership mutation of the
+    // channel (add / remove / teardown) advances it, so an in-flight FocusChannel can detect that its
+    // roster snapshot raced a mutation even when the channel had no watchers at read time.
+    private void BumpChannelVersionNoLock(string channelId)
+    {
+        _channelVersion.TryGetValue(channelId, out var version);
+        _channelVersion[channelId] = version + 1;
+    }
 
     private Dictionary<string, HashSet<string>> GetOrCreateChannelMapNoLock(string connectionId)
     {

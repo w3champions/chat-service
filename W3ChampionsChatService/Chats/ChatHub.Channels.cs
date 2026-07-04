@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
+using Serilog;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
@@ -81,24 +82,25 @@ public partial class ChatHub
         if (isPrivateLane)
         {
             // C6 (Task 9, D11): DERIVE presence interest from this focus — the SOLE way a connection ever
-            // gains it (there is no subscribe API). Load the channel's CURRENT membership and register
-            // interest in every member EXCEPT the caller's own tag. LoadForChannel is legitimate for a
-            // private lane (Dm = 2 members, GroupDm is ACL-bound/capped; the never-enumerate guardrail is
-            // Public-channel-only). This branch is reached for Dm/GroupDm ONLY — Public/SemiPublic/System
-            // focuses register NOTHING, structurally, since they never enter this branch.
-            // KNOWN NARROW TOCTOU (documented for the security gate): this Mongo read + RegisterFocus is
-            // NOT atomic with a concurrent membership mutation. If a member leaves/is-removed in the exact
-            // window after this read snapshots the roster but before RegisterFocus runs — and that
-            // departure's OnMemberRemoved fires before this connection is recorded as a watcher — this
-            // connection can register (fail-CLOSED-adjacent: presence-bool only) interest in a just-departed
-            // member that no later leg revokes until the next re-focus/unfocus/disconnect. The window is a
-            // single await-continuation gap; the authoritative REPLACE semantics of any subsequent re-focus
-            // self-correct it. Accepted as a bounded known limitation rather than adding a membership-version
-            // guard (out of this task's scope). The symmetric case (a just-added member missed by the read)
-            // is a fail-closed missed-notification, not a leak.
-            var members = await _membershipRepository.LoadForChannel(channelId);
-            _presenceInterestRegistry.RegisterFocus(
-                Context.ConnectionId, channelId, battleTag, members.Select(m => m.BattleTag));
+            // gains it (there is no subscribe API). Register interest in every current member EXCEPT the
+            // caller's own tag. LoadForChannel is legitimate for a private lane (Dm = 2 members, GroupDm is
+            // ACL-bound/capped; the never-enumerate guardrail is Public-channel-only). This branch is reached
+            // for Dm/GroupDm ONLY — Public/SemiPublic/System focuses register NOTHING, structurally.
+            //
+            // TOCTOU CLOSED (C6 Task 9 review fix): the Mongo roster read + registry commit is not a single
+            // atomic step, so a concurrent membership mutation (a co-member leaving / being kicked) could
+            // land in the await-continuation gap. Before this fix, if that departure's OnMemberRemoved fired
+            // while this connection was not yet recorded as a watcher, it was a no-op for this connection and
+            // the stale snapshot's RegisterFocus then re-added the just-departed member — a grant no later leg
+            // revoked until the next re-focus/unfocus/disconnect (i.e. potentially for the whole connection
+            // lifetime). RegisterPresenceInterestWithVersionGuard now closes that window with an optimistic-
+            // concurrency check: it reads the registry's per-channel membership version BEFORE the roster read
+            // and commits ONLY if the version is unchanged at commit time (re-reading on a detected race), so a
+            // version-matched commit is provably consistent with the registry's own view rather than a stale
+            // snapshot. The sole exception is a bounded-retry fallback that registers best-effort ONLY under
+            // pathological sustained mutation of this exact channel (see RegisterPresenceInterestWithVersionGuard)
+            // — a far smaller, explicitly-accepted residual risk than blocking the focus indefinitely.
+            await RegisterPresenceInterestWithVersionGuard(channelId, battleTag);
 
             // D11: FocusRegistry participation above still happens (focused delivery + the C6 interest
             // derivation depend on it) but the client gets an EMPTY roster, never the channel's active-
@@ -116,6 +118,53 @@ public partial class ChatHub
             .ToList();
 
         return new FocusChannelResult(ChatResultCode.Ok, viewers);
+    }
+
+    // Bound for the version-guarded presence-interest registration below. Membership mutations are rare
+    // relative to focus calls, so a race is resolved on the very next read in practice; this cap is purely
+    // defensive so FocusChannel can never spin indefinitely under pathological sustained mutation of the
+    // exact same channel. On exhaustion it registers the freshest snapshot best-effort — a slightly-stale
+    // presence-bool grant is a far smaller residual risk than blocking the focus.
+    private const int MaxPresenceRegisterAttempts = 8;
+
+    /// <summary>
+    /// C6 (Task 9 review fix): registers this connection's DERIVED presence interest for a just-focused
+    /// private-lane channel WITHOUT the original read-then-commit TOCTOU. Each attempt reads the registry's
+    /// per-channel membership version, snapshots the roster
+    /// (<see cref="Memberships.MembershipRepository.LoadForChannel"/>), then commits interest ONLY if the
+    /// version is still unchanged (<see cref="FanOut.PresenceInterestRegistry.TryRegisterFocusIfVersionMatches"/>)
+    /// — the version check and the commit share the registry's lock, so no mutation can slip a stale tag past
+    /// the guard. A concurrent membership change (leave / kick / channel deletion) bumps the version, rejecting
+    /// the stale snapshot and forcing a bounded re-read. The fast path (no concurrent mutation, the
+    /// overwhelmingly common case) costs exactly one extra version read before the Mongo round-trip and one
+    /// (lock-shared with the commit) after — negligible over the read itself.
+    /// </summary>
+    private async Task RegisterPresenceInterestWithVersionGuard(string channelId, string ownBattleTag)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            var version = _presenceInterestRegistry.GetChannelVersion(channelId);
+            var members = await _membershipRepository.LoadForChannel(channelId);
+            var memberTags = members.Select(m => m.BattleTag).ToList();
+
+            if (_presenceInterestRegistry.TryRegisterFocusIfVersionMatches(
+                    Context.ConnectionId, channelId, ownBattleTag, memberTags, version))
+            {
+                return;
+            }
+
+            if (attempt >= MaxPresenceRegisterAttempts)
+            {
+                // Bounded-retry fallback (extremely unlikely — sustained mutation of this exact channel):
+                // commit the freshest snapshot best-effort. The authoritative REPLACE semantics of any later
+                // re-focus self-correct it; blocking the focus indefinitely would be the worse outcome.
+                Log.Warning(
+                    "Presence-interest registration for connection {ConnectionId} on channel {ChannelId} did not converge within {Attempts} attempts under concurrent membership mutation — registering freshest snapshot best-effort",
+                    Context.ConnectionId, channelId, MaxPresenceRegisterAttempts);
+                _presenceInterestRegistry.RegisterFocus(Context.ConnectionId, channelId, ownBattleTag, memberTags);
+                return;
+            }
+        }
     }
 
     public Task<ChannelOperationResult> UnfocusChannel(string channelId)

@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Http.Connections.Features;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Time.Testing;
+using MongoDB.Driver;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
@@ -65,6 +66,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
     private MuteReconciliationService _reconcileService;
     private ChannelRepository _channelRepository;
     private MembershipRepository _membershipRepository;
+    private HookableMembershipRepository _hookableMembershipRepository; // same instance as _membershipRepository
     private MessageRepository _messageRepository;
     private SessionStateAssembler _assembler;
     private Mock<IChatAuthenticationService> _authService;
@@ -92,7 +94,11 @@ public class ChatHubPresenceTests : IntegrationTestBase
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
         _channelRepository = new ChannelRepository(MongoClient);
-        _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
+        // A hookable MembershipRepository (behaviorally identical to the base when no hook is armed) so ONE
+        // test can inject a deterministic concurrent membership mutation inside FocusChannel's read→commit
+        // window. Every other test leaves AfterLoadForChannel null → pure pass-through.
+        _hookableMembershipRepository = new HookableMembershipRepository(MongoClient, _channelRepository);
+        _membershipRepository = _hookableMembershipRepository;
         _messageRepository = new MessageRepository(MongoClient);
 
         _authService = new Mock<IChatAuthenticationService>();
@@ -592,5 +598,84 @@ public class ChatHubPresenceTests : IntegrationTestBase
 
         Assert.That(PresenceCount("conn-alice", XavierTag, online: true), Is.EqualTo(1),
             "interest survives unfocusing one of two focused channels that both reach the tag (refcount-by-channel)");
+    }
+
+    // ================================================================================================
+    // C6 T9 review fix — the FocusChannel/PresenceInterestRegistry read→commit TOCTOU.
+    //
+    // Reproduces the race by CONTROLLED INTERLEAVING (no timing / no sleep): a hookable MembershipRepository
+    // lands a concurrent member removal in the exact window between FocusChannel's roster read and its
+    // interest commit. Against the pre-fix code the focuser ends up watching the just-departed member
+    // (stale grant, never revoked until re-focus/disconnect); with the version guard it does not. This test
+    // FAILS against the pre-fix FocusChannel and PASSES with the fix — verified by reverting only the
+    // FocusChannel private-lane branch (see task-9-report.md).
+    // ================================================================================================
+
+    [Test]
+    public async Task FocusPrivateLane_ConcurrentMemberRemovalDuringRosterRead_DoesNotRegisterStaleInterest()
+    {
+        const string AliceTag = "Alice#1";
+        const string BobTag = "Bob#2";
+        const string XavierTag = "Xavier#9";
+
+        var group = await CreateChannel("grp-abx", ChannelType.GroupDm);
+        await SeedMembership(group.Id, AliceTag, MembershipRole.Owner);
+        await SeedMembership(group.Id, BobTag);
+        await SeedMembership(group.Id, XavierTag);
+
+        var alice = await Connect("conn-alice", AliceTag);
+
+        // Arm the interleaving hook AFTER connect (so connect-time reads are untouched): the FIRST
+        // LoadForChannel for this group — Alice's FocusChannel roster read — returns the STALE
+        // [Alice, Bob, Xavier] snapshot, and immediately AFTER that read (still inside FocusChannel's
+        // read→commit window, before Alice is recorded as a watcher) Bob concurrently leaves: his membership
+        // row is deleted from Mongo AND OnMemberRemoved fires on the shared registry — exactly what a real
+        // concurrent LeaveChannel/RemoveGroupMember does. Because Alice is NOT yet a watcher at that instant,
+        // Bob's OnMemberRemoved is a no-op FOR HER (the precise condition that made the pre-fix code register
+        // stale interest in Bob). One-shot: the hook clears itself so the version guard's re-read observes the
+        // clean post-removal roster [Alice, Xavier] and commits THAT.
+        _hookableMembershipRepository.AfterLoadForChannel = async loadedChannelId =>
+        {
+            if (loadedChannelId != group.Id)
+            {
+                return;
+            }
+            _hookableMembershipRepository.AfterLoadForChannel = null; // only the FIRST read races
+            await _membershipRepository.Delete(group.Id, BobTag);
+            _presenceInterestRegistry.OnMemberRemoved(group.Id, BobTag);
+        };
+
+        Assert.That((await alice.FocusChannel(group.Id)).Code, Is.EqualTo(ChatResultCode.Ok));
+
+        // The fix: Alice's committed interest reflects the POST-removal roster — she watches Xavier (still a
+        // member) but NOT Bob (who left inside the read→commit window). Against the pre-fix code the stale
+        // snapshot wins and Bob IS watched — the assertion below is exactly what fails there.
+        Assert.That(_presenceInterestRegistry.GetInterestedConnections(BobTag), Is.Empty,
+            "a member who left inside the read→commit window must NOT be watched — the TOCTOU is closed");
+        Assert.That(_presenceInterestRegistry.GetInterestedConnections(XavierTag), Is.EquivalentTo(new[] { "conn-alice" }),
+            "a member still present at commit time IS watched — the version guard re-reads without over-removing");
+    }
+
+    // A MembershipRepository seam (subclass over the real Mongo-backed repo, mirroring
+    // CountingUserDirectoryRepository / MentionFanOutTests.ThrowingInsertRepository — there is no interface
+    // seam here) that fires an injected async hook AFTER each real LoadForChannel returns. A test sets the
+    // hook to land a concurrent membership mutation deterministically inside FocusChannel's read→commit
+    // window, so the TOCTOU is reproduced by controlled interleaving rather than timing luck.
+    private sealed class HookableMembershipRepository(MongoClient client, ChannelRepository channelRepository)
+        : MembershipRepository(client, channelRepository)
+    {
+        // Fired with the just-read channelId; null (default) means pure pass-through.
+        public Func<string, Task> AfterLoadForChannel { get; set; }
+
+        public override async Task<List<ChannelMembership>> LoadForChannel(string channelId)
+        {
+            var result = await base.LoadForChannel(channelId);
+            var hook = AfterLoadForChannel;
+            if (hook != null)
+            {
+                await hook(channelId);
+            }
+            return result;
+        }
     }
 }

@@ -115,7 +115,10 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
     /// channel→users guardrail on <see cref="ChannelMembership"/> is about PUBLIC channels; groups
     /// are ACL-bound and capped at <see cref="ChatLimits.MaxGroupSize"/>, so enumerating a group's
     /// members (roster, owner lookups, auto-promotion) is the intended access pattern.</summary>
-    public Task<List<ChannelMembership>> LoadForChannel(string channelId) =>
+    // virtual: a test seam (mirroring UserDirectoryRepository.Load / MentionInboxRepository.Insert) so a
+    // subclass can interpose a deterministic concurrent membership mutation between this read and a caller's
+    // subsequent commit — used to reproduce the FocusChannel read→commit TOCTOU without timing/sleeps.
+    public virtual Task<List<ChannelMembership>> LoadForChannel(string channelId) =>
         Memberships.Find(m => m.ChannelId == channelId).ToListAsync();
 
     /// <summary>Member count for a single channel (C5 D12 — group size bounds, last-member-leaves
