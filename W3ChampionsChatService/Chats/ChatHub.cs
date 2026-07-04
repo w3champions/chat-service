@@ -221,13 +221,16 @@ public partial class ChatHub(
     /// no live session → <see cref="ChatResultCode.PermissionDenied"/> (there is no identity to attribute
     /// the delete to).</item>
     /// <item><see cref="Messages.MessageRepository.Load"/>; missing → <see cref="ChatResultCode.NotFound"/>.</item>
-    /// <item>Resolve the message's channel and enforce the PRIVACY WALL: a <see cref="ChannelType.Dm"/>/
-    /// <see cref="ChannelType.GroupDm"/> channel (or a vanished channel) → <see cref="ChatResultCode.PermissionDenied"/>,
-    /// nothing deleted — a moderator never touches private content. NOTE this is the TARGETED single-delete
-    /// wall (reject Dm/GroupDm/unresolvable); it is deliberately NARROWER than the blind cross-channel
-    /// <see cref="PurgeMessagesFromUser"/> sweep, whose <see cref="IsPurgeableChannel"/> wall ALSO excludes
-    /// System+Clan/System+Lobby. A single-delete acts on a specific message the moderator is already
-    /// viewing, so it is not scoped down to purge's Public/SemiPublic/Match include-list.</item>
+    /// <item>Resolve the message's channel and enforce the SHARED moderation scope wall (spec §10 + plan
+    /// D5): single-delete uses the EXACT SAME <see cref="IsPurgeableChannel"/> include-list as the
+    /// cross-channel <see cref="PurgeMessagesFromUser"/> sweep — <see cref="ChannelType.Public"/>,
+    /// <see cref="ChannelType.SemiPublic"/>, and <see cref="ChannelType.System"/> with
+    /// <see cref="SystemChannelKind.Match"/>. Everything else — <see cref="ChannelType.Dm"/>/
+    /// <see cref="ChannelType.GroupDm"/>, System+<see cref="SystemChannelKind.Clan"/>/
+    /// <see cref="SystemChannelKind.Lobby"/>, System with no kind, or a vanished/unresolvable channel —
+    /// → <see cref="ChatResultCode.PermissionDenied"/>, nothing deleted. Moderators never touch
+    /// private/clan/lobby content; the TTL cleans those. Single-delete and purge honor ONE wall so the
+    /// two moderation paths can never drift out of scope-parity.</item>
     /// <item>Soft-delete only, CONDITIONAL (C4 Task 4 directive (a)):
     /// <see cref="Messages.MessageRepository.MarkDeleted"/> flips <c>deleted{by,at}</c> only while
     /// <c>Deleted == null</c>; the row (and its <c>ExpiresAt</c>/TTL) survives, physical removal stays
@@ -265,11 +268,12 @@ public partial class ChatHub(
             return new ChannelOperationResult(ChatResultCode.NotFound);
         }
 
-        // 3. Privacy wall (D5): a moderator never touches DM/GroupDm content. Resolve the channel and
-        // reject Dm/GroupDm — nothing is deleted. A vanished channel is likewise rejected fail-closed
-        // (we cannot prove it is NOT private), so no delete slips past the wall on a data-integrity edge.
+        // 3. Moderation scope wall (spec §10 + plan D5): single-delete shares the SAME include-list as the
+        // cross-channel purge — Public / SemiPublic / System+Match ONLY, via the one IsPurgeableChannel
+        // predicate. So a moderator never touches DM/GroupDm, clan, or lobby content, and any unresolvable
+        // channel is rejected fail-closed (we cannot prove it is in scope). Nothing is deleted on rejection.
         var channel = await _channelRepository.Load(message.ChannelId);
-        if (channel == null || channel.Type == ChannelType.Dm || channel.Type == ChannelType.GroupDm)
+        if (channel == null || !IsPurgeableChannel(channel))
         {
             return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }

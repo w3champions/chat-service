@@ -290,6 +290,59 @@ public class ChatHubDeletionTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task DeleteMessage_ClanChannel_ReturnsPermissionDenied_NothingDeleted()
+    {
+        // Scope wall (spec §10 + plan D5): single-delete honors the SAME include-list as purge
+        // (IsPurgeableChannel), so a System/Clan channel is OUT of moderation scope — a moderator can
+        // never soft-delete clan content (TTL cleans it), symmetric with the purge wall.
+        var channel = await CreateSystemChannel(SystemChannelKind.Clan);
+        var message = await SeedMessage(channel.Id, AuthorBattleTag, "clan message");
+        _focusRegistry.Focus("viewer-conn", channel.Id, "viewer#1");
+
+        var result = await _chatHub.DeleteMessage(message.Id);
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNull(reloaded.Deleted, "a moderator must never soft-delete System/Clan content");
+        Assert.IsEmpty(_pushHarness.AllSignals);
+        Assert.IsEmpty(_mentionCleaner.Calls);
+    }
+
+    [Test]
+    public async Task DeleteMessage_LobbyChannel_ReturnsPermissionDenied_NothingDeleted()
+    {
+        // Scope wall (spec §10 + plan D5): a System/Lobby channel is likewise OUT of moderation scope —
+        // symmetric with purge (IsPurgeableChannel excludes System+Lobby). Nothing is deleted.
+        var channel = await CreateSystemChannel(SystemChannelKind.Lobby);
+        var message = await SeedMessage(channel.Id, AuthorBattleTag, "lobby message");
+        _focusRegistry.Focus("viewer-conn", channel.Id, "viewer#1");
+
+        var result = await _chatHub.DeleteMessage(message.Id);
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNull(reloaded.Deleted, "a moderator must never soft-delete System/Lobby content");
+        Assert.IsEmpty(_pushHarness.AllSignals);
+        Assert.IsEmpty(_mentionCleaner.Calls);
+    }
+
+    [Test]
+    public async Task DeleteMessage_MatchChannel_ReturnsOk_SoftDeletes()
+    {
+        // The shared scope wall INCLUDES System+Match, so a legit single-delete in a match channel still
+        // soft-deletes — proving the include-list wall is not over-tightened onto Public/SemiPublic only.
+        var channel = await CreateSystemChannel(SystemChannelKind.Match);
+        var message = await SeedMessage(channel.Id, AuthorBattleTag, "match spam");
+
+        var result = await _chatHub.DeleteMessage(message.Id);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNotNull(reloaded.Deleted, "a System/Match message is in moderation scope and must soft-delete");
+        Assert.AreEqual(ModeratorBattleTag, reloaded.Deleted.By);
+    }
+
+    [Test]
     public async Task DeleteMessage_InvokesMentionInboxCleaner_WithMessageId()
     {
         var channel = await CreateChannel();
