@@ -50,6 +50,34 @@ public class DmInitiationTracker
         }
     }
 
+    /// <summary>ATOMIC check-and-record of a NEW stranger-shell initiation under ONE lock (C5 FIX 2): prunes,
+    /// and if <paramref name="initiator"/> is already at/over <paramref name="cap"/> active initiations
+    /// returns <c>false</c> WITHOUT appending; otherwise appends the (<paramref name="targetNormalized"/>,
+    /// <paramref name="now"/>) event and returns <c>true</c>. Collapsing the former separate
+    /// <see cref="CountActive"/>-then-<see cref="Record"/> into a single critical section closes the TOCTOU
+    /// that let concurrent same-caller opens slip past the cap — "≤cap genuinely-new stranger initiations
+    /// admitted" now holds structurally, not just by the single-connection-per-battleTag invariant.</summary>
+    public bool TryRecord(string initiator, string targetNormalized, DateTime now, int cap)
+    {
+        lock (_lock)
+        {
+            PruneNoLock(now);
+            var count = _eventsByInitiator.TryGetValue(initiator, out var events) ? events.Count : 0;
+            if (count >= cap)
+            {
+                return false;
+            }
+
+            if (events == null)
+            {
+                events = new List<(string, DateTime)>();
+                _eventsByInitiator[initiator] = events;
+            }
+            events.Add((targetNormalized, now));
+            return true;
+        }
+    }
+
     /// <summary>Frees the (<paramref name="initiator"/>, <paramref name="targetNormalized"/>) pair's slot
     /// INSTANTLY on accept — removes EVERY event for that pair (case-insensitively), so an accepted
     /// conversation stops counting well before the 8h window. Called by the reply-accept / AcceptRequest

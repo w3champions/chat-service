@@ -273,6 +273,60 @@ public class ChatHubOpenDmTests : IntegrationTestBase
     }
 
     // ------------------------------------------------------------------------------------------------
+    // D8 / OQ-6 — a later dmPrivacy tightening never retro-gates an EXISTING conversation. Re-opening an
+    // already-created shell (pending OR accepted) short-circuits the directory + dmPrivacy + cap gates.
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task OpenDm_ExistingAcceptedShell_NonFriend_TargetNowNobody_ReturnsOkSameChannel()
+    {
+        const string caller = "peter#123";
+        const string target = "wolf#456";
+        // A shell already exists between two non-friends and was ACCEPTED (consent granted earlier).
+        await SeedDirectory(target);
+        var existing = await _channelRepository.FindOrCreateDm(caller, target, caller, DmRequestState.Pending, Now);
+        Assert.That(await _channelRepository.SetRequestAccepted(existing.Id, Now), Is.True, "the shell is flipped to Accepted");
+        // The target LATER tightens dmPrivacy to Nobody. Re-opening the established lane must NOT retro-gate
+        // (D8/OQ-6: accepted = "normal forever"; re-opening an existing shell is not a creation).
+        await SeedPrivacy(target, DmPrivacy.Nobody);
+        RegisterSession("conn-1", caller);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.OpenDm(target);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok),
+            "an existing accepted conversation re-opens even after the target tightens dmPrivacy to Nobody (D8/OQ-6)");
+        Assert.That(result.Channel.Id, Is.EqualTo(existing.Id), "the same channel is returned");
+        Assert.That(result.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(_dmInitiationTracker.CountActive(caller, Now), Is.EqualTo(0),
+            "re-opening an existing conversation records NO new initiation");
+    }
+
+    [Test]
+    public async Task OpenDm_ExistingPendingShell_TargetNowNobody_ReturnsOkSameChannel()
+    {
+        const string caller = "peter#123";
+        const string target = "wolf#456";
+        // A PENDING shell already exists (the initiator opened earlier while the target allowed Everyone).
+        await SeedDirectory(target);
+        var existing = await _channelRepository.FindOrCreateDm(caller, target, caller, DmRequestState.Pending, Now);
+        // The target then tightens to Nobody. Re-opening the same pending lane never re-gates here (pending-
+        // phase DELIVERY still re-checks dmPrivacy in the T4 send path — that gate is separate/unchanged).
+        await SeedPrivacy(target, DmPrivacy.Nobody);
+        RegisterSession("conn-1", caller);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.OpenDm(target);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok),
+            "re-opening an existing pending shell never re-gates on a later dmPrivacy tightening (D8/OQ-6)");
+        Assert.That(result.Channel.Id, Is.EqualTo(existing.Id), "the same channel is returned");
+        Assert.That(result.Channel.RequestState, Is.EqualTo(DmRequestState.Pending));
+        Assert.That(_dmInitiationTracker.CountActive(caller, Now), Is.EqualTo(0),
+            "re-opening records no new initiation");
+    }
+
+    // ------------------------------------------------------------------------------------------------
     // D5 — block-uniform observability
     // ------------------------------------------------------------------------------------------------
 

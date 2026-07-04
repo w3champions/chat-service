@@ -60,6 +60,47 @@ public class DmInitiationTrackerTests
     }
 
     [Test]
+    public void TryRecord_BelowCap_AdmitsAndCounts()
+    {
+        var tracker = new DmInitiationTracker();
+        var now = T0.UtcDateTime;
+        const int cap = ChatLimits.StrangerDmInitiationCap;
+
+        for (var i = 0; i < cap; i++)
+        {
+            Assert.That(tracker.TryRecord(Initiator, Target(i), now, cap), Is.True,
+                $"initiation #{i + 1} is within the cap → admitted");
+        }
+
+        Assert.That(tracker.CountActive(Initiator, now), Is.EqualTo(cap),
+            "every admitted initiation is recorded");
+    }
+
+    [Test]
+    public void TryRecord_AtCap_RejectsWithoutAppending()
+    {
+        var tracker = new DmInitiationTracker();
+        var now = T0.UtcDateTime;
+        const int cap = ChatLimits.StrangerDmInitiationCap;
+
+        for (var i = 0; i < cap; i++)
+        {
+            Assert.That(tracker.TryRecord(Initiator, Target(i), now, cap), Is.True);
+        }
+
+        // At the cap, further attempts are rejected AND must NOT append — the count never grows past the cap
+        // no matter how many times TryRecord is called (the atomic check-and-record closes the TOCTOU).
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.That(tracker.TryRecord(Initiator, $"over{i}#0", now, cap), Is.False,
+                "an initiation at/over the cap is rejected");
+        }
+
+        Assert.That(tracker.CountActive(Initiator, now), Is.EqualTo(cap),
+            "rejected initiations are not appended — the count stays pinned at the cap");
+    }
+
+    [Test]
     public void MarkAccepted_FreesCapacityInstantly()
     {
         var tracker = new DmInitiationTracker();
