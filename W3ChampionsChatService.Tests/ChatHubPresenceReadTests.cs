@@ -255,6 +255,39 @@ public class ChatHubPresenceReadTests : IntegrationTestBase
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.PermissionDenied));
     }
 
+    [Test]
+    public void GetPresence_FailClosedSession_PrecedesArgValidation_EvenForNullArray()
+    {
+        // Review-note follow-up: proves the session check strictly precedes the malformed-arg guards —
+        // a ghost connection with a NULL array must still get PermissionDenied, never a HubException.
+        var hub = BuildHub("conn-ghost");
+
+        GetPresenceResult result = null;
+        Assert.DoesNotThrowAsync(async () => result = await hub.GetPresence(null));
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.PermissionDenied));
+    }
+
+    [Test]
+    public async Task GetPresence_DuplicateAndBlankEntries_HandledGracefully()
+    {
+        const string CallerTag = "caller#1";
+        const string OnlineTag = "online#2";
+
+        var caller = await Connect("conn-caller", CallerTag);
+        await Connect("conn-online", OnlineTag);
+
+        // A duplicate tag and a blank/whitespace entry must never crash the read.
+        var result = await caller.GetPresence(new[] { OnlineTag, OnlineTag, string.Empty, "   " });
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Statuses, Has.Count.EqualTo(4), "one row per requested entry, duplicates included");
+        Assert.That(result.Statuses.Count(s => s.BattleTag == OnlineTag && s.Online), Is.EqualTo(2),
+            "a duplicated tag resolves independently (and correctly) for each occurrence");
+        Assert.That(result.Statuses.Where(s => string.IsNullOrWhiteSpace(s.BattleTag)).Select(s => s.Online),
+            Is.All.False, "a blank/whitespace entry must degrade to offline rather than throwing");
+    }
+
     // ================================================================================================
     // GetPresenceDetails — friend-gated LastSeenAt (D12, acceptance 6).
     // ================================================================================================
@@ -400,6 +433,46 @@ public class ChatHubPresenceReadTests : IntegrationTestBase
         var result = await hub.GetPresenceDetails(new[] { "someone#1" });
 
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.PermissionDenied));
+    }
+
+    [Test]
+    public void GetPresenceDetails_FailClosedSession_PrecedesArgValidation_EvenForNullArray()
+    {
+        // Review-note follow-up: proves the session check strictly precedes the malformed-arg guards —
+        // a ghost connection with a NULL array must still get PermissionDenied, never a HubException.
+        var hub = BuildHub("conn-ghost");
+
+        GetPresenceDetailsResult result = null;
+        Assert.DoesNotThrowAsync(async () => result = await hub.GetPresenceDetails(null));
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.PermissionDenied));
+    }
+
+    [Test]
+    public async Task GetPresenceDetails_DuplicateAndBlankEntries_HandledGracefully()
+    {
+        const string CallerTag = "caller#1";
+        const string FriendTag = "friend#2";
+        _friends[CallerTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { FriendTag };
+
+        var friend = await Connect("conn-friend", FriendTag);
+        _ = friend;
+        var connectInstant = Now;
+        var caller = await Connect("conn-caller", CallerTag);
+
+        // A duplicate friend tag and a blank/whitespace entry must never crash the read.
+        var result = await caller.GetPresenceDetails(new[] { FriendTag, FriendTag, string.Empty, "  " });
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Details, Has.Count.EqualTo(4), "one row per requested entry, duplicates included");
+        Assert.That(
+            result.Details.Where(d => d.BattleTag == FriendTag),
+            Has.All.Matches<PresenceDetailsDto>(d => d.Online && d.LastSeenAt == connectInstant),
+            "a duplicated friend tag resolves independently (and correctly) for each occurrence");
+        Assert.That(
+            result.Details.Where(d => string.IsNullOrWhiteSpace(d.BattleTag)),
+            Has.All.Matches<PresenceDetailsDto>(d => !d.Online && d.LastSeenAt == null),
+            "a blank/whitespace entry must degrade to offline + null LastSeenAt rather than throwing");
     }
 
     // ================================================================================================
