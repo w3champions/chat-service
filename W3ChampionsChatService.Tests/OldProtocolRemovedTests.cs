@@ -104,6 +104,13 @@ public class OldProtocolRemovedTests
             // only. T8 extends this set further with the group management surface (add/remove/promote/
             // rename); extend, never weaken.
             "CreateGroup",
+            // New protocol (C5 T8): the group-mutation surface — AddGroupMember/RemoveGroupMember/
+            // PromoteOwner/RenameGroup (ChatHub.Groups.cs). A widening of the pinned set (new declared
+            // methods), never a weakening — matching the T7 CreateGroup precedent.
+            "AddGroupMember",
+            "RemoveGroupMember",
+            "PromoteOwner",
+            "RenameGroup",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",

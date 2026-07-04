@@ -265,15 +265,32 @@ public partial class ChatHub
     }
 
     /// <summary>
-    /// Leaves a channel: deletes the membership row, drops the caller's <see cref="FanOut.OnlineMemberRegistry"/>
-    /// entry, and unfocuses it in <see cref="FanOut.FocusRegistry"/> — routing that roster change through the
-    /// batched <c>ViewersChanged</c> accumulator first, exactly like <see cref="UnfocusChannel"/> does, so a
-    /// focused viewer who explicitly leaves while staying connected still emits a <c>left</c> delta (no phantom
-    /// viewer). Idempotent and unconditional on membership state — leaving a channel the caller was never a
-    /// member of (or re-leaving one already left) is still <see cref="ChatResultCode.Ok"/>, mirroring
-    /// <see cref="UnfocusChannel"/>'s no-op-if-absent contract. Fail-closed on identity, same as
-    /// <see cref="JoinChannel"/> and <see cref="FocusChannel"/>: an unregistered connection has no battleTag to
-    /// delete a membership under.
+    /// Leaves a channel: deletes the caller's membership row, drops their <see cref="FanOut.OnlineMemberRegistry"/>
+    /// entry, and unfocuses it in <see cref="FanOut.FocusRegistry"/>. Idempotent and unconditional on
+    /// membership state — leaving a channel the caller was never a member of (or re-leaving one already left)
+    /// is still <see cref="ChatResultCode.Ok"/>, mirroring <see cref="UnfocusChannel"/>'s no-op-if-absent
+    /// contract; a missing/vanished channel or a non-membership NEVER becomes a NotFound/NotMember (the
+    /// pre-C5 contract). Fail-closed on identity: an unregistered connection has no battleTag to delete a
+    /// membership under.
+    /// <para>
+    /// C5 (Task 8): the channel is loaded BEFORE mutating so the departure branches by <see cref="ChannelType"/>:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><b>Public / SemiPublic / System (and a null/vanished channel)</b>: BYTE-IDENTICAL to the pre-C5
+    /// contract — route the roster change through the batched <c>ViewersChanged</c> accumulator
+    /// (<see cref="FanOut.ViewersAccumulator.RecordChange"/>) BEFORE the
+    /// <see cref="FanOut.FocusRegistry.Unfocus"/> so a focused viewer who explicitly leaves while staying
+    /// connected still emits a <c>left</c> delta (no phantom viewer); recording AFTER the unfocus would invert
+    /// the delta. A null channel is treated as non-private-lane, exactly as the legacy unconditional
+    /// RecordChange did.</item>
+    /// <item><b>Dm / GroupDm (private lanes)</b>: SKIP <see cref="FanOut.ViewersAccumulator.RecordChange"/>
+    /// (D11 — private lanes are excluded from the viewer-roster system entirely; a voluntary departure must
+    /// never surface a roster delta, structurally satisfying the C3 amendment for Dm/GroupDm — OQ-1). The Dm
+    /// conversation SHELL (channel doc) is left UNTOUCHED so pair-key resurrection keeps restoring it.</item>
+    /// <item><b>GroupDm departure bookkeeping</b> (via <see cref="HandleGroupDeparture"/>, after the
+    /// private-lane teardown): the last member leaving deletes the channel doc + residual memberships; a
+    /// departing LAST owner auto-promotes the longest-standing remaining member.</item>
+    /// </list>
     /// </summary>
     public async Task<ChannelOperationResult> LeaveChannel(string channelId)
     {
@@ -284,19 +301,76 @@ public partial class ChatHub
 
         var battleTag = session.Identity.BattleTag;
 
+        // Load the channel BEFORE mutating so the departure can branch by type. A missing/vanished channel
+        // stays a no-op Ok (treated as non-private-lane below) — LeaveChannel never returns NotFound.
+        var channel = await _channelRepository.Load(channelId);
+
         await _membershipRepository.Delete(channelId, battleTag);
         _onlineMemberRegistry.Leave(channelId, Context.ConnectionId);
 
-        // C3 (Task 14): route the viewer-roster change into the batched ViewersChanged accumulator BEFORE
-        // the FocusRegistry mutation, so its pre-window baseline reflects this battleTag as it was BEFORE
-        // the leave (VIEWING while still focused). Without this, an explicit leave while staying connected
-        // leaves a phantom viewer in every other viewer's roster (no `left` ever emitted). Mirrors
-        // UnfocusChannel; ordering is load-bearing — recording AFTER the unfocus would invert the delta.
-        _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        // C3 (Task 14) preserved for Public/SemiPublic/System: route the viewer-roster change into the
+        // batched ViewersChanged accumulator BEFORE the FocusRegistry mutation (pre-window baseline =
+        // VIEWING while still focused), so an explicit leave while staying connected still emits a `left`
+        // delta. C5 (Task 8, D11): SKIP this for Dm/GroupDm — private lanes never enter the roster system.
+        // A null/vanished channel is treated as non-private-lane, exactly like the legacy unconditional call.
+        var isPrivateLane = channel != null && channel.Type is ChannelType.Dm or ChannelType.GroupDm;
+        if (!isPrivateLane)
+        {
+            _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        }
 
         _focusRegistry.Unfocus(Context.ConnectionId, channelId);
 
+        // C5 (Task 8, D12): GroupDm departure bookkeeping — empty-deletion or last-owner auto-promotion.
+        if (channel != null && channel.Type == ChannelType.GroupDm)
+        {
+            await HandleGroupDeparture(channelId);
+        }
+
         return new ChannelOperationResult(ChatResultCode.Ok);
+    }
+
+    /// <summary>
+    /// C5 (Task 8, D12): post-leave bookkeeping for a <see cref="ChannelType.GroupDm"/>. Reloads the surviving
+    /// members (enumerating a group via <see cref="Memberships.MembershipRepository.LoadForChannel"/> is
+    /// legitimate — the never-enumerate guardrail is for PUBLIC channels; groups are ACL-bound and capped) and:
+    /// <list type="bullet">
+    /// <item>NONE remain ⇒ the LAST member left: hard-delete the channel doc
+    /// (<see cref="Channels.ChannelRepository.Delete"/>) + any residual membership rows
+    /// (<see cref="Memberships.MembershipRepository.DeleteAllForChannel"/>). Messages are left to the 90d TTL
+    /// (no reader exists for a deleted channel and moderators are scope-walled out of GroupDm).</item>
+    /// <item>An <see cref="MembershipRole.Owner"/> still remains ⇒ NO-OP (the owner-set is intact).</item>
+    /// <item>NO owner remains ⇒ auto-promote the LONGEST-STANDING remaining member (earliest
+    /// <c>JoinedAt</c>), ties broken deterministically by <see cref="string.CompareOrdinal(string, string)"/>
+    /// over the (already-lowercased) battleTags, to <see cref="MembershipRole.Owner"/>. Auto-promotion emits
+    /// NO live event — the promoted member learns their role on their next SessionState (L3 handoff).</item>
+    /// </list>
+    /// </summary>
+    private async Task HandleGroupDeparture(string channelId)
+    {
+        var remaining = await _membershipRepository.LoadForChannel(channelId);
+
+        if (remaining.Count == 0)
+        {
+            // Last member left ⇒ delete the channel doc + any residual membership rows (residual safety).
+            await _channelRepository.Delete(channelId);
+            await _membershipRepository.DeleteAllForChannel(channelId);
+            return;
+        }
+
+        if (remaining.Any(m => m.Role == MembershipRole.Owner))
+        {
+            // An owner still remains — the owner-set is intact, nothing to do.
+            return;
+        }
+
+        // No owner remains ⇒ auto-promote the longest-standing member (earliest JoinedAt, CompareOrdinal
+        // tie-break over the already-lowercased tags — deterministic and test-pinned).
+        var successor = remaining
+            .OrderBy(m => m.JoinedAt)
+            .ThenBy(m => m.BattleTag, StringComparer.Ordinal)
+            .First();
+        await _membershipRepository.SetRole(channelId, successor.BattleTag, MembershipRole.Owner);
     }
 
     /// <summary>

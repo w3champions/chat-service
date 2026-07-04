@@ -195,6 +195,16 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     public Task Delete(string channelId) => Channels.DeleteOneAsync(c => c.Id == channelId);
 
     /// <summary>
+    /// Renames a channel — sets the display <see cref="ChatChannel.Name"/> ONLY, NEVER
+    /// <see cref="ChatChannel.NormalizedName"/> (C5 D16, group rename via <c>ChatHub.RenameGroup</c>). A
+    /// GroupDm deliberately keeps a null <c>NormalizedName</c> so its display name can never collide into
+    /// <see cref="LoadAnyByNormalizedName"/>'s join-resolution path (which would block implicit semiPublic
+    /// creation of the same display name); mutating only <c>Name</c> preserves that invariant on rename.
+    /// </summary>
+    public Task SetName(string channelId, string name) =>
+        Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Name, name));
+
+    /// <summary>
     /// C4 Task 7 (D9): the eligible-channel list backing GET /api/moderation/channels — the
     /// channelId-resolution surface the website-backend's moderation proxy needs (the OLD
     /// ChatHistory-backed GET /api/chat/{chatroom} took room NAMEs directly; channels are the new unit).
