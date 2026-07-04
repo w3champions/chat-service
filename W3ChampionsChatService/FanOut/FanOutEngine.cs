@@ -60,7 +60,13 @@ public class FanOutEngine(
     FocusRegistry focusRegistry,
     OnlineMemberRegistry onlineMemberRegistry,
     ActivityCoalescer activityCoalescer,
-    ISessionRegistry sessionRegistry)
+    ISessionRegistry sessionRegistry,
+    // C6 (Task 9, D11): the presence-interest index. Two roles here: (1) the channel-membership hooks at
+    // the TOP of PushChannelAdded/PushChannelRemoved keep it current when a Dm/GroupDm's roster changes,
+    // BEFORE their offline early-returns (an interest update must land even when the changed user is
+    // offline); (2) PushPresenceChanged reads it to target the derived-interest set on an online/offline
+    // transition. Shared singleton (Startup) — the SAME instance the hub mutates via focus/leave.
+    PresenceInterestRegistry presenceInterestRegistry)
 {
     // The SignalR delivery channel — pushes the full MessageReceived payload to targeted connections.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
@@ -83,6 +89,9 @@ public class FanOutEngine(
     // SPECIFIC user's connection by battleTag rather than a channel's focused/online set, so they
     // resolve through this instead of FocusRegistry/OnlineMemberRegistry.
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
+
+    // C6 (Task 9, D11): the presence-interest index — see the ctor param doc comment.
+    private readonly PresenceInterestRegistry _presenceInterestRegistry = presenceInterestRegistry;
 
     /// <summary>
     /// Called by the send pipeline AFTER the message is durably persisted (seq allocated + inserted).
@@ -254,11 +263,21 @@ public class FanOutEngine(
     public async Task PushChannelAdded(ChatChannel channel, ChannelMembership membership, bool focus)
     {
         var battleTag = membership.BattleTag;
+
+        // C6 (Task 9, D11): update the presence-interest index FIRST — BEFORE the offline early-return
+        // below. A member added to a Dm/GroupDm makes every connection ALREADY watching that channel
+        // interested in the added tag, and that is true REGARDLESS of whether the added user is currently
+        // online: their being offline does not mean nobody is watching them (some other member may have
+        // the same channel focused right now and must gain interest so they learn when this user first
+        // comes online). Safe for any channel type — the index only ever holds private-lane watchers, so
+        // this is a no-op for a Public/SemiPublic/System channel nobody registered interest through.
+        _presenceInterestRegistry.OnMemberAdded(channel.Id, battleTag);
+
         var session = _sessionRegistry.GetByBattleTag(battleTag);
         if (session == null)
         {
             // Offline — nothing to push to, and nothing to seed (there is no live connection to seed
-            // the OnlineMemberRegistry entry against).
+            // the OnlineMemberRegistry entry against). The interest-index update above already ran.
             return;
         }
 
@@ -315,6 +334,13 @@ public class FanOutEngine(
     /// </summary>
     public async Task PushChannelRemoved(string channelId, string battleTag)
     {
+        // C6 (Task 9, D11): update the presence-interest index FIRST — BEFORE the offline early-return
+        // below. A member removed from a Dm/GroupDm makes every connection watching that channel drop
+        // interest in the removed tag, REGARDLESS of whether the removed user is currently online (an
+        // offline removed member still needs to be dropped from the watchers who had them). Safe for any
+        // channel type — a no-op for a channel nobody registered private-lane interest through.
+        _presenceInterestRegistry.OnMemberRemoved(channelId, battleTag);
+
         var session = _sessionRegistry.GetByBattleTag(battleTag);
         if (session == null)
         {
@@ -328,6 +354,12 @@ public class FanOutEngine(
         // {left} for this forced removal (Task 14 parity gap, deliberately deferred to the eventual caller).
         _onlineMemberRegistry.Leave(channelId, session.ConnectionId);
         _focusRegistry.Unfocus(session.ConnectionId, channelId);
+        // C6 (Task 9, D11): the removed user is no longer a member, so revoke THEIR OWN interest that was
+        // derived from focusing this channel too — a kicked user must not keep learning the presence of
+        // the channel's remaining members. (The OnMemberRemoved above only stops OTHERS watching THEM;
+        // this stops THEM watching others.) Refcount-safe: a tag they also reach via another focused
+        // channel survives.
+        _presenceInterestRegistry.RevokeFocus(session.ConnectionId, channelId);
 
         var dto = new ChannelRemovedDto(channelId);
         // Fault isolation (review fix, SEC-Low-3): the ChannelRemoved push is a BEST-EFFORT live
@@ -342,6 +374,47 @@ public class FanOutEngine(
         catch (Exception ex)
         {
             Log.Warning(ex, "Push of ChannelRemoved failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, session.ConnectionId, channelId);
+        }
+    }
+
+    /// <summary>
+    /// C6 (Task 9, D11): the presence-change emit helper. On a GENUINE online/offline transition of
+    /// <paramref name="battleTag"/>, delivers <see cref="ChatEvents.PresenceChanged"/> (carrying a
+    /// <see cref="PresenceChangedDto"/>) to exactly the connections with DERIVED interest — those returned
+    /// by <see cref="PresenceInterestRegistry.GetInterestedConnections"/> — MINUS
+    /// <paramref name="excludedConnectionId"/> (the subject's own connection; a user is never told about
+    /// their own presence). There is no subscribe API: the recipient set is derived purely from who has a
+    /// Dm/GroupDm containing <paramref name="battleTag"/> focused right now, so a connection focused
+    /// elsewhere (or watching nothing) receives NOTHING.
+    /// <para>
+    /// Per-recipient fault isolation mirrors <see cref="OnMessagePersisted"/>: a single torn-down
+    /// recipient cannot abort delivery to the rest and must NEVER propagate out — the caller is a
+    /// connect/disconnect lifecycle path that must complete regardless of a dead watcher's socket. Live
+    /// presence is best-effort; a missed recipient reconciles on its next reconnect (fresh SessionState /
+    /// GetPresence).
+    /// </para>
+    /// </summary>
+    public async Task PushPresenceChanged(string battleTag, bool online, string excludedConnectionId)
+    {
+        var dto = new PresenceChangedDto(battleTag, online);
+        foreach (var connectionId in _presenceInterestRegistry.GetInterestedConnections(battleTag))
+        {
+            // A user is never notified about their OWN presence transition. (Interest never records a
+            // connection against its own tag, so this is belt-and-suspenders — but it also excludes the
+            // exact connection that just connected/disconnected, whatever casing it registered under.)
+            if (connectionId == excludedConnectionId)
+            {
+                continue;
+            }
+
+            try
+            {
+                await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.PresenceChanged, dto);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Fan-out send of PresenceChanged failed for connection {ConnectionId} (subject {BattleTag}) — skipping, other recipients unaffected", connectionId, battleTag);
+            }
         }
     }
 

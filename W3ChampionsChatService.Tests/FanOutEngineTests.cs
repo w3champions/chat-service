@@ -68,7 +68,7 @@ public class FanOutEngineTests
     {
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry);
+        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry, new PresenceInterestRegistry());
     }
 
     // A SessionRegistry seeded with the given (connection, battleTag, isModerator) entries. A moderator
@@ -117,7 +117,7 @@ public class FanOutEngineTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
         return (harness, engine);
     }
 
@@ -367,7 +367,7 @@ public class FanOutEngineTests
         // UNFOCUSED level-All member who, for a NON-shadow message, WOULD receive a ChannelActivity.
         var members = new OnlineMemberRegistry();
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry());
 
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
@@ -553,7 +553,7 @@ public class FanOutEngineTests
         members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -575,7 +575,7 @@ public class FanOutEngineTests
         // An unfocused level-All recipient of an ACCEPTED Dm — suppression is lifted, so activity resumes.
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -593,7 +593,7 @@ public class FanOutEngineTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -705,7 +705,7 @@ public class FanOutEngineTests
         var groupMembers = new OnlineMemberRegistry();
         groupMembers.Join(ChannelId, GroupMemberConn, new MemberState(GroupMemberTag, NotificationLevel.All, 0, ChannelType.GroupDm));
         var groupEngine = new FanOutEngine(
-            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry());
+            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry(), new PresenceInterestRegistry());
         var groupChannel = new ChatChannel { Id = ChannelId, Type = ChannelType.GroupDm };
 
         await groupEngine.OnMessagePersisted(groupChannel, Message(), AuthorConnection, isShadow: false, Now);
@@ -721,7 +721,7 @@ public class FanOutEngineTests
         var publicMembers = new OnlineMemberRegistry();
         publicMembers.Join(ChannelId, PublicMemberConn, new MemberState(PublicMemberTag, NotificationLevel.All, 0, ChannelType.Public));
         var publicEngine = new FanOutEngine(
-            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry());
+            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry(), new PresenceInterestRegistry());
 
         await publicEngine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
@@ -740,7 +740,7 @@ public class FanOutEngineTests
         members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(content: "a pending message"), InitiatorConnection, isShadow: false, Now);
 

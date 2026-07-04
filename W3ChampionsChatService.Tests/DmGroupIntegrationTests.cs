@@ -129,7 +129,7 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         // the hubs mutate, so every push lands in a single ordered capture.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         _fanOutEngine = new FanOutEngine(
-            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry);
+            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry());
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
 
         // One shared provider over a controllable fake source (reads the per-tag dicts, OrdinalIgnoreCase),

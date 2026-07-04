@@ -27,6 +27,7 @@ internal static class FanOutEngineTestFactory
             new FocusRegistry(),
             members,
             new ActivityCoalescer(harness.HubContext, members),
-            new SessionRegistry());
+            new SessionRegistry(),
+            new PresenceInterestRegistry());
     }
 }

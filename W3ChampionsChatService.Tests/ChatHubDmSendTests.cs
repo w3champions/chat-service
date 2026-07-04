@@ -104,7 +104,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
         // MessageReceived / ChannelActivity emitted post-persist are observable.
         _harness = new HubPushCaptureHarness();
         _coalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry);
+        _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry());
 
         _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
             tag,

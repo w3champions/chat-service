@@ -105,6 +105,42 @@ public class SessionRegistryTests
         Assert.IsTrue(registry.TryGetByConnectionId("conn-1", out _));
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // C6 (Task 9, D11): Unregister's bool return is the disconnect-side presence-transition signal —
+    // true iff THIS call actually removed the battleTag's live mapping (a genuine offline transition).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public void Unregister_CurrentConnection_ReturnsTrue_GenuineOfflineTransition()
+    {
+        registry.Register("conn-1", Identity("peter#123"), null);
+
+        Assert.IsTrue(registry.Unregister("conn-1"),
+            "unregistering the CURRENT connection removes the live mapping — a genuine offline transition");
+    }
+
+    [Test]
+    public void Unregister_DisplacedOldSocket_ReturnsFalse_NotATransition()
+    {
+        registry.Register("conn-old", Identity("peter#123"), null);
+        registry.Register("conn-new", Identity("peter#123"), null); // displaces conn-old
+
+        // The dying OLD socket's late teardown did NOT remove the live mapping (it points at conn-new) —
+        // the user is still online, so this is NOT an offline transition and must return false.
+        Assert.IsFalse(registry.Unregister("conn-old"),
+            "a displaced old socket's disconnect is not an offline transition — the user is still online via conn-new");
+        Assert.AreEqual("conn-new", registry.GetByBattleTag("peter#123").ConnectionId);
+    }
+
+    [Test]
+    public void Unregister_UnknownConnection_ReturnsFalse()
+    {
+        registry.Register("conn-1", Identity("peter#123"), null);
+
+        Assert.IsFalse(registry.Unregister("conn-unknown"),
+            "an unknown/already-torn-down connection removed nothing — not a transition");
+    }
+
     [Test]
     public void Register_DifferentBattleTags_Coexist_NoDisplacement()
     {

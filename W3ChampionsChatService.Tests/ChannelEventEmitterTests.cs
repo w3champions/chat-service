@@ -45,7 +45,7 @@ public class ChannelEventEmitterTests
         var members = new OnlineMemberRegistry();
         var sessions = new SessionRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, sessions);
+        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, sessions, new PresenceInterestRegistry());
         return (harness, focus, members, sessions, engine);
     }
 

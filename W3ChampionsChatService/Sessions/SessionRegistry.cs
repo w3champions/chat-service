@@ -13,8 +13,15 @@ public interface ISessionRegistry
     ChatSession Register(string connectionId, W3CUserAuthentication identity, HubCallerContext context);
 
     /// <summary>Identity-checked teardown: forgets the connection, and removes the battleTag
-    /// mapping ONLY if it still points at connectionId. Safe against the displaced-old-socket race.</summary>
-    void Unregister(string connectionId);
+    /// mapping ONLY if it still points at connectionId. Safe against the displaced-old-socket race.
+    /// <para>
+    /// Returns TRUE iff this call actually removed the battleTag's live session mapping — a GENUINE
+    /// online→offline transition. Returns FALSE for an unknown/already-torn-down connectionId, OR for a
+    /// displaced OLD socket whose mapping already points at a NEWER connection (the user is still online).
+    /// C6 (Task 9, D11) uses this as the disconnect-side transition signal that gates the
+    /// <c>PresenceChanged(offline)</c> emit. Additive: existing callers may ignore the result.
+    /// </para></summary>
+    bool Unregister(string connectionId);
 
     bool TryGetByConnectionId(string connectionId, out ChatSession session);
 
@@ -77,23 +84,27 @@ public class SessionRegistry : ISessionRegistry
         }
     }
 
-    public void Unregister(string connectionId)
+    public bool Unregister(string connectionId)
     {
         lock (_lock)
         {
             if (!_battleTagByConnection.Remove(connectionId, out var battleTag))
             {
-                // Unknown/already-torn-down connection — nothing to do.
-                return;
+                // Unknown/already-torn-down connection — nothing to do; not a transition.
+                return false;
             }
 
             // IDENTITY-CHECKED teardown (flo "signed in elsewhere" race guard): remove the battleTag
             // mapping ONLY if it still points at THIS connection. After a displacement the mapping
-            // points at the NEW connection — the dying OLD socket must not evict it.
+            // points at the NEW connection — the dying OLD socket must not evict it (and its disconnect
+            // is NOT an online→offline transition: the user is still online via the newer connection).
             if (_byBattleTag.TryGetValue(battleTag, out var current) && current.ConnectionId == connectionId)
             {
                 _byBattleTag.Remove(battleTag);
+                return true; // this call removed the live mapping — a genuine offline transition.
             }
+
+            return false; // displaced old socket — the mapping already points at a newer connection.
         }
     }
 

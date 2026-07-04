@@ -130,7 +130,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         // coalescer/accumulator see the live roster/membership/read-state the hubs produce.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         _fanOutEngine = new FanOutEngine(
-            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry);
+            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry());
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
     }
 

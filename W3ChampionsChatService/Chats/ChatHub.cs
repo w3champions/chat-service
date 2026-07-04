@@ -155,6 +155,14 @@ public partial class ChatHub(
 
         // Single connection per battleTag (ChatLimits.MaxConnectionsPerBattleTag == 1): new wins.
         var displaced = _sessionRegistry.Register(Context.ConnectionId, identity, Context);
+
+        // C6 (Task 9, D11): a GENUINE offline→online transition is one where there was NO prior session
+        // for this battleTag. A displacement (displaced != null) is a reconnect of an ALREADY-online user
+        // (same battleTag, new socket) — online before AND after — so it is NOT a transition and must fire
+        // no PresenceChanged (the false-transition guard). The actual emit runs at the end of connect,
+        // after the session is fully seeded.
+        var wentOnline = displaced == null;
+
         if (displaced != null)
         {
             // Contract (acceptance 4): notify the OLD connection, THEN close it — event BEFORE close.
@@ -201,6 +209,17 @@ public partial class ChatHub(
             // off the DTO's own MuteState (present iff Full), mirroring MuteReconciliationService's
             // PlayerBannedFromChat payload shape ({ endDate }).
             await Clients.Caller.SendAsync(ChatEvents.PlayerBannedFromChat, new { endDate = dto.MuteState.EndDate });
+        }
+
+        // C6 (Task 9, D11): on a GENUINE offline→online transition, tell every connection with DERIVED
+        // interest in this user (someone with a focused Dm/GroupDm containing them) that they are now
+        // online — MINUS this user's own connection. Emitted through the fan-out engine's per-recipient
+        // fault-isolated path, so a dead watcher's socket can never fail the connect. A displacement
+        // (wentOnline == false) emits nothing: the user was already online. The recipient set is derived
+        // ENTIRELY from focus+membership — a connection watching nothing, or focused elsewhere, gets zero.
+        if (wentOnline)
+        {
+            await _fanOutEngine.PushPresenceChanged(identity.BattleTag, online: true, Context.ConnectionId);
         }
     }
 
@@ -264,6 +283,16 @@ public partial class ChatHub(
         // the ordering here is load-bearing, not cosmetic.
         var hasDisconnectingSession = _sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var disconnectingSession);
 
+        // C6 (Task 9, D11): capture the disconnecting battleTag NOW, before Unregister, for the
+        // presence-offline emit below (NPE-safe: null for a displaced old socket, which also short-circuits
+        // the wentOffline gate).
+        var disconnectingBattleTag = hasDisconnectingSession ? disconnectingSession.Identity.BattleTag : null;
+
+        // C6 (Task 9, D11): whether THIS disconnect is a genuine online→offline transition. Set from
+        // Unregister's return inside the try below; a displaced old socket returns false (the user is still
+        // online via a newer connection), suppressing any PresenceChanged(offline).
+        var wentOffline = false;
+
         // C3 (Task 8): tear down this connection's in-memory fan-out state UNCONDITIONALLY so it can
         // never leak past the socket's lifetime. INVARIANT, enforced structurally (not by statement
         // order): the removals below live in a `finally`, so they ALWAYS run — even if the teardown in
@@ -275,8 +304,9 @@ public partial class ChatHub(
         try
         {
             // Identity-checked teardown lives INSIDE the registry — the hub stays dumb. Safe against the
-            // displaced-old-socket race: a dying OLD socket will NOT evict the NEW session.
-            _sessionRegistry.Unregister(Context.ConnectionId);
+            // displaced-old-socket race: a dying OLD socket will NOT evict the NEW session. Its return is
+            // the D11 transition signal: true iff this call actually removed the battleTag's live mapping.
+            wentOffline = _sessionRegistry.Unregister(Context.ConnectionId);
 
             // Drop the connection→user mapping unconditionally. REQUIRED for mute-cache cleanup (a
             // ConnectionMapping.Remove also clears this connection's cached mute entry); no-op if absent.
@@ -316,6 +346,22 @@ public partial class ChatHub(
             // Task 13: also drop the connection's ChannelActivity coalescing state (routed through the
             // fan-out engine, which owns the coalescer) so the singleton can't leak past the socket.
             _fanOutEngine.OnConnectionClosed(Context.ConnectionId);
+            // C6 (Task 9, D11): drop this connection's OWN derived presence interest (it was watching
+            // others' presence via its focused DMs/groups). UNCONDITIONAL + no-op-safe, alongside the
+            // sibling registries — this removes it as a WATCHER; OTHER connections' interest in THIS
+            // user's tag is untouched (that is what the PresenceChanged(offline) emit below conveys).
+            _presenceInterestRegistry.RemoveConnection(Context.ConnectionId);
+        }
+
+        // C6 (Task 9, D11): a GENUINE online→offline transition (wentOffline) fires PresenceChanged(offline)
+        // to every connection with derived interest in this user — MINUS the (now-closing) own connection.
+        // A displaced old socket (wentOffline == false) fires nothing: the user is still online via the
+        // newer connection. Emitted AFTER the finally so RemoveConnection has cleared this connection's own
+        // watching first — harmless either way, since GetInterestedConnections keys on the SUBJECT's tag,
+        // which RemoveConnection(self) never touches.
+        if (wentOffline && disconnectingBattleTag != null)
+        {
+            await _fanOutEngine.PushPresenceChanged(disconnectingBattleTag, online: false, Context.ConnectionId);
         }
 
         // D9 (C6 Task 3, acceptance 6): the DISCONNECT-time directory write — true last-seen. Skipped

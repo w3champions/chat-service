@@ -80,6 +80,26 @@ public partial class ChatHub
 
         if (isPrivateLane)
         {
+            // C6 (Task 9, D11): DERIVE presence interest from this focus — the SOLE way a connection ever
+            // gains it (there is no subscribe API). Load the channel's CURRENT membership and register
+            // interest in every member EXCEPT the caller's own tag. LoadForChannel is legitimate for a
+            // private lane (Dm = 2 members, GroupDm is ACL-bound/capped; the never-enumerate guardrail is
+            // Public-channel-only). This branch is reached for Dm/GroupDm ONLY — Public/SemiPublic/System
+            // focuses register NOTHING, structurally, since they never enter this branch.
+            // KNOWN NARROW TOCTOU (documented for the security gate): this Mongo read + RegisterFocus is
+            // NOT atomic with a concurrent membership mutation. If a member leaves/is-removed in the exact
+            // window after this read snapshots the roster but before RegisterFocus runs — and that
+            // departure's OnMemberRemoved fires before this connection is recorded as a watcher — this
+            // connection can register (fail-CLOSED-adjacent: presence-bool only) interest in a just-departed
+            // member that no later leg revokes until the next re-focus/unfocus/disconnect. The window is a
+            // single await-continuation gap; the authoritative REPLACE semantics of any subsequent re-focus
+            // self-correct it. Accepted as a bounded known limitation rather than adding a membership-version
+            // guard (out of this task's scope). The symmetric case (a just-added member missed by the read)
+            // is a fail-closed missed-notification, not a leak.
+            var members = await _membershipRepository.LoadForChannel(channelId);
+            _presenceInterestRegistry.RegisterFocus(
+                Context.ConnectionId, channelId, battleTag, members.Select(m => m.BattleTag));
+
             // D11: FocusRegistry participation above still happens (focused delivery + the C6 interest
             // derivation depend on it) but the client gets an EMPTY roster, never the channel's active-
             // viewer set — a Dm/GroupDm never streams "who is viewing" (§1 non-goal, §9 channel-scoped
@@ -120,6 +140,13 @@ public partial class ChatHub
         // (connection, channel) pair, so unfocusing a channel the caller never focused (or an
         // unregistered connection) still returns Ok — there is nothing to reject.
         _focusRegistry.Unfocus(Context.ConnectionId, channelId);
+
+        // C6 (Task 9, D11): revoke this connection's presence interest derived from the channel.
+        // UNCONDITIONAL and no-op-safe — the registry self-noops for a (connection, channel) it never
+        // registered (e.g. a Public-channel unfocus), so no "is this even private?" branch is needed.
+        // Refcount-by-channel: a watched tag ALSO reachable via another focused channel survives.
+        _presenceInterestRegistry.RevokeFocus(Context.ConnectionId, channelId);
+
         return Task.FromResult(new ChannelOperationResult(ChatResultCode.Ok));
     }
 
@@ -321,6 +348,20 @@ public partial class ChatHub
 
         _focusRegistry.Unfocus(Context.ConnectionId, channelId);
 
+        // C6 (Task 9, D11): revoke THIS connection's presence interest derived from the channel it just
+        // left (UNCONDITIONAL + no-op-safe, mirroring UnfocusChannel — a Public-channel leave self-noops).
+        _presenceInterestRegistry.RevokeFocus(Context.ConnectionId, channelId);
+
+        // C6 (Task 9, D11): the leaver is no longer a member of a Dm/GroupDm, so every OTHER connection
+        // watching that private channel must drop the leaver's presence. Gated to private lanes (for a
+        // Public channel OnMemberRemoved is a registry no-op anyway — nothing registers interest through
+        // it — but gating keeps the intent explicit and off the hot public-leave path). A null/vanished
+        // channel is treated as non-private-lane, exactly like the accumulator branch above.
+        if (isPrivateLane)
+        {
+            _presenceInterestRegistry.OnMemberRemoved(channelId, battleTag);
+        }
+
         // C5 (Task 8, D12): GroupDm departure bookkeeping — empty-deletion or last-owner auto-promotion.
         if (channel != null && channel.Type == ChannelType.GroupDm)
         {
@@ -355,6 +396,10 @@ public partial class ChatHub
             // Last member left ⇒ delete the channel doc + any residual membership rows (residual safety).
             await _channelRepository.Delete(channelId);
             await _membershipRepository.DeleteAllForChannel(channelId);
+            // C6 (Task 9, D11): the channel is gone — drop any residual presence interest derived through
+            // it (defensive: the departing last member's own interest was already revoked in LeaveChannel,
+            // and no other member remains to be a watcher — but a deleted channel must leave no index trace).
+            _presenceInterestRegistry.RemoveChannel(channelId);
             return;
         }
 
