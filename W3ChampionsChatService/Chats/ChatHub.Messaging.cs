@@ -250,6 +250,15 @@ public partial class ChatHub
         // their OWN shadow/deleted rows are flagged too, not illusion-forced (they are a moderator). The
         // membership gate above is UNCHANGED — a non-member is already rejected regardless of permission;
         // the privileged any-channel read is the REST endpoint (Task 7), not this focused-view read.
+        //
+        // This branch does NOT re-apply the {Public, SemiPublic, System+Match} scope wall that
+        // single-delete/purge/the REST endpoint enforce — it is safe only emergently, by construction
+        // of the write paths: a shadow==true row can exist ONLY in a Public channel (the shadow flag is
+        // set Public-only at send time), and a deleted!=null row can exist ONLY in a moderatable channel
+        // (both delete paths are themselves scope-walled). So in any DM/GroupDm/System+Clan/System+Lobby
+        // channel a moderator happens to be a member of, ForModerator is byte-identical to
+        // ForUserDelivery — no private content or flag leaks. This safety depends on those write-time
+        // invariants holding in the send path and delete paths; it is not re-verified here.
         if (session.HasPermission(EPermission.Moderation))
         {
             var moderatorPage = aroundSeq.HasValue

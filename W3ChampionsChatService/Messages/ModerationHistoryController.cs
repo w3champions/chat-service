@@ -1,11 +1,9 @@
-using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
-using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Protocol;
 
 namespace W3ChampionsChatService.Messages;
@@ -62,10 +60,10 @@ public class ModerationHistoryController(ChannelRepository channelRepository, Me
         var page = await _messageRepository.LoadPageBeforeForModerator(channelId, beforeSeq, limit);
         var messages = page.Select(m => ModerationMessageDto.FromChannelMessage(channelId, m)).ToList();
 
-        // The clamp MessageRepository applies internally (Math.Clamp(limit, 1, ChatLimits.MessagePageSize))
-        // is mirrored here — not re-derived from the repo — so "was this page full" lines up exactly with
+        // The cursor uses the SAME clamp the repository applied internally (delegated via
+        // MessageRepository.ClampLimit, not re-derived) so "was this page full" lines up exactly with
         // what LoadPageBeforeForModerator actually fetched: a full page means older rows may remain.
-        var effectiveLimit = Math.Clamp(limit, 1, ChatLimits.MessagePageSize);
+        var effectiveLimit = MessageRepository.ClampLimit(limit);
         long? nextBeforeSeq = messages.Count == effectiveLimit ? messages.Min(m => m.Seq) : null;
 
         return Ok(new ModerationMessagePageDto(channelId, messages, nextBeforeSeq));

@@ -203,5 +203,5 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// Do not simplify this to <see cref="Math.Min"/> — that would silently reintroduce the
     /// unbounded-return footgun for a caller-supplied limit of 0 or less.
     /// </summary>
-    private static int ClampLimit(int limit) => Math.Clamp(limit, 1, ChatLimits.MessagePageSize);
+    internal static int ClampLimit(int limit) => Math.Clamp(limit, 1, ChatLimits.MessagePageSize);
 }
