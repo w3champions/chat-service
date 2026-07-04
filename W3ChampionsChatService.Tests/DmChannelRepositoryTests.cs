@@ -66,6 +66,7 @@ public class DmChannelRepositoryTests : IntegrationTestBase
     [Test]
     public async Task FindOrCreateDm_ConcurrentCalls_YieldOneDocument()
     {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
         var repo = new ChannelRepository(MongoClient);
 
         var tasks = Enumerable.Range(0, 8)
