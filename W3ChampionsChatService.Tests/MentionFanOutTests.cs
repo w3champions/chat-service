@@ -25,12 +25,13 @@ namespace W3ChampionsChatService.Tests;
 /// per connection. A <see cref="FakeTimeProvider"/>-derived <c>now</c> makes the CreatedAt/ExpiresAt
 /// assertions deterministic. NUnit constraint style.
 /// <para>
-/// The four eligibility rules (D3): (a) message NOT shadow; (b) target ≠ sender (case-insensitive);
+/// The five eligibility rules (D3): (a) message NOT shadow; (b) target ≠ sender (case-insensitive);
 /// (c) target has a <c>channel_memberships</c> row for THIS channel — the Dm/GroupDm excerpt PRIVACY
-/// WALL; (d) membership <c>NotificationLevel != None</c>. Every negative-eligibility test below ALSO
-/// mentions an eligible CONTROL member in the SAME call and asserts the control DID get an entry +
-/// event — so the test fails against a do-nothing stub AND against an over-permissive filter, not just
-/// one of the two.
+/// WALL; (d) membership <c>NotificationLevel != None</c>; (e) membership is NOT currently
+/// decline-suppressed (<c>DeclinedUntil</c> unset or already elapsed vs. <c>now</c>). Every
+/// negative-eligibility test below ALSO mentions an eligible CONTROL member in the SAME call and
+/// asserts the control DID get an entry + event — so the test fails against a do-nothing stub AND
+/// against an over-permissive filter, not just one of the two.
 /// </para>
 /// </summary>
 public class MentionFanOutTests : IntegrationTestBase
