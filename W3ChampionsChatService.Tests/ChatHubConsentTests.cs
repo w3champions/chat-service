@@ -79,6 +79,13 @@ public class ChatHubConsentTests : IntegrationTestBase
     // Every (connectionId, method, payload) the HUB itself pushed via Clients.Caller/Clients.Client.
     private readonly List<(string ConnectionId, string Method, object Payload)> _hubSends = new();
 
+    // ConnectionIds configured (via ThrowOnSend) to fault on every subsequent hub-direct SendAsync/
+    // SendCoreAsync — mirrors HubPushCaptureHarness.ThrowOnSend, but for THIS file's own Clients.Client
+    // mock (below). The hub's RequestReceived push (MaterializeDmRecipientAndNotify) goes out via the
+    // hub's OWN IHubCallerClients — NOT through FanOutEngine's _harness.HubContext — so it is not
+    // reachable via _harness.ThrowOnSend; this is the throwing-send hook for THAT path (C5 LOW-1).
+    private readonly Dictionary<string, Exception> _throwingConnections = new();
+
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
     [SetUp]
@@ -172,15 +179,40 @@ public class ChatHubConsentTests : IntegrationTestBase
         var proxy = new Mock<ISingleClientProxy>();
         proxy
             .Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((method, args, _) =>
+            .Returns<string, object[], CancellationToken>((method, args, _) =>
             {
+                Exception exceptionToThrow;
+                lock (_hubSends)
+                {
+                    _throwingConnections.TryGetValue(connId, out exceptionToThrow);
+                }
+
+                if (exceptionToThrow != null)
+                {
+                    return Task.FromException(exceptionToThrow);
+                }
+
                 lock (_hubSends)
                 {
                     _hubSends.Add((connId, method, args.Length > 0 ? args[0] : null));
                 }
-            })
-            .Returns(Task.CompletedTask);
+                return Task.CompletedTask;
+            });
         return proxy.Object;
+    }
+
+    /// <summary>
+    /// Configures every subsequent hub-direct <c>SendAsync</c>/<c>SendCoreAsync</c> call to
+    /// <paramref name="connectionId"/> to fault instead of recording — simulating a recipient connection
+    /// torn down mid-push (C5 LOW-1: the <see cref="ChatEvents.RequestReceived"/> push in
+    /// <c>MaterializeDmRecipientAndNotify</c>). Mirrors <see cref="HubPushCaptureHarness.ThrowOnSend"/>.
+    /// </summary>
+    private void ThrowOnSend(string connectionId, Exception exception = null)
+    {
+        lock (_hubSends)
+        {
+            _throwingConnections[connectionId] = exception ?? new InvalidOperationException($"Simulated send failure for connection '{connectionId}'");
+        }
     }
 
     private void RegisterSession(string connectionId, string battleTag) =>
@@ -441,6 +473,68 @@ public class ChatHubConsentTests : IntegrationTestBase
         Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(2), "a fresh RequestReceived fires after the window elapses");
         var (after, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-after", Now);
         Assert.That(after.PendingDmRequests.Select(r => r.ChannelId), Does.Contain(channel.Id), "the tray re-populates after the window");
+    }
+
+    [Test]
+    public async Task RequestReceivedPushThrows_SendStillOk_MessagePersisted()
+    {
+        // C5 LOW-1 (security review): the RequestReceived push in MaterializeDmRecipientAndNotify
+        // (ChatHub.Dm.cs) is the LONE un-fault-isolated live push on the send path — every sibling live
+        // push (FanOutEngine.OnMessagePersisted/PushChannelAdded/PushChannelRemoved) wraps its SendAsync
+        // in a best-effort try/catch, but this one is a bare await. If the recipient's connection is torn
+        // down mid-push, that exception must NOT propagate out of SendMessage — the message is already
+        // durably persisted (step 7, BEFORE this post-persist hook at step 7.5), and the pipeline's own
+        // guardrail is that an already-persisted send returns Ok regardless of fan-out hiccups.
+        // <para>
+        // Exercised on the DECLINE-CORRELATED resurface path specifically — the recipient declines, the
+        // 24h suppression window elapses, and the initiator's next message resurfaces a fresh
+        // RequestReceived. This is exactly the marquee decline-invisibility surface: were this push to
+        // leak an error out to the initiator only on this path, the initiator would observe an error-ack
+        // the pure-ignore path never produces — a leak of the recipient's decline.
+        // </para>
+        var channel = await CreateDm(DmRequestState.Pending);
+        _dmInitiationTracker.Record(Initiator, Recipient.ToLowerInvariant(), Now);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        await SeedPrivacy(Recipient, DmPrivacy.Everyone);
+        RegisterSession(RecipientConn, Recipient);
+        var initiatorHub = BuildHub(InitiatorConn);
+
+        var first = await initiatorHub.SendMessage(channel.Id, "first"); // materializes + RequestReceived #1 (no throw yet)
+        Assert.That(first.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(1));
+
+        var recipientHub = BuildHub(RecipientConn);
+        var decline = await recipientHub.DeclineRequest(channel.Id);
+        Assert.That(decline.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        // Past the 24h window: the NEXT message resurfaces a fresh RequestReceived (clears DeclinedUntil,
+        // re-fires) — exactly the branch that reaches the throwing SendAsync below.
+        _time.Advance(ChatLimits.DmDeclineSuppression + TimeSpan.FromMinutes(1));
+
+        // The recipient's live connection is torn down right as the resurfaced RequestReceived would push.
+        ThrowOnSend(RecipientConn);
+
+        SendMessageResult result = null;
+        Assert.DoesNotThrowAsync(
+            async () => result = await initiatorHub.SendMessage(channel.Id, "resurfacing message"),
+            "a torn-down recipient connection during the resurfaced RequestReceived push must not propagate " +
+            "out of SendMessage — the message is already persisted (C5 LOW-1 fault-isolation fix)");
+
+        Assert.That(result, Is.Not.Null, "SendMessage must return a typed result, not throw");
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "the initiator still gets Ok even though the recipient's push faulted");
+        Assert.That(result.MessageId, Is.Not.Null);
+        Assert.That(result.Seq, Is.EqualTo(first.Seq + 1), "the seq advanced — the message was durably persisted despite the push fault");
+
+        // The message IS durably persisted and readable despite the push fault.
+        var history = await initiatorHub.GetMessages(channel.Id, null, null, 50);
+        Assert.That(history.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(history.Messages.Select(m => m.Content), Does.Contain("resurfacing message"),
+            "the message persists even though the recipient's RequestReceived push threw");
+
+        // DeclinedUntil clears BEFORE the throwing push (durable state runs first, the notify is best-effort
+        // last) — it must stick even though the push itself failed.
+        Assert.That((await _membershipRepository.Load(channel.Id, Recipient)).DeclinedUntil, Is.Null,
+            "the resurface path clears the recipient's decline window regardless of the push fault");
     }
 
     [Test]

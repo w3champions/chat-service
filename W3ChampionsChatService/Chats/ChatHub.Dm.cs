@@ -2,6 +2,7 @@ using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
+using Serilog;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
@@ -571,7 +572,19 @@ public partial class ChatHub
         if (recipientSession != null)
         {
             var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now);
-            await Clients.Client(recipientSession.ConnectionId).SendAsync(ChatEvents.RequestReceived, dto);
+            // Fault isolation (C5 LOW-1, security review): the RequestReceived push is a BEST-EFFORT live
+            // notification — the message is already durably persisted (SendMessage's step 7, before this
+            // post-persist hook), so a torn-down recipient connection must NEVER propagate out of
+            // SendMessage; reconnect heals it via the tray (SessionState). Mirrors the same try/catch shape
+            // as FanOutEngine.OnMessagePersisted/PushChannelAdded/PushChannelRemoved.
+            try
+            {
+                await Clients.Client(recipientSession.ConnectionId).SendAsync(ChatEvents.RequestReceived, dto);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "RequestReceived push failed for {ConnectionId} on channel {ChannelId} — best-effort, tray resurfaces it via SessionState", recipientSession.ConnectionId, channel.Id);
+            }
         }
     }
 }
