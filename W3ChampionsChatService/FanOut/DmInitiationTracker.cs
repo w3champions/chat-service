@@ -35,7 +35,14 @@ public class DmInitiationTracker
     /// <summary>Records a NEW stranger-shell creation by <paramref name="initiator"/> to
     /// <paramref name="targetNormalized"/> at <paramref name="now"/>. Only genuine new shells are recorded
     /// (the hub skips this for an already-existing conversation and for a concurrent-upsert that returned
-    /// an existing doc).</summary>
+    /// an existing doc).
+    /// <para>
+    /// TEST-SUPPORT API: no production caller. Production <c>OpenDm</c> uses the atomic
+    /// <see cref="TryRecord"/> (which folds the check-and-record into one critical section); this method
+    /// is kept as a direct seed primitive for unit tests that need to pre-populate events without going
+    /// through the cap check.
+    /// </para>
+    /// </summary>
     public void Record(string initiator, string targetNormalized, DateTime now)
     {
         lock (_lock)
@@ -99,7 +106,14 @@ public class DmInitiationTracker
 
     /// <summary>The number of <paramref name="initiator"/>'s unaccepted initiations still inside the 8h
     /// window at <paramref name="now"/> (aged-out events are pruned first). The caller rejects a new
-    /// initiation when this is <c>&gt;= <see cref="ChatLimits.StrangerDmInitiationCap"/></c>.</summary>
+    /// initiation when this is <c>&gt;= <see cref="ChatLimits.StrangerDmInitiationCap"/></c>.
+    /// <para>
+    /// TEST-SUPPORT / observability API: no production caller. Production <c>OpenDm</c> gates on the
+    /// atomic <see cref="TryRecord"/> return value instead of calling this then <see cref="Record"/>
+    /// separately (that two-step was the pre-C5-FIX-2 TOCTOU). Kept as a mutation-free read accessor for
+    /// direct unit-test assertions on tracker state.
+    /// </para>
+    /// </summary>
     public int CountActive(string initiator, DateTime now)
     {
         lock (_lock)

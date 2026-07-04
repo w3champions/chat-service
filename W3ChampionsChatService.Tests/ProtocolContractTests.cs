@@ -336,4 +336,26 @@ public class ProtocolContractTests
         StringAssert.DoesNotContain("Declined", json);
         StringAssert.DoesNotContain("declined", json);
     }
+
+    [Test]
+    public void OpenDmResult_NeverSerializesDeclinedUntil_OnRawMembership()
+    {
+        // D3 leak-wall pin, entity level: OpenDmResult/CreateGroupResult/JoinChannelResult carry the
+        // RAW ChannelMembership (not the MembershipDto projection). Even though these results only ever
+        // carry the CALLER'S OWN membership, DeclinedUntil is server-only state and must never reach the
+        // wire via System.Text.Json — the same serializer SignalR's default hub protocol uses.
+        var membership = new ChannelMembership
+        {
+            ChannelId = "chan1",
+            BattleTag = "Peter#123",
+            JoinedAt = DateTime.UtcNow,
+            DeclinedUntil = DateTime.UtcNow.AddHours(24),
+        };
+        var result = new OpenDmResult(ChatResultCode.Ok, Membership: membership);
+
+        var json = JsonSerializer.Serialize(result);
+
+        StringAssert.DoesNotContain("Declined", json);
+        StringAssert.DoesNotContain("declined", json);
+    }
 }

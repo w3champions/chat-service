@@ -1,4 +1,5 @@
 using System;
+using System.Text.Json.Serialization;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
 using W3ChampionsChatService.Domain;
@@ -32,8 +33,13 @@ public class ChannelMembership
     /// C5 D3's soft+temporal decline: the recipient's tray suppression window ("declined" is NOT a
     /// DmRequestState value; the channel stays Pending). MUST NEVER be serialized to the client —
     /// <see cref="W3ChampionsChatService.Protocol.MembershipDto"/> is an explicit projection and MUST
-    /// NOT gain this field (the sender must never learn they were declined).
+    /// NOT gain this field (the sender must never learn they were declined). <see cref="JsonIgnoreAttribute"/>
+    /// closes this at the entity source (System.Text.Json — the SignalR default hub protocol) so results
+    /// that carry the raw entity directly (<c>OpenDmResult</c>/<c>CreateGroupResult</c>/<c>JoinChannelResult</c>)
+    /// can never leak it either, without affecting BSON persistence (<see cref="BsonIgnoreIfNullAttribute"/>
+    /// is independent and unchanged).
     /// </summary>
     [BsonIgnoreIfNull]
+    [JsonIgnore]
     public DateTime? DeclinedUntil { get; set; }
 }
