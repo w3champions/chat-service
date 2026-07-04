@@ -49,9 +49,10 @@ public class UserDirectoryRepository(MongoClient mongoClient) : MongoDbRepositor
     /// the entire document including <see cref="UserDirectoryEntry.Profile"/>. Reserved for the
     /// enrichment write, where a fresh Profile is actually available; the disconnect-time write must
     /// use <see cref="SetLastSeen"/> instead so a wb outage never clobbers a previously-cached Profile
-    /// with null (the disconnect-upsert clobber guard).
+    /// with null (the disconnect-upsert clobber guard). Virtual solely so tests can spy/count calls
+    /// (mirrors <see cref="Load"/>) — e.g. C6 Task 10's zero-directory-writes-from-a-read-path pin.
     /// </summary>
-    public Task Upsert(UserDirectoryEntry entry)
+    public virtual Task Upsert(UserDirectoryEntry entry)
     {
         var normalized = WithNormalizedBattleTag(entry);
         return Directory.ReplaceOneAsync(
@@ -74,8 +75,10 @@ public class UserDirectoryRepository(MongoClient mongoClient) : MongoDbRepositor
     /// the CONNECT-time <see cref="Upsert"/> may replace Profile, and only when a fresh wb read
     /// succeeded). Upserts if the row doesn't exist yet — the directory is a cache, so a first-ever
     /// disconnect for a user whose connect-time write never landed must still materialize a row.
+    /// Virtual solely so tests can spy/count calls (mirrors <see cref="Load"/>) — e.g. C6 Task 10's
+    /// zero-directory-writes-from-a-read-path pin.
     /// </summary>
-    public Task SetLastSeen(string battleTag, string displayBattleTag, string normalizedName, DateTime now)
+    public virtual Task SetLastSeen(string battleTag, string displayBattleTag, string normalizedName, DateTime now)
     {
         var tag = NormalizeTag(battleTag);
         var update = Builders<UserDirectoryEntry>.Update

@@ -121,6 +121,11 @@ public class OldProtocolRemovedTests
             // (ChatHub.Mentions.cs). Widens the pinned set, never weakens it — same precedent as every
             // C5/C6 growth above.
             "SearchMentionCandidates",
+            // New protocol (C6 T10, D12): the one-shot presence read surface — GetPresence/
+            // GetPresenceDetails (ChatHub.Presence.cs). Widens the pinned set, never weakens it — same
+            // precedent as every C5/C6 growth above.
+            "GetPresence",
+            "GetPresenceDetails",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",
