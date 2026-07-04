@@ -285,8 +285,20 @@ public partial class ChatHub
             }
             else
             {
+                // REVIEW FIX (C6 T8): the query's own limit is capped at how many slots tiers 1/2 have
+                // actually LEFT (never the flat MentionSearchMaxResults constant regardless of how full
+                // candidates already is), AND the tiers-1/2 battleTags already claimed (`seen`) are
+                // excluded server-side (see SearchByNormalizedPrefix's doc) — so every row this query
+                // can possibly return is both usable (never re-discarded as a dupe here) and not wasted
+                // on a request for more rows than could ever be added. Trimming the limit WITHOUT that
+                // exclusion would be unsafe on its own: rows this query would go on to discard as dupes
+                // could still rank ahead of a genuinely new match within a smaller window, starving it
+                // out exactly like the private lane's pre-fix bug — the exclusion is what makes a
+                // smaller limit safe.
+                var remaining = Math.Max(0, ChatLimits.MentionSearchMaxResults - candidates.Count);
+                var seenLower = seen.Select(tag => tag.ToLowerInvariant()).ToList();
                 var directoryMatches = await _userDirectory.SearchByNormalizedPrefix(
-                    prefixLower, minLastSeenAt, ChatLimits.MentionSearchMaxResults);
+                    prefixLower, minLastSeenAt, remaining, seenLower);
                 AddTier(directoryMatches.Select(e => e.DisplayBattleTag ?? e.BattleTag), 3);
             }
         }

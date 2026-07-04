@@ -554,6 +554,55 @@ public class ChatHubMentionSearchTests : IntegrationTestBase
         }
     }
 
+    [Test]
+    public async Task Search_PublicLane_DirectoryDupesRankedFirst_DoNotStarveOutLaterTier3OnlyCandidate()
+    {
+        // Regression (task reviewer finding, C6 T8): the SAME bug class the private lane already had
+        // fixed (Search_DmChannel_MemberNotCrowdedOutByUnrelatedDirectoryNoise, above) — a public-lane
+        // tier 3 directory query must not let rows it is about to discard as dupes of tiers 1/2 consume
+        // its own result window ahead of a genuinely new, later-sorting match. This fixture is the
+        // OPPOSITE ordering of Search_ResultCapAndDedupe_HoldUnderLargeOverlappingFixture (above), which
+        // (by coincidence of alphabetical naming — "dironly" sorts before "online"/"viewer") never
+        // actually exercised this: here the tier-1/2 dupes' OWN directory rows are named to sort BEFORE
+        // the one genuine tier-3-only candidate.
+        const string channelId = "chan-1";
+        const string target = "zzz-target#1"; // sorts AFTER every "online"/"viewer" row below.
+        RegisterSession("conn-caller", "caller#1");
+        JoinChannel(channelId, "conn-caller", "caller#1");
+        var hub = BuildHub("conn-caller");
+
+        // Tier 1: 5 viewers of THIS channel.
+        for (var i = 0; i < 5; i++)
+        {
+            var tag = $"viewer{i}#1";
+            RegisterSession($"conn-viewer-{i}", tag);
+            JoinChannel(channelId, $"conn-viewer-{i}", tag);
+            FocusChannel(channelId, $"conn-viewer-{i}", tag);
+        }
+
+        // Tier 2: 10 more online anywhere (not viewing this channel) — plus the caller itself, which
+        // GetOnlineBattleTags also surfaces, for 16 total candidates filled before tier 3 ever runs.
+        for (var i = 0; i < 10; i++)
+        {
+            RegisterSession($"conn-online-{i}", $"online{i}#1");
+        }
+
+        // Every tier-1/2 member ALSO gets a fresh, matching directory row — tier 3's own query will
+        // re-discover every one of them, and (alphabetically) ALL of them sort before "zzz-target#1".
+        // With only ChatLimits.MentionSearchMaxResults - 16 = 4 slots left, a query that (a) still asks
+        // for a full/flat limit while (b) not excluding rows it already knows are dupes would burn its
+        // entire window on these re-discovered dupes and never even reach the target.
+        for (var i = 0; i < 5; i++) await SeedDirectory($"viewer{i}#1", Now.AddDays(-1));
+        for (var i = 0; i < 10; i++) await SeedDirectory($"online{i}#1", Now.AddDays(-1));
+        await SeedDirectory(target, Now.AddDays(-1));
+
+        var result = await hub.SearchMentionCandidates(channelId, "");
+
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Contain(target),
+            "a genuine tier-3-only candidate must not be starved out by dupes that rank ahead of it " +
+            "in the directory query's own sort order");
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Zero cross-service calls — a throwing IWebsiteBackendRepository spy, wired through a REAL
     // ChatAuthenticationService, proves the search path never reaches the website backend.

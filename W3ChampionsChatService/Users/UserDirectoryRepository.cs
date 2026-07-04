@@ -96,13 +96,32 @@ public class UserDirectoryRepository(MongoClient mongoClient) : MongoDbRepositor
     /// (<c>^prefix</c>, no trailing anchor — a genuine prefix match, unlike the exact-match anchoring
     /// used elsewhere for the shadow-self fix) and regex-escaped so a battleTag containing regex
     /// metacharacters can never be misinterpreted as a pattern.
+    /// <para>
+    /// REVIEW FIX (C6 T8): <paramref name="excludeBattleTagsLower"/> ANDs in a <c>$nin</c> against the
+    /// lowercased <c>_id</c> — the caller's tiers 1/2 (already-claimed) battleTags — directly INTO this
+    /// query, rather than relying on <paramref name="limit"/> alone to hint how many rows are still
+    /// wanted. This is load-bearing, not cosmetic: a caller-side dedupe against <paramref name="limit"/>
+    /// alone can still be starved when the rows this query WOULD discard as dupes happen to sort ahead
+    /// of a genuinely new match (Mongo has no idea which rows the caller already has) — trimming
+    /// <paramref name="limit"/> down to "how many more are needed" while ALSO leaving those rows
+    /// eligible to be re-fetched only shrinks the window available to find new ones. Filtering them out
+    /// of the query itself means every returned row is guaranteed usable, so <paramref name="limit"/>
+    /// can safely equal exactly how many more candidates are wanted. Null/empty is "exclude nothing" —
+    /// the private lane never calls this (it filters its own already-loaded snapshot in memory instead).
+    /// </para>
     /// </summary>
-    public Task<List<UserDirectoryEntry>> SearchByNormalizedPrefix(string prefixLower, DateTime minLastSeenAt, int limit)
+    public Task<List<UserDirectoryEntry>> SearchByNormalizedPrefix(
+        string prefixLower, DateTime minLastSeenAt, int limit, IReadOnlyCollection<string> excludeBattleTagsLower = null)
     {
         var filterBuilder = Builders<UserDirectoryEntry>.Filter;
         var filter = filterBuilder.And(
             filterBuilder.Regex(e => e.NormalizedName, new BsonRegularExpression("^" + Regex.Escape(prefixLower))),
             filterBuilder.Gte(e => e.LastSeenAt, minLastSeenAt));
+
+        if (excludeBattleTagsLower is { Count: > 0 })
+        {
+            filter = filterBuilder.And(filter, filterBuilder.Nin(e => e.BattleTag, excludeBattleTagsLower));
+        }
 
         return Directory.Find(filter).Limit(limit).ToListAsync();
     }
