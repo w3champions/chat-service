@@ -60,8 +60,9 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
     private RelationshipProvider _relationshipProvider;
     private FakeTimeProvider _time;
 
-    // Per-tag friends, read by the fake source's snapshot factory (OrdinalIgnoreCase).
+    // Per-tag friends/blocked, read by the fake source's snapshot factory (OrdinalIgnoreCase).
     private readonly Dictionary<string, HashSet<string>> _friends = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, HashSet<string>> _blocked = new(StringComparer.OrdinalIgnoreCase);
 
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
@@ -69,6 +70,7 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
     public void SetupBeforeEach()
     {
         _friends.Clear();
+        _blocked.Clear();
         _time = new FakeTimeProvider(FixedNow);
 
         _connectionMapping = new ConnectionMapping();
@@ -95,7 +97,7 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
         _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
             tag,
             _friends.TryGetValue(tag, out var f) ? f : new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            _blocked.TryGetValue(tag, out var b) ? b : new HashSet<string>(StringComparer.OrdinalIgnoreCase),
             now));
         _relationshipProvider = new RelationshipProvider(_relationshipSource, _time);
 
@@ -157,6 +159,9 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
 
     private void SetFriends(string battleTag, params string[] friends) =>
         _friends[battleTag] = new HashSet<string>(friends, StringComparer.OrdinalIgnoreCase);
+
+    private void SetBlocked(string battleTag, params string[] blocked) =>
+        _blocked[battleTag] = new HashSet<string>(blocked, StringComparer.OrdinalIgnoreCase);
 
     private static string[] DistinctFriendTags(int count) =>
         Enumerable.Range(0, count).Select(i => $"friend{i}#{i}").ToArray();
@@ -293,6 +298,29 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.Throttled), "the friends-gate fails closed (retriable) when the relationship view is unavailable");
         Assert.That(result.RetryAfterSeconds, Is.EqualTo(ChatLimits.RelationshipRetryAfterSeconds));
         Assert.That(await _channelRepository.LoadAllOfType(ChannelType.GroupDm), Is.Empty);
+    }
+
+    [Test]
+    public async Task CreateGroup_StaleSnapshot_ThrottledRetriable_NothingPersisted()
+    {
+        SetFriends(Creator, "wolf#456", "fox#789");
+        // Warm a FRESH snapshot for the caller (members are genuinely friends) so the provider's cache is
+        // populated, then take the source down and advance past RelationshipCacheTtl. The provider's own
+        // refresh attempt (tier 2) fails and it falls back to the STALE last-known snapshot (tier 3, spec
+        // §14) rather than throwing — so this exercises CreateGroup's OWN stricter freshness check
+        // (`!snapshot.IsFresh(now)`), distinct from the fully-unavailable/no-cache case covered by
+        // CreateGroup_WbUnavailable_ThrottledRetriable_NothingPersisted above.
+        await _relationshipProvider.GetSnapshotAsync(Creator);
+        _relationshipSource.ShouldThrow = true;
+        _time.Advance(ChatLimits.RelationshipCacheTtl + TimeSpan.FromMinutes(1));
+        var hub = CreatorHub();
+
+        var result = await hub.CreateGroup("Squad", new[] { "wolf#456", "fox#789" });
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Throttled), "a STALE relationship snapshot fails closed (retriable) — the group friends-gate requires freshness, unlike the 1:1 delivery block-check");
+        Assert.That(result.RetryAfterSeconds, Is.EqualTo(ChatLimits.RelationshipRetryAfterSeconds));
+        Assert.That(await _channelRepository.LoadAllOfType(ChannelType.GroupDm), Is.Empty, "no channel persisted on a stale-snapshot reject");
+        Assert.That(await _membershipRepository.LoadForUser(Creator), Is.Empty, "no membership persisted either");
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -455,6 +483,11 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
         const string other = "fox#789";
         const string otherConn = "conn-fox";
         SetFriends(Creator, blocker, other);
+        // The blocker has a GENUINE 1:1 block against the sender (Creator) — a real relationship-service
+        // block edge, not a hypothetical one. Group delivery must still reach them (block=non-delivery is
+        // 1:1-only, per T4; the group send path never consults blocks at all — see ChatHub.Dm.cs
+        // ApplyPrivateLaneGates, which short-circuits to null for GroupDm before any block/friend read).
+        SetBlocked(blocker, Creator);
         RegisterSession(blockerConn, blocker);
         RegisterSession(otherConn, other);
         var hub = CreatorHub();

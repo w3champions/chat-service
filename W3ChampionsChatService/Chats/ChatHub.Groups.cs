@@ -56,9 +56,11 @@ public partial class ChatHub
     /// NULL — D16: a group name must never collide into <c>LoadAnyByNormalizedName</c>'s join-resolution
     /// path, which would block implicit semiPublic creation of the same display name) with a fresh +1y
     /// shell expiry (<see cref="ExpiryCalculator.ForChannelShell"/>). Insert the CREATOR's membership
-    /// FIRST (<see cref="MembershipRole.Owner"/>) — stamped before every other member's row for
-    /// deterministic auto-promotion ordering (T8) — then each member's (<see cref="MembershipRole.Member"/>),
-    /// all at <see cref="NotificationLevel.All"/> and the SAME <c>JoinedAt</c> instant.</item>
+    /// FIRST (<see cref="MembershipRole.Owner"/>), stamped <c>JoinedAt = now</c> — equal to (never later
+    /// than) every other member's row, since all of them share this same instant — then each member's
+    /// (<see cref="MembershipRole.Member"/>), all at <see cref="NotificationLevel.All"/>. Insertion order
+    /// carries no ordering semantics of its own: T8's auto-promotion selects its target by earliest
+    /// <c>JoinedAt</c>, tie-broken by an ordinal battleTag comparison — never by insert order.</item>
     /// <item><see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus: false) for the caller AND every
     /// member — "no-auto-open" is pinned, so every push carries <c>Focus == false</c>; an OFFLINE
     /// target is a no-op inside the engine (their next <c>SessionState</c> picks the group up on
@@ -154,8 +156,10 @@ public partial class ChatHub
         channel.ExpiresAt = ExpiryCalculator.ForChannelShell(channel, now);
         await _channelRepository.Insert(channel);
 
-        // Insert the CREATOR's membership FIRST (Owner) — stamped before every other member's row for
-        // deterministic auto-promotion ordering (T8), even though every JoinedAt here is the SAME instant.
+        // Insert the CREATOR's membership FIRST (Owner), stamped JoinedAt = now — equal to (never later
+        // than) every other member's row, since all of them share this SAME instant. Insertion order here
+        // carries no ordering semantics of its own: T8's auto-promotion picks its target by earliest
+        // JoinedAt, tie-broken by an ordinal battleTag comparison — never by insert order.
         var creatorMembership = new ChannelMembership
         {
             ChannelId = channel.Id,
