@@ -42,7 +42,9 @@ public class UserRepositoriesTests : IntegrationTestBase
 
         var settings = await repo.LoadOrDefault("Nobody#111");
 
-        Assert.AreEqual("Nobody#111", settings.BattleTag);
+        // C5 T4: the settings key is stored/read lowercased (case-insensitive dmPrivacy recheck) — the
+        // default-on-miss BattleTag reflects the normalized key, not the caller's verbatim casing.
+        Assert.AreEqual("nobody#111", settings.BattleTag);
         Assert.AreEqual(DmPrivacy.Everyone, settings.DmPrivacy);
         Assert.AreEqual(NotificationLevel.All, settings.DefaultNotificationLevel);
         Assert.IsTrue(settings.SoundsEnabled);

@@ -615,4 +615,54 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That(recipientRows.Count, Is.EqualTo(1),
             "exactly ONE recipient membership — the JWT-cased self-OpenDm did not insert a duplicate row");
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // battleTag casing — user_settings (dmPrivacy) must be casing-agnostic too (C5 T4 fix, security re-review)
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PendingRecheck_MixedCaseRecipientTightensToNobody_SubsequentSendSilentlyDropped()
+    {
+        // A real Battle.net recipient whose JWT carries UPPERCASE. The pending-phase dmPrivacy recheck
+        // (ApplyPrivateLaneGates) resolves the counterpart via ResolveDmCounterpart, which returns the
+        // LOWERCASED half of the pair-key. If UserSettingsRepository keys on exact case, a setting the
+        // recipient stores under their VERBATIM JWT casing is invisible to that lowercased read —
+        // LoadOrDefault misses and silently falls back to the Everyone default, letting the initiator's
+        // sends through past a tightened Nobody setting.
+        const string mixedRecipient = "Wolf#456"; // verbatim (uppercase) JWT casing
+        const string mixedRecipientConn = "conn-recip-mixed-privacy";
+
+        var channel = await _channelRepository.FindOrCreateDm(
+            Initiator, mixedRecipient, Initiator, DmRequestState.Pending, Now);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        // dmPrivacy starts at the spec default (Everyone), seeded under the recipient's verbatim JWT
+        // casing — exactly what a real settings doc would look like before any tightening.
+        await SeedPrivacy(mixedRecipient, DmPrivacy.Everyone);
+        var initiatorHub = BuildHub(InitiatorConn);
+
+        // (1) Message 1 while dmPrivacy = Everyone: delivered and persisted.
+        var first = await initiatorHub.SendMessage(channel.Id, "hi there");
+        Assert.That(first.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(await _messageRepository.Load(first.MessageId), Is.Not.Null, "message 1 is persisted while dmPrivacy=Everyone");
+        Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(1L));
+
+        // (2) The recipient tightens dmPrivacy to Nobody via the REAL SetDmPrivacy path — persisted under
+        // THEIR OWN JWT-cased identity (session.Identity.BattleTag), exactly as production does.
+        RegisterSession(mixedRecipientConn, mixedRecipient);
+        var recipientHub = BuildHub(mixedRecipientConn);
+        var setPrivacy = await recipientHub.SetDmPrivacy(DmPrivacy.Nobody);
+        Assert.That(setPrivacy.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        // (3) Message 2: the pending recheck must see the tightened Nobody setting the recipient just
+        // stored under their mixed-case identity — NOT silently miss it and fall back to Everyone.
+        var second = await initiatorHub.SendMessage(channel.Id, "still there?");
+
+        Assert.That(second.Code, Is.EqualTo(ChatResultCode.Ok), "a dmPrivacy-recheck failure is a SILENT drop (uniform Ok shape)");
+        Assert.That(second.MessageId, Is.Not.Null.And.Not.Empty, "a silent drop still fabricates a non-null messageId (D6)");
+        Assert.That(second.Seq, Is.Not.Null, "a silent drop still fabricates a non-null seq (D6)");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(1L), "message 2 allocates NO seq — LastSeq unchanged from message 1");
+        Assert.That((await _messageRepository.LoadForModerator(channel.Id)).Count, Is.EqualTo(1),
+            "message 2 is NOT persisted — only message 1 remains stored");
+    }
 }
