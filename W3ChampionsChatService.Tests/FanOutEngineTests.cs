@@ -92,20 +92,34 @@ public class FanOutEngineTests
             Permissions = isModerator ? new HashSet<EPermission> { EPermission.Moderation } : new HashSet<EPermission>(),
         };
 
-    private static ChannelMessage Message(bool shadowFlag = false, MessageDeletion deletion = null) =>
+    private static ChannelMessage Message(bool shadowFlag = false, MessageDeletion deletion = null, string content = "hello world") =>
         new ChannelMessage
         {
             Id = "message-1",
             ChannelId = ChannelId,
             Seq = 42,
             Sender = new MessageSender { BattleTag = AuthorBattleTag, Name = "Author" },
-            Content = "hello world",
+            Content = content,
             SentAt = new DateTime(2026, 7, 3, 12, 0, 0, DateTimeKind.Utc),
             // These domain flags are deliberately set on some tests to prove the DTO FORCES both false
             // for user-facing delivery regardless of the persisted value.
             Shadow = shadowFlag,
             Deleted = deletion,
         };
+
+    // C5 (Task 9, D15) DM activity preview fixture helper: a full engine wired to fresh registries, with
+    // ONE unfocused level-All recipient of an ACCEPTED Dm already joined — the exact recipient whose
+    // coalesced ChannelActivity should carry the preview.
+    private static (HubPushCaptureHarness harness, FanOutEngine engine) NewDmPreviewFixture()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var members = new OnlineMemberRegistry();
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+        return (harness, engine);
+    }
 
     [Test]
     public async Task OnMessagePersisted_FocusedViewers_ReceiveFullMessageReceived()
@@ -585,5 +599,107 @@ public class FanOutEngineTests
 
         // Focused delivery is NEVER suppressed — the recipient sees the live message.
         Assert.AreEqual(1, harness.SignalCount(RecipientConnection, ChatEvents.MessageReceived));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C5 (Task 9, D15) DM activity preview. An accepted Dm message's routed ChannelActivity carries a
+    // DmActivityPreviewDto — sender battleTag/name REUSED from the same MessageDto the focused-delivery
+    // path already built (no extra lookup), plus a bounded excerpt. GroupDm/Public activity always
+    // carries Preview: null (OQ-7 strict Dm-only scope), and a pending Dm still produces ZERO activity
+    // at all (D4 wall re-asserted now that previews are in play — no activity means no preview can leak
+    // an unsurfaced request).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task DmActivity_CarriesPreview_SenderAndExcerpt()
+    {
+        var (harness, engine) = NewDmPreviewFixture();
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: "hey there"), InitiatorConnection, isShadow: false, Now);
+
+        var dto = harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.IsNotNull(dto, "an accepted Dm's unfocused level-All recipient must receive a ChannelActivity");
+        var preview = dto.Preview as DmActivityPreviewDto;
+        Assert.IsNotNull(preview, "an accepted Dm's ChannelActivity must carry a DmActivityPreviewDto, not a plain null");
+        Assert.AreEqual(AuthorBattleTag, preview.SenderBattleTag, "the preview must reuse the persisted message's sender, not re-derive one");
+        Assert.AreEqual("Author", preview.SenderName);
+        Assert.AreEqual("hey there", preview.Excerpt);
+    }
+
+    [Test]
+    public async Task Excerpt_TruncatedAt120()
+    {
+        var (harness, engine) = NewDmPreviewFixture();
+        var longContent = new string('x', ChatLimits.DmPreviewExcerptLength + 80);
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: longContent), InitiatorConnection, isShadow: false, Now);
+
+        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        Assert.IsNotNull(preview);
+        Assert.AreEqual(ChatLimits.DmPreviewExcerptLength, preview.Excerpt.Length, "content over the cap must be truncated to exactly DmPreviewExcerptLength chars");
+        Assert.AreEqual(longContent.Substring(0, ChatLimits.DmPreviewExcerptLength), preview.Excerpt, "the excerpt must be the first N chars — no word-boundary trimming");
+
+        // Content AT/UNDER the cap passes through whole, with no padding.
+        var (shortHarness, shortEngine) = NewDmPreviewFixture();
+        await shortEngine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: "short"), InitiatorConnection, isShadow: false, Now);
+        var shortPreview = (shortHarness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        Assert.IsNotNull(shortPreview);
+        Assert.AreEqual("short", shortPreview.Excerpt, "content at/under the cap must pass through unchanged, with no padding");
+    }
+
+    [Test]
+    public async Task GroupAndPublicActivity_PreviewNull()
+    {
+        const string GroupMemberConn = "conn-group-member";
+        const string GroupMemberTag = "GroupMember#1";
+        var groupHarness = new HubPushCaptureHarness();
+        var groupFocus = new FocusRegistry();
+        var groupMembers = new OnlineMemberRegistry();
+        groupMembers.Join(ChannelId, GroupMemberConn, new MemberState(GroupMemberTag, NotificationLevel.All, 0, ChannelType.GroupDm));
+        var groupEngine = new FanOutEngine(
+            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry());
+        var groupChannel = new ChatChannel { Id = ChannelId, Type = ChannelType.GroupDm };
+
+        await groupEngine.OnMessagePersisted(groupChannel, Message(), AuthorConnection, isShadow: false, Now);
+
+        var groupDto = groupHarness.PayloadFor(GroupMemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.IsNotNull(groupDto, "an unfocused level-All group member must still receive plain activity");
+        Assert.IsNull(groupDto.Preview, "GroupDm activity must never carry a preview (D15/OQ-7 strict Dm-only scope)");
+
+        const string PublicMemberConn = "conn-public-member";
+        const string PublicMemberTag = "PublicMember#1";
+        var publicHarness = new HubPushCaptureHarness();
+        var publicFocus = new FocusRegistry();
+        var publicMembers = new OnlineMemberRegistry();
+        publicMembers.Join(ChannelId, PublicMemberConn, new MemberState(PublicMemberTag, NotificationLevel.All, 0, ChannelType.Public));
+        var publicEngine = new FanOutEngine(
+            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry());
+
+        await publicEngine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
+
+        var publicDto = publicHarness.PayloadFor(PublicMemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.IsNotNull(publicDto, "an unfocused level-All public member must still receive plain activity");
+        Assert.IsNull(publicDto.Preview, "Public activity must never carry a preview");
+    }
+
+    [Test]
+    public async Task PendingDm_NoActivityHenceNoPreview()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        focusRegistry.Focus(InitiatorConnection, ChannelId, DmInitiator);
+        var members = new OnlineMemberRegistry();
+        members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(content: "a pending message"), InitiatorConnection, isShadow: false, Now);
+
+        // Re-asserts the D4 wall now that previews are in play: a pending Dm produces ZERO
+        // ChannelActivity to the recipient — there is no activity event at all for a preview to ride on,
+        // so an unsurfaced request's content can never leak via a preview.
+        Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ChannelActivity),
+            "a pending Dm must produce zero ChannelActivity — no preview can ever surface for an unsurfaced request");
     }
 }

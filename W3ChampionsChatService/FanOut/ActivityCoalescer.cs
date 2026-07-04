@@ -72,11 +72,19 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// seq, so a lower out-of-order offer coalesces harmlessly instead of ever regressing the seq a client
     /// observes.
     /// </para>
+    /// <para>
+    /// C5 (Task 9, D15): <paramref name="preview"/> is the DM activity-preview slot (a
+    /// <c>DmActivityPreviewDto</c> for an accepted Dm message, else null — <see cref="FanOutEngine"/>
+    /// decides). The entry keeps only the LATEST offered preview (overwritten on every call, in BOTH the
+    /// immediate-emit and the coalesce branches below) so a coalesced burst emits the most recent
+    /// message's preview, exactly mirroring the latest-seq-only coalescing.
+    /// </para>
     /// </summary>
-    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now)
+    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null)
     {
         bool emit;
         long emitSeq = 0;
+        object emitPreview = null;
 
         lock (_lock)
         {
@@ -91,6 +99,10 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 channels[channelId] = entry;
             }
 
+            // Latest-offered-preview: overwritten unconditionally on every Offer, regardless of which
+            // branch fires below — a coalesced burst's pending always reflects the MOST RECENT preview.
+            entry.Preview = preview;
+
             if (now - entry.LastSentAt >= ChatLimits.ChannelActivityCoalesce)
             {
                 // Window elapsed → emit now and reopen the window. The emitted seq is the MAX of the
@@ -103,6 +115,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 entry.HasPending = false;
                 entry.PendingLastSeq = 0;
                 entry.LastEmittedSeq = emitSeq;
+                emitPreview = entry.Preview;
                 emit = true;
             }
             else
@@ -118,7 +131,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
 
         if (emit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, emitSeq);
+            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview);
         }
     }
 
@@ -127,10 +140,13 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// <paramref name="now"/>: emits the pending's latest seq (subject to emit-time suppression), resets
     /// the window, and clears the pending. Driven by Task 15's 1s-granularity flush service; because it
     /// only emits when ≥10s has elapsed since the last emit, the per-(conn,channel) spacing floor holds.
+    /// C5 (Task 9, D15): the flush carries whatever preview <see cref="Entry.Preview"/> holds at drain
+    /// time — the LATEST one <see cref="Offer"/> recorded for the burst, mirroring the latest-seq-only
+    /// coalescing.
     /// </summary>
     public async Task FlushDue(DateTime now)
     {
-        List<(string ConnectionId, string ChannelId, long LastSeq)> toEmit = null;
+        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview)> toEmit = null;
 
         lock (_lock)
         {
@@ -148,8 +164,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                         entry.PendingLastSeq = 0;
                         entry.LastEmittedSeq = seq;
 
-                        (toEmit ??= new List<(string, string, long)>())
-                            .Add((connectionId, channelId, seq));
+                        (toEmit ??= new List<(string, string, long, object)>())
+                            .Add((connectionId, channelId, seq, entry.Preview));
                     }
                 }
             }
@@ -160,9 +176,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        foreach (var (connectionId, channelId, lastSeq) in toEmit)
+        foreach (var (connectionId, channelId, lastSeq, preview) in toEmit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, lastSeq);
+            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview);
         }
     }
 
@@ -198,9 +214,10 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// threshold. Suppression is purely seq-based (no <c>now</c> needed here — the time-based window
     /// decision was already made by the caller under the lock). Runs OUTSIDE <see cref="_lock"/> and
     /// never lets a single failed send escape — mirroring <see cref="FanOutEngine"/>'s best-effort,
-    /// fault-isolated delivery.
+    /// fault-isolated delivery. <paramref name="preview"/> (C5, Task 9/D15) rides straight onto the
+    /// payload — null for every non-Dm channel and for C3-era callers that never pass one.
     /// </summary>
-    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq)
+    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null)
     {
         // A connection with no live membership entry for the channel (left/disconnected between offer
         // and emit) is not a valid recipient — skip. The window was already advanced by the caller.
@@ -216,8 +233,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        // preview is the C5 DM-preview slot — always null in C3 (see ChannelActivityDto).
-        var payload = new ChannelActivityDto(channelId, lastSeq, Preview: null);
+        var payload = new ChannelActivityDto(channelId, lastSeq, preview);
 
         try
         {
@@ -236,7 +252,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// "window elapsed" and fires immediately. <see cref="LastEmittedSeq"/> is the running high-water
     /// mark of every seq this (connection, channel) has emitted or pended — both <see cref="Offer"/> and
     /// <see cref="FlushDue"/> take the MAX against it so an out-of-order lower offer can never regress
-    /// the seq a client observes.
+    /// the seq a client observes. <see cref="Preview"/> (C5, Task 9/D15) mirrors that latest-wins
+    /// discipline for the DM preview slot — <see cref="Offer"/> overwrites it unconditionally every call.
     /// </summary>
     private sealed class Entry
     {
@@ -244,5 +261,6 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
         internal bool HasPending;
         internal long PendingLastSeq;
         internal long LastEmittedSeq;
+        internal object Preview;
     }
 }

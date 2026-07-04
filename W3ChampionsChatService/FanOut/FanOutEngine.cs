@@ -174,6 +174,18 @@ public class FanOutEngine(
             return;
         }
 
+        // C5 (Task 9, D15): DM activity preview. Built ONCE per persisted message (identical for every
+        // Offer call in the loop below) — OQ-7 pins this to `Dm` channels only; GroupDm/Public/System
+        // activity always carries a null Preview. A pending Dm never reaches the Offer call below at all
+        // (the suppression `continue` skips every recipient, and the initiator/sender is skipped just
+        // after it), so this is only ever OFFERED for an accepted Dm — building it unconditionally for
+        // any Dm channel is harmless (it is simply never read for a still-pending one). Sender fields are
+        // REUSED from `dto.Sender` (the same MessageDto already built above for focused delivery) rather
+        // than a fresh lookup — no extra Mongo read.
+        object dmPreview = channel.Type == ChannelType.Dm
+            ? new DmActivityPreviewDto(dto.Sender.BattleTag, dto.Sender.Name, BuildDmPreviewExcerpt(message.Content))
+            : null;
+
         // Activity routing (fan-out decision 3): unfocused level-All members are offered the seq; the
         // coalescer owns coalescing + suppression + emit. Snapshot the focused connections once into a
         // set for O(1) "is this connection focused?" tests as we scan the member roster.
@@ -215,9 +227,20 @@ public class FanOutEngine(
                 continue;
             }
 
-            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now);
+            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, dmPreview);
         }
     }
+
+    /// <summary>
+    /// C5 (Task 9, D15): the DM activity-preview excerpt — the first
+    /// <see cref="ChatLimits.DmPreviewExcerptLength"/> characters of the message content (the
+    /// mention-inbox "~120 chars" precedent, spec §5). A plain bounded substring; no word-boundary
+    /// trimming (no existing excerpt helper does that either).
+    /// </summary>
+    private static string BuildDmPreviewExcerpt(string content) =>
+        content.Length <= ChatLimits.DmPreviewExcerptLength
+            ? content
+            : content.Substring(0, ChatLimits.DmPreviewExcerptLength);
 
     /// <summary>
     /// Pushes a newly-added channel to <paramref name="membership"/>'s owning user's LIVE connection

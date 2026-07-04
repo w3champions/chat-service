@@ -7,10 +7,12 @@ namespace W3ChampionsChatService.Protocol;
 /// channel and the latest sequence, so coalescing a burst into one push is lossless (a later push
 /// with the newest <see cref="LastSeq"/> supersedes any it replaced).
 /// <para>
-/// <see cref="Preview"/> is a forward-declared slot for C5's DM message preview — the field exists in
-/// the C3 wire contract so clients can bind it now, but it is ALWAYS null in C3 (only DM channels ever
-/// populate it, and only once C5 lands). Typed <c>object</c> deliberately: C3 does not commit to the
-/// preview's shape, and a null serializes identically regardless of the eventual type.
+/// <see cref="Preview"/> was a forward-declared slot for C5's DM message preview in C3 (field present in
+/// the wire contract, always null). C5 (Task 9, D15) fills it: for an accepted <c>Dm</c> channel's
+/// activity it carries a <see cref="DmActivityPreviewDto"/> (sender + a bounded excerpt); for every other
+/// channel type (<c>GroupDm</c>/<c>Public</c>/<c>System</c>) it remains null (OQ-7, strict Dm-only
+/// scope — groups get plain activity). Typed <c>object</c> deliberately: the wire contract does not
+/// commit to a single preview shape, and a null serializes identically regardless of the type.
 /// </para>
 /// </summary>
 public record ChannelActivityDto(string ChannelId, long LastSeq, object Preview = null);

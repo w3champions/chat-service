@@ -259,6 +259,34 @@ public class ActivityCoalescerTests
         Assert.AreEqual(6, payloads[1].LastSeq, "the flush must never regress below the already-emitted seq 6");
     }
 
+    // ---- C5 (Task 9, D15) DM preview coalescing --------------------------------------------------
+
+    [Test]
+    public async Task CoalescedBurst_EmitsLatestPreview()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+        var preview1 = new DmActivityPreviewDto(AuthorTag, "Author", "first message");
+        var preview2 = new DmActivityPreviewDto(AuthorTag, "Author", "second message");
+        var preview3 = new DmActivityPreviewDto(AuthorTag, "Author", "third message — latest");
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview1);                // immediate emit — opens the window
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview2);   // within window — coalesce
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 7, T0.AddSeconds(2), preview3);   // within window — pending is now the LATEST preview
+
+        // The immediate first emit carried its OWN (first) preview.
+        Assert.AreEqual(1, harness.SignalCount(MemberConn, ChatEvents.ChannelActivity));
+        var first = harness.PayloadFor(MemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.AreEqual(preview1, first.Preview, "the immediate first emit must carry its own offered preview");
+
+        // The burst produced no extra emits — it collapsed into a single pending. Once the window
+        // elapses, the flush must carry the LATEST preview of the burst, not the first or an
+        // intermediate one (mirrors the seq coalescing: lossless because only the newest matters).
+        await coalescer.FlushDue(T0.AddSeconds(11));
+        var payloads = ActivityPayloads(harness, MemberConn);
+        Assert.AreEqual(2, payloads.Count);
+        Assert.AreEqual(preview3, payloads[1].Preview, "the coalesced flush must carry the MOST RECENT preview of the burst");
+    }
+
     // ---- Engine-routing tests ----------------------------------------------------------------------
 
     [Test]
