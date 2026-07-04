@@ -72,6 +72,7 @@ public class ChatHubConsentTests : IntegrationTestBase
     private FakeRelationshipSource _relationshipSource;
     private RelationshipProvider _relationshipProvider;
     private FakeTimeProvider _time;
+    private Mock<IChatAuthenticationService> _authService;
 
     private readonly Dictionary<string, HashSet<string>> _friends = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, HashSet<string>> _blocked = new(StringComparer.OrdinalIgnoreCase);
@@ -124,16 +125,15 @@ public class ChatHubConsentTests : IntegrationTestBase
             now));
         _relationshipProvider = new RelationshipProvider(_relationshipSource, _time);
 
-        var authService = new Mock<IChatAuthenticationService>();
-        authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+        _authService = new Mock<IChatAuthenticationService>();
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
             _messageRepository,
             new MuteRepository(MongoClient),
-            authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -160,7 +160,8 @@ public class ChatHubConsentTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             _relationshipProvider,
             _userSettings,
-            _dmInitiationTracker);
+            _dmInitiationTracker,
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingProxy(connectionId));
@@ -223,6 +224,9 @@ public class ChatHubConsentTests : IntegrationTestBase
 
     private static W3CUserAuthentication Identity(string battleTag) =>
         new() { BattleTag = battleTag, Name = battleTag.Split('#')[0] };
+
+    private static ChatUser ChatUserFor(W3CUserAuthentication identity) =>
+        new(identity.BattleTag, identity.IsAdmin, identity.Name, new ProfilePicture(), null, null);
 
     // Seeds a connection the way the connect/first-message path does: live session, cached ChatUser, and
     // a Dm OnlineMemberRegistry entry so the hot-path IsMember gate passes.
@@ -300,7 +304,7 @@ public class ChatHubConsentTests : IntegrationTestBase
         Assert.That(_dmInitiationTracker.CountActive(Initiator, Now), Is.EqualTo(0), "accept frees the initiator's stranger-initiation slot");
 
         // The tray empties for the recipient; the DM stays a normal channel.
-        var (dto, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-tray", Now);
+        var (dto, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-tray", Now, ChatUserFor(Identity(Recipient)));
         Assert.That(dto.PendingDmRequests, Is.Empty, "an accepted request no longer appears in the tray");
         Assert.That(dto.Channels.Select(c => c.Channel.Id), Does.Contain(channel.Id), "the accepted DM remains a normal channel");
 
@@ -416,7 +420,7 @@ public class ChatHubConsentTests : IntegrationTestBase
         await initiatorHub.SendMessage(channel.Id, "message two");
 
         // Pre-decline: the request is in the recipient's tray.
-        var (before, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-tray-1", Now);
+        var (before, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-tray-1", Now, ChatUserFor(Identity(Recipient)));
         Assert.That(before.PendingDmRequests.Select(r => r.ChannelId), Does.Contain(channel.Id), "the request is in the tray before decline");
 
         // The recipient declines.
@@ -425,7 +429,7 @@ public class ChatHubConsentTests : IntegrationTestBase
         Assert.That(decline.Code, Is.EqualTo(ChatResultCode.Ok));
 
         // (a) The tray drops it for 24h, but the DM stays in Channels (open-later shows full history).
-        var (after, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-tray-2", Now);
+        var (after, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-tray-2", Now, ChatUserFor(Identity(Recipient)));
         Assert.That(after.PendingDmRequests, Is.Empty, "a declined request is suppressed from the tray for 24h");
         Assert.That(after.Channels.Select(c => c.Channel.Id), Does.Contain(channel.Id), "the declined DM still appears in Channels");
 
@@ -462,7 +466,7 @@ public class ChatHubConsentTests : IntegrationTestBase
         // Inside the window: still suppressed, no fresh RequestReceived.
         _time.Advance(TimeSpan.FromHours(23));
         await initiatorHub.SendMessage(channel.Id, "still within window");
-        var (mid, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-mid", Now);
+        var (mid, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-mid", Now, ChatUserFor(Identity(Recipient)));
         Assert.That(mid.PendingDmRequests, Is.Empty, "still suppressed inside the 24h window");
         Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(1), "no fresh RequestReceived inside the window");
 
@@ -471,7 +475,7 @@ public class ChatHubConsentTests : IntegrationTestBase
         await initiatorHub.SendMessage(channel.Id, "after 24h");
         Assert.That((await _membershipRepository.Load(channel.Id, Recipient)).DeclinedUntil, Is.Null, "the resurface path clears the decline window (T4)");
         Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(2), "a fresh RequestReceived fires after the window elapses");
-        var (after, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-after", Now);
+        var (after, _) = await _assembler.AssembleAndSeed(Identity(Recipient), "conn-after", Now, ChatUserFor(Identity(Recipient)));
         Assert.That(after.PendingDmRequests.Select(r => r.ChannelId), Does.Contain(channel.Id), "the tray re-populates after the window");
     }
 
@@ -627,7 +631,7 @@ public class ChatHubConsentTests : IntegrationTestBase
             .Select(s => $"{s.Method}|{Normalize(JsonSerializer.Serialize(s.Payload), initiator, recipient, channelId)}"));
         senderEvents.Sort(StringComparer.Ordinal);
 
-        var (dto, _) = await _assembler.AssembleAndSeed(Identity(initiator), $"assemble-{suffix}", Now);
+        var (dto, _) = await _assembler.AssembleAndSeed(Identity(initiator), $"assemble-{suffix}", Now, ChatUserFor(Identity(initiator)));
         var sessionJson = Normalize(JsonSerializer.Serialize(dto), initiator, recipient, channelId);
 
         return new SenderObservation(sendResults, senderEvents, sessionJson);

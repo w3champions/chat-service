@@ -75,7 +75,7 @@ public class ChatHubMarkReadTests : IntegrationTestBase
         _authService = new Mock<IChatAuthenticationService>();
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
 
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
@@ -91,7 +91,6 @@ public class ChatHubMarkReadTests : IntegrationTestBase
             _channelRepository,
             _messageRepository,
             _muteRepository,
-            _authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -118,7 +117,8 @@ public class ChatHubMarkReadTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            _authService.Object);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
@@ -325,7 +325,8 @@ public class ChatHubMarkReadTests : IntegrationTestBase
         // durable membership row — proving MarkRead's Mongo write, not just the in-memory registry,
         // carries the caught-up cursor forward.
         var identity = new W3CUserAuthentication { BattleTag = BattleTag, Name = BattleTag.Split('#')[0] };
-        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-reconnect", Now);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-reconnect", Now,
+            new ChatUser(identity.BattleTag, identity.IsAdmin, identity.Name, new ProfilePicture(), null, null));
 
         var channelDto = dto.Channels.Single(c => c.Channel.Id == channel.Id);
         Assert.AreEqual(0L, channelDto.UnreadCount);
@@ -360,7 +361,8 @@ public class ChatHubMarkReadTests : IntegrationTestBase
         // A fresh reconnect assembles SessionState straight from the durable stores — the count-based
         // (D7) unread reads 0 because every visible row is at or below the clamped cursor.
         var identity = new W3CUserAuthentication { BattleTag = BattleTag, Name = BattleTag.Split('#')[0] };
-        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-reconnect", Now);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-reconnect", Now,
+            new ChatUser(identity.BattleTag, identity.IsAdmin, identity.Name, new ProfilePicture(), null, null));
 
         var channelDto = dto.Channels.Single(c => c.Channel.Id == channel.Id);
         Assert.AreEqual(0L, channelDto.UnreadCount, "clamp + count-based unread coexist — unread is 0 after the clamped MarkRead");

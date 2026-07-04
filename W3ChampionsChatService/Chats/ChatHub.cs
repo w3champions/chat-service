@@ -71,7 +71,14 @@ public partial class ChatHub(
     // the in-memory 8h stranger-initiation cap (singleton — Startup). Both are consumed by the OpenDm/
     // SetDmPrivacy partial in ChatHub.Dm.cs and reused by later C5 tasks (T4/T6 accept transitions).
     UserSettingsRepository userSettings,
-    DmInitiationTracker dmInitiationTracker) : Hub
+    DmInitiationTracker dmInitiationTracker,
+    // D9 (C6 Task 3): the chat-flair resolution service. Previously only SessionStateAssembler held
+    // this dependency; it is now HOISTED to the hub so OnConnectedAsync can resolve ONCE (getting both
+    // the ChatUser AND whether the enrichment was FreshFromWb) and thread the SAME resolved ChatUser
+    // into both AssembleAndSeed (SessionState flair) and the connect-time directory upsert (which needs
+    // FreshFromWb to decide whether it may replace the cached Profile) — one wb round-trip serves both,
+    // where the pre-D9 path resolved it twice.
+    IChatAuthenticationService chatAuthenticationService) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
@@ -103,6 +110,8 @@ public partial class ChatHub(
     // C5 (Task 3): the DM front-door deps — the dmPrivacy settings store and the stranger-initiation cap.
     private readonly UserSettingsRepository _userSettings = userSettings;
     private readonly DmInitiationTracker _dmInitiationTracker = dmInitiationTracker;
+    // D9 (C6 Task 3): the hoisted chat-flair resolution — see the constructor param doc comment above.
+    private readonly IChatAuthenticationService _chatAuthenticationService = chatAuthenticationService;
 
     public override async Task OnConnectedAsync()
     {
@@ -132,18 +141,23 @@ public partial class ChatHub(
             displaced.Context?.Abort();
         }
 
-        // Single clock read for the whole connect path — reused for both the directory stub's
-        // LastSeenAt and the assembler's mute-expiry resolution below, so every "now" on this path
-        // comes from the SAME injected TimeProvider read instead of each step taking its own
-        // independent wall-clock snapshot (identical in production; makes the path deterministically
-        // testable under a FakeTimeProvider).
+        // Single clock read for the whole connect path — reused for the directory upsert's LastSeenAt
+        // and the assembler's mute-expiry resolution below, so every "now" on this path comes from the
+        // SAME injected TimeProvider read instead of each step taking its own independent wall-clock
+        // snapshot (identical in production; makes the path deterministically testable under a
+        // FakeTimeProvider).
         var now = _timeProvider.GetUtcNow().UtcDateTime;
-        await UpsertDirectoryStub(identity, now);
+
+        // D9 (C6 Task 3): resolve the chat flair ONCE — hoisted out of the assembler so the SAME wb
+        // round-trip serves BOTH the SessionState flair (passed straight through to AssembleAndSeed
+        // below) AND the connect-time directory upsert's FreshFromWb decision (UpsertDirectory).
+        var resolution = await _chatAuthenticationService.GetUserFromIdentity(identity);
+        await UpsertDirectory(identity, resolution, now);
 
         // C5 (Task 1, spec §6): warm the relationship cache with the CONNECTING user's OWN snapshot so the
         // block/friend gates (later C5 tasks) and friend-presence (C6) start hot. Fire-and-forget and
         // NON-FATAL: it is deliberately NOT awaited (a slow/unreachable wb read must never add latency to,
-        // or fail, a connect), and any failure is swallowed + logged exactly like UpsertDirectoryStub. The
+        // or fail, a connect), and any failure is swallowed + logged exactly like UpsertDirectory. The
         // task touches only the singleton provider + the captured battleTag, so it is safe even after this
         // hub instance is disposed; a cache miss simply self-heals on the first gated action.
         _ = PrefetchRelationshipSnapshot(identity.BattleTag);
@@ -153,8 +167,9 @@ public partial class ChatHub(
         // snapshot to the CALLER only — it is that connection's private state rebuild (spec acceptance
         // 8), never a group broadcast. FATAL by design: if AssembleAndSeed throws (e.g. a Mongo hiccup)
         // the connect fails — an authenticated connection with no snapshot is useless — so we do NOT
-        // swallow it (unlike the non-fatal directory stub above).
-        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now);
+        // swallow it (unlike the non-fatal directory upsert above). The already-resolved chatUser is
+        // threaded straight through — AssembleAndSeed no longer re-resolves it itself (D9).
+        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now, resolution.User);
         await Clients.Caller.SendAsync(ChatEvents.SessionState, dto);
 
         if (muteStatus == MuteStatus.Full)
@@ -167,23 +182,34 @@ public partial class ChatHub(
         }
     }
 
-    // Stub directory upsert (full enrichment is C6). Read-modify-write via Load → set → Upsert so a
-    // future cached Profile is preserved. Non-fatal: a directory write must never fail a connect.
-    // `now` is the caller's single injected-clock read (OnConnectedAsync) — routed through, not read
-    // again here, so this stays on the SAME TimeProvider clock as the rest of the connect path.
-    private async Task UpsertDirectoryStub(W3CUserAuthentication identity, DateTime now)
+    // D9 (C6 Task 3): the FULL connect-time directory upsert — replaces the C3 name-only stub.
+    // Read-modify-write via Load → set → Upsert (the Task 2 full-replace Upsert) so a Profile this call
+    // does NOT own to overwrite survives untouched. LastSeenAt, DisplayBattleTag, and NormalizedName
+    // (the lowercased FULL battleTag — D8/T2 convention, e.g. "peter#123", not just "peter") are ALWAYS
+    // refreshed: the user IS connecting, that much is true even on a wb outage. Profile is replaced
+    // ONLY when <paramref name="resolution"/>.FreshFromWb — the NEVER-CLOBBER invariant: a wb outage
+    // must NEVER overwrite a previously-cached, good Profile with the near-null plain/cached-fallback
+    // ChatUser's flair. Non-fatal: a directory write must never fail a connect. `now` is the caller's
+    // single injected-clock read (OnConnectedAsync) — routed through, not read again here, so this
+    // stays on the SAME TimeProvider clock as the rest of the connect path.
+    private async Task UpsertDirectory(W3CUserAuthentication identity, ChatUserResolution resolution, DateTime now)
     {
         try
         {
             var entry = await _userDirectory.Load(identity.BattleTag)
                 ?? new UserDirectoryEntry { BattleTag = identity.BattleTag };
-            entry.NormalizedName = identity.Name?.Trim().ToLowerInvariant();
+            entry.DisplayBattleTag = identity.BattleTag;
+            entry.NormalizedName = identity.BattleTag?.Trim().ToLowerInvariant();
             entry.LastSeenAt = now;
+            if (resolution.FreshFromWb)
+            {
+                entry.Profile = ChatProfileMapper.FromChatUser(resolution.User);
+            }
             await _userDirectory.Upsert(entry);
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Failed to upsert user_directory stub for {BattleTag}", identity.BattleTag);
+            Log.Warning(ex, "Failed to upsert user_directory entry for {BattleTag}", identity.BattleTag);
         }
     }
 
@@ -206,6 +232,16 @@ public partial class ChatHub(
 
     public override async Task OnDisconnectedAsync(Exception exception)
     {
+        // D9 (C6 Task 3): capture the disconnecting session's identity BEFORE Unregister —
+        // TryGetByConnectionId is fail-closed for a DISPLACED old socket: once the NEW connection's
+        // Register() call overwrote SessionRegistry's battleTag→session pointer, this OLD connectionId
+        // no longer resolves here, so `hasSession` is false on exactly that race and the disconnect-time
+        // directory upsert below is skipped — the user IS still online via their new connection, so
+        // their LastSeenAt must not be rewound by the dying old socket. Calling this AFTER Unregister
+        // would always return false (Unregister also drops this connectionId's reverse-map entry), so
+        // the ordering here is load-bearing, not cosmetic.
+        var hasDisconnectingSession = _sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var disconnectingSession);
+
         // C3 (Task 8): tear down this connection's in-memory fan-out state UNCONDITIONALLY so it can
         // never leak past the socket's lifetime. INVARIANT, enforced structurally (not by statement
         // order): the removals below live in a `finally`, so they ALWAYS run — even if the teardown in
@@ -260,7 +296,32 @@ public partial class ChatHub(
             _fanOutEngine.OnConnectionClosed(Context.ConnectionId);
         }
 
+        // D9 (C6 Task 3, acceptance 6): the DISCONNECT-time directory write — true last-seen. Skipped
+        // entirely for a displaced old socket (hasDisconnectingSession false — see the capture above).
+        if (hasDisconnectingSession)
+        {
+            await UpsertLastSeenOnDisconnect(disconnectingSession.Identity);
+        }
+
         await base.OnDisconnectedAsync(exception);
+    }
+
+    // D9 (C6 Task 3): uses the partial SetLastSeen (Task 2) — NEVER the full-replace Upsert — so a
+    // previously-cached Profile is untouched by construction (SetLastSeen's own contract; see
+    // Users/UserDirectoryRepository.cs). Non-fatal: a directory write must never fail disconnect
+    // teardown.
+    private async Task UpsertLastSeenOnDisconnect(W3CUserAuthentication identity)
+    {
+        try
+        {
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
+            var normalizedName = identity.BattleTag?.Trim().ToLowerInvariant();
+            await _userDirectory.SetLastSeen(identity.BattleTag, identity.BattleTag, normalizedName, now);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to update user_directory LastSeenAt on disconnect for {BattleTag}", identity.BattleTag);
+        }
     }
 
     /// <summary>

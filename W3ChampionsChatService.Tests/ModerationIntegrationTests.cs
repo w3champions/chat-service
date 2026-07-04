@@ -119,14 +119,13 @@ public class ModerationIntegrationTests : IntegrationTestBase
         _authService = new Mock<IChatAuthenticationService>();
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, null, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, null, new ProfilePicture(), null, null), true));
 
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
             _messageRepository,
             _muteRepository,
-            _authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
 
@@ -181,7 +180,8 @@ public class ModerationIntegrationTests : IntegrationTestBase
             _mentionCleaner,
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

@@ -36,7 +36,6 @@ public class SessionStateAssembler(
     ChannelRepository channelRepository,
     MessageRepository messageRepository,
     IMuteRepository muteRepository,
-    IChatAuthenticationService chatAuthenticationService,
     OnlineMemberRegistry onlineMemberRegistry,
     ConnectionMapping connectionMapping)
 {
@@ -46,15 +45,19 @@ public class SessionStateAssembler(
     private static readonly IReadOnlySet<EPermission> ChatRelevantPermissions =
         new HashSet<EPermission> { EPermission.Moderation };
 
+    // D9: chatUser is now RESOLVED BY THE CALLER (ChatHub, hoisted) and handed straight through — this
+    // method no longer calls IChatAuthenticationService.GetUserFromIdentity itself. Before this change
+    // the connect path resolved the flair TWICE per connect (once here, once again for the connect-time
+    // directory upsert); hoisting the ONE resolution into the hub and threading it through here (and
+    // into the directory upsert) means a single wb round-trip serves both.
     public async Task<(SessionStateDto Dto, MuteStatus MuteStatus)> AssembleAndSeed(
-        W3CUserAuthentication identity, string connectionId, DateTime now)
+        W3CUserAuthentication identity, string connectionId, DateTime now, ChatUser chatUser)
     {
         var memberships = await membershipRepository.LoadForUser(identity.BattleTag);
         var channelsById = (await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
             .ToDictionary(c => c.Id);
         var publicCatalog = await channelRepository.LoadAllOfType(ChannelType.Public);
         var mutedPlayer = await muteRepository.GetMutedPlayer(identity.BattleTag);
-        var chatUser = await chatAuthenticationService.GetUserFromIdentity(identity);
 
         var muteStatus = ResolveMuteStatus(mutedPlayer, now);
 
@@ -198,15 +201,10 @@ public class SessionStateAssembler(
         return new OwnProfileDto(identity.BattleTag, identity.Name, identity.IsAdmin, ToChatProfile(chatUser), permissions);
     }
 
-    // ChatUser doesn't yet carry league/rank/gamesPlayed — ChatProfile's own doc marks those as
-    // additive ranking enrichment (C6 directory / W1 wb endpoint); left null until that lands.
-    private static ChatProfile ToChatProfile(ChatUser chatUser) => new()
-    {
-        ClanId = chatUser.ClanTag,
-        ProfilePicture = chatUser.ProfilePicture,
-        ChatColor = chatUser.ChatColor,
-        ChatIcons = chatUser.ChatIcons,
-    };
+    // D9: delegates to the single shared ChatUser→ChatProfile mapper (Domain/ChatProfileMapper.cs) —
+    // also used by ChatHub.BuildSenderSnapshot — so OwnProfile.Flair and the per-message sender
+    // snapshot can never drift on which ChatUser fields become client-visible flair.
+    private static ChatProfile ToChatProfile(ChatUser chatUser) => ChatProfileMapper.FromChatUser(chatUser);
 
     // SECURITY: shadow bans must never surface to the client — only a FULL ban exposes {endDate}.
     // No mute / expired mute (muteStatus == None) also yields null.

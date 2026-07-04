@@ -46,6 +46,7 @@ public class ChatHubSettingsTests : IntegrationTestBase
     private UserSettingsRepository _userSettings;
     private DmInitiationTracker _dmInitiationTracker;
     private FakeTimeProvider _time;
+    private Mock<IChatAuthenticationService> _authService;
 
     [SetUp]
     public void SetupBeforeEach()
@@ -67,16 +68,15 @@ public class ChatHubSettingsTests : IntegrationTestBase
         _userSettings = new UserSettingsRepository(MongoClient);
         _dmInitiationTracker = new DmInitiationTracker();
 
-        var authService = new Mock<IChatAuthenticationService>();
-        authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+        _authService = new Mock<IChatAuthenticationService>();
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
             _messageRepository,
             new MuteRepository(MongoClient),
-            authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -103,7 +103,8 @@ public class ChatHubSettingsTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             RelationshipProviderTestFactory.CreateIgnored(),
             _userSettings,
-            _dmInitiationTracker);
+            _dmInitiationTracker,
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);

@@ -56,7 +56,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
 
         var chatAuthenticationService = new Mock<IChatAuthenticationService>();
         chatAuthenticationService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
-            .ReturnsAsync(new ChatUser(ModeratorBattleTag, true, "Admin", new ProfilePicture(), null, null));
+            .ReturnsAsync(new ChatUserResolution(new ChatUser(ModeratorBattleTag, true, "Admin", new ProfilePicture(), null, null), true));
 
         _connectionMapping = new ConnectionMapping();
         _channelRepository = new ChannelRepository(MongoClient);
@@ -81,7 +81,6 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _channelRepository,
             _messageRepository,
             _muteRepository,
-            chatAuthenticationService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
 
@@ -105,7 +104,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _mentionCleaner,
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            chatAuthenticationService.Object);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

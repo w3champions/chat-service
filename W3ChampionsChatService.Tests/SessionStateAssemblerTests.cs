@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
-using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
@@ -29,7 +28,6 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     private MembershipRepository _membershipRepository;
     private MessageRepository _messageRepository;
     private MuteRepository _muteRepository;
-    private Mock<IChatAuthenticationService> _chatAuthService;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private ConnectionMapping _connectionMapping;
     private SessionStateAssembler _assembler;
@@ -44,26 +42,14 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _connectionMapping = new ConnectionMapping();
 
-        // Echoes the identity back into a ChatUser carrying stable, assertable flair — the mute/flair
-        // services aren't the thing under test here (per the brief), so this is a real MuteRepository
-        // (Testcontainers Mongo) but a mocked IChatAuthenticationService.
-        _chatAuthService = new Mock<IChatAuthenticationService>();
-        _chatAuthService
-            .Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
-            .Returns((W3CUserAuthentication id) => Task.FromResult(new ChatUser(
-                id.BattleTag,
-                id.IsAdmin,
-                "ClanX",
-                new ProfilePicture { Race = AvatarCategory.HU, PictureId = 7, IsClassic = true },
-                new ChatColor("chat_color_red"),
-                new[] { new ChatIcon("chat_icon_star") })));
-
+        // D9: AssembleAndSeed no longer resolves the ChatUser itself — the caller (ChatHub, hoisted)
+        // hands it the already-resolved chatUser. ChatUserFor below stands in for what the mocked
+        // IChatAuthenticationService used to echo back: stable, assertable flair keyed off the identity.
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
             _messageRepository,
             _muteRepository,
-            _chatAuthService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -76,6 +62,17 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             IsAdmin = isAdmin,
             Permissions = perms.ToHashSet(),
         };
+
+    // D9: the ChatUser AssembleAndSeed's caller resolves ONCE and hands through — the mute/flair
+    // services aren't the thing under test here (per the brief), so this is a fixed, stable stand-in
+    // for what the (now-hoisted) IChatAuthenticationService used to echo back per identity.
+    private static ChatUser ChatUserFor(W3CUserAuthentication identity) => new(
+        identity.BattleTag,
+        identity.IsAdmin,
+        "ClanX",
+        new ProfilePicture { Race = AvatarCategory.HU, PictureId = 7, IsClassic = true },
+        new ChatColor("chat_color_red"),
+        new[] { new ChatIcon("chat_icon_star") });
 
     private async Task<ChatChannel> InsertChannel(ChannelType type, string name, long lastSeq)
     {
@@ -171,7 +168,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             await InsertMessage(chanB.Id, identity.BattleTag, seq);
         }
 
-        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         Assert.AreEqual(2, dto.Channels.Count);
         var a = dto.Channels.Single(c => c.Channel.Id == chanA.Id);
@@ -208,7 +205,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         await InsertMembership(chan.Id, viewer.BattleTag, lastReadSeq: 0);
         await InsertMessage(chan.Id, "Alpha#1", seq: 1, shadow: true);
 
-        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-b", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-b", DateTime.UtcNow, ChatUserFor(viewer));
 
         var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
         Assert.AreEqual(0L, c.UnreadCount, "a foreign author's shadow row must generate NO unread for other members");
@@ -225,7 +222,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         await InsertMembership(chan.Id, viewer.BattleTag, lastReadSeq: 0);
         await InsertMessage(chan.Id, "Alpha#1", seq: 1, deleted: true);
 
-        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-b", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-b", DateTime.UtcNow, ChatUserFor(viewer));
 
         var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
         Assert.AreEqual(0L, c.UnreadCount, "a soft-deleted row must generate NO phantom unread after a purge");
@@ -243,7 +240,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         await InsertMembership(chan.Id, author.BattleTag, lastReadSeq: 0);
         await InsertMessage(chan.Id, author.BattleTag, seq: 1, shadow: true);
 
-        var (dto, _) = await _assembler.AssembleAndSeed(author, "conn-a", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(author, "conn-a", DateTime.UtcNow, ChatUserFor(author));
 
         var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
         Assert.AreEqual(1L, c.UnreadCount, "the viewer's OWN shadow rows count toward their own unread — the symmetric illusion");
@@ -265,7 +262,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             await InsertMessage(chan.Id, viewer.BattleTag, seq);
         }
 
-        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-1", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-1", DateTime.UtcNow, ChatUserFor(viewer));
 
         var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
         Assert.AreEqual(lastSeq - lastReadSeq, c.UnreadCount, "on a clean channel the count-based unread equals LastSeq − LastReadSeq");
@@ -286,7 +283,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             await InsertMessage(chan.Id, viewer.BattleTag, seq);
         }
 
-        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-1", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-1", DateTime.UtcNow, ChatUserFor(viewer));
 
         var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
         Assert.AreEqual(0L, c.UnreadCount, "no rows after the cursor → unread 0, never negative");
@@ -301,7 +298,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         var pub = await InsertChannel(ChannelType.Public, "W3C Lounge", lastSeq: 0);
         var identity = Identity("Peter#123");
 
-        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         Assert.IsNotEmpty(dto.PublicCatalog);
         Assert.IsTrue(dto.PublicCatalog.Any(c => c.Id == pub.Id));
@@ -312,7 +309,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     {
         var identity = Identity("Peter#123");
 
-        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         Assert.IsEmpty(dto.PendingDmRequests);
         Assert.AreEqual(0, dto.MentionUnreadCount);
@@ -335,14 +332,14 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         await InsertMembership(channel.Id, recipient, lastReadSeq: 0);
 
         // The RECIPIENT sees the request in their tray (it names the initiator, RequestedAt = LastMessageAt).
-        var (recipientDto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt);
+        var (recipientDto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt, ChatUserFor(Identity(recipient)));
         Assert.AreEqual(1, recipientDto.PendingDmRequests.Count);
         Assert.AreEqual(channel.Id, recipientDto.PendingDmRequests[0].ChannelId);
         Assert.AreEqual(initiator, recipientDto.PendingDmRequests[0].FromBattleTag);
         Assert.AreEqual(requestedAt, recipientDto.PendingDmRequests[0].RequestedAt);
 
         // The INITIATOR never sees their OWN outgoing request in the tray (it is not a request TO them).
-        var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt);
+        var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt, ChatUserFor(Identity(initiator)));
         Assert.IsEmpty(initiatorDto.PendingDmRequests, "the initiator never sees their own outgoing request in the tray");
     }
 
@@ -356,8 +353,8 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         await InsertMembership(channel.Id, initiator, lastReadSeq: 0);
         await InsertMembership(channel.Id, recipient, lastReadSeq: 0);
 
-        var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt);
-        var (recipientDto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt);
+        var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt, ChatUserFor(Identity(initiator)));
+        var (recipientDto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt, ChatUserFor(Identity(recipient)));
 
         // D4 dual-listing: the pending DM is a normal channel for BOTH parties (needed so FocusChannel /
         // GetMessages / registry membership work), in addition to riding the recipient's tray.
@@ -390,12 +387,12 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         });
 
         // Inside the window: suppressed from the tray (but still in Channels).
-        var (inside, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-1", now.AddHours(1));
+        var (inside, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-1", now.AddHours(1), ChatUserFor(Identity(recipient)));
         Assert.IsEmpty(inside.PendingDmRequests, "a decline-suppressed request is hidden from the tray inside the window");
         Assert.IsTrue(inside.Channels.Any(c => c.Channel.Id == channel.Id), "the decline-suppressed DM stays a normal channel");
 
         // After the window (DeclinedUntil <= now): reappears in the tray.
-        var (after, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-2", now.AddHours(25));
+        var (after, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-2", now.AddHours(25), ChatUserFor(Identity(recipient)));
         Assert.AreEqual(1, after.PendingDmRequests.Count, "the request reappears in the tray once the decline window elapses");
         Assert.AreEqual(channel.Id, after.PendingDmRequests[0].ChannelId);
     }
@@ -405,7 +402,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     {
         var identity = Identity("Peter#123", name: "PeterDisplay", isAdmin: true, EPermission.Moderation, EPermission.Queue);
 
-        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         // Reflection guard: OwnProfileDto must never expose the raw permission set or any
         // Identity/Context-shaped member — only a projected string list.
@@ -432,13 +429,47 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task SessionState_OwnProfileFlair_CarriesLeagueRankGames_WhenCached()
+    {
+        // D9/W1 amendment: OwnProfileDto.Flair (the C3 stub) now carries the full league/rank/games
+        // enrichment when the resolved chatUser carries it — filling the stub this task was scoped to.
+        var identity = Identity("Peter#123");
+        var enrichedUser = new ChatUser(identity.BattleTag, false, "W3C", new ProfilePicture(), new ChatColor("chat_color_red"), Array.Empty<ChatIcon>())
+        {
+            LeagueId = 3,
+            LeagueName = "Diamond",
+            LeagueOrder = 5,
+            LeagueDivision = 2,
+            RankNumber = 14,
+            GameMode = 1,
+            GateWay = 20,
+            GamesPlayed = 42,
+            Season = 22,
+        };
+
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, enrichedUser);
+
+        var flair = dto.OwnProfile.Flair;
+        Assert.IsNotNull(flair);
+        Assert.AreEqual(3, flair.LeagueId);
+        Assert.AreEqual("Diamond", flair.LeagueName);
+        Assert.AreEqual(5, flair.LeagueOrder);
+        Assert.AreEqual(2, flair.LeagueDivision);
+        Assert.AreEqual(14, flair.RankNumber);
+        Assert.AreEqual(1, flair.GameMode);
+        Assert.AreEqual(20, flair.GateWay);
+        Assert.AreEqual(42, flair.GamesPlayed);
+        Assert.AreEqual(22, flair.Season);
+    }
+
+    [Test]
     public async Task Assemble_MuteState_FullBan_EndDateOnly_ShadowInvisible()
     {
         var fullEnd = DateTime.UtcNow.AddDays(1);
         var fullIdentity = Identity("fullbanned#1");
         await FullBan(fullIdentity.BattleTag, fullEnd);
 
-        var (fullDto, fullStatus) = await _assembler.AssembleAndSeed(fullIdentity, "conn-full", DateTime.UtcNow);
+        var (fullDto, fullStatus) = await _assembler.AssembleAndSeed(fullIdentity, "conn-full", DateTime.UtcNow, ChatUserFor(fullIdentity));
 
         Assert.AreEqual(MuteStatus.Full, fullStatus);
         Assert.IsNotNull(fullDto.MuteState, "A full ban must surface a non-null muteState");
@@ -453,7 +484,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         var shadowIdentity = Identity("shadow#1");
         await ShadowBan(shadowIdentity.BattleTag, shadowEnd);
 
-        var (shadowDto, shadowStatus) = await _assembler.AssembleAndSeed(shadowIdentity, "conn-shadow", DateTime.UtcNow);
+        var (shadowDto, shadowStatus) = await _assembler.AssembleAndSeed(shadowIdentity, "conn-shadow", DateTime.UtcNow, ChatUserFor(shadowIdentity));
 
         Assert.AreEqual(MuteStatus.Shadow, shadowStatus);
         Assert.IsNull(shadowDto.MuteState, "A shadow ban must NEVER surface to the client — muteState must be null");
@@ -474,7 +505,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     {
         var identity = Identity("clean#1");
 
-        var (dto, status) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, status) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         Assert.AreEqual(MuteStatus.None, status);
         Assert.IsNull(dto.MuteState);
@@ -486,7 +517,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         var identity = Identity("expired#1");
         await FullBan(identity.BattleTag, DateTime.UtcNow.AddMinutes(-10));
 
-        var (dto, status) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, status) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         Assert.AreEqual(MuteStatus.None, status, "An expired mute must be treated as no mute");
         Assert.IsNull(dto.MuteState);
@@ -499,7 +530,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         var identity = Identity("fullbanned#2");
         await FullBan(identity.BattleTag, DateTime.UtcNow.AddDays(1));
 
-        var (dto, status) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
+        var (dto, status) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
 
         Assert.AreEqual(MuteStatus.Full, status);
         Assert.IsEmpty(dto.PublicCatalog, "A full-ban connect must filter the public catalog to empty");
@@ -512,7 +543,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         var identity = Identity("Peter#123");
         await InsertMembership(chan.Id, identity.BattleTag, lastReadSeq: 7, level: NotificationLevel.Mentions);
 
-        await _assembler.AssembleAndSeed(identity, "conn-x", DateTime.UtcNow);
+        await _assembler.AssembleAndSeed(identity, "conn-x", DateTime.UtcNow, ChatUserFor(identity));
 
         var members = _onlineMemberRegistry.GetMembers(chan.Id);
         var member = members.Single(m => m.BattleTag == identity.BattleTag);
@@ -526,7 +557,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         // Unmuted connect: RegisterUser must make GetUser resolve, SetMute must seed None.
         var identity = Identity("Peter#123");
 
-        await _assembler.AssembleAndSeed(identity, "conn-y", DateTime.UtcNow);
+        await _assembler.AssembleAndSeed(identity, "conn-y", DateTime.UtcNow, ChatUserFor(identity));
 
         var registeredUser = _connectionMapping.GetUser("conn-y");
         Assert.IsNotNull(registeredUser, "AssembleAndSeed must RegisterUser on the legacy ConnectionMapping");
@@ -540,7 +571,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         var bannedIdentity = Identity("banned#9");
         await FullBan(bannedIdentity.BattleTag, bannedEnd);
 
-        await _assembler.AssembleAndSeed(bannedIdentity, "conn-z", DateTime.UtcNow);
+        await _assembler.AssembleAndSeed(bannedIdentity, "conn-z", DateTime.UtcNow, ChatUserFor(bannedIdentity));
 
         Assert.IsTrue(_connectionMapping.TryGetMute("conn-z", out var cachedFull));
         Assert.AreEqual(MuteStatus.Full, cachedFull.Status);

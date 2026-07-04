@@ -144,14 +144,13 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         _authService = new Mock<IChatAuthenticationService>();
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
 
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
             _messageRepository,
             _muteRepository,
-            _authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
 
@@ -196,7 +195,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             _relationshipProvider,
             _userSettings,
-            _dmInitiationTracker);
+            _dmInitiationTracker,
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -353,8 +353,12 @@ public class DmGroupIntegrationTests : IntegrationTestBase
             .Select(s => (ChannelAddedDto)s.Payload)
             .ToList();
 
-    private async Task<SessionStateDto> AssembleTray(string battleTag) =>
-        (await _assembler.AssembleAndSeed(Identity(battleTag), "tray-" + Guid.NewGuid().ToString("N"), Now)).Item1;
+    private async Task<SessionStateDto> AssembleTray(string battleTag)
+    {
+        var identity = Identity(battleTag);
+        var chatUser = new ChatUser(identity.BattleTag, identity.IsAdmin, identity.Name, new ProfilePicture(), null, null);
+        return (await _assembler.AssembleAndSeed(identity, "tray-" + Guid.NewGuid().ToString("N"), Now, chatUser)).Item1;
+    }
 
     // ============================================================================================
     // Group 1 — FULL MATRIX, stranger × Everyone lifecycle (matrix rows: create-pending → tray →

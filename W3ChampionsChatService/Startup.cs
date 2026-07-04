@@ -50,6 +50,11 @@ public class Startup
             options.MaximumReceiveMessageSize = 16 * 1024;
         });
 
+        // D9 (C6 Task 3): registers IHttpClientFactory — WebsiteBackendRepository is rebuilt on it,
+        // killing the per-call `new HttpClient()` socket-exhaustion anti-pattern (a fresh HttpClient
+        // allocates its own handler/socket pool every call; the factory pools handlers across calls).
+        services.AddHttpClient();
+
         services.AddTransient<IChatAuthenticationService, ChatAuthenticationService>();
         services.AddTransient<IW3CAuthenticationService, W3CAuthenticationService>();
         services.AddTransient<IWebsiteBackendRepository, WebsiteBackendRepository>();

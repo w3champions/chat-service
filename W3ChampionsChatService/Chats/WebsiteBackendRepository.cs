@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Net.Http;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -10,13 +10,21 @@ public interface IWebsiteBackendRepository
     Task<ChatDetailsDto> GetChatDetails(string battleTag);
 }
 
-public class WebsiteBackendRepository : IWebsiteBackendRepository
+/// <summary>
+/// D9: rebuilt on <see cref="IHttpClientFactory"/> — kills the per-call <c>new HttpClient()</c>
+/// socket-exhaustion anti-pattern (a fresh <see cref="HttpClient"/> allocates its own
+/// <see cref="HttpMessageHandler"/>/socket pool every call; the factory pools handlers across calls
+/// even though it still hands back a lightweight per-call <see cref="HttpClient"/> wrapper — the
+/// standard ASP.NET Core guidance for this exact problem). Same route, same interface — a
+/// behavior-preserving plumbing swap.
+/// </summary>
+public class WebsiteBackendRepository(IHttpClientFactory httpClientFactory) : IWebsiteBackendRepository
 {
     private static readonly string StatisticServiceApiUrl = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_URI") ?? "https://statistic-service.test.w3champions.com";
 
     public async Task<ChatDetailsDto> GetChatDetails(string battleTag)
     {
-        var httpClient = new HttpClient();
+        var httpClient = httpClientFactory.CreateClient();
         httpClient.BaseAddress = new Uri(StatisticServiceApiUrl);
         var escapeDataString = Uri.EscapeDataString(battleTag);
         var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
@@ -26,16 +34,51 @@ public class WebsiteBackendRepository : IWebsiteBackendRepository
     }
 }
 
-public class ChatDetailsDto(string clanId, ProfilePicture profilePicture, ChatColor chatColor, ChatIcon[] chatIcons)
+/// <summary>
+/// D9: extended ADDITIVELY and tolerantly — <see cref="Rank"/>/<see cref="GamesPlayed"/>/
+/// <see cref="Season"/> are the W1-amendment enrichment fields. Today's wb payload lacks them, so
+/// they deserialize null (the legacy-payload tolerant-stub pin); once W1 lands they carry the
+/// player's best-rank snapshot. Optional constructor parameters (rather than required ones) so a
+/// direct 4-arg construction (the pre-existing legacy shape) still compiles.
+/// </summary>
+public class ChatDetailsDto(
+    string clanId,
+    ProfilePicture profilePicture,
+    ChatColor chatColor,
+    ChatIcon[] chatIcons,
+    ChatRankDto rank = null,
+    int? gamesPlayed = null,
+    int? season = null)
 {
     public string ClanId { get; } = clanId;
     public ProfilePicture ProfilePicture { get; } = profilePicture;
 
     public ChatColor ChatColor { get; } = chatColor;
     public ChatIcon[] ChatIcons { get; } = chatIcons;
+
+    public ChatRankDto Rank { get; } = rank;
+    public int? GamesPlayed { get; } = gamesPlayed;
+    public int? Season { get; } = season;
 }
 
-
+/// <summary>
+/// The wb "best rank" sub-object (W1 amendment). Field names are VERBATIM as wb serializes them
+/// (camelCase JSON binds to these PascalCase properties via Newtonsoft's default case-insensitive
+/// constructor-parameter matching — no <c>[JsonProperty]</c> needed, matching this file's existing
+/// convention) — deliberately NOT renamed to match spec §4's naming; that divergence is intentional
+/// (W1 amendment), not a bug. Null on <see cref="ChatDetailsDto.Rank"/> when the player is unranked
+/// this season.
+/// </summary>
+public class ChatRankDto(int leagueId, string leagueName, int leagueOrder, int leagueDivision, int rankNumber, int gameMode, int gateWay)
+{
+    public int LeagueId { get; } = leagueId;
+    public string LeagueName { get; } = leagueName;
+    public int LeagueOrder { get; } = leagueOrder;
+    public int LeagueDivision { get; } = leagueDivision;
+    public int RankNumber { get; } = rankNumber;
+    public int GameMode { get; } = gameMode;
+    public int GateWay { get; } = gateWay;
+}
 
 public class ChatColor(string colorId) : IEquatable<ChatColor>
 {

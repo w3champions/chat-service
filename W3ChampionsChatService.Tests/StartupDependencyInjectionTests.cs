@@ -134,6 +134,30 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void IWebsiteBackendRepository_ResolvesToWebsiteBackendRepository()
+    {
+        // D9 (C6 Task 3): WebsiteBackendRepository is rebuilt on IHttpClientFactory — this resolves only
+        // if services.AddHttpClient() is registered.
+        using var provider = BuildProvider();
+
+        var repo = provider.GetRequiredService<IWebsiteBackendRepository>();
+        Assert.IsInstanceOf<WebsiteBackendRepository>(repo,
+            "IWebsiteBackendRepository must resolve to the concrete WebsiteBackendRepository");
+    }
+
+    [Test]
+    public void IChatAuthenticationService_ResolvesToChatAuthenticationService()
+    {
+        // D9: ChatAuthenticationService gained a new UserDirectoryRepository ctor dep (the directory-cache
+        // fallback tier) — this resolves only if the whole dependency graph is DI-satisfiable.
+        using var provider = BuildProvider();
+
+        var service = provider.GetRequiredService<IChatAuthenticationService>();
+        Assert.IsInstanceOf<ChatAuthenticationService>(service,
+            "IChatAuthenticationService must resolve to the concrete ChatAuthenticationService");
+    }
+
+    [Test]
     public void TimeProvider_IsRegisteredAsSystemSingleton()
     {
         using var provider = BuildProvider();

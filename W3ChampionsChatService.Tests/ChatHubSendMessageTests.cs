@@ -82,7 +82,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         _authService = new Mock<IChatAuthenticationService>();
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
 
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
@@ -98,7 +98,6 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _channelRepository,
             _messageRepository,
             _muteRepository,
-            _authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -125,7 +124,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

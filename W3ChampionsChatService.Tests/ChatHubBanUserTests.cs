@@ -54,7 +54,7 @@ public class ChatHubBanUserTests : IntegrationTestBase
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
         chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
-            .ReturnsAsync(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null));
+            .ReturnsAsync(new ChatUserResolution(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null), true));
 
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
@@ -73,7 +73,6 @@ public class ChatHubBanUserTests : IntegrationTestBase
                 _channelRepository,
                 _messageRepository,
                 _muteRepository,
-                chatAuthService.Object,
                 _onlineMemberRegistry,
                 _connectionMapping),
             new FocusRegistry(),
@@ -89,7 +88,8 @@ public class ChatHubBanUserTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            chatAuthService.Object);
 
         _clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

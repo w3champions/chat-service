@@ -410,14 +410,9 @@ public partial class ChatHub
         {
             BattleTag = chatUser.BattleTag,
             Name = chatUser.Name,
-            // Flair mirrors SessionStateAssembler.ToChatProfile — the same ChatUser→ChatProfile mapping.
-            Flair = new ChatProfile
-            {
-                ClanId = chatUser.ClanTag,
-                ProfilePicture = chatUser.ProfilePicture,
-                ChatColor = chatUser.ChatColor,
-                ChatIcons = chatUser.ChatIcons,
-            },
+            // D9: delegates to the single shared ChatUser→ChatProfile mapper (Domain/ChatProfileMapper.cs) —
+            // the SAME mapper SessionStateAssembler.ToChatProfile uses — so the two can never drift.
+            Flair = ChatProfileMapper.FromChatUser(chatUser),
         };
     }
 }

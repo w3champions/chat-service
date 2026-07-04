@@ -98,7 +98,7 @@ public class MutePortTests : IntegrationTestBase
         _authService = new Mock<IChatAuthenticationService>();
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
 
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
@@ -117,7 +117,7 @@ public class MutePortTests : IntegrationTestBase
     // ── Hub construction ─────────────────────────────────────────────────────────
 
     private SessionStateAssembler NewAssembler(IMuteRepository muteRepository) =>
-        new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _authService.Object, _onlineMemberRegistry, _connectionMapping);
+        new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _onlineMemberRegistry, _connectionMapping);
 
     private ChatHub NewHub(SessionStateAssembler assembler, ViewersAccumulator viewers, IHubCallerClients clients, HubCallerContext context)
     {
@@ -141,7 +141,8 @@ public class MutePortTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker())
+            new DmInitiationTracker(),
+            _authService.Object)
         {
             Clients = clients,
             Context = context,

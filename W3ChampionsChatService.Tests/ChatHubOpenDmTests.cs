@@ -54,6 +54,7 @@ public class ChatHubOpenDmTests : IntegrationTestBase
     private FakeRelationshipSource _relationshipSource;
     private RelationshipProvider _relationshipProvider;
     private FakeTimeProvider _time;
+    private Mock<IChatAuthenticationService> _authService;
 
     // Per-tag friends/blocked, read by the fake source's snapshot factory (OrdinalIgnoreCase).
     private readonly Dictionary<string, HashSet<string>> _friends = new(StringComparer.OrdinalIgnoreCase);
@@ -91,16 +92,15 @@ public class ChatHubOpenDmTests : IntegrationTestBase
             now));
         _relationshipProvider = new RelationshipProvider(_relationshipSource, _time);
 
-        var authService = new Mock<IChatAuthenticationService>();
-        authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+        _authService = new Mock<IChatAuthenticationService>();
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, id.Name, new ProfilePicture(), null, null), true));
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
             _messageRepository,
             new MuteRepository(MongoClient),
-            authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -127,7 +127,8 @@ public class ChatHubOpenDmTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             _relationshipProvider,
             _userSettings,
-            _dmInitiationTracker);
+            _dmInitiationTracker,
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);

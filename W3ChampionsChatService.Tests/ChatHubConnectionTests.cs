@@ -85,9 +85,11 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _sends.Clear();
 
         _authService = new Mock<IChatAuthenticationService>();
+        // D9: default happy-path resolution — FreshFromWb: true (a normal successful wb round-trip).
+        // Individual tests below override this to simulate a wb outage (FreshFromWb: false).
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
             .ReturnsAsync((W3CUserAuthentication id) =>
-                new ChatUser(id.BattleTag, id.IsAdmin, null, new ProfilePicture(), null, null));
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, null, new ProfilePicture(), null, null), true));
 
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
@@ -102,7 +104,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
             _channelRepository,
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             _muteRepository,
-            _authService.Object,
             _onlineMemberRegistry,
             _connectionMapping);
     }
@@ -132,7 +133,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             _relationshipProvider,
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            _authService.Object);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -328,32 +330,189 @@ public class ChatHubConnectionTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Connect_UpsertsUserDirectoryStub_PreservingProfile()
+    public async Task Connect_UpsertsDirectory_ProfileAndDisplayTagAndFullTagNormalizedName()
     {
-        // Decision 13: the connect stub is a read-modify-write (Load → set NormalizedName/LastSeenAt →
-        // Upsert), so a previously-cached Profile survives (full enrichment is C6).
+        // D9: the FULL connect-time directory upsert — a fresh wb enrichment writes Profile,
+        // DisplayBattleTag (original JWT casing), and NormalizedName (the lowercased FULL battleTag,
+        // NOT just the name part — the C3 stub's defect this task fixes).
+        const string mixedCaseTag = "Wolf#456";
+        var enrichedUser = new ChatUser(mixedCaseTag, false, "clan-1", new ProfilePicture(), new ChatColor("chat_color_blue"), Array.Empty<ChatIcon>())
+        {
+            RankNumber = 7,
+        };
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync(new ChatUserResolution(enrichedUser, true));
+
+        var ticket = _ticketStore.Mint(Identity(battleTag: mixedCaseTag, name: "Wolf"), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-dir", ticket);
+
+        await hub.OnConnectedAsync();
+
+        var entry = await _userDirectory.Load(mixedCaseTag);
+        Assert.IsNotNull(entry, "The directory entry must exist after connect");
+        Assert.AreEqual(mixedCaseTag, entry.DisplayBattleTag, "DisplayBattleTag preserves the caller's original JWT casing");
+        Assert.AreEqual("wolf#456", entry.NormalizedName, "NormalizedName must be the lowercased FULL battleTag, not just the name part");
+        Assert.Less((DateTime.UtcNow - entry.LastSeenAt).Duration(), TimeSpan.FromSeconds(5),
+            "LastSeenAt must be refreshed to now (±5s)");
+        Assert.IsNotNull(entry.Profile, "A fresh wb enrichment (FreshFromWb: true) must write the Profile");
+        Assert.AreEqual("clan-1", entry.Profile.ClanId);
+        Assert.AreEqual(7, entry.Profile.RankNumber);
+    }
+
+    [Test]
+    public async Task Connect_WbDown_DirectoryUpsertPreservesExistingProfile_UpdatesLastSeenAt()
+    {
+        // The never-clobber-cached-profile invariant: a wb outage at connect time must NEVER overwrite
+        // a good, previously-cached Profile with nulls — LastSeenAt/DisplayBattleTag/NormalizedName
+        // still refresh (the user IS connecting, that's still true), but Profile is left untouched.
         var existingProfile = new ChatProfile { ClanId = "clan-1", RankNumber = 7 };
         await _userDirectory.Upsert(new UserDirectoryEntry
         {
             BattleTag = BattleTag,
+            DisplayBattleTag = BattleTag,
             NormalizedName = "stale",
             LastSeenAt = DateTime.UtcNow.AddDays(-30),
             Profile = existingProfile,
         });
 
+        // Simulate a wb outage: the plain (non-fresh) fallback resolution.
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync((W3CUserAuthentication id) =>
+                new ChatUserResolution(new ChatUser(id.BattleTag, id.IsAdmin, null, new ProfilePicture(), null, null), false));
+
         var ticket = _ticketStore.Mint(Identity(battleTag: BattleTag, name: "Peter"), DateTime.UtcNow);
-        var (hub, _) = BuildConnection("conn-dir", ticket);
+        var (hub, _) = BuildConnection("conn-dir-down", ticket);
 
         await hub.OnConnectedAsync();
 
         var entry = await _userDirectory.Load(BattleTag);
-        Assert.IsNotNull(entry, "The directory entry must exist after connect");
-        Assert.AreEqual("peter", entry.NormalizedName, "NormalizedName must be the lowercased identity name");
+        Assert.IsNotNull(entry);
+        Assert.AreEqual("peter#123", entry.NormalizedName, "NormalizedName still refreshes even on a wb outage — the user IS connecting");
         Assert.Less((DateTime.UtcNow - entry.LastSeenAt).Duration(), TimeSpan.FromSeconds(5),
-            "LastSeenAt must be refreshed to now (±5s)");
-        Assert.IsNotNull(entry.Profile, "The pre-existing Profile must be preserved (read-modify-write)");
+            "LastSeenAt still refreshes on a wb outage");
+        Assert.IsNotNull(entry.Profile, "the PRE-EXISTING cached Profile must survive a wb outage — never clobbered with nulls");
         Assert.AreEqual("clan-1", entry.Profile.ClanId);
         Assert.AreEqual(7, entry.Profile.RankNumber);
+    }
+
+    [Test]
+    public async Task Disconnect_UpdatesLastSeenAt_PreservesProfile()
+    {
+        // Acceptance 6's lastSeenAt leg: the disconnect-time write (SetLastSeen, Task 2's partial
+        // update) advances LastSeenAt but — by construction of SetLastSeen — never touches Profile.
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-disc", ticket);
+        await hub.OnConnectedAsync();
+
+        // Simulate whatever Profile the directory cache holds by the time this connection disconnects
+        // (e.g. from an earlier successful enrichment) — independent of what THIS connect wrote.
+        var cachedProfile = new ChatProfile { ClanId = "clan-1", RankNumber = 7 };
+        var seeded = await _userDirectory.Load(BattleTag);
+        seeded.Profile = cachedProfile;
+        await _userDirectory.Upsert(seeded);
+
+        var beforeDisconnect = DateTime.UtcNow;
+        await hub.OnDisconnectedAsync(null);
+
+        var entry = await _userDirectory.Load(BattleTag);
+        Assert.IsNotNull(entry);
+        Assert.GreaterOrEqual(entry.LastSeenAt, beforeDisconnect.AddSeconds(-1),
+            "LastSeenAt must advance to the disconnect time");
+        Assert.IsNotNull(entry.Profile, "SetLastSeen (the disconnect-time write) must never clobber the cached Profile");
+        Assert.AreEqual("clan-1", entry.Profile.ClanId);
+        Assert.AreEqual(7, entry.Profile.RankNumber);
+    }
+
+    [Test]
+    public async Task Disconnect_DisplacedOldSocket_DoesNotTouchDirectory()
+    {
+        // A displaced OLD socket's disconnect must NOT rewind LastSeenAt — the user is still online via
+        // their NEW connection. TryGetByConnectionId is fail-closed for exactly this race (captured
+        // BEFORE Unregister in OnDisconnectedAsync).
+        var ticketOld = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (oldHub, _) = BuildConnection("conn-old-dir", ticketOld);
+        await oldHub.OnConnectedAsync();
+
+        var ticketNew = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (newHub, _) = BuildConnection("conn-new-dir", ticketNew);
+        await newHub.OnConnectedAsync();
+
+        // Stamp a known sentinel LastSeenAt (far from "now") so a rewind is unmistakable.
+        var sentinelLastSeen = DateTime.UtcNow.AddHours(1);
+        var afterSecondConnect = await _userDirectory.Load(BattleTag);
+        afterSecondConnect.LastSeenAt = sentinelLastSeen;
+        await _userDirectory.Upsert(afterSecondConnect);
+
+        await oldHub.OnDisconnectedAsync(null);
+
+        var entry = await _userDirectory.Load(BattleTag);
+        Assert.Less((entry.LastSeenAt - sentinelLastSeen).Duration(), TimeSpan.FromMilliseconds(5),
+            "a displaced OLD socket's disconnect must not touch the directory while the user is still online via the NEW connection");
+    }
+
+    [Test]
+    public async Task SenderSnapshot_And_OwnProfile_UseSameMapper()
+    {
+        // D9: BuildSenderSnapshot (ChatHub.Messaging.cs, the per-message sender flair) and ToChatProfile
+        // (SessionStateAssembler, OwnProfile.Flair) both delegate to the SAME ChatProfileMapper.FromChatUser
+        // — this proves the two call sites can never drift on a fully-enriched user.
+        var channel = new ChatChannel { Type = ChannelType.Public, Name = "General", NormalizedName = ChannelNames.Normalize("General") };
+        await _channelRepository.Insert(channel);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = BattleTag,
+            LastReadSeq = 0,
+            NotificationLevel = NotificationLevel.All,
+            Role = MembershipRole.Member,
+            JoinedAt = DateTime.UtcNow,
+        });
+
+        var enrichedUser = new ChatUser(
+            BattleTag, false, "W3C",
+            new ProfilePicture { Race = AvatarCategory.HU, PictureId = 3, IsClassic = true },
+            new ChatColor("chat_color_blue"),
+            new[] { new ChatIcon("chat_icon_star") })
+        {
+            LeagueId = 3,
+            LeagueName = "Diamond",
+            LeagueOrder = 5,
+            LeagueDivision = 2,
+            RankNumber = 14,
+            GameMode = 1,
+            GateWay = 20,
+            GamesPlayed = 42,
+            Season = 22,
+        };
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync(new ChatUserResolution(enrichedUser, true));
+
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-mapper", ticket);
+        await hub.OnConnectedAsync();
+
+        // Path 1: the per-message sender snapshot.
+        var sendResult = await hub.SendMessage(channel.Id, "hello");
+        Assert.AreEqual(ChatResultCode.Ok, sendResult.Code);
+        var persisted = await new W3ChampionsChatService.Messages.MessageRepository(MongoClient).Load(sendResult.MessageId);
+
+        // Path 2: OwnProfile.Flair, via the assembler directly (already seeded/shared in this fixture).
+        var (dto, _) = await _assembler.AssembleAndSeed(Identity(), "conn-mapper-2", DateTime.UtcNow, enrichedUser);
+
+        var expectedFlair = ChatProfileMapper.FromChatUser(enrichedUser);
+        foreach (var flair in new[] { persisted.Sender.Flair, dto.OwnProfile.Flair })
+        {
+            Assert.AreEqual(expectedFlair.ClanId, flair.ClanId);
+            Assert.AreEqual(expectedFlair.LeagueId, flair.LeagueId);
+            Assert.AreEqual(expectedFlair.LeagueName, flair.LeagueName);
+            Assert.AreEqual(expectedFlair.LeagueOrder, flair.LeagueOrder);
+            Assert.AreEqual(expectedFlair.LeagueDivision, flair.LeagueDivision);
+            Assert.AreEqual(expectedFlair.RankNumber, flair.RankNumber);
+            Assert.AreEqual(expectedFlair.GameMode, flair.GameMode);
+            Assert.AreEqual(expectedFlair.GateWay, flair.GateWay);
+            Assert.AreEqual(expectedFlair.GamesPlayed, flair.GamesPlayed);
+            Assert.AreEqual(expectedFlair.Season, flair.Season);
+        }
     }
 
     [Test]

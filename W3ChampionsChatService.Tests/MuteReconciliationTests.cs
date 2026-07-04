@@ -57,7 +57,7 @@ public class MuteReconciliationTests : IntegrationTestBase
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
         chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
-            .ReturnsAsync(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null));
+            .ReturnsAsync(new ChatUserResolution(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null), true));
 
         _channelRepository = new ChannelRepository(MongoClient);
         _onlineMemberRegistry = new OnlineMemberRegistry();
@@ -73,7 +73,6 @@ public class MuteReconciliationTests : IntegrationTestBase
                 _channelRepository,
                 new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
                 _muteRepository,
-                chatAuthService.Object,
                 _onlineMemberRegistry,
                 _connectionMapping),
             new FocusRegistry(),
@@ -89,7 +88,8 @@ public class MuteReconciliationTests : IntegrationTestBase
             new NoOpMentionInboxCleaner(),
             RelationshipProviderTestFactory.CreateIgnored(),
             new UserSettingsRepository(MongoClient),
-            new DmInitiationTracker());
+            new DmInitiationTracker(),
+            chatAuthService.Object);
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();

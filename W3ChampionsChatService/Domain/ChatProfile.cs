@@ -15,6 +15,12 @@ public class ChatProfile
     public ChatColor ChatColor { get; set; }
     public ChatIcon[] ChatIcons { get; set; }
     public int? LeagueId { get; set; }
+    public string LeagueName { get; set; }
+    public int? LeagueOrder { get; set; }
+    public int? LeagueDivision { get; set; }
     public int? RankNumber { get; set; }
+    public int? GameMode { get; set; }
+    public int? GateWay { get; set; }
     public int? GamesPlayed { get; set; }
+    public int? Season { get; set; }
 }
