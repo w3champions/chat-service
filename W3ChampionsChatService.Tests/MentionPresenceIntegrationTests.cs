@@ -611,7 +611,9 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         const string OnlineTag = "vic-online#200"; // tier 2 — online, not viewing the searched channel
         const string FreshTag = "vic-fresh#300";  // tier 3 — offline, active 89d ago (within the gate), enriched
         const string PlainTag = "vic-plain#400";  // tier 3 — offline, active 89d ago, NO cached profile
+        const string BoundaryTag = "vic-edge#600"; // tier 3 — offline, active EXACTLY 90d ago (the inclusive '>=' edge)
         const string StaleTag = "vic-old#500";    // excluded — offline, active 91d ago (beyond the gate)
+        const string NonMatchTag = "zeta-online#900"; // online, but a NON-matching prefix — must be prefix-excluded
 
         var channel = await CreateChannel("search-room", ChannelType.Public);
         await SeedMembership(channel.Id, CallerTag);
@@ -621,12 +623,17 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         var viewerHub = await Connect("conn-viewer", ViewerTag);
         Assert.That((await viewerHub.FocusChannel(channel.Id)).Code, Is.EqualTo(ChatResultCode.Ok)); // tier 1
         await Connect("conn-online", OnlineTag); // online anywhere, never focuses this channel → tier 2
+        await Connect("conn-nonmatch", NonMatchTag); // online (a tier-2 candidate) but its tag does NOT start with "vic"
 
         // Tier 3 / gate fixture — directly-seeded directory rows (never connected), so LastSeenAt + Profile
         // are fully controlled (immune to the connect-time upsert).
         var freshProfile = new ChatProfile { ClanId = "ClanZ", LeagueName = "Grandmaster", RankNumber = 1, GamesPlayed = 42 };
         await SeedDirectory(FreshTag, Now.AddDays(-89), freshProfile);
         await SeedDirectory(PlainTag, Now.AddDays(-89), profile: null);
+        // The EXACT 90d edge: the tier-3 gate is Gte(LastSeenAt, now - MentionCandidateActivityWindow)
+        // (UserDirectoryRepository.SearchByNormalizedPrefix). The clock never advances in this test, so
+        // this row's LastSeenAt (Now.AddDays(-90)) is bit-identical to the query's minLastSeenAt.
+        await SeedDirectory(BoundaryTag, Now.AddDays(-90), profile: null);
         await SeedDirectory(StaleTag, Now.AddDays(-91), profile: null);
 
         var result = await caller.SearchMentionCandidates(channel.Id, "vic");
@@ -647,6 +654,18 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         // The 90d gate (tier 3 ONLY): the 91d-stale user is excluded entirely.
         Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Not.Contain(StaleTag),
             "an offline user last active beyond the 90d window is excluded from tier 3");
+
+        // The EXACT boundary: last active at PRECISELY now-90d falls on the INCLUSIVE side of the '>='
+        // gate (Gte in SearchByNormalizedPrefix) — kept, not excluded. Pins which side of the edge the
+        // 89d-included / 91d-excluded pair straddles.
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Contain(BoundaryTag),
+            "a user last active at EXACTLY now-90d is on the inclusive side of the '>=' tier-3 gate — included, not excluded");
+        Assert.That(byTag[BoundaryTag].Tier, Is.EqualTo(3), "the exact-boundary user is a tier-3 directory match");
+
+        // The prefix filter genuinely EXCLUDES a non-matching online user (a tier-2 candidate) — the
+        // result is not merely "everyone" because every OTHER fixture tag happens to start with "vic".
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Not.Contain(NonMatchTag),
+            "an online user whose tag does NOT match the 'vic' prefix is prefix-excluded, proving the tier filter actually filters");
 
         // Enrichment PRESENCE (a cached profile flows through) vs ABSENCE (a bare directory row degrades to null).
         Assert.That(byTag[FreshTag].Profile, Is.Not.Null, "a directory row with a cached profile enriches the candidate");
@@ -754,6 +773,75 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That(FriendPresenceFor("conn-friend").Count(p => p.BattleTag == SubjectTag && !p.Online), Is.EqualTo(1),
             "the online friend receives exactly one FriendPresenceChanged(offline)");
         Assert.That(FriendPresenceFor("conn-nonfriend"), Is.Empty, "the non-friend still receives nothing on disconnect");
+    }
+
+    // ============================================================================================
+    // Slate 6b — GetPresenceDetails_LastSeenAt_FriendGated_EndToEnd (acceptance 6, the friend-gated
+    // READ leg — DISTINCT from Slate 6's friends-only PUSH). LastSeenAt is the single most
+    // privacy-sensitive datum in the presence subsystem: online/offline is UNGATED, but LastSeenAt is
+    // populated ONLY for the CALLER's OWN friends (ChatHub.Presence.cs BuildPresenceDetails, sourced
+    // from Task 3's disconnect upsert), fails closed to null on a RelationshipUnavailableException, and
+    // even then Online is still honestly reported. All three legs (friend / non-friend / outage) over
+    // the SAME real RelationshipProvider + real connect/disconnect directory upserts the fixture wires.
+    // ============================================================================================
+
+    [Test]
+    public async Task GetPresenceDetails_LastSeenAt_FriendGated_EndToEnd()
+    {
+        const string SubjectTag = "readsubject#1";     // connects then disconnects → a REAL directory LastSeenAt from the disconnect upsert
+        const string FriendTag = "readfriend#2";        // the caller who IS friends with the subject (and stays online as a probe target)
+        const string StrangerTag = "readstranger#3";    // the caller who is NOT friends with the subject
+        const string OutageFriendTag = "readoutage#4";  // an ACTUAL friend of the subject, but connects DURING a relationship outage
+
+        // --- The subject connects, then disconnects. The disconnect upsert (Task 3 SetLastSeen) is the
+        // ONLY source of the LastSeenAt the friend leg reads back — advance the clock first so it is
+        // unambiguously the disconnect instant, never the earlier connect instant.
+        var subject = await Connect("conn-readsubject", SubjectTag);
+        _time.Advance(TimeSpan.FromMinutes(5));
+        var disconnectInstant = Now;
+        await subject.OnDisconnectedAsync(null);
+
+        // --- Leg (a): a caller's OWN friend gets a non-null LastSeenAt (sourced from the disconnect
+        // upsert), with Online honestly offline.
+        _friends[FriendTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { SubjectTag };
+        var friendHub = await Connect("conn-readfriend", FriendTag);
+        var friendResult = await friendHub.GetPresenceDetails(new[] { SubjectTag });
+        Assert.That(friendResult.Code, Is.EqualTo(ChatResultCode.Ok));
+        var friendView = friendResult.Details.Single();
+        Assert.That(friendView.Online, Is.False, "the subject disconnected — Online is honestly offline");
+        Assert.That(friendView.LastSeenAt, Is.EqualTo(disconnectInstant),
+            "a caller's OWN friend gets a non-null LastSeenAt sourced from the subject's DISCONNECT upsert, not the earlier connect");
+
+        // --- Leg (b): a NON-friend gets a null LastSeenAt, with Online STILL honest. Querying the online
+        // FriendTag alongside the offline subject proves Online is computed independently of friendship —
+        // it is not merely a hardcoded false suppressed together with the timestamp.
+        var strangerHub = await Connect("conn-readstranger", StrangerTag); // _friends[StrangerTag] left unset → no friends
+        var strangerResult = await strangerHub.GetPresenceDetails(new[] { SubjectTag, FriendTag });
+        Assert.That(strangerResult.Code, Is.EqualTo(ChatResultCode.Ok));
+        var strangerByTag = strangerResult.Details.ToDictionary(d => d.BattleTag, StringComparer.OrdinalIgnoreCase);
+        Assert.That(strangerByTag[SubjectTag].Online, Is.False, "Online honestly reported for a non-friend (offline subject)");
+        Assert.That(strangerByTag[SubjectTag].LastSeenAt, Is.Null,
+            "a non-friend's LastSeenAt comes back null even though a REAL disconnect-upsert value exists in the directory");
+        Assert.That(strangerByTag[FriendTag].Online, Is.True, "Online honestly reported for a non-friend (online target)");
+        Assert.That(strangerByTag[FriendTag].LastSeenAt, Is.Null,
+            "LastSeenAt stays suppressed for a non-friend regardless of the target's online status");
+
+        // --- Leg (c): fail closed. The relationship source now faults EVERY fetch, so the outage caller —
+        // an ACTUAL friend of the subject — can neither obtain nor have prefetched a snapshot (ShouldThrow
+        // is set BEFORE its connect, so the connect-time fire-and-forget prefetch faults too and nothing
+        // is cached). LastSeenAt fails closed to null on the sensitive datum ONLY; Online stays honest.
+        _friends[OutageFriendTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { SubjectTag };
+        _relationshipSource.ShouldThrow = true;
+        var outageHub = await Connect("conn-readoutage", OutageFriendTag);
+        var outageResult = await outageHub.GetPresenceDetails(new[] { SubjectTag, FriendTag });
+        Assert.That(outageResult.Code, Is.EqualTo(ChatResultCode.Ok));
+        var outageByTag = outageResult.Details.ToDictionary(d => d.BattleTag, StringComparer.OrdinalIgnoreCase);
+        Assert.That(outageByTag[SubjectTag].LastSeenAt, Is.Null,
+            "a RelationshipUnavailableException fails LastSeenAt closed to null even for an ACTUAL friend with real directory data");
+        Assert.That(outageByTag[FriendTag].LastSeenAt, Is.Null,
+            "fails closed on the timestamp regardless of the target's online status");
+        Assert.That(outageByTag[SubjectTag].Online, Is.False, "Online stays honest (offline) even when the relationship snapshot is unavailable");
+        Assert.That(outageByTag[FriendTag].Online, Is.True, "Online stays honest (online) even when the relationship snapshot is unavailable");
     }
 
     // ============================================================================================
@@ -897,6 +985,47 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             "MentionNotified is delivered via Clients.Client(targetConnectionId) — a single targeted send, never a broadcast");
         Assert.That(capturedMethods, Is.EqualTo(new[] { ChatEvents.MentionNotified }),
             "the single targeted send carries exactly the MentionNotified event");
+    }
+
+    // 8(b) continued: source-scan complement to the behavioral pin above (mirrors 8(a)'s
+    // Guardrail_OnlyTheCleaner_HardDeletesMentionInbox). The behavioral pin catches a refactor that
+    // REPLACES the targeted Clients.Client(...) with a broadcast, but NOT a broadcast added ALONGSIDE the
+    // existing targeted send (it would still capture the targeted connection and pass). This closes that
+    // false-negative: NO production file that references the ChatEvents.MentionNotified event may
+    // co-locate it with a broadcast client surface (Clients.All/AllExcept/Group/GroupExcept/Others/User).
+    // The one legitimate emitter (MentionFanOut) sends ONLY via a targeted Clients.Client(connectionId).
+    [Test]
+    public void Guardrail_MentionNotified_SourceScan_NeverCoLocatedWithABroadcastSurface()
+    {
+        var productionDir = ProductionSourceDir();
+        Assert.That(Directory.Exists(productionDir), Is.True,
+            $"expected the production project source at '{productionDir}' — the source-scan guardrail cannot run without it");
+
+        var broadcasters = Directory
+            .EnumerateFiles(productionDir, "*.cs", SearchOption.AllDirectories)
+            .Where(path => !path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}")
+                && !path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}"))
+            .Where(path =>
+            {
+                var text = File.ReadAllText(path);
+                var emitsMentionNotified = text.Contains("ChatEvents.MentionNotified");
+                // A "Clients.All" contains-check also catches "Clients.AllExcept"; "Clients.Group" also
+                // catches "Clients.GroupExcept" — every broadcast surface in D4's leak boundary. The
+                // targeted "Clients.Client(...)" the legitimate emitter uses matches none of these.
+                var broadcasts = text.Contains("Clients.All")
+                    || text.Contains("Clients.Group")
+                    || text.Contains("Clients.Others")
+                    || text.Contains("Clients.User");
+                return emitsMentionNotified && broadcasts;
+            })
+            .Select(Path.GetFileName)
+            .OrderBy(name => name)
+            .ToList();
+
+        Assert.That(broadcasters, Is.Empty,
+            "MentionNotified must ONLY ever be pushed via a targeted Clients.Client(connectionId) send — no production " +
+            "file that references ChatEvents.MentionNotified may co-locate it with a broadcast surface " +
+            $"(Clients.All/AllExcept/Group/GroupExcept/Others/User). Found: [{string.Join(", ", broadcasters)}].");
     }
 
     // 8(c): the hub surface physically declares all six new C6 client→server methods. The EXACT-count pin
