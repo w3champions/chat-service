@@ -100,6 +100,10 @@ public class OldProtocolRemovedTests
             // DeclineRequest (ChatHub.Dm.cs). Recipient-only; both return ChannelOperationResult.
             "AcceptRequest",
             "DeclineRequest",
+            // New protocol (C5 T7): group creation — CreateGroup (ChatHub.Groups.cs), create-from-scratch
+            // only. T8 extends this set further with the group management surface (add/remove/promote/
+            // rename); extend, never weaken.
+            "CreateGroup",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",
