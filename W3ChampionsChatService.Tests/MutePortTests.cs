@@ -254,12 +254,12 @@ public class MutePortTests : IntegrationTestBase
 
     // Seeds a connection the way the connect path does: a live session, the connection→user mapping, the
     // mute cache, and an OnlineMemberRegistry membership for the channel (the zero-DB "IS a member" signal).
-    private void SeedMember(string connectionId, string battleTag, string channelId, MuteStatus mute = MuteStatus.None, DateTime? muteEnd = null)
+    private void SeedMember(string connectionId, string battleTag, string channelId, MuteStatus mute = MuteStatus.None, DateTime? muteEnd = null, ChannelType type = ChannelType.Public)
     {
         RegisterSession(connectionId, battleTag);
         _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute(connectionId, mute, muteEnd ?? DateTime.MinValue);
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0, type));
     }
 
     private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public, SystemChannelKind? systemKind = null)
@@ -493,7 +493,7 @@ public class MutePortTests : IntegrationTestBase
     public async Task Send_UnbannedUser_AllChannelTypes_Ok(ChannelType type)
     {
         var channel = await CreateChannel($"chan-{type}", type, type == ChannelType.System ? SystemChannelKind.Match : null);
-        SeedMember("conn-1", BattleTag, channel.Id);
+        SeedMember("conn-1", BattleTag, channel.Id, type: type);
         var hub = BuildHub("conn-1");
 
         var result = await hub.SendMessage(channel.Id, "hello");
@@ -511,7 +511,7 @@ public class MutePortTests : IntegrationTestBase
     public async Task Send_FullMuted_TypeMatrix_OnlyPublicGated(ChannelType type, ChatResultCode expected)
     {
         var channel = await CreateChannel($"chan-{type}", type, type == ChannelType.System ? SystemChannelKind.Match : null);
-        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Full, muteEnd: Now.AddDays(1));
+        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Full, muteEnd: Now.AddDays(1), type: type);
         var hub = BuildHub("conn-1");
 
         var result = await hub.SendMessage(channel.Id, "let me talk");

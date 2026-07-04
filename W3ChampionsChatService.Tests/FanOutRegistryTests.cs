@@ -203,8 +203,8 @@ public class FanOutRegistryTests
     {
         var memberships = new[]
         {
-            ("channel-a", new MemberState("peter#123", NotificationLevel.All, 10)),
-            ("channel-b", new MemberState("peter#123", NotificationLevel.Mentions, 0)),
+            ("channel-a", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Public)),
+            ("channel-b", new MemberState("peter#123", NotificationLevel.Mentions, 0, ChannelType.Public)),
         };
 
         _memberRegistry.Seed("conn-1", memberships);
@@ -218,7 +218,7 @@ public class FanOutRegistryTests
     [Test]
     public void Join_AddsSingleMembership()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
 
         var members = _memberRegistry.GetMembers("channel-a");
 
@@ -229,7 +229,7 @@ public class FanOutRegistryTests
     [Test]
     public void Leave_RemovesSingleMembership()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
 
         _memberRegistry.Leave("channel-a", "conn-1");
 
@@ -245,8 +245,8 @@ public class FanOutRegistryTests
     [Test]
     public void SetLevel_UpdatesNotificationLevel_ForThatMembershipOnly()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
-        _memberRegistry.Join("channel-a", "conn-2", new MemberState("alice#456", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
+        _memberRegistry.Join("channel-a", "conn-2", new MemberState("alice#456", NotificationLevel.All, 0, ChannelType.Public));
 
         _memberRegistry.SetNotificationLevel("channel-a", "conn-1", NotificationLevel.None);
 
@@ -264,7 +264,7 @@ public class FanOutRegistryTests
     [Test]
     public void SetLastReadSeq_UpdatesLastReadSeq_ForThatMembershipOnly()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
 
         _memberRegistry.SetLastReadSeq("channel-a", "conn-1", 42);
 
@@ -286,7 +286,7 @@ public class FanOutRegistryTests
     [Test]
     public void IsMember_TrueForSeededChannel_FalseOtherwise()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
 
         Assert.IsTrue(_memberRegistry.IsMember("conn-1", "channel-a"),
             "A seeded (connectionId, channelId) pair must report membership via the O(1) reverse-index lookup");
@@ -299,10 +299,10 @@ public class FanOutRegistryTests
     [Test]
     public void GetMembers_ReturnsSnapshot_NotLiveInternalCollection()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
 
         var snapshot = _memberRegistry.GetMembers("channel-a");
-        _memberRegistry.Join("channel-a", "conn-2", new MemberState("alice#456", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-2", new MemberState("alice#456", NotificationLevel.All, 0, ChannelType.Public));
 
         Assert.That(snapshot.Count, Is.EqualTo(1));
     }
@@ -310,9 +310,9 @@ public class FanOutRegistryTests
     [Test]
     public void RemoveConnection_DropsAllOfAConnectionsEntries_AcrossChannels()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
-        _memberRegistry.Join("channel-b", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
-        _memberRegistry.Join("channel-a", "conn-2", new MemberState("alice#456", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
+        _memberRegistry.Join("channel-b", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
+        _memberRegistry.Join("channel-a", "conn-2", new MemberState("alice#456", NotificationLevel.All, 0, ChannelType.Public));
 
         _memberRegistry.RemoveConnection("conn-1");
 
@@ -325,7 +325,7 @@ public class FanOutRegistryTests
     [Test]
     public void OnlineMemberRegistry_RemoveConnection_UnknownConnection_NoOps()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0));
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
 
         Assert.DoesNotThrow(() => _memberRegistry.RemoveConnection("conn-unknown"));
 
@@ -344,8 +344,8 @@ public class FanOutRegistryTests
         // and each registry keys strictly by connectionId (never by battleTag).
         _focusRegistry.Focus("conn-peter", "channel-a", "peter#123");
         _focusRegistry.Focus("conn-alice", "channel-a", "alice#456");
-        _memberRegistry.Join("channel-a", "conn-peter", new MemberState("peter#123", NotificationLevel.All, 0));
-        _memberRegistry.Join("channel-a", "conn-alice", new MemberState("alice#456", NotificationLevel.Mentions, 5));
+        _memberRegistry.Join("channel-a", "conn-peter", new MemberState("peter#123", NotificationLevel.All, 0, ChannelType.Public));
+        _memberRegistry.Join("channel-a", "conn-alice", new MemberState("alice#456", NotificationLevel.Mentions, 5, ChannelType.Public));
 
         _memberRegistry.SetNotificationLevel("channel-a", "conn-peter", NotificationLevel.None);
         _focusRegistry.Unfocus("conn-peter", "channel-a");
@@ -386,7 +386,7 @@ public class FanOutRegistryTests
                     _focusRegistry.GetFocusedConnections(channelId);
                     _focusRegistry.GetRoster(channelId);
 
-                    _memberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, i));
+                    _memberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, i, ChannelType.Public));
                     _memberRegistry.SetNotificationLevel(channelId, connectionId, NotificationLevel.Mentions);
                     _memberRegistry.SetLastReadSeq(channelId, connectionId, i);
                     _memberRegistry.GetMembers(channelId);

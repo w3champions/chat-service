@@ -431,7 +431,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
         await hub.OnConnectedAsync();
 
         _focusRegistry.Focus("conn-1", "chan-1", BattleTag);
-        _onlineMemberRegistry.Join("chan-1", "conn-1", new MemberState(BattleTag, NotificationLevel.All, 0));
+        _onlineMemberRegistry.Join("chan-1", "conn-1", new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Public));
         _messageRateLimiter.TryAcquire("conn-1", "chan-1", DateTime.UtcNow);
 
         await hub.OnDisconnectedAsync(null);

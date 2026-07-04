@@ -60,13 +60,32 @@ public partial class ChatHub
             return new FocusChannelResult(ChatResultCode.PermissionDenied);
         }
 
+        // C5 (Task 5, D11): Dm/GroupDm never enter the viewer-roster/ViewersAccumulator system — spec §9
+        // scopes viewer rosters to CHANNELS, and DM/group presence is member-presence via the C6 interest
+        // index instead. Zero-DB type lookup: IsMember above already proved this (channelId, connectionId)
+        // entry exists, so IsPrivateLaneChannel resolves it without a second Mongo round-trip.
+        var isPrivateLane = IsPrivateLaneChannel(channelId, Context.ConnectionId);
+
         // C3 (Task 14): route the viewer-roster change into the batched ViewersChanged accumulator
         // BEFORE the FocusRegistry mutation, so its captured pre-window baseline reflects this battleTag
         // as it was BEFORE this focus (i.e. NOT-yet-viewing on a genuine first focus). Emits nothing
-        // itself — the flush hosted service (Task 15) drains the accumulated batch ≤ every 5s.
-        _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        // itself — the flush hosted service (Task 15) drains the accumulated batch ≤ every 5s. Skipped
+        // entirely for a private-lane channel (D11) — it must never carry a roster delta.
+        if (!isPrivateLane)
+        {
+            _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        }
 
         _focusRegistry.Focus(Context.ConnectionId, channelId, battleTag);
+
+        if (isPrivateLane)
+        {
+            // D11: FocusRegistry participation above still happens (focused delivery + the C6 interest
+            // derivation depend on it) but the client gets an EMPTY roster, never the channel's active-
+            // viewer set — a Dm/GroupDm never streams "who is viewing" (§1 non-goal, §9 channel-scoped
+            // rosters, and the decline-invisibility "presence" guardrail).
+            return new FocusChannelResult(ChatResultCode.Ok, Array.Empty<ChannelViewerDto>());
+        }
 
         // Roster = the channel's ACTIVE viewers (online AND focused) from FocusRegistry — NEVER from
         // membership. Each distinct battleTag is resolved to a display name via the live session; a
@@ -87,7 +106,12 @@ public partial class ChatHub
         // FocusRegistry's own per-connection record (not the session) so this stays as unconditional
         // and identity-independent as the Unfocus below — a connection with no focus state records
         // nothing. Emits nothing itself; the flush service drains the batch ≤ every 5s.
-        if (_focusRegistry.TryGetBattleTag(Context.ConnectionId, out var battleTag))
+        // C5 (Task 5, D11): skipped for Dm/GroupDm — the same zero-DB IsPrivateLaneChannel lookup used by
+        // FocusChannel and the disconnect teardown loop. A connection with no OnlineMemberRegistry entry
+        // (e.g. a stale/torn-down membership) is NOT treated as private-lane — this mirrors the pre-T5
+        // unconditional-record behavior for that edge case.
+        if (_focusRegistry.TryGetBattleTag(Context.ConnectionId, out var battleTag)
+            && !IsPrivateLaneChannel(channelId, Context.ConnectionId))
         {
             _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
         }
@@ -104,6 +128,20 @@ public partial class ChatHub
         var session = _sessionRegistry.GetByBattleTag(battleTag);
         return session?.Identity?.Name ?? battleTag;
     }
+
+    /// <summary>
+    /// C5 (Task 5, D11): zero-DB channel-type lookup via <see cref="OnlineMemberRegistry.TryGetMember"/> —
+    /// true iff a (channel, connection) entry exists AND its <see cref="MemberState.ChannelType"/> is
+    /// <see cref="ChannelType.Dm"/>/<see cref="ChannelType.GroupDm"/>, the two types excluded from the
+    /// viewer-roster/<see cref="FanOut.ViewersAccumulator"/> system (spec §9 + the decline-invisibility
+    /// "presence" guardrail). A MISSING entry is NOT private-lane — mirrors the legacy behavior where an
+    /// absent registry entry never suppressed the accumulator record. Shared by <see cref="UnfocusChannel"/>
+    /// and the disconnect teardown loop (<c>ChatHub.cs</c>); <see cref="FocusChannel"/> inlines the same
+    /// lookup since it already holds the <c>TryGetMember</c> result from its membership check above.
+    /// </summary>
+    private bool IsPrivateLaneChannel(string channelId, string connectionId) =>
+        _onlineMemberRegistry.TryGetMember(channelId, connectionId, out var member)
+        && member.ChannelType is ChannelType.Dm or ChannelType.GroupDm;
 
     /// <summary>
     /// Membership self-service join, including implicit semiPublic creation (acceptance 9/10). The
@@ -221,7 +259,7 @@ public partial class ChatHub
         await _membershipRepository.Insert(membership);
 
         _onlineMemberRegistry.Join(channel.Id, Context.ConnectionId,
-            new MemberState(battleTag, NotificationLevel.Mentions, membership.LastReadSeq));
+            new MemberState(battleTag, NotificationLevel.Mentions, membership.LastReadSeq, channel.Type));
 
         return new JoinChannelResult(ChatResultCode.Ok, Channel: channel, Membership: membership);
     }

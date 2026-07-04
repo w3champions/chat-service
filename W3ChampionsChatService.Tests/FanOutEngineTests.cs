@@ -357,7 +357,7 @@ public class FanOutEngineTests
 
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
-        members.Join(ChannelId, UnfocusedMemberConnection, new MemberState("Bystander#9", NotificationLevel.All, 0));
+        members.Join(ChannelId, UnfocusedMemberConnection, new MemberState("Bystander#9", NotificationLevel.All, 0, ChannelType.Public));
 
         await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
 
@@ -536,8 +536,8 @@ public class FanOutEngineTests
         // level-All member who, for a NON-pending channel, WOULD be offered a ChannelActivity.
         focusRegistry.Focus(InitiatorConnection, ChannelId, DmInitiator);
         var members = new OnlineMemberRegistry();
-        members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0));
-        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0));
+        members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
             harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
 
@@ -559,7 +559,7 @@ public class FanOutEngineTests
         var focusRegistry = new FocusRegistry();
         var members = new OnlineMemberRegistry();
         // An unfocused level-All recipient of an ACCEPTED Dm — suppression is lifted, so activity resumes.
-        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0));
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
             harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
 
@@ -577,7 +577,7 @@ public class FanOutEngineTests
         // The recipient DELIBERATELY opened (focused) the pending window.
         focusRegistry.Focus(RecipientConnection, ChannelId, DmRecipient);
         var members = new OnlineMemberRegistry();
-        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0));
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
             harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
 

@@ -253,7 +253,7 @@ public class FanOutEngine(
         _onlineMemberRegistry.Join(
             channel.Id,
             session.ConnectionId,
-            new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq));
+            new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type));
 
         var dto = new ChannelAddedDto(channel, MembershipDto.From(membership), focus);
         await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelAdded, dto);

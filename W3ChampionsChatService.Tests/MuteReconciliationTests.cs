@@ -223,7 +223,7 @@ public class MuteReconciliationTests : IntegrationTestBase
             new W3CUserAuthentication { BattleTag = "victim#123", Name = "victim" },
             null);
         _onlineMemberRegistry.Join(channelId, "VictimConn",
-            new MemberState("victim#123", NotificationLevel.Mentions, 0));
+            new MemberState("victim#123", NotificationLevel.Mentions, 0, ChannelType.Public));
     }
 
     [Test]

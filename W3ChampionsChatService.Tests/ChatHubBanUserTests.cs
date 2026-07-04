@@ -419,7 +419,7 @@ public class ChatHubBanUserTests : IntegrationTestBase
             null);
         _connectionMapping.Add(connectionId, "W3C Lounge", new ChatUser(battleTag, false, null, new ProfilePicture(), null, null));
         _connectionMapping.SetMute(connectionId, MuteStatus.None, DateTime.MinValue);
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0, ChannelType.Public));
     }
 
     /// <summary>

@@ -9,8 +9,15 @@ namespace W3ChampionsChatService.FanOut;
 /// Immutable per-(channel, connection) subscription record. Replaced wholesale (never mutated) by
 /// <see cref="OnlineMemberRegistry.SetNotificationLevel"/> / <see cref="OnlineMemberRegistry.SetLastReadSeq"/>
 /// via <c>with</c>-expressions, per the immutable-update convention used across the codebase.
+/// <para>
+/// C5 (Task 5, D11): <see cref="ChannelType"/> is carried so <c>ChatHub.FocusChannel</c>/<c>UnfocusChannel</c>/
+/// the disconnect teardown loop can zero-DB-lookup a (channel, connection) entry's type via
+/// <see cref="OnlineMemberRegistry.TryGetMember"/> and exclude <see cref="Domain.ChannelType.Dm"/>/
+/// <see cref="Domain.ChannelType.GroupDm"/> from the viewer-roster/<c>ViewersAccumulator</c> system —
+/// DM/group presence is member-presence via the C6 interest index, never a streamed roster (spec §9).
+/// </para>
 /// </summary>
-public sealed record MemberState(string BattleTag, NotificationLevel NotificationLevel, long LastReadSeq);
+public sealed record MemberState(string BattleTag, NotificationLevel NotificationLevel, long LastReadSeq, ChannelType ChannelType);
 
 /// <summary>
 /// The online-member subscription index: channelId -> connectionId -> <see cref="MemberState"/>.

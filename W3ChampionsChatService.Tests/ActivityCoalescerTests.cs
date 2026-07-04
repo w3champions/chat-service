@@ -59,7 +59,7 @@ public class ActivityCoalescerTests
     {
         var harness = new HubPushCaptureHarness();
         var members = new OnlineMemberRegistry();
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, memberLastReadSeq));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, memberLastReadSeq, ChannelType.Public));
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
         return (harness, members, coalescer);
     }
@@ -266,7 +266,7 @@ public class ActivityCoalescerTests
     {
         var (harness, focus, members, engine) = NewEngineFixture();
         // A level-All member who is NOT focused on the channel — the exact recipient of a ChannelActivity.
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         // The author is a separate, focused connection (its own echo is Task 12's concern, not asserted here).
         focus.Focus(AuthorConn, ChannelId, AuthorTag);
 
@@ -287,7 +287,7 @@ public class ActivityCoalescerTests
         var (harness, _, members, engine) = NewEngineFixture();
         // The SENDER is themselves an unfocused level-All member (SendMessage requires membership, NOT
         // focus) — without the sender guard they would self-notify about their own message.
-        members.Join(ChannelId, AuthorConn, new MemberState(AuthorTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, AuthorConn, new MemberState(AuthorTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
 
         await engine.OnMessagePersisted(Channel(), Message(seq: 5), senderConnectionId: AuthorConn, isShadow: false, T0);
 
@@ -298,7 +298,7 @@ public class ActivityCoalescerTests
     public async Task LevelMentions_GetsNothing()
     {
         var (harness, _, members, engine) = NewEngineFixture();
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.Mentions, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.Mentions, LastReadSeq: 0, ChannelType: ChannelType.Public));
 
         await engine.OnMessagePersisted(Channel(), Message(), AuthorConn, isShadow: false, T0);
 
@@ -311,7 +311,7 @@ public class ActivityCoalescerTests
     public async Task LevelNone_GetsNothing()
     {
         var (harness, _, members, engine) = NewEngineFixture();
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.None, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.None, LastReadSeq: 0, ChannelType: ChannelType.Public));
 
         await engine.OnMessagePersisted(Channel(), Message(), AuthorConn, isShadow: false, T0);
 
@@ -325,7 +325,7 @@ public class ActivityCoalescerTests
         var (harness, focus, members, engine) = NewEngineFixture();
         // A level-All member who IS focused on the channel: they already receive the full MessageReceived,
         // so they must get NO coalesced activity ping.
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         focus.Focus(MemberConn, ChannelId, MemberTag);
 
         await engine.OnMessagePersisted(Channel(), Message(), AuthorConn, isShadow: false, T0);
@@ -339,10 +339,10 @@ public class ActivityCoalescerTests
     {
         var (harness, focus, members, engine) = NewEngineFixture();
         // A level-All non-author member, NOT focused — precisely the recipient a shadow post must NOT ping.
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         // The shadow author is a separate focused connection (its own visible echo is delivered — the illusion).
         focus.Focus(AuthorConn, ChannelId, AuthorTag);
-        members.Join(ChannelId, AuthorConn, new MemberState(AuthorTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, AuthorConn, new MemberState(AuthorTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
 
         await engine.OnMessagePersisted(Channel(), Message(shadow: true), AuthorConn, isShadow: true, T0);
 
@@ -378,7 +378,7 @@ public class ActivityCoalescerTests
     {
         var harness = new HubPushCaptureHarness();
         var members = new OnlineMemberRegistry();
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
         var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer, new SessionRegistry());
 

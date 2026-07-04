@@ -187,11 +187,14 @@ public class ChatHubDmSendTests : IntegrationTestBase
 
     // Seeds a connection the SAME way the connect path does for the SENDER: a live session, the cached
     // ChatUser (sender-snapshot source), and an OnlineMemberRegistry entry so step-3 IsMember passes.
-    private void SeedMember(string connectionId, string battleTag, string channelId)
+    // C5 (Task 5, D11): the registry entry's ChannelType defaults to Dm — the overwhelming majority of
+    // this file's tests seed a Dm sender — with the Group/Public tests passing their own channel's type
+    // explicitly.
+    private void SeedMember(string connectionId, string battleTag, string channelId, ChannelType type = ChannelType.Dm)
     {
         RegisterSession(connectionId, battleTag);
         _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, false, battleTag.Split('#')[0], new ProfilePicture(), null, null));
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0, type));
     }
 
     private Task SeedPrivacy(string battleTag, DmPrivacy privacy) =>
@@ -520,7 +523,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
     {
         var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastSeq = 0, LastMessageAt = Now, ExpiresAt = Now.AddDays(365) };
         await _channelRepository.Insert(group);
-        SeedMember(InitiatorConn, Initiator, group.Id);
+        SeedMember(InitiatorConn, Initiator, group.Id, ChannelType.GroupDm);
         _time.Advance(TimeSpan.FromHours(1));
         var sendTime = Now;
 
@@ -538,7 +541,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
     {
         var channel = new ChatChannel { Type = ChannelType.Public, Name = "general", NormalizedName = ChannelNames.Normalize("general") };
         await _channelRepository.Insert(channel);
-        SeedMember(InitiatorConn, Initiator, channel.Id);
+        SeedMember(InitiatorConn, Initiator, channel.Id, ChannelType.Public);
 
         var result = await BuildHub(InitiatorConn).SendMessage(channel.Id, "public message");
 

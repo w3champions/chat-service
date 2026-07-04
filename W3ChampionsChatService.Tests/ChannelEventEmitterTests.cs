@@ -100,7 +100,7 @@ public class ChannelEventEmitterTests
         var (harness, focus, members, sessions, engine) = NewFixture();
         RegisterOnline(sessions, ConnectionId, BattleTag);
         // Seed both registries (including focus) so the cleanup is actually observable.
-        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, 0));
+        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Public));
         focus.Focus(ConnectionId, ChannelId, BattleTag);
 
         await engine.PushChannelRemoved(ChannelId, BattleTag);

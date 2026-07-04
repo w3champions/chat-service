@@ -337,7 +337,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
     // Seeds the hot-path "IS a member" signal FocusChannel reads (zero DB), the way the assembler would
     // at connect — so FocusChannel takes the member hot path and never touches Mongo.
     private void SeedMembership(string connectionId, string battleTag) =>
-        _onlineMemberRegistry.Join(ChannelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0));
+        _onlineMemberRegistry.Join(ChannelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0, ChannelType.Public));
 
     // ---- HUB-LEVEL: mid-window joiner --------------------------------------------------------------
 

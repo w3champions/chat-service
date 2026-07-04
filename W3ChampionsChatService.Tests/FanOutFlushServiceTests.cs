@@ -54,7 +54,7 @@ public class FanOutFlushServiceTests
         // coalesces into a pending that a FlushDue at >= T0+10s must drain. Unread (6-0) <= 100 → not
         // suppressed, so the flush is observable.
         var members = new OnlineMemberRegistry();
-        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0));
+        members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0); // immediate emit — opens window at T0
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0); // within window — coalesce into pending

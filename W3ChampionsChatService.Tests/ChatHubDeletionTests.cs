@@ -364,7 +364,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
         var doomed = await SeedMessage(channel.Id, AuthorBattleTag, "delete me");
 
         // Make the moderator a member so we can drive the USER read path (GetMessages → UserVisible).
-        _onlineMemberRegistry.Join(channel.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channel.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0, channel.Type));
 
         var result = await _chatHub.DeleteMessage(doomed.Id);
         Assert.AreEqual(ChatResultCode.Ok, result.Code);
@@ -741,8 +741,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
         var doomedB = await SeedMessage(channelB.Id, target, "purge me B");
 
         // Make the moderator a member of both channels so we can drive the USER read path (UserVisible).
-        _onlineMemberRegistry.Join(channelA.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0));
-        _onlineMemberRegistry.Join(channelB.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelA.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0, channelA.Type));
+        _onlineMemberRegistry.Join(channelB.Id, ModeratorConnectionId, new MemberState(ModeratorBattleTag, NotificationLevel.Mentions, 0, channelB.Type));
 
         var result = await _chatHub.PurgeMessagesFromUser(target);
         Assert.AreEqual(ChatResultCode.Ok, result.Code);

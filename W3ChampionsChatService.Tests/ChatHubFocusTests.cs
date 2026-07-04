@@ -136,8 +136,8 @@ public class ChatHubFocusTests : IntegrationTestBase
 
     // Seeds OnlineMemberRegistry the way SessionStateAssembler.AssembleAndSeed does at connect —
     // this is the hot-path "IS a member" signal FocusChannel reads (zero DB).
-    private void SeedMembership(string connectionId, string channelId, string battleTag) =>
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0));
+    private void SeedMembership(string connectionId, string channelId, string battleTag, ChannelType type = ChannelType.Public) =>
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0, type));
 
     [Test]
     public async Task FocusChannel_Member_ReturnsOk_WithFullViewerRoster()

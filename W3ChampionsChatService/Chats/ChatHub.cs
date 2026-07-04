@@ -240,6 +240,14 @@ public partial class ChatHub(
                 var now = _timeProvider.GetUtcNow().UtcDateTime;
                 foreach (var channelId in _focusRegistry.GetFocusedChannels(Context.ConnectionId))
                 {
+                    // C5 (Task 5, D11): skip Dm/GroupDm — a forced teardown of a private-lane focus must
+                    // never enter the ViewersAccumulator (zero-DB lookup via OnlineMemberRegistry, BEFORE
+                    // RemoveConnection below clears the entry). Public/SemiPublic/System are unaffected.
+                    if (IsPrivateLaneChannel(channelId, Context.ConnectionId))
+                    {
+                        continue;
+                    }
+
                     _viewersAccumulator.RecordChange(channelId, focusedBattleTag, now);
                 }
             }

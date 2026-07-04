@@ -197,8 +197,9 @@ public partial class ChatHub
     /// <see cref="MembershipRepository.InsertIfAbsent"/> — a re-open returns the existing row untouched)
     /// and seeds this connection into the <see cref="OnlineMemberRegistry"/>. DM memberships keep the model
     /// default <see cref="NotificationLevel.All"/> (never flipped) and <see cref="MembershipRole.Member"/>.
-    /// The registry seed mirrors <c>JoinChannel</c>'s (ChatHub.Channels.cs); the <c>ChannelType</c> seed
-    /// field arrives in T5, so this uses the existing three-field <see cref="MemberState"/> signature.
+    /// The registry seed mirrors <c>JoinChannel</c>'s (ChatHub.Channels.cs); <see cref="OpenDm"/> only ever
+    /// calls this for a <see cref="ChannelType.Dm"/> channel, so the <see cref="MemberState.ChannelType"/>
+    /// seed (C5 Task 5, D11) is stamped <see cref="ChannelType.Dm"/> literally.
     /// </summary>
     private async Task<ChannelMembership> EnsureCallerMembership(string channelId, string caller, DateTime now)
     {
@@ -212,7 +213,7 @@ public partial class ChatHub
         });
 
         _onlineMemberRegistry.Join(channelId, Context.ConnectionId,
-            new MemberState(caller, membership.NotificationLevel, membership.LastReadSeq));
+            new MemberState(caller, membership.NotificationLevel, membership.LastReadSeq, ChannelType.Dm));
 
         return membership;
     }

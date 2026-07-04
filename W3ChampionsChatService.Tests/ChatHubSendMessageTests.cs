@@ -179,7 +179,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         RegisterSession(connectionId, battleTag);
         _connectionMapping.RegisterUser(connectionId, chatUser ?? FlairUser(battleTag));
         _connectionMapping.SetMute(connectionId, mute, muteEnd ?? DateTime.MinValue);
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0, ChannelType.Public));
     }
 
     // ---------------------------------------------------------------------------------------------

@@ -92,7 +92,7 @@ public class SessionStateAssembler(
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
 
-        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, channelBackedMemberships);
+        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, channelBackedMemberships, channelsById);
         SeedLegacyMuteCache(connectionId, chatUser, muteStatus, mutedPlayer);
 
         return (dto, muteStatus);
@@ -160,15 +160,21 @@ public class SessionStateAssembler(
     private static MuteStateDto ToMuteStateDto(MuteStatus status, LoungeMute mute) =>
         status == MuteStatus.Full ? new MuteStateDto(mute.endDate) : null;
 
-    private void SeedOnlineMemberRegistry(string connectionId, string battleTag, List<ChannelMembership> channelBackedMemberships)
+    private void SeedOnlineMemberRegistry(
+        string connectionId,
+        string battleTag,
+        List<ChannelMembership> channelBackedMemberships,
+        IReadOnlyDictionary<string, ChatChannel> channelsById)
     {
         // channelBackedMemberships is already filtered to rows whose channel exists (same filter the
         // DTO's Channels list uses) — the registry's channel set must match the DTO's exactly, so
         // nothing ever fans out to a channel with no row. Materialized (ToList) before crossing into
         // the registry's locked Seed — Seed enumerates its argument while holding the lock
-        // (FanOut/OnlineMemberRegistry.cs carry-forward note).
+        // (FanOut/OnlineMemberRegistry.cs carry-forward note). C5 (Task 5, D11): each entry's
+        // ChannelType comes from the already-loaded channelsById map (zero extra Mongo reads) so
+        // ChatHub can later zero-DB-lookup whether a (channel, connection) is a Dm/GroupDm private lane.
         var seed = channelBackedMemberships
-            .Select(m => (m.ChannelId, new MemberState(battleTag, m.NotificationLevel, m.LastReadSeq)))
+            .Select(m => (m.ChannelId, new MemberState(battleTag, m.NotificationLevel, m.LastReadSeq, channelsById[m.ChannelId].Type)))
             .ToList();
         onlineMemberRegistry.Seed(connectionId, seed);
     }

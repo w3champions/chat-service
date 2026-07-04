@@ -153,7 +153,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         RegisterSession(connectionId, battleTag);
         _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, false, battleTag.Split('#')[0], new ProfilePicture(), null, null));
         _connectionMapping.SetMute(connectionId, MuteStatus.None, DateTime.MinValue);
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0, ChannelType.Public));
     }
 
     // Registers a live MODERATOR session — IsAdmin AND Permissions⊇{Moderation}, exactly the conjunct
@@ -178,7 +178,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         RegisterModeratorSession(connectionId, battleTag);
         _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, true, battleTag.Split('#')[0], new ProfilePicture(), null, null));
         _connectionMapping.SetMute(connectionId, MuteStatus.None, DateTime.MinValue);
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0, ChannelType.Public));
     }
 
     // Seeds a durable message via the SAME seq-allocation path the real send pipeline uses

@@ -152,7 +152,7 @@ public class ChatHubMarkReadTests : IntegrationTestBase
         RegisterSession(connectionId, battleTag);
         _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, false, battleTag.Split('#')[0], new ProfilePicture(), null, null));
         _connectionMapping.SetMute(connectionId, MuteStatus.None, DateTime.MinValue);
-        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, lastReadSeq));
+        _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, lastReadSeq, ChannelType.Public));
         await _membershipRepository.Insert(new ChannelMembership
         {
             ChannelId = channelId,
