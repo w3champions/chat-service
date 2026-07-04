@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Protocol;
@@ -69,3 +71,39 @@ public record ModerationMessageDto(
             DeletedAt: message.Deleted?.At,
             Shadow: message.Shadow);
 }
+
+/// <summary>
+/// REST channel-list projection of a <see cref="ChatChannel"/> (C4 Task 7, D9): backs
+/// GET /api/moderation/channels — the channelId-resolution surface the website-backend's moderation
+/// proxy needs (the OLD ChatHistory-backed GET /api/chat/{chatroom} took room NAMEs directly).
+/// </summary>
+public record ModerationChannelDto(
+    string Id,
+    string Name,
+    ChannelType Type,
+    SystemChannelKind? SystemKind,
+    string SystemRef,
+    long LastSeq,
+    DateTime? LastMessageAt)
+{
+    public static ModerationChannelDto FromChannel(ChatChannel channel) =>
+        new(
+            Id: channel.Id,
+            Name: channel.Name,
+            Type: channel.Type,
+            SystemKind: channel.SystemKind,
+            SystemRef: channel.SystemRef,
+            LastSeq: channel.LastSeq,
+            LastMessageAt: channel.LastMessageAt);
+}
+
+/// <summary>
+/// REST response envelope for GET /api/moderation/channels/{channelId}/messages (C4 Task 7, D9):
+/// <see cref="Messages"/> is ASCENDING seq order (oldest to newest within the page);
+/// <see cref="NextBeforeSeq"/> is the cursor for the next OLDER page — the min seq returned, or null
+/// when the page was not full (no older rows remain).
+/// </summary>
+public record ModerationMessagePageDto(
+    string ChannelId,
+    IReadOnlyList<ModerationMessageDto> Messages,
+    long? NextBeforeSeq);

@@ -70,6 +70,12 @@ public static class ChatLimits
     /// limits above this are clamped down, never rejected).</summary>
     public const int MessagePageSize = 100;
 
+    /// <summary>GET /api/moderation/channels page size cap (C4 Task 7, D9 — not spec §13; requested
+    /// limits above this are clamped down, never rejected, default 100). Distinct from
+    /// <see cref="MessagePageSize"/>: this pages CHANNELS (coarse-grained, one row per room/match),
+    /// not messages, so a larger ceiling is appropriate.</summary>
+    public const int ModerationChannelsPageSize = 500;
+
     /// <summary>Auto-throttle escalation (C3 plan decision, Task 1). Spec §13 pins only "60s
     /// automatic throttle"; the trigger threshold/window are NOT spec-pinned — cheap to change
     /// (C3-plan.md Open question 3). Repeated rate-limit violations within the window escalate to

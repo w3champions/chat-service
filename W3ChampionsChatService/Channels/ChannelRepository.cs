@@ -96,4 +96,28 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     private static bool IsDuplicateKey(MongoCommandException ex) => ex.Code == 11000;
+
+    /// <summary>
+    /// C4 Task 7 (D9): the eligible-channel list backing GET /api/moderation/channels — the
+    /// channelId-resolution surface the website-backend's moderation proxy needs (the OLD
+    /// ChatHistory-backed GET /api/chat/{chatroom} took room NAMEs directly; channels are the new unit).
+    /// Eligible types mirror <see cref="ChannelModeration.IsModeratable"/> EXACTLY (Public / SemiPublic /
+    /// System+Match) — expressed here as an explicit Mongo filter (a C# predicate can't be pushed into a
+    /// query), so keep both definitions in sync if the scope wall ever changes. Sorted by LastMessageAt
+    /// DESCENDING (most recently active first); <paramref name="limit"/> is clamped to
+    /// [1, <see cref="ChatLimits.ModerationChannelsPageSize"/>] — never MongoDB's Limit(0) "no limit".
+    /// </summary>
+    public Task<List<ChatChannel>> LoadModeratableChannels(int limit)
+    {
+        var effectiveLimit = Math.Clamp(limit, 1, ChatLimits.ModerationChannelsPageSize);
+        var filterBuilder = Builders<ChatChannel>.Filter;
+        var filter = filterBuilder.Or(
+            filterBuilder.Eq(c => c.Type, ChannelType.Public),
+            filterBuilder.Eq(c => c.Type, ChannelType.SemiPublic),
+            filterBuilder.And(
+                filterBuilder.Eq(c => c.Type, ChannelType.System),
+                filterBuilder.Eq(c => c.SystemKind, SystemChannelKind.Match)));
+
+        return Channels.Find(filter).SortByDescending(c => c.LastMessageAt).Limit(effectiveLimit).ToListAsync();
+    }
 }
