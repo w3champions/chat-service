@@ -419,6 +419,60 @@ public class FanOutEngine(
     }
 
     /// <summary>
+    /// C6 (Task 11, D13): the friend-presence push — the mechanism a later cross-repo (W3) item retires
+    /// wb's <c>FriendOnlineStatus</c> broadcast against (mirrors wb's <c>NotifyFriendsWithIsOnline</c>).
+    /// On a GENUINE online/offline transition of <paramref name="subjectBattleTag"/>, delivers
+    /// <see cref="ChatEvents.FriendPresenceChanged"/> (carrying a <see cref="FriendPresenceChangedDto"/>)
+    /// to every one of <paramref name="friends"/> that CURRENTLY has a live connection — resolved
+    /// per-friend via <see cref="ISessionRegistry.GetByBattleTag"/>. This is a DIFFERENT targeting
+    /// mechanism than <see cref="PushPresenceChanged"/>: that method targets the DERIVED
+    /// focus/membership interest index, this one targets the subject's actual FRIENDS list (from C5's
+    /// <see cref="Relationships.IRelationshipProvider"/>, resolved by the caller). An offline friend is
+    /// silently skipped — nothing to push to, not an error.
+    /// <para>
+    /// <paramref name="excludedConnectionId"/> guards against ever self-notifying the subject's own
+    /// connection — defensive, mirroring <see cref="PushPresenceChanged"/>'s own self-notify guard, in
+    /// case a malformed friends list ever contained the subject itself.
+    /// </para>
+    /// <para>
+    /// Per-recipient fault isolation mirrors every other push above: one dead friend's socket must never
+    /// prevent the rest from being notified, and must NEVER propagate out — the caller is the connect/
+    /// disconnect lifecycle's fire-and-forget background task, which has ALREADY completed its own
+    /// (connect/disconnect) work by the time this runs. Live delivery is best-effort; a missed friend
+    /// reconciles via its own next <c>GetPresence</c>/<c>GetPresenceDetails</c> read.
+    /// </para>
+    /// </summary>
+    public async Task PushFriendPresenceChanged(string subjectBattleTag, bool online, IReadOnlySet<string> friends, string excludedConnectionId)
+    {
+        var dto = new FriendPresenceChangedDto(subjectBattleTag, online);
+        foreach (var friendBattleTag in friends)
+        {
+            var session = _sessionRegistry.GetByBattleTag(friendBattleTag);
+            if (session == null)
+            {
+                // Offline friend — nothing to push to; not an error.
+                continue;
+            }
+
+            if (session.ConnectionId == excludedConnectionId)
+            {
+                // Defensive: never self-notify the subject's own connection (a well-formed friends list
+                // never actually contains the subject itself).
+                continue;
+            }
+
+            try
+            {
+                await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.FriendPresenceChanged, dto);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Fan-out send of FriendPresenceChanged failed for connection {ConnectionId} (subject {BattleTag}) — skipping, other friends unaffected", session.ConnectionId, subjectBattleTag);
+            }
+        }
+    }
+
+    /// <summary>
     /// C4 (Task 3, D4): the moderation removal emit helper. Delivers the FINAL channel-scoped
     /// <see cref="MessageDeletedDto"/> to the channel's FOCUSED connections, EXCLUDING
     /// <paramref name="excludedConnectionIds"/> — the hub passes the moderated author's own connection
