@@ -117,6 +117,10 @@ public class OldProtocolRemovedTests
             "GetMentionInbox",
             "MarkMentionsRead",
             "MarkAllMentionsRead",
+            // New protocol (C6 T8): the mention-autocomplete search — SearchMentionCandidates
+            // (ChatHub.Mentions.cs). Widens the pinned set, never weakens it — same precedent as every
+            // C5/C6 growth above.
+            "SearchMentionCandidates",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",

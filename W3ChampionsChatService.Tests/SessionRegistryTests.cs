@@ -123,4 +123,23 @@ public class SessionRegistryTests
         var displaced = registry.Register("conn-1", Identity("peter#123"), null);
         Assert.IsNull(displaced);
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // C6 (Task 8, D10): GetOnlineBattleTags — Tier 2's snapshot source for SearchMentionCandidates.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public void GetOnlineBattleTags_SnapshotUnderLock_ReflectsRegisterUnregister()
+    {
+        registry.Register("conn-a", Identity("alice#1"), null);
+        registry.Register("conn-b", Identity("bob#2"), null);
+
+        var online = registry.GetOnlineBattleTags();
+        CollectionAssert.AreEquivalent(new[] { "alice#1", "bob#2" }, online);
+
+        registry.Unregister("conn-a");
+
+        var afterUnregister = registry.GetOnlineBattleTags();
+        CollectionAssert.AreEquivalent(new[] { "bob#2" }, afterUnregister);
+    }
 }

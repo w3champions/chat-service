@@ -1,8 +1,11 @@
+using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Chats;
 
@@ -124,5 +127,164 @@ public partial class ChatHub
         await _mentionInboxRepository.MarkAllRead(session.Identity.BattleTag, now);
 
         return new ChannelOperationResult(ChatResultCode.Ok);
+    }
+
+    /// <summary>
+    /// C6 (Task 8, D10): the mention-autocomplete search — a THREE-TIER candidate search served
+    /// ENTIRELY from chat's OWN state (this hub's in-memory registries + its own <c>user_directory</c>
+    /// Mongo collection). NEVER a website-backend call. Tiers, in this EXACT priority order — a
+    /// candidate found in an earlier tier is never re-listed in a later one (dedup is first-tier-wins):
+    /// <list type="number">
+    /// <item>Tier 1 — active viewers of THIS channel (<see cref="FanOut.FocusRegistry.GetRoster"/>).</item>
+    /// <item>Tier 2 — every online user, anywhere, not necessarily viewing this channel
+    /// (<see cref="Sessions.ISessionRegistry.GetOnlineBattleTags"/> — the new Task 8 snapshot).</item>
+    /// <item>Tier 3 — offline-but-recently-active <c>user_directory</c> matches
+    /// (<see cref="Users.UserDirectoryRepository.SearchByNormalizedPrefix"/>), gated to
+    /// <see cref="ChatLimits.MentionCandidateActivityWindow"/> (90d, D14) — the ONLY tier the activity
+    /// gate applies to; tiers 1-2 are "online right now" and are trivially within the window regardless
+    /// of what their directory <c>LastSeenAt</c> bookkeeping happens to say.</item>
+    /// </list>
+    /// <para>
+    /// PRIVATE-LANE SCOPING (<see cref="ChannelType.Dm"/>/<see cref="ChannelType.GroupDm"/> ONLY): every
+    /// tier's universe is additionally restricted to the channel's actual DURABLE member set, resolved
+    /// via ONE <see cref="Memberships.MembershipRepository.LoadForChannel"/> read — a non-member is never
+    /// offered as an autocomplete target inside a private conversation (Task 5 already ensures mentioning
+    /// a non-member never actually notifies them; this closes the matching UI-noise gap). Public/
+    /// SemiPublic/System search the full, unrestricted universe (no such read is made for them).
+    /// </para>
+    /// <para>
+    /// ENRICHMENT: the whole assembled (deduped, capped) candidate list is enriched via ONE
+    /// <see cref="Users.UserDirectoryRepository.LoadMany"/> batch read — never a per-candidate lookup,
+    /// never a website-backend call. A candidate with no directory row (or a row with no cached
+    /// <see cref="ChatProfile"/> yet) degrades gracefully: <c>Profile</c> stays null and <c>Name</c> is
+    /// still derived from the candidate's own battleTag (the same <c>tag.Split('#')[0]</c> convention
+    /// <see cref="ChatUser"/> uses) — never an error, never an exclusion.
+    /// </para>
+    /// AUTHORIZATION + resolution order:
+    /// <list type="number">
+    /// <item>Fail-closed session → <see cref="ChatResultCode.PermissionDenied"/>.</item>
+    /// <item>Membership via <see cref="FanOut.OnlineMemberRegistry.TryGetMember"/> (the SAME hot-path,
+    /// zero-DB check <c>SendMessage</c> uses) → <see cref="ChatResultCode.NotMember"/> on a miss. This
+    /// also yields the channel's <see cref="ChannelType"/> at no extra cost — driving the private-lane
+    /// scoping decision above without a second membership read.</item>
+    /// <item>Assemble tiers 1-3 in order (each tier skipped once the cap is already met — tier 3's
+    /// directory read never runs if tiers 1-2 alone already filled the cap), capped at
+    /// <see cref="ChatLimits.MentionSearchMaxResults"/> total.</item>
+    /// <item>ONE batch enrichment read, project to <see cref="MentionCandidateDto"/>, return
+    /// <see cref="ChatResultCode.Ok"/>.</item>
+    /// </list>
+    /// </summary>
+    public async Task<SearchMentionCandidatesResult> SearchMentionCandidates(string channelId, string prefix)
+    {
+        // 1. Fail-closed: no live session → no identity to authorize the search under.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new SearchMentionCandidatesResult(ChatResultCode.PermissionDenied);
+        }
+
+        // 2. Membership (hot path, zero DB) — the SAME check SendMessage uses. TryGetMember (rather
+        // than the plain IsMember) also yields MemberState.ChannelType, which the private-lane scoping
+        // decision below needs, at no extra cost.
+        if (!_onlineMemberRegistry.TryGetMember(channelId, Context.ConnectionId, out var callerState))
+        {
+            return new SearchMentionCandidatesResult(ChatResultCode.NotMember);
+        }
+
+        var prefixLower = (prefix ?? string.Empty).Trim().ToLowerInvariant();
+
+        // Private-lane scoping (Dm/GroupDm ONLY): the channel's actual durable member set — a small
+        // read (2 rows for a Dm, at most ChatLimits.MaxGroupSize for a GroupDm) — restricts every tier
+        // below. null (Public/SemiPublic/System) means "unrestricted universe".
+        HashSet<string> memberScope = null;
+        if (callerState.ChannelType is ChannelType.Dm or ChannelType.GroupDm)
+        {
+            var memberships = await _membershipRepository.LoadForChannel(channelId);
+            memberScope = new HashSet<string>(memberships.Select(m => m.BattleTag), StringComparer.OrdinalIgnoreCase);
+        }
+
+        var candidates = new List<(string BattleTag, int Tier)>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Applies the private-lane scope + prefix filters and the dedup/cap bookkeeping shared by every
+        // tier below. A battleTag excluded by scope or prefix is never marked "seen" (harmless either
+        // way — scope/prefix are identical across tiers — but keeps the dedup set exactly the assembled
+        // candidate set).
+        void AddTier(IEnumerable<string> battleTags, int tier)
+        {
+            foreach (var battleTag in battleTags)
+            {
+                if (candidates.Count >= ChatLimits.MentionSearchMaxResults)
+                {
+                    return;
+                }
+                if (memberScope != null && !memberScope.Contains(battleTag))
+                {
+                    continue;
+                }
+                if (prefixLower.Length > 0 && !battleTag.ToLowerInvariant().StartsWith(prefixLower, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                if (!seen.Add(battleTag))
+                {
+                    continue;
+                }
+                candidates.Add((battleTag, tier));
+            }
+        }
+
+        // Tier 1: active viewers of THIS channel.
+        AddTier(_focusRegistry.GetRoster(channelId), 1);
+
+        // Tier 2: online users anywhere (not necessarily viewing this channel).
+        if (candidates.Count < ChatLimits.MentionSearchMaxResults)
+        {
+            AddTier(_sessionRegistry.GetOnlineBattleTags(), 2);
+        }
+
+        // Tier 3: offline-but-recently-active directory matches — the ONLY tier the 90d activity gate
+        // applies to (tiers 1-2 are "online now", trivially within the window regardless of their
+        // directory LastSeenAt bookkeeping). Skipped entirely once the cap is already met.
+        if (candidates.Count < ChatLimits.MentionSearchMaxResults)
+        {
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
+            var minLastSeenAt = now - ChatLimits.MentionCandidateActivityWindow;
+            var directoryMatches = await _userDirectory.SearchByNormalizedPrefix(
+                prefixLower, minLastSeenAt, ChatLimits.MentionSearchMaxResults);
+            AddTier(directoryMatches.Select(e => e.DisplayBattleTag ?? e.BattleTag), 3);
+        }
+
+        // Enrichment: ONE batch directory read across the whole assembled candidate list (skipped
+        // entirely for an empty candidate set — nothing to enrich).
+        var dtos = new List<MentionCandidateDto>(candidates.Count);
+        if (candidates.Count > 0)
+        {
+            var directoryByTag = (await _userDirectory.LoadMany(candidates.Select(c => c.BattleTag)))
+                .ToDictionary(e => e.BattleTag, StringComparer.OrdinalIgnoreCase);
+            dtos.AddRange(candidates.Select(c => BuildCandidateDto(c.BattleTag, c.Tier, directoryByTag)));
+        }
+
+        return new SearchMentionCandidatesResult(ChatResultCode.Ok, dtos);
+    }
+
+    /// <summary>
+    /// Projects one assembled (battleTag, tier) pair to its <see cref="MentionCandidateDto"/> using the
+    /// ONE batch-loaded directory snapshot (<paramref name="directoryByTag"/>, keyed case-insensitively
+    /// on <see cref="UserDirectoryEntry.BattleTag"/>). A directory hit supplies
+    /// <see cref="UserDirectoryEntry.DisplayBattleTag"/> (the authoritative last-known display casing)
+    /// and its cached <see cref="ChatProfile"/> — which may itself still be null (a directory row can
+    /// exist with no enrichment landed yet, the <c>Search_StubbedProfile_GracefullyAbsent</c> leg). A
+    /// miss (no directory row at all) falls back to the candidate's own tier-native battleTag with a
+    /// null Profile. <c>Name</c> is ALWAYS derived by splitting the resolved battleTag at '#' — mirrors
+    /// <see cref="ChatUser"/>'s own convention — so a missing/unenriched directory row degrades
+    /// gracefully instead of erroring or excluding the candidate.
+    /// </summary>
+    private static MentionCandidateDto BuildCandidateDto(
+        string battleTag, int tier, IReadOnlyDictionary<string, UserDirectoryEntry> directoryByTag)
+    {
+        directoryByTag.TryGetValue(battleTag, out var entry);
+        var displayTag = entry?.DisplayBattleTag ?? battleTag;
+        var name = displayTag.Split('#')[0];
+        return new MentionCandidateDto(displayTag, name, tier, entry?.Profile);
     }
 }

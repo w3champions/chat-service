@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Microsoft.AspNetCore.SignalR;
 using W3ChampionsChatService.Authentication;
 
@@ -18,6 +19,15 @@ public interface ISessionRegistry
     bool TryGetByConnectionId(string connectionId, out ChatSession session);
 
     ChatSession GetByBattleTag(string battleTag);
+
+    /// <summary>
+    /// C6 (Task 8, D10): a snapshot of every currently-registered battleTag — Tier 2 of
+    /// <c>SearchMentionCandidates</c> ("online users anywhere", not necessarily viewing the channel
+    /// being searched). Display casing: each entry is the LIVE casing last <see cref="Register"/>ed
+    /// for that battleTag (mirrors <see cref="ChatSession.Identity"/>'s casing), never the lowercased
+    /// Mongo/directory convention. Taken under the same lock as every other read here.
+    /// </summary>
+    IReadOnlyCollection<string> GetOnlineBattleTags();
 }
 
 /// <summary>
@@ -109,6 +119,14 @@ public class SessionRegistry : ISessionRegistry
         lock (_lock)
         {
             return _byBattleTag.TryGetValue(battleTag, out var session) ? session : null;
+        }
+    }
+
+    public IReadOnlyCollection<string> GetOnlineBattleTags()
+    {
+        lock (_lock)
+        {
+            return _byBattleTag.Keys.ToList();
         }
     }
 }
