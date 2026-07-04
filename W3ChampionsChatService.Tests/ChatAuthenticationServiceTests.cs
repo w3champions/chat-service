@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Moq;
 using Newtonsoft.Json;
@@ -104,6 +105,45 @@ public class ChatAuthenticationServiceTests : IntegrationTestBase
         Assert.AreEqual(20, resolution.User.GateWay);
         Assert.AreEqual(42, resolution.User.GamesPlayed);
         Assert.AreEqual(22, resolution.User.Season);
+    }
+
+    [Test]
+    public async Task Enrichment_WbFails_AdminDirectoryCacheRestore_AdminIconNotDoubled()
+    {
+        // C6 whole-branch review (Minor): the cached directory Profile for an admin ALREADY carries a
+        // forced AdminIcon — it was produced by BuildChatUser on the wb-success path (which force-prepends
+        // AdminIcon) before being cached. On a wb outage the D9 tier-2 fallback restores that Profile via
+        // BuildChatUser AGAIN, which must NOT prepend a SECOND AdminIcon → [AdminIcon, AdminIcon, ...].
+        await _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = "admin#1",
+            DisplayBattleTag = "Admin#1",
+            NormalizedName = "admin#1",
+            LastSeenAt = DateTime.UtcNow.AddDays(-1),
+            Profile = new ChatProfile
+            {
+                ClanId = "W3C",
+                ChatColor = ChatColor.AdminColor,
+                ChatIcons = new[] { ChatIcon.AdminIcon, new ChatIcon("chat_icon_star") },
+            },
+        });
+
+        var wb = new Mock<IWebsiteBackendRepository>();
+        wb.Setup(r => r.GetChatDetails(It.IsAny<string>()))
+            .ThrowsAsync(new Exception("wb outage"));
+        var service = BuildService(wb.Object);
+        var identity = new W3CUserAuthentication { BattleTag = "Admin#1", Name = "Admin", IsAdmin = true };
+
+        var resolution = await service.GetUserFromIdentity(identity);
+
+        Assert.IsFalse(resolution.FreshFromWb, "a directory-cache restore is not a fresh wb enrichment");
+        var user = resolution.User;
+        Assert.IsNotNull(user);
+        Assert.AreEqual(1, user.ChatIcons.Count(i => i.Equals(ChatIcon.AdminIcon)),
+            "the restored admin icon must appear EXACTLY once — never doubled by re-applying admin forcing");
+        Assert.AreEqual(2, user.ChatIcons.Length, "exactly the two cached icons — AdminIcon + star, no duplicate");
+        Assert.AreEqual(ChatIcon.AdminIcon, user.ChatIcons[0], "the admin icon stays first");
+        Assert.AreEqual(ChatColor.AdminColor, user.ChatColor, "admin color forcing is idempotent (scalar, never doubled)");
     }
 
     [Test]

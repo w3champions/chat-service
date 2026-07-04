@@ -60,11 +60,13 @@ public class CleanupJobs(MongoClient mongoClient) : MongoDbRepositoryBase(mongoC
             .ToListAsync();
         if (idleBattleTags.Count == 0) return 0;
 
-        // The durable membership battleTag key is stored lowercased (C5 T4 — see MembershipRepository's
-        // class doc), while the directory's own BattleTag casing is verbatim JWT casing (directory
-        // normalization is C6's concern). Lowercase the directory-sourced idle tags before matching them
-        // against the membership key — otherwise a mixed-case (majority) directory tag would match no
-        // membership row and idle pruning would silently no-op.
+        // Both stores key on battleTag, and both now store it LOWERCASED: the durable membership key
+        // (C5 T4 — see MembershipRepository's class doc) and, since C6 T2's D8 re-keying, the directory
+        // _id/BattleTag too (the original JWT casing now lives on UserDirectoryEntry.DisplayBattleTag, not
+        // on the projected BattleTag). The projected idle tags are therefore already lowercased and this
+        // .ToLowerInvariant() is a no-op on them — kept as a defensive boundary normalization so a legacy
+        // pre-D8 (mixed-case) directory _id still lingering in the collection (entries are kept, never
+        // TTL'd) can't silently match no membership row and no-op the prune.
         var idleMembershipKeys = idleBattleTags.Select(t => t.ToLowerInvariant()).ToList();
         var result = await memberships.DeleteManyAsync(
             Builders<ChannelMembership>.Filter.In(m => m.BattleTag, idleMembershipKeys));

@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Authentication;
@@ -115,7 +116,11 @@ public class ChatAuthenticationService(
 
     // Shared builder: admin color/icon forcing applies identically whether the flair came fresh from wb
     // or was restored from the cached Profile, and both call sites populate the SAME set of additive
-    // enrichment fields on ChatUser (D9).
+    // enrichment fields on ChatUser (D9). The admin-icon prepend is IDEMPOTENT (Contains-guarded): the
+    // directory-cache tier restores an admin's cached Profile whose ChatIcons ALREADY start with a forced
+    // AdminIcon (it was itself produced by this builder on the wb-success path before being cached), so a
+    // naive prepend would double it on that fallback. Guarding the prepend (rather than skipping admin
+    // forcing on the cache tier) still promotes a user who became admin AFTER their Profile was cached.
     private static ChatUser BuildChatUser(
         W3CUserAuthentication identity,
         string clanId,
@@ -136,7 +141,12 @@ public class ChatAuthenticationService(
         if (identity.IsAdmin)
         {
             chatColor = ChatColor.AdminColor;
-            icons = [ChatIcon.AdminIcon, .. icons];
+            // Idempotent: never prepend a second AdminIcon when restoring an already-admin-forced cached
+            // Profile on the wb-outage fallback tier (ChatIcon has value equality by IconId).
+            if (!icons.Contains(ChatIcon.AdminIcon))
+            {
+                icons = [ChatIcon.AdminIcon, .. icons];
+            }
         }
 
         return new ChatUser(identity.BattleTag, identity.IsAdmin, clanId, profilePicture, chatColor, icons)

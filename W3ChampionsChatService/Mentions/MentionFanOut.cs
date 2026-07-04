@@ -35,6 +35,11 @@ namespace W3ChampionsChatService.Mentions;
 /// <item>The target's membership <see cref="ChannelMembership.NotificationLevel"/> is not
 /// <see cref="NotificationLevel.None"/> — "none: silence" (spec §7) is an explicit opt-out that outranks
 /// mentions, not just level-All activity.</item>
+/// <item>The target's membership is NOT currently decline-suppressed
+/// (<see cref="ChannelMembership.DeclinedUntil"/> unset or already elapsed vs. <c>now</c>) — a pending-Dm
+/// recipient who DECLINED (C5 D3's 24h soft window) must never be pinged by the initiator's mentions, even
+/// though a decline never lowers the membership level. Mirrors
+/// <see cref="SessionStateAssembler.BuildPendingDmTray"/>, which hides the same window from the tray.</item>
 /// </list>
 /// FOCUS IS IRRELEVANT here (unlike C3 activity routing, which suppresses focused members): a focused
 /// target STILL gets the entry + event. The server never guesses whether a mention was "seen"; a
@@ -78,7 +83,7 @@ public class MentionFanOut(
 
     /// <summary>
     /// Fans a persisted, non-shadow message's validated mention tags out to the eligible members —
-    /// see the class doc for the four eligibility rules and the fault-isolation contract.
+    /// see the class doc for the five eligibility rules and the fault-isolation contract.
     /// <paramref name="now"/> is the trusted server clock the hub already read once for this send
     /// (threaded in, not re-read, so the entry's CreatedAt/ExpiresAt decide against the same instant).
     /// </summary>
@@ -128,6 +133,19 @@ public class MentionFanOut(
                 // Rule (d): "none: silence" (spec §7) outranks mentions — an explicit opt-out suppresses
                 // the mention too, not just level-All activity.
                 if (membership.NotificationLevel == NotificationLevel.None)
+                {
+                    continue;
+                }
+
+                // Rule (e): the C5 decline-suppression window (D3). A pending-Dm recipient who DECLINED
+                // keeps their membership at NotificationLevel.All — a decline sets ONLY DeclinedUntil
+                // (ChatHub.Dm.DeclineRequest) and never lowers the level — so rules (c)/(d) alone would let
+                // the initiator's pending mentions ping straight through the 24h soft-suppression window,
+                // contradicting the C5 guarantee that a declined request never pings them. Mirror
+                // SessionStateAssembler.BuildPendingDmTray's `DeclinedUntil > now` boundary against the SAME
+                // trusted `now` this send already read (not a fresh clock) — the window is temporal, so an
+                // elapsed DeclinedUntil resumes normal notification (self-heals in 24h).
+                if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
                 {
                     continue;
                 }

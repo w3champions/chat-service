@@ -73,13 +73,18 @@ public class MentionFanOutTests : IntegrationTestBase
             new W3CUserAuthentication { BattleTag = battleTag, Name = battleTag.Split('#')[0] },
             null);
 
-    private Task SeedMembership(string battleTag, NotificationLevel level = NotificationLevel.All, string channelId = ChannelId) =>
+    private Task SeedMembership(
+        string battleTag,
+        NotificationLevel level = NotificationLevel.All,
+        string channelId = ChannelId,
+        DateTime? declinedUntil = null) =>
         _membershipRepository.Insert(new ChannelMembership
         {
             ChannelId = channelId,
             BattleTag = battleTag,
             NotificationLevel = level,
             JoinedAt = Now,
+            DeclinedUntil = declinedUntil,
         });
 
     private static ChatChannel Channel(ChannelType type = ChannelType.Public) =>
@@ -250,6 +255,52 @@ public class MentionFanOutTests : IntegrationTestBase
         Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1),
             "a NotificationLevel.Mentions member control still gets the mention");
         Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Notify_DeclineSuppressedPendingDmRecipient_NoEntryNoEvent_ControlMemberStillNotified()
+    {
+        // C6 whole-branch review (Important): a pending-Dm recipient who DECLINED must not be pinged by
+        // the initiator's mentions during the C5 24h soft-suppression window. A decline sets ONLY
+        // DeclinedUntil (ChatHub.Dm.DeclineRequest) and never lowers the membership level — the recipient
+        // membership was materialized at NotificationLevel.All — so without the decline gate the four
+        // legacy rules would let each pending <@recipient> mention leak an entry + push straight through
+        // the window (contradicting "a declined request never pings them", and inconsistent with
+        // SessionStateAssembler.BuildPendingDmTray which hides the same DeclinedUntil-active Dm).
+        // The control (a member with NO decline window) proves the gate is decline-SCOPED, not a blanket
+        // break of the whole fan-out.
+        await SeedMembership("recipient#1", NotificationLevel.All, declinedUntil: Now.AddHours(1));
+        RegisterSession("conn-recipient", "recipient#1");
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "recipient#1", "wolf#456" }, Now);
+
+        Assert.That(await InboxOf("recipient#1"), Is.Empty,
+            "a decline-suppressed pending-Dm recipient gets NO entry during the 24h window");
+        Assert.That(MentionEventCount("conn-recipient"), Is.EqualTo(0),
+            "and NO event — a declined request never pings them (C5 guarantee)");
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1),
+            "a member with no decline window (control) still gets an entry");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1), "and still gets the event");
+    }
+
+    [Test]
+    public async Task Notify_ExpiredDeclineSuppression_NotifiesNormally()
+    {
+        // The suppression is TEMPORAL, not permanent — an ELAPSED DeclinedUntil (window already closed)
+        // must NOT keep suppressing the mention (guards the fix against over-shooting into a permanent
+        // mute of that Dm). Mirrors BuildPendingDmTray's `DeclinedUntil > now` boundary against the SAME
+        // now the send read.
+        await SeedMembership("recipient#1", NotificationLevel.All, declinedUntil: Now.AddHours(-1));
+        RegisterSession("conn-recipient", "recipient#1");
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "recipient#1" }, Now);
+
+        Assert.That(await InboxOf("recipient#1"), Has.Count.EqualTo(1),
+            "once the decline window has elapsed the mention notifies normally — the entry is created");
+        Assert.That(MentionEventCount("conn-recipient"), Is.EqualTo(1),
+            "and the live event is delivered");
     }
 
     [Test]
