@@ -115,4 +115,25 @@ public static class ChatLimits
     /// mention-inbox excerpt precedent's "~120 chars" (spec §5) rather than inventing a new number.
     /// Not itself spec §13 text; hard-coded, adjust here only.</summary>
     public const int DmPreviewExcerptLength = 120;
+
+    /// <summary>Mention-candidate directory activity gate (C6 plan decision, D14) — spec-pinned
+    /// (§7: "lastSeenAt ≥ now−90d"). Applies to Tier 3 (directory) search results only; Tiers 1-2
+    /// (active viewers/online users) are online now, trivially within the window.</summary>
+    public static readonly TimeSpan MentionCandidateActivityWindow = TimeSpan.FromDays(90);
+
+    /// <summary>SearchMentionCandidates total result cap across all three tiers (C6 plan decision,
+    /// D14 — not spec §13; hard-coded, adjust here only).</summary>
+    public const int MentionSearchMaxResults = 20;
+
+    /// <summary>MarkMentionsRead batch-id array size cap (C6 plan decision, D14 — not spec §13;
+    /// requests above this are rejected with <c>HubException</c>, never silently clamped).</summary>
+    public const int MentionAckBatchMax = 100;
+
+    /// <summary>GetMentionInbox result cap, newest-first (C6 plan decision, D14 — not spec §13; the
+    /// 30d mention-inbox TTL bounds the underlying collection anyway).</summary>
+    public const int MentionInboxMaxEntries = 200;
+
+    /// <summary>GetPresence/GetPresenceDetails battleTag-array size cap (C6 plan decision, D14 —
+    /// not spec §13; requests above this are rejected with <c>HubException</c>).</summary>
+    public const int PresenceQueryMaxBattleTags = 200;
 }

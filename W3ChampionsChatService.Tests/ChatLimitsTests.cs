@@ -56,4 +56,16 @@ public class ChatLimitsTests
         // itself spec §13 text, mirrors TicketMintWindow's role for the mint limits above).
         Assert.AreEqual(TimeSpan.FromHours(1), ChatLimits.ChannelCreationWindow);
     }
+
+    [Test]
+    public void MentionAndPresenceConstants_MatchC6PlanDecisionTask1D14()
+    {
+        // Spec-pinned (§7: "lastSeenAt ≥ now−90d") — Tier 3 (directory) search results only.
+        Assert.AreEqual(TimeSpan.FromDays(90), ChatLimits.MentionCandidateActivityWindow);
+        // Plan decisions (C6 plan Task 1, D14) — NOT spec §13 text; hard-coded, adjust here only.
+        Assert.AreEqual(20, ChatLimits.MentionSearchMaxResults);
+        Assert.AreEqual(100, ChatLimits.MentionAckBatchMax);
+        Assert.AreEqual(200, ChatLimits.MentionInboxMaxEntries);
+        Assert.AreEqual(200, ChatLimits.PresenceQueryMaxBattleTags);
+    }
 }

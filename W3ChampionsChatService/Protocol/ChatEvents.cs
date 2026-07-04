@@ -27,4 +27,19 @@ public static class ChatEvents
     /// consent-state transition, not fired on every pending message — the tray is already live via
     /// SessionState). Carries a <c>PendingDmRequestDto</c>.</summary>
     public const string RequestReceived = nameof(RequestReceived);
+
+    /// <summary>C6: targeted push to a mention target's live connection immediately after the
+    /// offline <c>MentionInboxEntry</c> row is inserted (spec §7; C6-plan.md D4). Carries a
+    /// <c>MentionNotifiedDto</c>.</summary>
+    public const string MentionNotified = nameof(MentionNotified);
+
+    /// <summary>C6: pushed to connections with derived presence interest (a focused Dm/GroupDm
+    /// containing the subject) on a true online/offline transition — there is no subscribe API
+    /// (spec §9; C6-plan.md D11). Carries a <c>PresenceChangedDto</c>.</summary>
+    public const string PresenceChanged = nameof(PresenceChanged);
+
+    /// <summary>C6: pushed to a user's online friends on a true online/offline transition —
+    /// replaces the wb <c>FriendOnlineStatus</c> push (C6-plan.md D13). Carries a
+    /// <c>FriendPresenceChangedDto</c>.</summary>
+    public const string FriendPresenceChanged = nameof(FriendPresenceChanged);
 }

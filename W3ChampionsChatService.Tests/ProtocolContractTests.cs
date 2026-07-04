@@ -48,6 +48,9 @@ public class ProtocolContractTests
         Assert.AreEqual("ConnectionDisplaced", ChatEvents.ConnectionDisplaced);
         Assert.AreEqual("ThrottleNotice", ChatEvents.ThrottleNotice);
         Assert.AreEqual("RequestReceived", ChatEvents.RequestReceived);
+        Assert.AreEqual("MentionNotified", ChatEvents.MentionNotified);
+        Assert.AreEqual("PresenceChanged", ChatEvents.PresenceChanged);
+        Assert.AreEqual("FriendPresenceChanged", ChatEvents.FriendPresenceChanged);
     }
 
     [Test]
@@ -335,6 +338,20 @@ public class ProtocolContractTests
 
         StringAssert.DoesNotContain("Declined", json);
         StringAssert.DoesNotContain("declined", json);
+    }
+
+    // ── C6 Task 1 (D14) — mention/presence protocol vocabulary const pins ────────────────
+
+    [Test]
+    public void ChatLimits_C6NewConstants_MatchPlanD14()
+    {
+        // Spec-pinned (§7: "lastSeenAt ≥ now−90d") — applies to Tier 3 (directory) search only.
+        Assert.AreEqual(TimeSpan.FromDays(90), ChatLimits.MentionCandidateActivityWindow);
+        // Plan decisions (C6 T1) — not spec §13 text; hard-coded, adjust here only.
+        Assert.AreEqual(20, ChatLimits.MentionSearchMaxResults);
+        Assert.AreEqual(100, ChatLimits.MentionAckBatchMax);
+        Assert.AreEqual(200, ChatLimits.MentionInboxMaxEntries);
+        Assert.AreEqual(200, ChatLimits.PresenceQueryMaxBattleTags);
     }
 
     [Test]

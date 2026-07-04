@@ -60,3 +60,26 @@ public record CreateGroupResult(
     double? RetryAfterSeconds = null,
     ChatChannel Channel = null,
     ChannelMembership Membership = null);
+
+/// <summary>GetMentionInbox (C6 D6) — newest-first, capped at
+/// <see cref="Domain.ChatLimits.MentionInboxMaxEntries"/>.</summary>
+public record GetMentionInboxResult(
+    ChatResultCode Code,
+    IReadOnlyList<MentionInboxEntryDto> Entries = null);
+
+/// <summary>SearchMentionCandidates (C6 D10) — tiered viewer/online/directory search results,
+/// deduped across tiers and capped at <see cref="Domain.ChatLimits.MentionSearchMaxResults"/>.</summary>
+public record SearchMentionCandidatesResult(
+    ChatResultCode Code,
+    IReadOnlyList<MentionCandidateDto> Candidates = null);
+
+/// <summary>GetPresence (C6 D12) — one-shot, ungated online-bool reads.</summary>
+public record GetPresenceResult(
+    ChatResultCode Code,
+    IReadOnlyList<PresenceStatusDto> Statuses = null);
+
+/// <summary>GetPresenceDetails (C6 D12) — one-shot reads with friend-gated
+/// <see cref="PresenceDetailsDto.LastSeenAt"/>.</summary>
+public record GetPresenceDetailsResult(
+    ChatResultCode Code,
+    IReadOnlyList<PresenceDetailsDto> Details = null);
