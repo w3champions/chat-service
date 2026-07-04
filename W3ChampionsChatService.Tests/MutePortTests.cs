@@ -139,7 +139,9 @@ public class MutePortTests : IntegrationTestBase
             FanOutEngineTestFactory.CreateIgnored(),
             viewers,
             new NoOpMentionInboxCleaner(),
-            RelationshipProviderTestFactory.CreateIgnored())
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker())
         {
             Clients = clients,
             Context = context,

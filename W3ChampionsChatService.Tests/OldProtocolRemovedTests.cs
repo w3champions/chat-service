@@ -58,7 +58,8 @@ public class OldProtocolRemovedTests
     /// Clients/Context/Groups property accessors), so this only sees what ChatHub itself contributes.
     /// A partial class compiles into ONE type, so this sees every method across all three
     /// declaration files (ChatHub.cs, ChatHub.Channels.cs, ChatHub.Messaging.cs) together. Asserts the
-    /// name set is EXACTLY: the eight new-protocol client→server methods (Task 9-13/16-17) + the three
+    /// name set is EXACTLY: the eight C3 new-protocol client→server methods (Task 9-13/16-17) + the two
+    /// C5 DM front-door methods (OpenDm/SetDmPrivacy) + the three
     /// kept legacy moderation methods (DeleteMessage/PurgeMessagesFromUser/BanUser, still
     /// [UserHasPermission(Moderation)]-gated) + the two Hub lifecycle overrides
     /// (OnConnectedAsync/OnDisconnectedAsync, `public override` — client-callable indirectly via the
@@ -91,6 +92,10 @@ public class OldProtocolRemovedTests
             "SendMessage",
             "GetMessages",
             "MarkRead",
+            // New protocol (C5 T3): the DM front door — OpenDm/SetDmPrivacy (ChatHub.Dm.cs). Later C5
+            // tasks extend this set further (accept/decline, group create/manage); extend, never weaken.
+            "OpenDm",
+            "SetDmPrivacy",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",

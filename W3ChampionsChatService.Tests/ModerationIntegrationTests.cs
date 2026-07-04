@@ -179,7 +179,9 @@ public class ModerationIntegrationTests : IntegrationTestBase
             _fanOutEngine,
             _viewersAccumulator,
             _mentionCleaner,
-            RelationshipProviderTestFactory.CreateIgnored());
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker());
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

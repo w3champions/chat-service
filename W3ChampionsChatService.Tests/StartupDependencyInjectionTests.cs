@@ -322,6 +322,20 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void DmInitiationTracker_IsSingleton_SharedAcrossResolutions()
+    {
+        // C5 Task 3 (D7/D19): the stranger-DM initiation cap tracker holds the per-initiator 8h event
+        // windows every OpenDm invocation reads/writes and the accept transitions (T4/T6) free — a
+        // transient would fragment each initiator's counter across hub invocations, defeating the cap.
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<DmInitiationTracker>();
+        var second = provider.GetRequiredService<DmInitiationTracker>();
+
+        Assert.AreSame(first, second, "DmInitiationTracker MUST be a singleton");
+    }
+
+    [Test]
     public void ChatHub_ConstructorGraph_ResolvesFromDi_IncludingMentionCleaner()
     {
         // C4 Task 3 added IMentionInboxCleaner as a ChatHub constructor dependency (the durable

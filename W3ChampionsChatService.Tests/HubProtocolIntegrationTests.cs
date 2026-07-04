@@ -164,7 +164,9 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
             _fanOutEngine,
             _viewersAccumulator,
             new NoOpMentionInboxCleaner(),
-            RelationshipProviderTestFactory.CreateIgnored());
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker());
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

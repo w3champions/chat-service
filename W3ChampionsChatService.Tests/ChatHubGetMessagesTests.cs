@@ -117,7 +117,9 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
             _fanOutEngine,
             ViewersAccumulatorTestFactory.CreateIgnored(),
             new NoOpMentionInboxCleaner(),
-            RelationshipProviderTestFactory.CreateIgnored());
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

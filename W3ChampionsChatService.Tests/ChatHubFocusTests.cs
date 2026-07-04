@@ -103,7 +103,9 @@ public class ChatHubFocusTests : IntegrationTestBase
             FanOutEngineTestFactory.CreateIgnored(),
             ViewersAccumulatorTestFactory.CreateIgnored(),
             new NoOpMentionInboxCleaner(),
-            RelationshipProviderTestFactory.CreateIgnored());
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

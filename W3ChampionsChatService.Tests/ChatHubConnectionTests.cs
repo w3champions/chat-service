@@ -130,7 +130,9 @@ public class ChatHubConnectionTests : IntegrationTestBase
             FanOutEngineTestFactory.CreateIgnored(),
             ViewersAccumulatorTestFactory.CreateIgnored(),
             new NoOpMentionInboxCleaner(),
-            _relationshipProvider);
+            _relationshipProvider,
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker());
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

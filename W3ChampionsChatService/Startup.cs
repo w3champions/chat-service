@@ -154,6 +154,12 @@ public class Startup
         // relationship-gated paths fail closed retriable.
         services.AddSingleton<IRelationshipProvider, RelationshipProvider>();
         services.AddTransient<IRelationshipSource, WebsiteBackendRelationshipSource>();
+
+        // C5 (Task 3, D7/D19): the in-memory stranger-DM initiation cap tracker. Singleton — it holds the
+        // per-initiator 8h event windows that every OpenDm invocation reads/writes and the accept
+        // transitions (T4/T6) free; a transient would fragment each initiator's counter across hub
+        // invocations, defeating the cap (the ChannelCreationRateLimiter singleton rationale).
+        services.AddSingleton<DmInitiationTracker>();
         Log.Information("Services added");
     }
 

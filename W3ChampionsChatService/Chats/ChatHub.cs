@@ -64,7 +64,14 @@ public partial class ChatHub(
     // in this hub). T3 adds the remaining two DM deps (UserSettingsRepository, DmInitiationTracker) in a
     // single sweep. Singleton (Startup); the prefetch below is the FIRST and ONLY T1 consumer — no gating
     // reads it yet (later tasks gate block/friend/consent on it).
-    IRelationshipProvider relationshipProvider) : Hub
+    IRelationshipProvider relationshipProvider,
+    // C5 (Task 3, D19): the remaining TWO DM front-door deps, added in a single ctor growth (T1 already
+    // took IRelationshipProvider above one task early for the connect-time prefetch). UserSettingsRepository
+    // backs the dmPrivacy gate + SetDmPrivacy (a thin per-user settings read/write); DmInitiationTracker is
+    // the in-memory 8h stranger-initiation cap (singleton — Startup). Both are consumed by the OpenDm/
+    // SetDmPrivacy partial in ChatHub.Dm.cs and reused by later C5 tasks (T4/T6 accept transitions).
+    UserSettingsRepository userSettings,
+    DmInitiationTracker dmInitiationTracker) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
@@ -93,6 +100,9 @@ public partial class ChatHub(
     // C5 (Task 1): the relationship provider — connect-time warm prefetch below; gating consumers land in
     // later C5 tasks.
     private readonly IRelationshipProvider _relationshipProvider = relationshipProvider;
+    // C5 (Task 3): the DM front-door deps — the dmPrivacy settings store and the stranger-initiation cap.
+    private readonly UserSettingsRepository _userSettings = userSettings;
+    private readonly DmInitiationTracker _dmInitiationTracker = dmInitiationTracker;
 
     public override async Task OnConnectedAsync()
     {

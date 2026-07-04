@@ -123,7 +123,9 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _fanOutEngine,
             ViewersAccumulatorTestFactory.CreateIgnored(),
             new NoOpMentionInboxCleaner(),
-            RelationshipProviderTestFactory.CreateIgnored());
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker());
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();
