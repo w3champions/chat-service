@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
@@ -30,7 +32,9 @@ public class FanOutEngineTests
     private const string AuthorConnection = "conn-author";
     private const string OtherFocusedConnection = "conn-other-focused";
     private const string UnfocusedMemberConnection = "conn-unfocused-member";
+    private const string ModeratorConnection = "conn-moderator";
     private const string AuthorBattleTag = "Author#1";
+    private const string ModeratorBattleTag = "Mod#7";
 
     // A fixed instant for the threaded-in server clock. These Task-12 tests seed only the FocusRegistry
     // (not the OnlineMemberRegistry), so the Task-13 activity routing finds no members to offer — the
@@ -44,12 +48,39 @@ public class FanOutEngineTests
     // (ISessionRegistry, for the ChannelAdded/ChannelRemoved emit helpers — unused by these
     // OnMessagePersisted tests, so a throwaway instance is enough). A helper keeps every test's
     // construction terse; the OnlineMemberRegistry stays empty in these tests so no activity is routed.
-    private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry)
+    private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry) =>
+        NewEngine(harness, focusRegistry, new SessionRegistry());
+
+    // C4 (Task 5) overload: a seeded SessionRegistry lets the moderator-flagged live-delivery tests
+    // (D8) resolve a focused connection's permission via ISessionRegistry.TryGetByConnectionId, exactly
+    // as OnMessagePersisted does at runtime. The OnlineMemberRegistry stays empty (no activity routing).
+    private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry, ISessionRegistry sessionRegistry)
     {
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, new SessionRegistry());
+        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry);
     }
+
+    // A SessionRegistry seeded with the given (connection, battleTag, isModerator) entries. A moderator
+    // entry mirrors ChatSession.HasPermission's conjunct exactly: IsAdmin AND Permissions⊇{Moderation}.
+    private static SessionRegistry SessionsWith(params (string ConnectionId, string BattleTag, bool IsModerator)[] entries)
+    {
+        var registry = new SessionRegistry();
+        foreach (var (connectionId, battleTag, isModerator) in entries)
+        {
+            registry.Register(connectionId, Identity(battleTag, isModerator), null);
+        }
+        return registry;
+    }
+
+    private static W3CUserAuthentication Identity(string battleTag, bool isModerator) =>
+        new W3CUserAuthentication
+        {
+            BattleTag = battleTag,
+            Name = battleTag.Split('#')[0],
+            IsAdmin = isModerator,
+            Permissions = isModerator ? new HashSet<EPermission> { EPermission.Moderation } : new HashSet<EPermission>(),
+        };
 
     private static ChannelMessage Message(bool shadowFlag = false, MessageDeletion deletion = null) =>
         new ChannelMessage
@@ -214,6 +245,141 @@ public class FanOutEngineTests
         var dto = harness.PayloadFor(OtherFocusedConnection, ChatEvents.MessageReceived) as MessageDto;
         Assert.IsNotNull(dto);
         Assert.AreEqual("message-1", dto.Id);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C4 (Task 5, D8) moderator-flagged LIVE delivery. A shadow post still reaches nobody but its own
+    // author (the illusion echo) AND now every FOCUSED moderator — who receives it REAL-flagged (via
+    // MessageDto.ForModerator, Shadow == true). The author-echo branch outranks the moderator branch, so
+    // a shadow author who is themselves a moderator still gets the unflagged echo. Focused-only still
+    // holds for moderators; a focused NON-moderator still receives NOTHING; and a shadow message still
+    // routes ZERO activity (the coalescer guard is untouched). Resolution is in-memory (SessionRegistry).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Shadow_FocusedModerator_ReceivesFlaggedMessageReceived()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The shadow author AND a focused moderator (a DIFFERENT connection) are both on the channel.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
+        var sessions = SessionsWith((ModeratorConnection, ModeratorBattleTag, true));
+        var engine = NewEngine(harness, focusRegistry, sessions);
+
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
+
+        // The focused moderator receives the shadow post with the REAL shadow flag (ForModerator).
+        Assert.AreEqual(1, harness.SignalCount(ModeratorConnection, ChatEvents.MessageReceived));
+        var dto = harness.PayloadFor(ModeratorConnection, ChatEvents.MessageReceived) as MessageDto;
+        Assert.IsNotNull(dto, "a focused moderator must receive the shadow MessageReceived");
+        Assert.IsTrue(dto.Shadow, "a focused moderator sees the REAL shadow flag, not the illusion");
+    }
+
+    [Test]
+    public async Task Shadow_FocusedNonModerator_StillReceivesNothing()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The shadow author AND a focused NON-moderator (a registered plain user) are both on the channel.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(OtherFocusedConnection, ChannelId, "Viewer#2");
+        var sessions = SessionsWith((OtherFocusedConnection, "Viewer#2", false));
+        var engine = NewEngine(harness, focusRegistry, sessions);
+
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
+
+        // The C3 pin: a focused NON-moderator receives ZERO signals for a shadow post — the moderator
+        // branch must never leak a shadow message to an ordinary focused member.
+        Assert.AreEqual(0, harness.SignalCount(OtherFocusedConnection, ChatEvents.MessageReceived));
+        // Sanity: fan-out ran — the author still got their own (illusion) echo.
+        Assert.AreEqual(1, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));
+    }
+
+    [Test]
+    public async Task Shadow_AuthorEcho_StillForcedFalse_EvenIfAuthorIsModerator()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The shadow author is THEMSELVES a moderator, focused on the channel.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        var sessions = SessionsWith((AuthorConnection, AuthorBattleTag, true));
+        var engine = NewEngine(harness, focusRegistry, sessions);
+
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
+
+        // Illusion outranks the flag: the author's OWN echo is forced non-shadow even though the author
+        // is a moderator (the author-echo branch must be evaluated BEFORE the moderator branch).
+        Assert.AreEqual(1, harness.SignalCount(AuthorConnection, ChatEvents.MessageReceived));
+        var dto = harness.PayloadFor(AuthorConnection, ChatEvents.MessageReceived) as MessageDto;
+        Assert.IsNotNull(dto);
+        Assert.IsFalse(dto.Shadow, "a shadow author's own echo is forced false even when the author is a moderator");
+    }
+
+    [Test]
+    public async Task Shadow_UnfocusedModerator_ReceivesNothing()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The author is focused; the moderator has a live session but is NOT focused on the channel.
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        var sessions = SessionsWith((ModeratorConnection, ModeratorBattleTag, true));
+        var engine = NewEngine(harness, focusRegistry, sessions);
+
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
+
+        // Focused-only holds for moderators too: an UNFOCUSED moderator is absent from the focused index,
+        // so it is never a delivery target — the moderator flag never reaches a non-viewer.
+        Assert.AreEqual(0, harness.SignalCount(ModeratorConnection, ChatEvents.MessageReceived));
+    }
+
+    [Test]
+    public async Task Shadow_ModeratorDelivery_GeneratesNoActivityOffers()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var sessions = SessionsWith((ModeratorConnection, ModeratorBattleTag, true));
+        // Explicit construction so we can seed the OnlineMemberRegistry the engine actually uses: an
+        // UNFOCUSED level-All member who, for a NON-shadow message, WOULD receive a ChannelActivity.
+        var members = new OnlineMemberRegistry();
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions);
+
+        focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
+        focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
+        members.Join(ChannelId, UnfocusedMemberConnection, new MemberState("Bystander#9", NotificationLevel.All, 0));
+
+        await engine.OnMessagePersisted(Channel(), Message(shadowFlag: true), AuthorConnection, isShadow: true, Now);
+
+        // The moderator still got the flagged live message...
+        Assert.AreEqual(1, harness.SignalCount(ModeratorConnection, ChatEvents.MessageReceived));
+        // ...but a shadow message generates ZERO ChannelActivity for anyone (coalescer guard untouched),
+        // even now that a moderator receives it live.
+        Assert.AreEqual(0, harness.SignalCount(UnfocusedMemberConnection, ChatEvents.ChannelActivity));
+        Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ChannelActivity),
+            "a shadow message must generate zero ChannelActivity offers, even with a moderator focused");
+    }
+
+    [Test]
+    public async Task NonShadow_ModeratorReceivesPlainForUserDelivery()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
+        var sessions = SessionsWith((ModeratorConnection, ModeratorBattleTag, true));
+        var engine = NewEngine(harness, focusRegistry, sessions);
+
+        // A NON-shadow send. The persisted domain flags are deliberately set (Shadow + a Deleted marker)
+        // so ForUserDelivery and ForModerator would project DIFFERENTLY — a moderator receiving the plain
+        // ForUserDelivery reads both as false, proving the non-shadow path never routes through the flag.
+        var flaggedDomain = Message(shadowFlag: true, deletion: new MessageDeletion { By = "mod#1", At = DateTime.UtcNow });
+        await engine.OnMessagePersisted(Channel(), flaggedDomain, AuthorConnection, isShadow: false, Now);
+
+        Assert.AreEqual(1, harness.SignalCount(ModeratorConnection, ChatEvents.MessageReceived));
+        var dto = harness.PayloadFor(ModeratorConnection, ChatEvents.MessageReceived) as MessageDto;
+        Assert.IsNotNull(dto);
+        Assert.IsFalse(dto.Shadow, "a non-shadow live message is delivered plain (ForUserDelivery) even to a moderator");
+        Assert.IsFalse(dto.Deleted, "a non-shadow live message is delivered plain (ForUserDelivery) even to a moderator");
     }
 
     // ---------------------------------------------------------------------------------------------

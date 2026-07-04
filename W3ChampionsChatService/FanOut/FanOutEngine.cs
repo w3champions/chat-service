@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
@@ -120,10 +121,29 @@ public class FanOutEngine(
         // (never the membership roster) is what enforces the "no full payloads to unfocused" guardrail.
         foreach (var connectionId in _focusRegistry.GetFocusedConnections(channel.Id))
         {
-            // Shadow-ban integrity: a shadow post reaches nobody but its own author's connection.
+            // Default payload: the user-facing projection. It is what EVERY focused connection receives
+            // on a non-shadow message, and what the shadow AUTHOR's own echo receives (illusion forced
+            // false). Only the shadow branch below may swap it for the moderator projection.
+            var payload = dto;
+
+            // Shadow routing (C4 D8). The author-echo case is excluded here by the connectionId guard so
+            // it is decided BEFORE the moderator branch — a shadow author who is ALSO a moderator gets the
+            // unflagged echo above (the illusion outranks the flag), never the real-flagged copy.
             if (isShadow && connectionId != senderConnectionId)
             {
-                continue;
+                // A shadow post reaches no OTHER member EXCEPT a focused moderator, who receives it with
+                // the REAL shadow flag (ForModerator). Permission is resolved in-memory (zero DB) from the
+                // connection's live session — exactly ChatSession.HasPermission's IsAdmin∧Moderation conjunct.
+                if (_sessionRegistry.TryGetByConnectionId(connectionId, out var moderatorSession)
+                    && moderatorSession.HasPermission(EPermission.Moderation))
+                {
+                    payload = MessageDto.ForModerator(channel.Id, message);
+                }
+                else
+                {
+                    // Any other focused member: shadow-ban integrity — a shadow post reaches them not at all.
+                    continue;
+                }
             }
 
             // Fault isolation (review fix): live delivery is best-effort — a missed recipient refetches
@@ -133,7 +153,7 @@ public class FanOutEngine(
             // Ok ack regardless of fan-out hiccups.
             try
             {
-                await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.MessageReceived, dto);
+                await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.MessageReceived, payload);
             }
             catch (Exception ex)
             {

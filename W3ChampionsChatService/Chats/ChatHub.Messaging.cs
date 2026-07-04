@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
@@ -243,13 +244,27 @@ public partial class ChatHub
                 : new GetMessagesResult(ChatResultCode.NotMember);
         }
 
-        // 4. Page. The repo already applies UserVisible filtering and clamps the limit — passed
-        // straight through, no re-filtering/re-clamping here.
+        // 4. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no
+        // UserVisible filter, so deleted rows and EVERY author's shadow rows come back — and projects
+        // with the REAL flags (ForModerator). This is the moderator's own in-channel focused view, so
+        // their OWN shadow/deleted rows are flagged too, not illusion-forced (they are a moderator). The
+        // membership gate above is UNCHANGED — a non-member is already rejected regardless of permission;
+        // the privileged any-channel read is the REST endpoint (Task 7), not this focused-view read.
+        if (session.HasPermission(EPermission.Moderation))
+        {
+            var moderatorPage = aroundSeq.HasValue
+                ? await _messageRepository.LoadPageAroundForModerator(channelId, aroundSeq.Value, limit)
+                : await _messageRepository.LoadPageBeforeForModerator(channelId, beforeSeq, limit);
+            var moderatorMessages = moderatorPage.Select(m => MessageDto.ForModerator(channelId, m)).ToList();
+            return new GetMessagesResult(ChatResultCode.Ok, moderatorMessages);
+        }
+
+        // Non-moderator: the repo applies UserVisible filtering and clamps the limit — passed straight
+        // through, no re-filtering/re-clamping here — then map to the SAME forced-false illusion
+        // FanOutEngine uses for push.
         var page = aroundSeq.HasValue
             ? await _messageRepository.LoadPageAround(channelId, battleTag, aroundSeq.Value, limit)
             : await _messageRepository.LoadPageBefore(channelId, battleTag, beforeSeq, limit);
-
-        // 5. Map to the wire projection — the SAME forced-false illusion FanOutEngine uses for push.
         var messages = page.Select(m => MessageDto.ForUserDelivery(channelId, m)).ToList();
         return new GetMessagesResult(ChatResultCode.Ok, messages);
     }
