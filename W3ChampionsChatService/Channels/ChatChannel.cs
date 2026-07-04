@@ -34,6 +34,16 @@ public class ChatChannel
     [BsonIgnoreIfNull]
     public DmRequestState? RequestState { get; set; }
 
+    /// <summary>
+    /// Dm only — the battleTag of whoever wrote first, stamped once at pending-shell creation via
+    /// $setOnInsert (never mutated afterwards). Serialized to BOTH parties (C5 D3): it rides the raw
+    /// <see cref="ChatChannel"/> in <c>ChannelDto</c>/<c>ChannelAddedDto</c>, and both parties already
+    /// know who opened the conversation, so this is not a leak. Decline state is placement-DISJOINT
+    /// from this field — see <see cref="W3ChampionsChatService.Memberships.ChannelMembership.DeclinedUntil"/>.
+    /// </summary>
+    [BsonIgnoreIfNull]
+    public string RequestInitiatedBy { get; set; }
+
     /// <summary>Per-channel monotonic message counter — allocated via findOneAndUpdate $inc.</summary>
     public long LastSeq { get; set; }
 

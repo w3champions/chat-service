@@ -47,6 +47,7 @@ public class ProtocolContractTests
         Assert.AreEqual("PlayerBannedFromChat", ChatEvents.PlayerBannedFromChat);
         Assert.AreEqual("ConnectionDisplaced", ChatEvents.ConnectionDisplaced);
         Assert.AreEqual("ThrottleNotice", ChatEvents.ThrottleNotice);
+        Assert.AreEqual("RequestReceived", ChatEvents.RequestReceived);
     }
 
     [Test]
@@ -250,5 +251,89 @@ public class ProtocolContractTests
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code);
         Assert.AreEqual(3, result.MessagesDeleted);
+    }
+
+    // ── C5 Task 2 (D17/D18) — DM/group domain + repository foundation pins ───────────────
+
+    [Test]
+    public void ChatLimits_C5NewConstants_MatchPlanD17()
+    {
+        // Spec-pinned (§4): decline is soft + temporal, 24h suppression.
+        Assert.AreEqual(TimeSpan.FromHours(24), ChatLimits.DmDeclineSuppression);
+        // Spec-pinned (§4: "3–100 members") — the floor half of the existing MaxGroupSize ceiling.
+        Assert.AreEqual(3, ChatLimits.GroupMinSize);
+        // Plan decisions (C5 T2) — not spec §13 text; hard-coded, adjust here only.
+        Assert.AreEqual(64, ChatLimits.GroupNameMaxLength);
+        Assert.AreEqual(120, ChatLimits.DmPreviewExcerptLength);
+    }
+
+    [Test]
+    public void OpenDmResult_CarriesChannelAndMembership()
+    {
+        var channel = new ChatChannel { Id = "c1", Type = ChannelType.Dm };
+        var membership = new ChannelMembership { Id = "m1" };
+
+        var result = new OpenDmResult(ChatResultCode.Ok, Channel: channel, Membership: membership);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreSame(channel, result.Channel);
+        Assert.AreSame(membership, result.Membership);
+        Assert.IsNull(result.RetryAfterSeconds);
+    }
+
+    [Test]
+    public void OpenDmResult_Throttled_CarriesRetryAfterSeconds_NoChannelOrMembership()
+    {
+        var result = new OpenDmResult(ChatResultCode.Throttled, RetryAfterSeconds: 30);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code);
+        Assert.AreEqual(30, result.RetryAfterSeconds);
+        Assert.IsNull(result.Channel);
+        Assert.IsNull(result.Membership);
+    }
+
+    [Test]
+    public void CreateGroupResult_CarriesChannelAndCreatorMembership()
+    {
+        var channel = new ChatChannel { Id = "g1", Type = ChannelType.GroupDm };
+        var membership = new ChannelMembership { Id = "m1", Role = MembershipRole.Owner };
+
+        var result = new CreateGroupResult(ChatResultCode.Ok, Channel: channel, Membership: membership);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreSame(channel, result.Channel);
+        Assert.AreEqual(MembershipRole.Owner, result.Membership.Role);
+    }
+
+    [Test]
+    public void PendingDmRequestDto_CarriesChannelInitiatorAndTimestamp()
+    {
+        var requestedAt = DateTime.UtcNow;
+        var dto = new PendingDmRequestDto("c1", "Peter#123", requestedAt);
+
+        Assert.AreEqual("c1", dto.ChannelId);
+        Assert.AreEqual("Peter#123", dto.FromBattleTag);
+        Assert.AreEqual(requestedAt, dto.RequestedAt);
+    }
+
+    [Test]
+    public void MembershipDto_NeverSerializesDeclinedUntil()
+    {
+        // D3 leak pin: DeclinedUntil lives on the RECIPIENT's membership row and must never reach
+        // the wire — MembershipDto.From is an explicit projection, so this must hold structurally
+        // even though the domain type itself carries the field.
+        var membership = new ChannelMembership
+        {
+            ChannelId = "chan1",
+            BattleTag = "Peter#123",
+            JoinedAt = DateTime.UtcNow,
+            DeclinedUntil = DateTime.UtcNow.AddHours(24),
+        };
+
+        var dto = MembershipDto.From(membership);
+        var json = JsonSerializer.Serialize(dto);
+
+        StringAssert.DoesNotContain("Declined", json);
+        StringAssert.DoesNotContain("declined", json);
     }
 }

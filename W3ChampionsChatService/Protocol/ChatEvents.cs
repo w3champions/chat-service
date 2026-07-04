@@ -22,4 +22,9 @@ public static class ChatEvents
     public const string PlayerBannedFromChat = nameof(PlayerBannedFromChat);
     public const string ConnectionDisplaced = nameof(ConnectionDisplaced);
     public const string ThrottleNotice = nameof(ThrottleNotice);
+
+    /// <summary>C5: targeted push to the RECIPIENT of a new/resurfaced pending Dm request (a
+    /// consent-state transition, not fired on every pending message — the tray is already live via
+    /// SessionState). Carries a <c>PendingDmRequestDto</c>.</summary>
+    public const string RequestReceived = nameof(RequestReceived);
 }

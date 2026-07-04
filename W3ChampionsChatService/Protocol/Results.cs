@@ -45,3 +45,18 @@ public record ChannelOperationResult(
 public record PurgeMessagesResult(
     ChatResultCode Code,
     int MessagesDeleted);
+
+/// <summary>OpenDm (C5 D18) — same shape as <see cref="JoinChannelResult"/>: the caller's channel +
+/// own membership on success, nothing on a typed reject.</summary>
+public record OpenDmResult(
+    ChatResultCode Code,
+    double? RetryAfterSeconds = null,
+    ChatChannel Channel = null,
+    ChannelMembership Membership = null);
+
+/// <summary>CreateGroup (C5 D18) — the new group channel + the creator's own (Owner) membership.</summary>
+public record CreateGroupResult(
+    ChatResultCode Code,
+    double? RetryAfterSeconds = null,
+    ChatChannel Channel = null,
+    ChannelMembership Membership = null);

@@ -97,4 +97,22 @@ public static class ChatLimits
     /// typed <c>Throttled</c> reject so the client retries after the provider has had a chance to
     /// re-fetch (≈ one wb round-trip plus jitter), rather than being silently dropped.</summary>
     public const int RelationshipRetryAfterSeconds = 30;
+
+    /// <summary>Spec-pinned (§4): a decline is soft + temporal — it leaves the recipient's tray and
+    /// suppresses notifications for 24h, after which the sender's next message surfaces a fresh
+    /// request. NOT a spec-numbers-config knob; hard-coded like every other spec §13 value.</summary>
+    public static readonly TimeSpan DmDeclineSuppression = TimeSpan.FromHours(24);
+
+    /// <summary>Group size floor. Spec-pinned (§4: "3–100 members") — <see cref="MaxGroupSize"/> is
+    /// the existing ceiling half of that same range; this const exists so the floor has a name too.</summary>
+    public const int GroupMinSize = 3;
+
+    /// <summary>Group display-name length cap (chars). C5 plan decision (T2) — not spec §13 text;
+    /// hard-coded, adjust here only.</summary>
+    public const int GroupNameMaxLength = 64;
+
+    /// <summary>DM activity-preview excerpt length (chars) — C5 plan decision (T2/D15), reusing the
+    /// mention-inbox excerpt precedent's "~120 chars" (spec §5) rather than inventing a new number.
+    /// Not itself spec §13 text; hard-coded, adjust here only.</summary>
+    public const int DmPreviewExcerptLength = 120;
 }

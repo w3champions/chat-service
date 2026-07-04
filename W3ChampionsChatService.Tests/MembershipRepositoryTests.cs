@@ -122,4 +122,65 @@ public class MembershipRepositoryTests : IntegrationTestBase
 
         Assert.AreEqual(2, count);
     }
+
+    // ── C5 Task 2 — DM/group repository foundation additions ─────────────────────────────
+
+    [Test]
+    public async Task LoadForChannel_And_CountForChannel_ReturnAllMembersOfOneChannel()
+    {
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Wolf#456", JoinedAt = DateTime.UtcNow });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+
+        var members = await repo.LoadForChannel("chan1");
+        var count = await repo.CountForChannel("chan1");
+
+        Assert.AreEqual(2, members.Count);
+        CollectionAssert.AreEquivalent(new[] { "Peter#123", "Wolf#456" }, members.Select(m => m.BattleTag).ToList());
+        Assert.AreEqual(2, count);
+    }
+
+    [Test]
+    public async Task SetRole_Persists()
+    {
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        Assert.AreEqual(MembershipRole.Member, (await repo.Load("chan1", "Peter#123")).Role);
+
+        await repo.SetRole("chan1", "Peter#123", MembershipRole.Owner);
+
+        Assert.AreEqual(MembershipRole.Owner, (await repo.Load("chan1", "Peter#123")).Role);
+    }
+
+    [Test]
+    public async Task SetDeclinedUntil_And_ClearDeclinedUntil_RoundTrip()
+    {
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        Assert.IsNull((await repo.Load("chan1", "Peter#123")).DeclinedUntil);
+
+        var declinedUntil = DateTime.UtcNow.AddHours(24);
+        await repo.SetDeclinedUntil("chan1", "Peter#123", declinedUntil);
+        var declined = await repo.Load("chan1", "Peter#123");
+        Assert.IsNotNull(declined.DeclinedUntil);
+        Assert.IsTrue((declined.DeclinedUntil.Value - declinedUntil).Duration() < TimeSpan.FromSeconds(1));
+
+        await repo.ClearDeclinedUntil("chan1", "Peter#123");
+        Assert.IsNull((await repo.Load("chan1", "Peter#123")).DeclinedUntil);
+    }
+
+    [Test]
+    public async Task DeleteAllForChannel_RemovesEveryMembershipRow_LeavesOtherChannelsIntact()
+    {
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Wolf#456", JoinedAt = DateTime.UtcNow });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+
+        await repo.DeleteAllForChannel("chan1");
+
+        Assert.AreEqual(0, (await repo.LoadForChannel("chan1")).Count);
+        Assert.AreEqual(1, (await repo.LoadForUser("Peter#123")).Count);
+    }
 }
