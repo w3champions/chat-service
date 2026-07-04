@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Bson;
@@ -241,5 +242,45 @@ public class ChannelRepositoryTests : IntegrationTestBase
         Assert.IsNotNull(found);
         Assert.AreEqual(semi.Id, found.Id);
         Assert.AreEqual(ChannelType.SemiPublic, found.Type);
+    }
+
+    // C4 Task 7 review finding: the moderation "scope wall" — {Public, SemiPublic, System+Match} — now
+    // exists as TWO independent expressions: ChannelModeration.IsModeratable (a C# predicate, used by
+    // ChatHub.DeleteMessage/PurgeMessagesFromUser + the REST message read) and LoadModeratableChannels'
+    // Mongo filter (used by the REST channel-listing endpoint), because a C# predicate can't be pushed
+    // into a query. They agree today but could silently drift if only one is ever edited, which would
+    // let the moderator channel LIST leak clan/lobby/dm channel metadata that the message read still
+    // correctly rejects. This test seeds one channel per every ChannelType x SystemChannelKind
+    // combination and asserts the two expressions agree EXACTLY on which of them are moderatable, so any
+    // future one-sided edit fails the build instead of silently drifting.
+    [Test]
+    public async Task LoadModeratableChannels_ExactlyMatches_ChannelModerationIsModeratable_AcrossAllTypeKindCombinations()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var now = DateTime.UtcNow;
+
+        var allChannels = new List<ChatChannel>
+        {
+            new() { Type = ChannelType.Public, LastMessageAt = now },
+            new() { Type = ChannelType.SemiPublic, LastMessageAt = now },
+            new() { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, LastMessageAt = now },
+            new() { Type = ChannelType.System, SystemKind = SystemChannelKind.Clan, LastMessageAt = now },
+            new() { Type = ChannelType.System, SystemKind = SystemChannelKind.Lobby, LastMessageAt = now },
+            new() { Type = ChannelType.System, SystemKind = null, LastMessageAt = now },
+            new() { Type = ChannelType.Dm, LastMessageAt = now },
+            new() { Type = ChannelType.GroupDm, LastMessageAt = now },
+        };
+
+        foreach (var channel in allChannels)
+        {
+            await repo.Insert(channel);
+        }
+
+        var expectedIds = allChannels.Where(ChannelModeration.IsModeratable).Select(c => c.Id).ToHashSet();
+        var actualIds = (await repo.LoadModeratableChannels(allChannels.Count)).Select(c => c.Id).ToHashSet();
+
+        CollectionAssert.AreEquivalent(expectedIds, actualIds,
+            "LoadModeratableChannels' Mongo filter must select EXACTLY the channels ChannelModeration.IsModeratable " +
+            "agrees are moderatable — the two scope-wall expressions must never drift apart");
     }
 }

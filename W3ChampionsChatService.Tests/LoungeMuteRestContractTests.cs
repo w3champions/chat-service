@@ -2,8 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Text.Json;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using NUnit.Framework;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Mutes;
@@ -83,6 +86,50 @@ public class LoungeMuteRestContractTests : IntegrationTestBase
         CollectionAssert.IsSubsetOf(
             new[] { "battleTag", "endDate", "insertDate", "author", "reason", "isShadowBan" }, propertyNames,
             "the six wb-consumed business fields must all still exist on LoungeMute");
+    }
+
+    /// <summary>
+    /// The test above only proves the six CLR properties still exist on <see cref="LoungeMute"/> via
+    /// reflection — it never inspects the actual bytes the GET action puts on the wire. A
+    /// <c>[JsonIgnore]</c> or a rename that keeps the CLR property but changes the emitted key would slip
+    /// straight past a property-name check while still breaking the website-backend, which parses the
+    /// serialized JSON, not the C# type. This pins the REAL wire contract: it resolves the exact
+    /// <see cref="JsonSerializerOptions"/> the GET /api/loungeMute action serializes with (plain
+    /// <c>services.AddControllers()</c> in Startup.cs — no <c>.AddJsonOptions(...)</c> override — so this
+    /// mirrors that configuration rather than assuming a naming policy from memory) and asserts the
+    /// serialized key SET matches exactly.
+    /// </summary>
+    [Test]
+    public async Task Get_SerializesFullLoungeMuteShape_WireKeysMatchTheGetEndpointsActualSerializer()
+    {
+        await _muteRepository.AddLoungeMute(new LoungeMuteRequest
+        {
+            battleTag = "Target#123",
+            endDate = new DateTime(2026, 8, 1, 0, 0, 0, DateTimeKind.Utc).ToString("O"),
+            author = "mod#1",
+            reason = "spam",
+            isShadowBan = true,
+        });
+
+        var result = await _controller.GetLoungeMutes() as OkObjectResult;
+        var mute = (result.Value as List<LoungeMute>).Single();
+
+        var services = new ServiceCollection();
+        services.AddControllers();
+        using var provider = services.BuildServiceProvider();
+        var wireOptions = provider.GetRequiredService<IOptions<Microsoft.AspNetCore.Mvc.JsonOptions>>().Value.JsonSerializerOptions;
+
+        var wireJson = JsonSerializer.Serialize(mute, wireOptions);
+        var wireKeys = JsonDocument.Parse(wireJson).RootElement.EnumerateObject().Select(p => p.Name).ToHashSet();
+
+        // "id" is the real 7th wire key alongside the six business fields — LoungeMute implements
+        // IIdentifiable (public string Id => battleTag), a computed property that serializes onto the
+        // wire like any other; it is pre-existing byte-compat surface, not introduced by this test.
+        var expectedWireKeys = new HashSet<string> { "id", "battleTag", "endDate", "insertDate", "author", "reason", "isShadowBan" };
+        CollectionAssert.AreEquivalent(expectedWireKeys, wireKeys,
+            "the /api/loungeMute wire contract must expose EXACTLY these serialized keys — a renamed, " +
+            "dropped, or [JsonIgnore]'d field breaks the website-backend even though it would still round-trip " +
+            "on the C# side");
     }
 
     [Test]
