@@ -128,6 +128,20 @@ public partial class ChatHub
             return new SendMessageResult(ChatResultCode.NotFound);
         }
 
+        // 5.5 Private-lane gates (C5 Task 4) — Dm/GroupDm ONLY. Runs BEFORE persist so a silent-drop or
+        // fail-closed reject writes and delivers nothing. Returns a short-circuit result (a silent
+        // FakeSendAck for a blocked/pending-cap/dmPrivacy drop, or the one fail-closed Throttled when the
+        // relationship snapshot is entirely unavailable) or null to proceed. It may FLIP channel.RequestState
+        // in-memory (reply/auto-accept) so the persist step below computes the +1y accepted-shell expiry.
+        if (channel.Type is ChannelType.Dm or ChannelType.GroupDm)
+        {
+            var shortCircuit = await ApplyPrivateLaneGates(channel, session.Identity.BattleTag, now);
+            if (shortCircuit != null)
+            {
+                return shortCircuit;
+            }
+        }
+
         // 6. Mute gate — PUBLIC channels ONLY (guardrail: never gate semiPublic/system/dm).
         var isShadow = false;
         if (channel.Type == ChannelType.Public)
@@ -149,10 +163,17 @@ public partial class ChatHub
         // as step 4 rather than letting an untyped exception escape as a generic SignalR error (the
         // pipeline's "every rejection is a typed result" guardrail). A genuine Insert failure below is a
         // real infrastructure error and is deliberately left to propagate.
+        // C5 D10 (shell-expiry maintenance, the C1-amendment gap): for Dm/GroupDm the SAME atomic
+        // findOneAndUpdate also $sets ExpiresAt to the shell TTL (pending Dm +30d / accepted Dm+GroupDm +1y,
+        // computed from the POST-5.5 RequestState). public/semiPublic/System pass null → ExpiresAt is left
+        // completely untouched (creation-anchored or permanent — the PublicSend regression pin).
+        var shellExpiresAt = channel.Type is ChannelType.Dm or ChannelType.GroupDm
+            ? ExpiryCalculator.ForChannelShell(channel, now)
+            : (DateTime?)null;
         long seq;
         try
         {
-            seq = await _channelRepository.AllocateSeq(channelId, now);
+            seq = await _channelRepository.AllocateSeq(channelId, now, shellExpiresAt);
         }
         catch (InvalidOperationException)
         {
@@ -170,6 +191,15 @@ public partial class ChatHub
             ExpiresAt = ExpiryCalculator.ForChannelMessage(channel.Type, now),
         };
         await _messageRepository.Insert(message);
+
+        // 7.5 Dm recipient materialization + RequestReceived (C5 Task 4, D4) — post-persist, BEFORE fan-out.
+        // Lazily creates the counterpart's membership on first delivery (seeding their registry via
+        // PushChannelAdded(focus:false)) and fires the targeted RequestReceived consent transition for a
+        // fresh/resurfaced pending request. GroupDm needs none of this (all members already have rows).
+        if (channel.Type == ChannelType.Dm)
+        {
+            await MaterializeDmRecipientAndNotify(channel, session.Identity.BattleTag, now);
+        }
 
         // 8. Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
         // delivery + shadow-author-only routing, then unfocused level-All members are routed to the

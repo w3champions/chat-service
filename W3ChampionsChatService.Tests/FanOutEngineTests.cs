@@ -36,6 +36,12 @@ public class FanOutEngineTests
     private const string AuthorBattleTag = "Author#1";
     private const string ModeratorBattleTag = "Mod#7";
 
+    // C5 (Task 4, D4) pending-Dm activity suppression fixtures.
+    private const string DmInitiator = "Initiator#1";
+    private const string DmRecipient = "Recipient#2";
+    private const string InitiatorConnection = "conn-dm-initiator";
+    private const string RecipientConnection = "conn-dm-recipient";
+
     // A fixed instant for the threaded-in server clock. These Task-12 tests seed only the FocusRegistry
     // (not the OnlineMemberRegistry), so the Task-13 activity routing finds no members to offer — the
     // MessageReceived assertions here are unaffected by the routing extension.
@@ -43,6 +49,10 @@ public class FanOutEngineTests
 
     private static ChatChannel Channel() =>
         new ChatChannel { Id = ChannelId, Type = ChannelType.Public };
+
+    // A 1:1 Dm channel in a given consent state, initiated by DmInitiator (C5 T4 suppression tests).
+    private static ChatChannel DmChannel(DmRequestState state) =>
+        new ChatChannel { Id = ChannelId, Type = ChannelType.Dm, RequestState = state, RequestInitiatedBy = DmInitiator };
 
     // The Task-13 activity routing gives FanOutEngine two more deps, and Task 18 adds a third
     // (ISessionRegistry, for the ChannelAdded/ChannelRemoved emit helpers — unused by these
@@ -507,5 +517,73 @@ public class FanOutEngineTests
         Assert.AreEqual(0, harness.SignalCount(AuthorConnection, ChatEvents.BulkMessagesDeleted));
         // ...but the OTHER focused connection still received its removal push.
         Assert.AreEqual(1, harness.SignalCount(OtherFocusedConnection, ChatEvents.BulkMessagesDeleted));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C5 (Task 4, D4) pending-Dm activity suppression. While a 1:1 request is unresolved (Pending) the
+    // RECIPIENT (any member != RequestInitiatedBy) receives ZERO ChannelActivity — their only signals are
+    // the targeted RequestReceived + the tray. The initiator's own delivery is unaffected, an ACCEPTED Dm
+    // resumes activity, and a recipient who DELIBERATELY focused the pending window still gets the live
+    // MessageReceived (focused delivery is never suppressed).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PendingDm_RecipientGetsNoActivity_InitiatorEchoUnaffected()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The initiator (sender) is focused → still receives its own echo. The recipient is an unfocused
+        // level-All member who, for a NON-pending channel, WOULD be offered a ChannelActivity.
+        focusRegistry.Focus(InitiatorConnection, ChannelId, DmInitiator);
+        var members = new OnlineMemberRegistry();
+        members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0));
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0));
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
+
+        // The initiator's focused connection still gets its echo — suppression targets only the recipient.
+        Assert.AreEqual(1, harness.SignalCount(InitiatorConnection, ChatEvents.MessageReceived));
+        // The pending recipient gets ZERO activity (D4) and no full payload (unfocused).
+        Assert.AreEqual(0, harness.SignalCount(RecipientConnection, ChatEvents.ChannelActivity));
+        Assert.AreEqual(0, harness.SignalCount(RecipientConnection, ChatEvents.MessageReceived));
+        Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ChannelActivity),
+            "a pending Dm recipient receives zero ChannelActivity while the request is unresolved");
+    }
+
+    [Test]
+    public async Task AcceptedDm_RecipientGetsActivity()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var members = new OnlineMemberRegistry();
+        // An unfocused level-All recipient of an ACCEPTED Dm — suppression is lifted, so activity resumes.
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0));
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(), InitiatorConnection, isShadow: false, Now);
+
+        // Accepted → no suppression → the first offer emits a ChannelActivity immediately.
+        Assert.AreEqual(1, harness.SignalCount(RecipientConnection, ChatEvents.ChannelActivity));
+    }
+
+    [Test]
+    public async Task FocusedPendingRecipient_StillGetsMessageReceived()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        // The recipient DELIBERATELY opened (focused) the pending window.
+        focusRegistry.Focus(RecipientConnection, ChannelId, DmRecipient);
+        var members = new OnlineMemberRegistry();
+        members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0));
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry());
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
+
+        // Focused delivery is NEVER suppressed — the recipient sees the live message.
+        Assert.AreEqual(1, harness.SignalCount(RecipientConnection, ChatEvents.MessageReceived));
     }
 }

@@ -271,6 +271,11 @@ public class MutePortTests : IntegrationTestBase
             NormalizedName = ChannelNames.Normalize(name),
             SystemKind = systemKind,
             SystemRef = type == ChannelType.System ? "sysref-" + name : null,
+            // A real Dm always carries a pair-key + request state (FindOrCreateDm invariant) — C5's send-path
+            // private-lane gates (step 5.5) resolve the counterpart from the pair-key. Stamp a realistic,
+            // already-Accepted 1:1 so these mute-SCOPE tests exercise the Dm path without the consent machine.
+            PairKey = type == ChannelType.Dm ? DmPairKey.For(BattleTag, "counterpart#0") : null,
+            RequestState = type == ChannelType.Dm ? DmRequestState.Accepted : null,
         };
         await _channelRepository.Insert(channel);
         return channel;

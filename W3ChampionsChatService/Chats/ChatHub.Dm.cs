@@ -1,6 +1,8 @@
 using System;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
+using MongoDB.Bson;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
@@ -213,5 +215,236 @@ public partial class ChatHub
             new MemberState(caller, membership.NotificationLevel, membership.LastReadSeq));
 
         return membership;
+    }
+
+    // ================================================================================================
+    // C5 (Task 4): send-path private-lane gates + shared helpers. SendMessage (ChatHub.Messaging.cs)
+    // calls into these between the channel load and the persist step (step 5.5), and again post-persist
+    // for Dm recipient materialization.
+    // ================================================================================================
+
+    /// <summary>
+    /// D6 silent-drop ack fabrication. Every DELIBERATELY silent Dm drop (blocked 1:1 send; pending-cap
+    /// exceeded; pending-phase dmPrivacy recheck failure) returns this shape — an <see cref="ChatResultCode.Ok"/>
+    /// carrying a FABRICATED, non-null <c>MessageId</c>/<c>Seq</c> so it is byte-shaped exactly like a real
+    /// ack. A <c>null</c> id/seq on Ok, or any non-Ok code, would instantly leak the block/decline/cap state
+    /// (silent-drop uniformity is the marquee property). The fabricated seq is <c>channel.LastSeq + 1</c>
+    /// (the next real seq a client would expect); clients dedupe by messageId, so the never-persisted id is
+    /// harmless (D6 documented residuals).
+    /// </summary>
+    private static SendMessageResult FakeSendAck(ChatChannel channel) =>
+        new SendMessageResult(ChatResultCode.Ok, MessageId: ObjectId.GenerateNewId().ToString(), Seq: channel.LastSeq + 1);
+
+    /// <summary>
+    /// Resolves the COUNTERPART battleTag of a 1:1 <see cref="ChannelType.Dm"/> from its
+    /// <see cref="ChatChannel.PairKey"/> by stripping the sender's normalized tag. The pair-key is
+    /// <c>{a}|{b}</c> of the two sorted, lowercased tags (<see cref="DmPairKey.For"/>), so the returned
+    /// counterpart is LOWERCASED (normalized) — matching how it is used downstream (case-insensitive
+    /// snapshot/registry lookups; the materialized membership + settings reads). Never called for GroupDm
+    /// (no pair-key).
+    /// </summary>
+    private static string ResolveDmCounterpart(ChatChannel channel, string senderBattleTag)
+    {
+        var parts = channel.PairKey.Split('|');
+        var senderNormalized = senderBattleTag.Trim().ToLowerInvariant();
+        return string.Equals(parts[0], senderNormalized, StringComparison.OrdinalIgnoreCase) ? parts[1] : parts[0];
+    }
+
+    /// <summary>
+    /// The shared consent-accept transition used by BOTH reply-accept (a recipient's first reply) and
+    /// auto-accept (an initiator's send once the two are friends). Conditionally flips the channel
+    /// <see cref="DmRequestState.Pending"/> → <see cref="DmRequestState.Accepted"/> via
+    /// <see cref="Channels.ChannelRepository.SetRequestAccepted"/> (idempotent under an accept-race — only
+    /// the winning flip returns true). On the WINNING flip it (a) clears the recipient's own
+    /// decline-suppression window (<see cref="Memberships.MembershipRepository.ClearDeclinedUntil"/>) so a
+    /// previously-declined-then-accepted conversation is fully resolved, and (b) frees the initiator's
+    /// stranger-initiation slot INSTANTLY (<see cref="FanOut.DmInitiationTracker.MarkAccepted"/> — "accepted
+    /// frees capacity"). <paramref name="recipient"/> is the NON-initiator party (the reply's sender, or the
+    /// counterpart on an initiator auto-accept); its normalized form keys the tracker exactly as
+    /// <see cref="OpenDm"/> recorded it. The caller updates its in-memory <c>channel.RequestState</c> so the
+    /// persist step computes the +1y accepted-shell expiry.
+    /// </summary>
+    private async Task AcceptPendingCore(string channelId, string initiator, string recipient, DateTime now)
+    {
+        var flipped = await _channelRepository.SetRequestAccepted(channelId, now);
+        if (!flipped)
+        {
+            // Already accepted (a concurrent AcceptRequest / reply won the race) — treat as accepted, but do
+            // not re-clear/re-free (the winning flip already did, keeping the transition's side-effects once).
+            return;
+        }
+
+        await _membershipRepository.ClearDeclinedUntil(channelId, recipient);
+        _dmInitiationTracker.MarkAccepted(initiator, recipient.ToLowerInvariant());
+    }
+
+    /// <summary>
+    /// Step 5.5 of the send pipeline (private-lane gates), invoked from
+    /// <see cref="SendMessage(string, string)"/> ONLY for <see cref="ChannelType.Dm"/>/
+    /// <see cref="ChannelType.GroupDm"/> channels, between the channel load and the mute gate. Returns a
+    /// SHORT-CIRCUIT <see cref="SendMessageResult"/> to return immediately (a silent <see cref="FakeSendAck"/>,
+    /// or the one fail-closed <see cref="ChatResultCode.Throttled"/>), or <c>null</c> to proceed to persist.
+    /// May flip <paramref name="channel"/>'s in-memory <see cref="ChatChannel.RequestState"/> to
+    /// <see cref="DmRequestState.Accepted"/> (reply/auto-accept) so the persist step re-stamps the +1y
+    /// accepted-shell expiry rather than the +30d pending one. Honored EXACTLY in this order:
+    /// <list type="number">
+    /// <item><b>GroupDm</b>: membership was already checked at step 3 — no block/consent gates; proceed.</item>
+    /// <item><b>Dm block gate</b> (EVERY Dm send, pending OR accepted — a block silences an established lane
+    /// too): fetch the COUNTERPART's snapshot ONCE (reused below). If it has BLOCKED the sender ⇒
+    /// <see cref="FakeSendAck"/> (persist NOTHING, deliver NOTHING, materialize NO membership — "never
+    /// delivered/stored, no new lane opens"). If NO snapshot exists at all
+    /// (<see cref="RelationshipUnavailableException"/>) ⇒ <see cref="ChatResultCode.Throttled"/> — the ONLY
+    /// non-silent fail-closed here (a system-outage condition independent of block state; a silent drop
+    /// would wrongly imply a block, and a stale snapshot is accepted so this only triggers on a total miss).</item>
+    /// <item><b>Pending machine</b> (only while <see cref="DmRequestState.Pending"/>):
+    /// <list type="bullet">
+    /// <item>sender ≠ <see cref="ChatChannel.RequestInitiatedBy"/> (the recipient replying) ⇒ reply-accept
+    /// (<see cref="AcceptPendingCore"/>) then proceed as Accepted — a reply is never capped.</item>
+    /// <item>sender = initiator AND the counterpart snapshot now lists the sender as a friend ⇒ auto-accept
+    /// (friends bypass consent, D8) then proceed as Accepted.</item>
+    /// <item>sender = initiator, still a stranger ⇒ recheck the recipient's <see cref="DmPrivacy"/>
+    /// (ALLOW-LIST: only <see cref="DmPrivacy.Everyone"/> proceeds; Friends/Nobody/out-of-range ⇒
+    /// <see cref="FakeSendAck"/>, silent and uniform with a decline), then the pending-depth cap
+    /// (<c>LastSeq ≥ <see cref="ChatLimits.PendingConversationMaxMessages"/></c> ⇒ <see cref="FakeSendAck"/>).</item>
+    /// </list></item>
+    /// </list>
+    /// </summary>
+    private async Task<SendMessageResult> ApplyPrivateLaneGates(ChatChannel channel, string senderBattleTag, DateTime now)
+    {
+        // GroupDm: no consent/block gates — membership already proven at step 3.
+        if (channel.Type == ChannelType.GroupDm)
+        {
+            return null;
+        }
+
+        var counterpart = ResolveDmCounterpart(channel, senderBattleTag);
+
+        // (1) Block gate — the counterpart's snapshot, reused for the friend check below.
+        RelationshipSnapshot snapshot;
+        try
+        {
+            snapshot = await _relationshipProvider.GetSnapshotAsync(counterpart);
+        }
+        catch (RelationshipUnavailableException)
+        {
+            // No snapshot at all: fail closed retriable (NON-silent). Block-agnostic — leaks no block state.
+            return new SendMessageResult(ChatResultCode.Throttled, ChatLimits.RelationshipRetryAfterSeconds);
+        }
+
+        if (snapshot.HasBlocked(senderBattleTag))
+        {
+            // Blocked: silent non-delivery. Nothing is persisted, delivered, or materialized (SendMessage
+            // returns this before the persist/materialize/fan-out steps).
+            return FakeSendAck(channel);
+        }
+
+        // (2) Pending machine.
+        if (channel.RequestState == DmRequestState.Pending)
+        {
+            if (!string.Equals(senderBattleTag, channel.RequestInitiatedBy, StringComparison.OrdinalIgnoreCase))
+            {
+                // Recipient replying → reply-accept, then proceed as Accepted (never capped).
+                await AcceptPendingCore(channel.Id, channel.RequestInitiatedBy, senderBattleTag, now);
+                channel.RequestState = DmRequestState.Accepted;
+            }
+            else if (snapshot.IsFriendWith(senderBattleTag))
+            {
+                // Initiator sending, now friends → auto-accept (D8), then proceed as Accepted.
+                await AcceptPendingCore(channel.Id, channel.RequestInitiatedBy, counterpart, now);
+                channel.RequestState = DmRequestState.Accepted;
+            }
+            else
+            {
+                // Initiator sending, still a stranger. Re-check the recipient's dmPrivacy every send (D8);
+                // an ALLOW-LIST so a tightened setting (or an out-of-range cast) fails closed to a silent
+                // drop — indistinguishable from a decline.
+                var recipientSettings = await _userSettings.LoadOrDefault(counterpart);
+                if (recipientSettings.DmPrivacy is not DmPrivacy.Everyone)
+                {
+                    return FakeSendAck(channel);
+                }
+
+                // Pending-depth cap: only the initiator grows a pending conversation, so LastSeq is the depth.
+                if (channel.LastSeq >= ChatLimits.PendingConversationMaxMessages)
+                {
+                    return FakeSendAck(channel);
+                }
+            }
+        }
+
+        return null; // proceed to persist
+    }
+
+    /// <summary>
+    /// Post-persist, pre-fan-out Dm hook (invoked from <see cref="SendMessage(string, string)"/> after the
+    /// message is durably stored, for <see cref="ChannelType.Dm"/> only): lazily materializes the
+    /// counterpart's membership and fires the <see cref="ChatEvents.RequestReceived"/> transition.
+    /// <list type="bullet">
+    /// <item>Materializes the counterpart's membership if absent (idempotent
+    /// <see cref="Memberships.MembershipRepository.InsertIfAbsent"/>, level <see cref="NotificationLevel.All"/>,
+    /// role <see cref="MembershipRole.Member"/>). A NEW materialization is detected race-safely by comparing
+    /// the returned row's Id to the candidate's fresh Id — on insert they match; an existing match returns
+    /// the pre-existing row (different Id), and under a concurrent double-materialize exactly one caller wins
+    /// the unique index and sees its own candidate Id. On first materialization it
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) — seeding the recipient's registry and
+    /// pushing <c>ChannelAdded</c> WITHOUT auto-opening the DM.</item>
+    /// <item>Fires <see cref="ChatEvents.RequestReceived"/> (targeted at the recipient's single live
+    /// connection via <see cref="Sessions.ISessionRegistry.GetByBattleTag"/>; offline ⇒ skipped, the tray
+    /// carries it via SessionState in T6) IFF the channel is <see cref="DmRequestState.Pending"/> AND the
+    /// sender is the initiator AND (the membership was JUST materialized OR the recipient's decline window
+    /// has elapsed — <c>now ≥ DeclinedUntil</c>, cleared first so the request resurfaces). Suppressed while
+    /// still inside the decline window, and NOT re-fired on every pending message (the tray is already live).
+    /// A reply/auto-accept flipped the in-memory RequestState to Accepted, so those never re-notify here.</item>
+    /// </list>
+    /// </summary>
+    private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now)
+    {
+        var counterpart = ResolveDmCounterpart(channel, senderBattleTag);
+
+        var candidate = new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = counterpart,
+            Role = MembershipRole.Member,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = now,
+        };
+        var recipientMembership = await _membershipRepository.InsertIfAbsent(candidate);
+        var newlyMaterialized = recipientMembership.Id == candidate.Id;
+
+        if (newlyMaterialized)
+        {
+            // Seeds the recipient's OnlineMemberRegistry + pushes ChannelAdded(focus:false) if they are
+            // online; a no-op for an offline recipient (their SessionState picks the channel up on connect).
+            await _fanOutEngine.PushChannelAdded(channel, recipientMembership, focus: false);
+        }
+
+        // RequestReceived transition — only a fresh/resurfaced pending request FROM the initiator.
+        if (channel.RequestState != DmRequestState.Pending
+            || !string.Equals(senderBattleTag, channel.RequestInitiatedBy, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var declinedUntil = recipientMembership.DeclinedUntil;
+        var resurface = declinedUntil.HasValue && now >= declinedUntil.Value;
+
+        // Suppress while still inside the decline window; and don't re-fire on ordinary later messages.
+        if (!newlyMaterialized && !resurface)
+        {
+            return;
+        }
+
+        if (resurface)
+        {
+            await _membershipRepository.ClearDeclinedUntil(channel.Id, counterpart);
+        }
+
+        var recipientSession = _sessionRegistry.GetByBattleTag(counterpart);
+        if (recipientSession != null)
+        {
+            var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now);
+            await Clients.Client(recipientSession.ConnectionId).SendAsync(ChatEvents.RequestReceived, dto);
+        }
     }
 }

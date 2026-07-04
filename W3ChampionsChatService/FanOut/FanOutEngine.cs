@@ -180,6 +180,20 @@ public class FanOutEngine(
         var focusedConnections = new HashSet<string>(_focusRegistry.GetFocusedConnections(channel.Id));
         foreach (var (connectionId, state) in _onlineMemberRegistry.GetMembersWithConnections(channel.Id))
         {
+            // C5 (Task 4, D4): pending-Dm activity suppression. While a 1:1 request is unresolved (Pending)
+            // the RECIPIENT — any member whose battleTag is NOT the request initiator — receives ZERO
+            // ChannelActivity; their only signals are the targeted RequestReceived + the tray (SessionState),
+            // so a declined/ignored request never pings them. The FOCUSED live MessageReceived above is NOT
+            // suppressed (a recipient who deliberately opened the pending window still sees messages), and an
+            // ACCEPTED Dm resumes activity normally. The initiator (== RequestInitiatedBy) is never suppressed
+            // here (they are the sender anyway, skipped just below).
+            if (channel.Type == ChannelType.Dm
+                && channel.RequestState == DmRequestState.Pending
+                && !state.BattleTag.Equals(channel.RequestInitiatedBy, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
             // Never ping the sender about their OWN message: they already hold the ack {messageId, seq},
             // and SendMessage does not require the sender to be focused on the channel, so a level-All
             // sender posting to an unfocused channel would otherwise self-notify (and their LastReadSeq
