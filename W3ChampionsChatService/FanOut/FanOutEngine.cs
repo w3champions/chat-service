@@ -18,9 +18,11 @@ namespace W3ChampionsChatService.FanOut;
 /// The single seam the send pipeline calls once a message is durably persisted (seam created in Task
 /// 11; body filled in Task 12). <see cref="OnMessagePersisted"/> delivers the full
 /// <c>MessageReceived</c> payload to the channel's online+focused viewers ONLY, with
-/// shadow-author-only routing (a shadow message reaches nobody but its own author, preserving the
-/// illusion). It delivers through <see cref="IHubContext{ChatHub}"/> targeting the focused connections
-/// from <see cref="FocusRegistry"/>.
+/// shadow-author-plus-moderator routing (C4 D8): a shadow message reaches only its own author — who
+/// gets the unflagged illusion echo — and any focused connection holding <see
+/// cref="EPermission.Moderation"/>, who gets a real-flagged <c>ForModerator</c> copy; every other
+/// focused connection gets nothing. It delivers through <see cref="IHubContext{ChatHub}"/> targeting
+/// the focused connections from <see cref="FocusRegistry"/>.
 /// <para>
 /// This engine does NOT itself SEND the unfocused members' coalesced <c>ChannelActivity</c> — that is
 /// the <see cref="ActivityCoalescer"/>, driven by the flush hosted service (Task 15). What
@@ -85,14 +87,17 @@ public class FanOutEngine(
     /// <summary>
     /// Called by the send pipeline AFTER the message is durably persisted (seq allocated + inserted).
     /// Delivers the full <c>MessageReceived</c> payload to the channel's FOCUSED connections only, with
-    /// shadow-author-only routing.
+    /// shadow-author-plus-moderator routing (C4 D8).
     /// <list type="bullet">
     /// <item>Non-shadow: every focused connection receives it — INCLUDING the sender's own focused
     /// connection (the echo; the client dedups against its ack <c>{messageId, seq}</c>).</item>
-    /// <item>Shadow (<paramref name="isShadow"/> true): ONLY the author's own focused connection
-    /// (<paramref name="senderConnectionId"/>) receives it — the intersection of the focused set and the
-    /// author's connection. No other connection may see a shadow post (shadow-ban integrity). If the
-    /// author is not focused on the channel, the intersection is empty and the message reaches no one.</item>
+    /// <item>Shadow (<paramref name="isShadow"/> true, C4 D8): the author's own focused connection
+    /// (<paramref name="senderConnectionId"/>) receives the unflagged illusion echo (<c>Shadow</c> forced
+    /// false), AND any OTHER focused connection whose session holds <see cref="EPermission.Moderation"/>
+    /// receives a real-flagged (<c>Shadow == true</c>) <c>ForModerator</c> copy. Every other focused
+    /// member, and every unfocused connection, receives nothing (shadow-ban integrity holds for
+    /// non-moderators). Shadow messages still generate zero activity/unread for anyone — moderators
+    /// included — per the activity routing below.</item>
     /// </list>
     /// GUARDRAIL: UNFOCUSED connections never receive <c>MessageReceived</c> — full payloads go to
     /// focused connections only. Unfocused members' notification is the coalesced <c>ChannelActivity</c>,
