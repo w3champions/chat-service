@@ -235,12 +235,27 @@ public class FanOutEngine(
     /// C5 (Task 9, D15): the DM activity-preview excerpt — the first
     /// <see cref="ChatLimits.DmPreviewExcerptLength"/> characters of the message content (the
     /// mention-inbox "~120 chars" precedent, spec §5). A plain bounded substring; no word-boundary
-    /// trimming (no existing excerpt helper does that either).
+    /// trimming (no existing excerpt helper does that either). Surrogate-safe: chat content is
+    /// emoji-heavy, and <see cref="string.Length"/>/<see cref="string.Substring(int, int)"/> count
+    /// UTF-16 code units, so a naive cut can land inside a supplementary-plane character's surrogate
+    /// pair, emitting a lone high surrogate. If the boundary would split a pair, the whole character
+    /// is dropped instead.
     /// </summary>
-    private static string BuildDmPreviewExcerpt(string content) =>
-        content.Length <= ChatLimits.DmPreviewExcerptLength
-            ? content
-            : content.Substring(0, ChatLimits.DmPreviewExcerptLength);
+    private static string BuildDmPreviewExcerpt(string content)
+    {
+        var limit = ChatLimits.DmPreviewExcerptLength;
+        if (content.Length <= limit)
+        {
+            return content;
+        }
+
+        if (char.IsHighSurrogate(content[limit - 1]))
+        {
+            limit--;
+        }
+
+        return content.Substring(0, limit);
+    }
 
     /// <summary>
     /// Pushes a newly-added channel to <paramref name="membership"/>'s owning user's LIVE connection

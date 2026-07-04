@@ -648,6 +648,54 @@ public class FanOutEngineTests
     }
 
     [Test]
+    public async Task Excerpt_DoesNotSplitSurrogatePair()
+    {
+        var (harness, engine) = NewDmPreviewFixture();
+        // 119 ASCII chars + one supplementary-plane emoji (a UTF-16 surrogate pair) straddles the
+        // DmPreviewExcerptLength (120) boundary: the emoji occupies UTF-16 code units 119-120. A naive
+        // Substring(0, 120) would cut the pair in half, leaving a lone high surrogate at the end.
+        var content = new string('x', ChatLimits.DmPreviewExcerptLength - 1) + "😀" + "trailing content that will be cut off";
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: content), InitiatorConnection, isShadow: false, Now);
+
+        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        Assert.IsNotNull(preview);
+        var excerpt = preview.Excerpt;
+
+        Assert.IsFalse(char.IsHighSurrogate(excerpt[^1]), "the excerpt must never end in a lone (unpaired) high surrogate");
+        for (var i = 0; i < excerpt.Length; i++)
+        {
+            if (char.IsHighSurrogate(excerpt[i]))
+            {
+                Assert.IsTrue(i + 1 < excerpt.Length && char.IsLowSurrogate(excerpt[i + 1]), $"unpaired high surrogate at index {i} — malformed UTF-16");
+            }
+            else if (char.IsLowSurrogate(excerpt[i]))
+            {
+                Assert.IsTrue(i > 0 && char.IsHighSurrogate(excerpt[i - 1]), $"unpaired low surrogate at index {i} — malformed UTF-16");
+            }
+        }
+
+        // The straddling emoji is dropped WHOLE rather than split — the excerpt is 119 chars (the
+        // 119 leading 'x's), not 120-with-a-broken-half.
+        Assert.AreEqual(ChatLimits.DmPreviewExcerptLength - 1, excerpt.Length, "a surrogate pair straddling the boundary must be dropped whole, not split");
+        Assert.AreEqual(new string('x', ChatLimits.DmPreviewExcerptLength - 1), excerpt);
+    }
+
+    [Test]
+    public async Task Excerpt_Exactly120Chars_FullContentNoTruncation()
+    {
+        var (harness, engine) = NewDmPreviewFixture();
+        var exactContent = new string('x', ChatLimits.DmPreviewExcerptLength);
+
+        await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: exactContent), InitiatorConnection, isShadow: false, Now);
+
+        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        Assert.IsNotNull(preview);
+        Assert.AreEqual(ChatLimits.DmPreviewExcerptLength, preview.Excerpt.Length, "content exactly at the cap must pass through whole, unchanged");
+        Assert.AreEqual(exactContent, preview.Excerpt, "content exactly at the cap must equal the full content — the <= boundary must not truncate");
+    }
+
+    [Test]
     public async Task GroupAndPublicActivity_PreviewNull()
     {
         const string GroupMemberConn = "conn-group-member";
