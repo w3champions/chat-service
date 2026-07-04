@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using NUnit.Framework;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -108,6 +109,40 @@ public class OldProtocolRemovedTests
             "sneaking back in (e.g. a second SendMessage) would collapse into the same set entry " +
             "above and hide behind this raw-count check instead.");
     }
+
+    /// <summary>
+    /// C4 Task 9 (final sweep) guardrail. Message deletion in this service is TTL-only physical
+    /// removal — moderator delete/purge only ever soft-deletes (sets <c>Deleted{By,At}</c> via
+    /// <see cref="MessageRepository.MarkDeleted"/> / <see cref="MessageRepository.MarkDeletedMany"/>).
+    /// This is a reflection pin on <see cref="MessageRepository"/>'s PUBLIC surface: no method whose
+    /// name contains a delete/remove/drop verb is allowed to exist EXCEPT the two known soft-delete
+    /// methods. A future public <c>DeleteMessagePermanently</c> (or similarly named hard-delete API)
+    /// added to <see cref="MessageRepository"/> fails this test loudly instead of silently
+    /// reintroducing a physical-delete path that TTL/retention assumptions don't expect.
+    /// </summary>
+    [Test]
+    public void ModerationNeverHardDeletes()
+    {
+        var allowedSoftDeleteNames = new HashSet<string> { "MarkDeleted", "MarkDeletedMany" };
+
+        var suspiciousMethods = typeof(MessageRepository)
+            .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
+            .Where(m => !m.IsSpecialName)
+            .Where(m => ContainsDeleteVerb(m.Name))
+            .Where(m => !allowedSoftDeleteNames.Contains(m.Name))
+            .Select(m => m.Name)
+            .ToList();
+
+        Assert.That(suspiciousMethods, Is.Empty,
+            "MessageRepository must expose NO message hard-delete API. Found suspicious public " +
+            $"method(s): [{string.Join(", ", suspiciousMethods)}]. Physical message removal is " +
+            "TTL-only (ExpiresAt) — use MarkDeleted/MarkDeletedMany (soft-delete, $set) instead.");
+    }
+
+    private static bool ContainsDeleteVerb(string methodName) =>
+        methodName.Contains("Delete", StringComparison.OrdinalIgnoreCase) ||
+        methodName.Contains("Remove", StringComparison.OrdinalIgnoreCase) ||
+        methodName.Contains("Drop", StringComparison.OrdinalIgnoreCase);
 
     private static MethodInfo PublicMethod(string name) =>
         HubType.GetMethod(name, BindingFlags.Public | BindingFlags.Instance);
