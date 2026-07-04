@@ -1,6 +1,8 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
+using MongoDB.Bson;
+using MongoDB.Bson.Serialization;
 using MongoDB.Driver;
 using NUnit.Framework;
 using W3ChampionsChatService.Domain;
@@ -196,6 +198,53 @@ public class MessageRepositoryTests : IntegrationTestBase
 
         CollectionAssert.AreEqual(new[] { 1L }, view.Select(m => m.Seq).ToArray(),
             "a viewer whose tag is merely a prefix of another shadow sender's tag must not see it — the anchor must be exact");
+    }
+
+    [Test]
+    public async Task UserVisible_ShadowSelfRegexResidual_StillUsesChannelIdSeqIndex_NotCollscan()
+    {
+        // Reviewer finding on C6 T2: ShadowVisibleToSelf's anchored case-insensitive regex is
+        // deliberately a residual predicate (evaluated on the FETCH stage, after ux_channelId_seq has
+        // already bounded the scan by ChannelId) rather than a query-level Collation — a Collation
+        // would force Mongo to pick an index sharing that exact collation for every predicate, and
+        // ux_channelId_seq has none, so the query would silently regress to a full COLLSCAN on this
+        // hot read path (every message page load). This pins that index-selection guarantee so a
+        // future "helpful" Collation fix for the casing issue regresses loudly instead of silently.
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        var repo = new MessageRepository(MongoClient);
+        for (var seq = 1; seq <= 20; seq++)
+        {
+            await repo.Insert(NewMessage("chan1", seq, seq % 5 == 0 ? "Wolf#456" : "Peter#123"));
+        }
+
+        // The exact filter UserVisible builds for a viewer whose casing differs from the stored
+        // sender snapshot — i.e. the shape that exercises the anchored regex disjunct.
+        var filter = MessageRepository.UserVisible("chan1", "peter#123");
+        var registry = BsonSerializer.SerializerRegistry;
+        var renderedFilter = filter.Render(new RenderArgs<ChannelMessage>(registry.GetSerializer<ChannelMessage>(), registry));
+
+        var db = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
+        var explainCommand = new BsonDocument
+        {
+            { "explain", new BsonDocument
+                {
+                    { "find", ChatCollections.Messages },
+                    { "filter", renderedFilter },
+                }
+            },
+            { "verbosity", "queryPlanner" },
+        };
+
+        var explain = await db.RunCommandAsync<BsonDocument>(explainCommand);
+        var winningPlan = explain["queryPlanner"]["winningPlan"].AsBsonDocument;
+
+        Assert.AreEqual("FETCH", winningPlan["stage"].AsString,
+            "the shadow-self regex disjunct must be applied as a residual FETCH-stage filter, not baked into index bounds");
+        var inputStage = winningPlan["inputStage"].AsBsonDocument;
+        Assert.AreEqual("IXSCAN", inputStage["stage"].AsString,
+            "UserVisible must still be served by an index scan on this hot read path, never a full collection scan");
+        Assert.AreEqual("ux_channelId_seq", inputStage["indexName"].AsString,
+            "a future Collation-based fix for the shadow-self casing rule must not silently drop this query off ux_channelId_seq");
     }
 
     [Test]
