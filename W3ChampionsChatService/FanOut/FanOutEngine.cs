@@ -312,6 +312,51 @@ public class FanOutEngine(
     }
 
     /// <summary>
+    /// C4 (Task 4, D6): the moderator-purge removal emit helper. Mirrors <see cref="PushMessageDeleted"/>
+    /// exactly, but carries a BATCH of message ids as a channel-scoped <see cref="BulkMessagesDeletedDto"/>
+    /// to the channel's FOCUSED connections, EXCLUDING <paramref name="excludedConnectionIds"/> — the hub
+    /// passes the purge target's own connection ids there (legacy <c>AllExcept(target)</c> semantics: the
+    /// purged user is not tipped off live; their own copies vanish on next reload since <c>UserVisible</c>
+    /// excludes deleted rows). A focused MODERATOR receives the SAME event and branches client-side.
+    /// <list type="bullet">
+    /// <item>Targets the FOCUSED connections only (via <see cref="FocusRegistry.GetFocusedConnections"/>):
+    /// a channel with NO focused viewers emits NOTHING (the loop simply never runs).</item>
+    /// <item>Per-recipient fault isolation mirrors <see cref="OnMessagePersisted"/>: a single recipient's
+    /// torn-down connection cannot abort delivery to the remaining focused viewers and must NEVER
+    /// propagate out — the hub has already durably soft-deleted the batch and logged its audit line;
+    /// live removal delivery is best-effort. A missed recipient's copies vanish on its next reload.</item>
+    /// </list>
+    /// The hub invokes this ONCE PER affected channel (one dto per channel), so each dto's
+    /// <see cref="BulkMessagesDeletedDto.MessageIds"/> are the purged ids for THAT channel only.
+    /// </summary>
+    public async Task PushBulkMessagesDeleted(string channelId, IReadOnlyList<string> messageIds, IReadOnlyCollection<string> excludedConnectionIds)
+    {
+        var excluded = new HashSet<string>(excludedConnectionIds);
+        var dto = new BulkMessagesDeletedDto(channelId, messageIds);
+
+        foreach (var connectionId in _focusRegistry.GetFocusedConnections(channelId))
+        {
+            // Legacy AllExcept(target) semantics: the purge target's own connections are skipped.
+            if (excluded.Contains(connectionId))
+            {
+                continue;
+            }
+
+            // Fault isolation (mirrors OnMessagePersisted): live delivery is best-effort — a missed
+            // recipient's copies vanish on its next GetMessages/reconnect anyway. One recipient's
+            // torn-down connection must not abort the rest, and must never propagate out of here.
+            try
+            {
+                await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.BulkMessagesDeleted, dto);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "Fan-out send of BulkMessagesDeleted failed for connection {ConnectionId} on channel {ChannelId} — skipping, other recipients unaffected", connectionId, channelId);
+            }
+        }
+    }
+
+    /// <summary>
     /// Disconnect hook: drops the closing connection's coalescing window state from the
     /// <see cref="ActivityCoalescer"/>. The hub already delegates all fan-out to this engine and holds
     /// no reference to the coalescer directly, so it routes the coalescer's per-connection teardown

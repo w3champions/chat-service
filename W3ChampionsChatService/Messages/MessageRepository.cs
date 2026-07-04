@@ -40,22 +40,44 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     public Task<List<ChannelMessage>> LoadForModerator(string channelId) =>
         Messages.Find(m => m.ChannelId == channelId).SortBy(m => m.Seq).ToListAsync();
 
-    /// <summary>Soft delete: sets deleted{by,at}. Physical removal happens ONLY via TTL.</summary>
-    public Task MarkDeleted(string messageId, string deletedBy, DateTime deletedAt) =>
-        Messages.UpdateOneAsync(
-            m => m.Id == messageId,
-            Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt }));
+    /// <summary>
+    /// Soft delete: sets deleted{by,at}. Physical removal happens ONLY via TTL. The write is
+    /// CONDITIONAL on <c>Deleted == null</c> (C4 Task 4 directive (a)) so a concurrent double-delete
+    /// can never overwrite the first moderator's attribution nor re-fire the caller's downstream
+    /// side-effects (cleanup/event/audit) — closing the load-then-write TOCTOU. Returns <c>true</c>
+    /// iff this call actually flipped the row (<c>ModifiedCount == 1</c>); <c>false</c> means the row
+    /// was already deleted (or vanished), and the caller must treat it as an idempotent no-op.
+    /// </summary>
+    public async Task<bool> MarkDeleted(string messageId, string deletedBy, DateTime deletedAt)
+    {
+        var filter = Builders<ChannelMessage>.Filter.And(
+            Builders<ChannelMessage>.Filter.Eq(m => m.Id, messageId),
+            Builders<ChannelMessage>.Filter.Eq(m => m.Deleted, null));
+        var update = Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt });
+
+        var result = await Messages.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
 
     /// <summary>
-    /// D6 bulk soft delete (a later C4 task's moderator purge): sets deleted{by,at} in ONE write on
-    /// every id in <paramref name="messageIds"/>. Documents not in the id list, and every OTHER field
-    /// on the matched documents (notably ExpiresAt/TTL), are left untouched — physical removal stays
-    /// TTL-only, exactly like the single-message <see cref="MarkDeleted"/>.
+    /// D6 bulk soft delete (the moderator purge): sets deleted{by,at} in ONE write on every id in
+    /// <paramref name="messageIds"/>. The filter is CONDITIONAL on <c>Deleted == null</c> (C4 Task 4
+    /// directive (a)) so a re-purge only newly-deletes (never overwriting a prior attribution), and the
+    /// returned <c>ModifiedCount</c> is the ACTUAL number of rows this call flipped — the count the
+    /// caller's audit line and UI feedback are based on. Documents not in the id list, already-deleted
+    /// rows, and every OTHER field on the matched documents (notably ExpiresAt/TTL) are left untouched —
+    /// physical removal stays TTL-only, exactly like the single-message <see cref="MarkDeleted"/>.
     /// </summary>
-    public Task MarkDeletedMany(IReadOnlyCollection<string> messageIds, string deletedBy, DateTime deletedAt) =>
-        Messages.UpdateManyAsync(
+    public async Task<long> MarkDeletedMany(IReadOnlyCollection<string> messageIds, string deletedBy, DateTime deletedAt)
+    {
+        var filter = Builders<ChannelMessage>.Filter.And(
             Builders<ChannelMessage>.Filter.In(m => m.Id, messageIds),
-            Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt }));
+            Builders<ChannelMessage>.Filter.Eq(m => m.Deleted, null));
+        var update = Builders<ChannelMessage>.Update.Set(m => m.Deleted, new MessageDeletion { By = deletedBy, At = deletedAt });
+
+        var result = await Messages.UpdateManyAsync(filter, update);
+        return result.ModifiedCount;
+    }
 
     /// <summary>
     /// D6 purge query (a later C4 task's moderator purge): every NON-deleted row sent by

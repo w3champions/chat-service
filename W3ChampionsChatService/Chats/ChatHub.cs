@@ -223,22 +223,29 @@ public partial class ChatHub(
     /// <item><see cref="Messages.MessageRepository.Load"/>; missing → <see cref="ChatResultCode.NotFound"/>.</item>
     /// <item>Resolve the message's channel and enforce the PRIVACY WALL: a <see cref="ChannelType.Dm"/>/
     /// <see cref="ChannelType.GroupDm"/> channel (or a vanished channel) → <see cref="ChatResultCode.PermissionDenied"/>,
-    /// nothing deleted — a moderator never touches private content (single-delete gets the same scope
-    /// wall as purge).</item>
-    /// <item>Idempotency: an ALREADY soft-deleted message (<c>Deleted != null</c>) →
-    /// <see cref="ChatResultCode.Ok"/> with NO event, NO cleanup, NO re-mark (the original deletion
-    /// attribution is preserved).</item>
-    /// <item>Soft-delete only — <see cref="Messages.MessageRepository.MarkDeleted"/> sets
-    /// <c>deleted{by,at}</c>; the row (and its <c>ExpiresAt</c>/TTL) survives, physical removal stays
-    /// TTL-only (NEVER a hard delete).</item>
-    /// <item>Mention-inbox cleanup (D10) <see cref="IMentionInboxCleaner.RemoveForMessages"/> — done
-    /// AFTER MarkDeleted and BEFORE the event so the inbox is cleaned even if fan-out hiccups.
-    /// DeleteMessage is this hook's first caller.</item>
+    /// nothing deleted — a moderator never touches private content. NOTE this is the TARGETED single-delete
+    /// wall (reject Dm/GroupDm/unresolvable); it is deliberately NARROWER than the blind cross-channel
+    /// <see cref="PurgeMessagesFromUser"/> sweep, whose <see cref="IsPurgeableChannel"/> wall ALSO excludes
+    /// System+Clan/System+Lobby. A single-delete acts on a specific message the moderator is already
+    /// viewing, so it is not scoped down to purge's Public/SemiPublic/Match include-list.</item>
+    /// <item>Soft-delete only, CONDITIONAL (C4 Task 4 directive (a)):
+    /// <see cref="Messages.MessageRepository.MarkDeleted"/> flips <c>deleted{by,at}</c> only while
+    /// <c>Deleted == null</c>; the row (and its <c>ExpiresAt</c>/TTL) survives, physical removal stays
+    /// TTL-only (NEVER a hard delete). The whole side-effect tail (audit + cleanup + event) is GATED on
+    /// the write having actually modified the row: an already-deleted message, or one another moderator
+    /// deleted in the load→write window, returns <see cref="ChatResultCode.Ok"/> with NO
+    /// audit/cleanup/event and the ORIGINAL attribution untouched (idempotent — closes the TOCTOU).</item>
+    /// <item>Audit-before-side-effects (C4 Task 4 directive (b)): the moderation audit
+    /// <see cref="Log.Information"/> (moderator battleTag + message id + channel id) fires IMMEDIATELY
+    /// after the durable soft-delete commits — BEFORE the cleaner and fan-out — so a committed moderation
+    /// action is always logged even if a later (C6) throwing cleaner aborts the tail.</item>
+    /// <item>Mention-inbox cleanup (D10) <see cref="IMentionInboxCleaner.RemoveForMessages"/> — AFTER the
+    /// audit and still BEFORE the event so the inbox is cleaned even if fan-out hiccups. DeleteMessage is
+    /// this hook's first caller.</item>
     /// <item>Deliver the FINAL channel-scoped <see cref="MessageDeletedDto"/> (D4) to the channel's
     /// FOCUSED viewers, EXCLUDING the moderated author's own connections (legacy <c>AllExcept(author)</c>
-    /// semantics) — a focused moderator receives the SAME event and flags client-side.</item>
-    /// <item>Audit <see cref="Log.Information"/> (ports the legacy audit line: moderator battleTag +
-    /// message id + channel id) and return <see cref="ChatResultCode.Ok"/>.</item>
+    /// semantics) — a focused moderator receives the SAME event and flags client-side. Return
+    /// <see cref="ChatResultCode.Ok"/>.</item>
     /// </list>
     /// </summary>
     [UserHasPermission(EPermission.Moderation)]
@@ -267,20 +274,28 @@ public partial class ChatHub(
             return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }
 
-        // 4. Idempotent: an already soft-deleted message is a no-op — Ok, but NO event, NO cleanup, and
-        // the original deletion attribution is left untouched (do NOT re-mark under the new moderator).
-        if (message.Deleted != null)
+        // 4. Soft-delete only (NEVER a hard delete), CONDITIONAL on Deleted == null (directive (a)): sets
+        // deleted{by,at}; the row and its ExpiresAt/TTL survive. `now` comes from the SAME injected
+        // TimeProvider the rest of the hub uses. The whole side-effect tail is GATED on this write having
+        // modified the row — an already-deleted message, or one another moderator deleted in the
+        // load->write window, returns Ok with NO audit/cleanup/event, preserving the original attribution
+        // (idempotent; closes the double-delete TOCTOU).
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var modified = await _messageRepository.MarkDeleted(messageId, moderatorBattleTag, now);
+        if (!modified)
         {
             return new ChannelOperationResult(ChatResultCode.Ok);
         }
 
-        // 5. Soft-delete only (NEVER a hard delete): sets deleted{by,at}; the row and its ExpiresAt/TTL
-        // survive. `now` comes from the SAME injected TimeProvider the rest of the hub uses.
-        var now = _timeProvider.GetUtcNow().UtcDateTime;
-        await _messageRepository.MarkDeleted(messageId, moderatorBattleTag, now);
+        // 5. Moderation audit (directive (b)): logged IMMEDIATELY after the durable soft-delete commits,
+        // BEFORE the cleaner and the fan-out — a committed moderation action must always be audited even
+        // if a later (C6) throwing cleaner aborts the tail. Ports the legacy audit line.
+        Log.Information(
+            "Moderator {ModeratorBattleTag} soft-deleted message {MessageId} in channel {ChannelId}",
+            moderatorBattleTag, messageId, channel.Id);
 
-        // 6. Mention-inbox cleanup (D10) BEFORE the event, so the inbox is purged even if fan-out
-        // hiccups. DeleteMessage is the first caller of this C4/C6 coordination surface.
+        // 6. Mention-inbox cleanup (D10) — after the audit, still BEFORE the event so the inbox is purged
+        // even if fan-out hiccups. DeleteMessage is the first caller of this C4/C6 coordination surface.
         await _mentionInboxCleaner.RemoveForMessages(new[] { messageId });
 
         // 7. Deliver the channel-scoped removal (D4) to the channel's focused viewers, EXCLUDING the
@@ -290,31 +305,120 @@ public partial class ChatHub(
         var authorConnectionIds = _connections.GetConnectionIdsForUser(message.Sender.BattleTag);
         await _fanOutEngine.PushMessageDeleted(channel.Id, messageId, authorConnectionIds);
 
-        // 8. Moderation audit (ports the legacy audit line) + typed ack.
-        Log.Information(
-            "Moderator {ModeratorBattleTag} soft-deleted message {MessageId} in channel {ChannelId}",
-            moderatorBattleTag, messageId, channel.Id);
         return new ChannelOperationResult(ChatResultCode.Ok);
     }
 
+    /// <summary>
+    /// C4 (Task 4, D6): durable CROSS-CHANNEL moderation purge of every eligible message a user sent.
+    /// <see cref="UserHasPermission"/> + <see cref="ChatHubPermissionFilter"/> already gate this on
+    /// <see cref="EPermission.Moderation"/>; the pipeline below is honored in EXACTLY this order:
+    /// <list type="number">
+    /// <item>Fail-closed moderator resolution via <see cref="ISessionRegistry.TryGetByConnectionId"/> —
+    /// no live session → <see cref="ChatResultCode.PermissionDenied"/> (no identity to attribute to).</item>
+    /// <item><see cref="Messages.MessageRepository.LoadPurgeableBySender"/> — the target's NON-deleted
+    /// rows as (Id, ChannelId), CASE-INSENSITIVE via the sender collation (so a mixed-case argument still
+    /// matches the stored casing). No date filter: "within retention" is already bounded by the TTL.</item>
+    /// <item>PRIVACY + SCOPE WALL (the pinned wall): resolve the distinct channels via
+    /// <see cref="ChannelRepository.LoadByIds"/> and keep ONLY <see cref="ChannelType.Public"/>,
+    /// <see cref="ChannelType.SemiPublic"/>, and <see cref="ChannelType.System"/> with
+    /// <see cref="SystemChannelKind.Match"/>. <see cref="ChannelType.Dm"/>/<see cref="ChannelType.GroupDm"/>
+    /// and System+<see cref="SystemChannelKind.Clan"/>/<see cref="SystemChannelKind.Lobby"/> are NEVER
+    /// purged; a row whose channel is unresolvable is dropped fail-closed (we cannot prove it is not
+    /// private).</item>
+    /// <item>CONDITIONAL bulk soft-delete (directive (a)) of the surviving eligible ids via
+    /// <see cref="Messages.MessageRepository.MarkDeletedMany"/> (filters <c>Deleted == null</c>); the
+    /// returned <c>ModifiedCount</c> is the COUNT the result + audit are based on. Zero eligible (or zero
+    /// actually modified on a re-purge) → <see cref="ChatResultCode.Ok"/> + 0 with NO side-effects
+    /// (idempotency is structural — a re-purge's load returns empty because the rows are now deleted).</item>
+    /// <item>Audit-before-side-effects (directive (b)): the audit <see cref="Log.Information"/> (moderator
+    /// battleTag + target + COUNT) fires IMMEDIATELY after the durable commit — BEFORE cleaner + fan-out.</item>
+    /// <item><see cref="IMentionInboxCleaner.RemoveForMessages"/> over the soft-deleted ids ONLY (never the
+    /// dm/clan/lobby/unresolvable ids that were never touched), then per affected channel emit
+    /// <see cref="FanOutEngine.PushBulkMessagesDeleted"/> to that channel's FOCUSED viewers MINUS the
+    /// target's own connections (resolved case-insensitively via
+    /// <see cref="ConnectionMapping.GetConnectionIdsForUser"/>).</item>
+    /// <item>Return <see cref="PurgeMessagesResult"/>(<see cref="ChatResultCode.Ok"/>, ModifiedCount).</item>
+    /// </list>
+    /// The target's own SHADOW rows in eligible channels are purged like any other row. NEVER a hard
+    /// delete — docs survive with <c>ExpiresAt</c>/TTL untouched.
+    /// </summary>
     [UserHasPermission(EPermission.Moderation)]
-    public async Task PurgeMessagesFromUser(string battleTag)
+    public async Task<PurgeMessagesResult> PurgeMessagesFromUser(string battleTag)
     {
-        var deletedMessages = _chatHistory.DeleteMessagesFromUser(battleTag);
-        if (deletedMessages.Count > 0)
+        // 1. Fail-closed: no live session → no moderator identity to attribute the purge to.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
         {
-            var adminUser = _connections.GetUser(Context.ConnectionId);
-            Log.Information("Purging {Count} messages from user {BattleTag} on request of {AdminUserName}", deletedMessages.Count, battleTag, adminUser.BattleTag);
+            return new PurgeMessagesResult(ChatResultCode.PermissionDenied, 0);
+        }
+        var moderatorBattleTag = session.Identity.BattleTag;
 
-            var authorConnectionIds = _connections.GetConnectionIdsForUser(battleTag);
-            await Clients.AllExcept(authorConnectionIds).SendAsync("BulkMessageDeleted", deletedMessages.Select(m => m.Id).ToList());
-        }
-        else
+        // 2. Load the target's non-deleted rows (case-insensitive). Already-deleted rows are excluded, so
+        // a re-purge naturally returns empty — structural idempotency, no separate guard needed.
+        var targets = await _messageRepository.LoadPurgeableBySender(battleTag);
+        if (targets.Count == 0)
         {
-            var adminUser = _connections.GetUser(Context.ConnectionId);
-            Log.Information("Purging messages from user {BattleTag} by request of {AdminUserName} failed: No messages found", battleTag, adminUser.BattleTag);
+            return new PurgeMessagesResult(ChatResultCode.Ok, 0);
         }
+
+        // 3. Privacy + scope wall: resolve the distinct channels and keep ONLY eligible types. A row whose
+        // channel is unresolvable (no doc) is absent from eligibleChannelIds → dropped fail-closed.
+        var distinctChannelIds = targets.Select(t => t.ChannelId).Distinct().ToList();
+        var channels = await _channelRepository.LoadByIds(distinctChannelIds);
+        var eligibleChannelIds = channels.Where(IsPurgeableChannel).Select(c => c.Id).ToHashSet();
+
+        var eligibleTargets = targets.Where(t => eligibleChannelIds.Contains(t.ChannelId)).ToList();
+        if (eligibleTargets.Count == 0)
+        {
+            return new PurgeMessagesResult(ChatResultCode.Ok, 0);
+        }
+        var eligibleIds = eligibleTargets.Select(t => t.Id).ToList();
+
+        // 4. Conditional bulk soft-delete (directive (a)); the actual ModifiedCount drives count + audit.
+        // Zero modified (e.g. a racing concurrent purge already flipped them) → Ok + 0, no side-effects.
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
+        var modifiedCount = await _messageRepository.MarkDeletedMany(eligibleIds, moderatorBattleTag, now);
+        if (modifiedCount == 0)
+        {
+            return new PurgeMessagesResult(ChatResultCode.Ok, 0);
+        }
+
+        // 5. Audit-before-side-effects (directive (b)): logged immediately after the durable commit,
+        // BEFORE cleaner + fan-out, so a committed purge is always audited even if a later throwing
+        // cleaner (C6) aborts the tail.
+        Log.Information(
+            "Moderator {ModeratorBattleTag} purged {Count} messages from user {BattleTag}",
+            moderatorBattleTag, modifiedCount, battleTag);
+
+        // 6. Mention-inbox cleanup over the soft-deleted ids only (the eligible-channel ids — never the
+        // dm/clan/lobby/unresolvable ids that were never touched), BEFORE the fan-out.
+        await _mentionInboxCleaner.RemoveForMessages(eligibleIds);
+
+        // 7. Per affected channel, emit the channel-scoped BulkMessagesDeletedDto to that channel's
+        // FOCUSED viewers MINUS the target's own connections (not tipped off live). A channel with no
+        // focused viewers emits nothing (handled inside the engine). Emitting the loaded eligible ids per
+        // channel is idempotent client-side even if a concurrent purge flipped a subset first.
+        var targetConnectionIds = _connections.GetConnectionIdsForUser(battleTag);
+        foreach (var group in eligibleTargets.GroupBy(t => t.ChannelId))
+        {
+            var messageIds = group.Select(t => t.Id).ToList();
+            await _fanOutEngine.PushBulkMessagesDeleted(group.Key, messageIds, targetConnectionIds);
+        }
+
+        return new PurgeMessagesResult(ChatResultCode.Ok, (int)modifiedCount);
     }
+
+    /// <summary>
+    /// The pinned purge privacy + scope wall (D6): the include-list is EXACTLY three channel shapes —
+    /// <see cref="ChannelType.Public"/>, <see cref="ChannelType.SemiPublic"/>, and
+    /// <see cref="ChannelType.System"/> with <see cref="SystemChannelKind.Match"/>. Everything else
+    /// (DM, GroupDm, System+Clan, System+Lobby) is NOT purgeable — a moderator never touches private or
+    /// out-of-scope content. Kept as a single predicate so the wall can never drift between the
+    /// filter and any future caller.
+    /// </summary>
+    private static bool IsPurgeableChannel(ChatChannel channel) =>
+        channel.Type == ChannelType.Public
+        || channel.Type == ChannelType.SemiPublic
+        || (channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match);
 
     [UserHasPermission(EPermission.Moderation)]
     public async Task BanUser(string battleTag, string reason, bool isShadowBan, string endDate)
