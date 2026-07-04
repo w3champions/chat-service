@@ -227,11 +227,14 @@ public partial class ChatHub
     /// <see cref="ChatResultCode.Throttled"/> (fail closed retriable), a target not in
     /// <c>snapshot.Friends</c> → <see cref="ChatResultCode.PermissionDenied"/>. There is deliberately NO
     /// block check here (D14: group anti-abuse is leave+unfriend, never a re-add guard).</item>
-    /// <item>Insert the membership (<see cref="MembershipRole.Member"/>, <see cref="NotificationLevel.All"/>,
-    /// <c>JoinedAt = now</c>) and <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) —
-    /// no-auto-open, seeding the added member's registry when online (offline → their next SessionState
-    /// surfaces the group). Never <see cref="EnsureCallerMembership"/> (which hardcodes
-    /// <see cref="ChannelType.Dm"/>).</item>
+    /// <item>Insert the membership IDEMPOTENTLY (<see cref="Memberships.MembershipRepository.InsertIfAbsent"/>
+    /// — <see cref="MembershipRole.Member"/>, <see cref="NotificationLevel.All"/>, <c>JoinedAt = now</c>) so
+    /// two concurrent adds of the SAME new friend (both of which read <c>null</c> at the already-member
+    /// short-circuit above and then race the <c>ux_channelId_battleTag</c> unique index) BOTH resolve to
+    /// <see cref="ChatResultCode.Ok"/> instead of one surfacing a raw E11000 duplicate-key write, then
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) — no-auto-open, seeding the added
+    /// member's registry when online (offline → their next SessionState surfaces the group). Never
+    /// <see cref="EnsureCallerMembership"/> (which hardcodes <see cref="ChannelType.Dm"/>).</item>
     /// </list>
     /// </summary>
     public async Task<ChannelOperationResult> AddGroupMember(string channelId, string targetBattleTag)
@@ -312,8 +315,13 @@ public partial class ChatHub
             NotificationLevel = NotificationLevel.All,
             JoinedAt = now,
         };
-        await _membershipRepository.Insert(membership);
-        await _fanOutEngine.PushChannelAdded(channel, membership, focus: false);
+        // Idempotent insert (SEC-Low-2): two concurrent AddGroupMember calls for the same new friend both
+        // pass the already-member short-circuit above (each read null), then race the ux_channelId_battleTag
+        // unique index. Plain Insert would let one caller hit an unhandled E11000 MongoWriteException;
+        // InsertIfAbsent resolves both to the existing-or-inserted row (never null on success), so both
+        // return Ok. Push the returned row (equivalent to the locally-built one) when present.
+        var inserted = await _membershipRepository.InsertIfAbsent(membership);
+        await _fanOutEngine.PushChannelAdded(channel, inserted ?? membership, focus: false);
 
         return new ChannelOperationResult(ChatResultCode.Ok);
     }

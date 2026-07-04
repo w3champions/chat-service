@@ -250,13 +250,27 @@ public class FanOutEngine(
             return;
         }
 
+        // AUTHORITATIVE — must always run (it precedes the best-effort send): seeding the registry is what
+        // makes this channel's activity fan-out reach the connection from the very next message.
         _onlineMemberRegistry.Join(
             channel.Id,
             session.ConnectionId,
             new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type));
 
         var dto = new ChannelAddedDto(channel, MembershipDto.From(membership), focus);
-        await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelAdded, dto);
+        // Fault isolation (review fix, SEC-Low-3): the ChannelAdded push is a BEST-EFFORT live
+        // notification — the channel + membership are already durably persisted and the registry seeded
+        // above, and a reconnecting client re-derives its channel list from SessionState, so a torn-down
+        // target connection throwing from SendAsync must NEVER propagate out of the caller
+        // (AddGroupMember/OpenDm/CreateGroup) after its durable mutation already succeeded.
+        try
+        {
+            await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelAdded, dto);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Push of ChannelAdded failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, session.ConnectionId, channel.Id);
+        }
     }
 
     /// <summary>
@@ -295,6 +309,8 @@ public class FanOutEngine(
             return;
         }
 
+        // AUTHORITATIVE — must always run (they precede the best-effort send): clearing the registry/focus
+        // is what guarantees this connection is never fanned out to (activity or focus) after the removal.
         // C5/C7 WIRING NOTE: see the doc comment above — a currently-focused viewer's removal does not
         // route through ViewersAccumulator.RecordChange here, so remaining viewers get no ViewersChanged
         // {left} for this forced removal (Task 14 parity gap, deliberately deferred to the eventual caller).
@@ -302,7 +318,19 @@ public class FanOutEngine(
         _focusRegistry.Unfocus(session.ConnectionId, channelId);
 
         var dto = new ChannelRemovedDto(channelId);
-        await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelRemoved, dto);
+        // Fault isolation (review fix, SEC-Low-3): the ChannelRemoved push is a BEST-EFFORT live
+        // notification — the membership row is already durably removed and the registry/focus cleared
+        // above, and a reconnecting client re-derives its channel list from SessionState, so a torn-down
+        // target connection throwing from SendAsync must NEVER propagate out of the caller
+        // (RemoveGroupMember) after its durable mutation already succeeded.
+        try
+        {
+            await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelRemoved, dto);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Push of ChannelRemoved failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, session.ConnectionId, channelId);
+        }
     }
 
     /// <summary>

@@ -756,4 +756,169 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
         Assert.That((await hub.PromoteOwner("c", "x#1")).Code, Is.EqualTo(ChatResultCode.PermissionDenied));
         Assert.That((await hub.RenameGroup("c", "New")).Code, Is.EqualTo(ChatResultCode.PermissionDenied));
     }
+
+    // ================================================================================================
+    // Group 10 — post-review hardening fences (owner-oracle ordering; stale-snapshot; push fault isolation)
+    // ================================================================================================
+
+    [Test]
+    public async Task Remove_AbsentTarget_ByOwner_NotFound()
+    {
+        // An OWNER clears the owner gate, then the target-existence check fires: removing a battleTag that
+        // is NOT a member ⇒ NotFound. Locks the owner-passes-then-target-missing branch (only an owner ever
+        // reaches this existence signal — that is WHY the owner gate precedes it).
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        PutOnline("conn-owner", channel.Id, "owner#1");
+
+        var result = await BuildHub("conn-owner").RemoveGroupMember(channel.Id, "ghost#9");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.NotFound), "an owner removing a non-member reaches the existence check and gets NotFound");
+    }
+
+    [Test]
+    public async Task Promote_AbsentTarget_ByOwner_NotFound()
+    {
+        // Mirror of Remove: an OWNER promoting a non-member reaches the target-existence check ⇒ NotFound.
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        PutOnline("conn-owner", channel.Id, "owner#1");
+
+        var result = await BuildHub("conn-owner").PromoteOwner(channel.Id, "ghost#9");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.NotFound), "an owner promoting a non-member reaches the existence check and gets NotFound");
+    }
+
+    [Test]
+    public async Task Remove_ByNonOwner_NullTarget_PermissionDenied()
+    {
+        // The anti-oracle wall: a NON-owner passing a null/whitespace target gets PermissionDenied (NOT a
+        // HubException) because the caller-owner gate PRECEDES the null-target HubException guard. A non-owner
+        // must never get a DIFFERENT signal for a null vs a real target — that asymmetry would itself leak
+        // that the owner check ran. RED-verify: hoisting the null-guard above the owner gate flips this to
+        // HubException (confirmed during hardening, then reverted).
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        await SeedMembership(channel.Id, "member#2", MembershipRole.Member, Now);
+        PutOnline("conn-m2", channel.Id, "member#2");
+        var hub = BuildHub("conn-m2");
+
+        Assert.That((await hub.RemoveGroupMember(channel.Id, null)).Code, Is.EqualTo(ChatResultCode.PermissionDenied), "a non-owner with a null target is denied at the owner gate, never reaching the null-target HubException");
+        Assert.That((await hub.RemoveGroupMember(channel.Id, "   ")).Code, Is.EqualTo(ChatResultCode.PermissionDenied), "same for a whitespace target");
+    }
+
+    [Test]
+    public async Task Promote_ByNonOwner_NullTarget_PermissionDenied()
+    {
+        // Mirror of Remove: a NON-owner promoting with a null/whitespace target is denied at the owner gate,
+        // NOT via the HubException null-guard (which sits after it). RED-verify as for Remove above.
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        await SeedMembership(channel.Id, "member#2", MembershipRole.Member, Now);
+        PutOnline("conn-m2", channel.Id, "member#2");
+        var hub = BuildHub("conn-m2");
+
+        Assert.That((await hub.PromoteOwner(channel.Id, null)).Code, Is.EqualTo(ChatResultCode.PermissionDenied), "a non-owner with a null target is denied at the owner gate, never reaching the null-target HubException");
+        Assert.That((await hub.PromoteOwner(channel.Id, "   ")).Code, Is.EqualTo(ChatResultCode.PermissionDenied), "same for a whitespace target");
+    }
+
+    [Test]
+    public async Task Remove_ByOwner_NullTarget_HubException()
+    {
+        // The owner-side of the asymmetry (D18 client-bug mapping): an OWNER who clears the owner gate then
+        // passes a null/whitespace target hits the null-target guard and gets a HubException. Together with
+        // Remove_ByNonOwner_NullTarget_PermissionDenied this pins the exact owner-first ordering the
+        // anti-oracle wall depends on. Only AddGroupMember previously pinned the owner null-target throw.
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        PutOnline("conn-owner", channel.Id, "owner#1");
+        var hub = BuildHub("conn-owner");
+
+        Assert.That(async () => await hub.RemoveGroupMember(channel.Id, null), Throws.TypeOf<HubException>());
+        Assert.That(async () => await hub.RemoveGroupMember(channel.Id, "   "), Throws.TypeOf<HubException>());
+    }
+
+    [Test]
+    public async Task Promote_ByOwner_NullTarget_HubException()
+    {
+        // Mirror of Remove: an OWNER promoting with a null/whitespace target throws HubException (D18).
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        PutOnline("conn-owner", channel.Id, "owner#1");
+        var hub = BuildHub("conn-owner");
+
+        Assert.That(async () => await hub.PromoteOwner(channel.Id, null), Throws.TypeOf<HubException>());
+        Assert.That(async () => await hub.PromoteOwner(channel.Id, "   "), Throws.TypeOf<HubException>());
+    }
+
+    [Test]
+    public async Task OrdinaryMemberLeaves_OwnerRemains_NoPromotionNoDeletion()
+    {
+        // An ORDINARY member leaving a group that still has an owner: HandleGroupDeparture no-ops (an owner
+        // remains) — the channel survives, nothing is promoted, remaining members keep their roles, and only
+        // the leaver's row is gone. Complements OwnerLeaves_OtherOwnerRemains (owner-leaves path) and
+        // LastMemberLeaves (empty-deletion path).
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        await SeedMembership(channel.Id, "member#2", MembershipRole.Member, Now.AddMinutes(1));
+        await SeedMembership(channel.Id, "member#3", MembershipRole.Member, Now.AddMinutes(2));
+        PutOnline("conn-m2", channel.Id, "member#2");
+
+        var result = await BuildHub("conn-m2").LeaveChannel(channel.Id);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(await _channelRepository.Load(channel.Id), Is.Not.Null, "the channel survives an ordinary member's departure");
+        Assert.That(await _membershipRepository.Load(channel.Id, "member#2"), Is.Null, "only the leaver's row is gone");
+        Assert.That((await _membershipRepository.Load(channel.Id, "owner#1")).Role, Is.EqualTo(MembershipRole.Owner), "the owner remains sole owner — no promotion");
+        Assert.That((await _membershipRepository.Load(channel.Id, "member#3")).Role, Is.EqualTo(MembershipRole.Member), "the remaining ordinary member keeps its role");
+        Assert.That((await _membershipRepository.LoadForChannel(channel.Id)).Count(m => m.Role == MembershipRole.Owner), Is.EqualTo(1), "exactly one owner (the original) after an ordinary leave");
+    }
+
+    [Test]
+    public async Task AddGroupMember_StaleSnapshot_ThrottledRetriable_NothingPersisted()
+    {
+        // Warm a FRESH snapshot for the caller (the target IS the caller's friend) so the provider's cache
+        // is populated, then take the source down and advance past RelationshipCacheTtl. The provider's
+        // tier-2 refresh fails and it falls back to the STALE last-known snapshot (tier 3, spec §14) rather
+        // than throwing — so this exercises AddGroupMember's OWN stricter freshness check
+        // (`!snapshot.IsFresh(now)`), distinct from the fully-unavailable/no-cache throw-path covered by
+        // Add_WbDown_ThrottledRetriable above. Mirrors CreateGroup_StaleSnapshot_...
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        PutOnline("conn-owner", channel.Id, "owner#1");
+        SetFriends("owner#1", "newbie#3");
+        await _relationshipProvider.GetSnapshotAsync("owner#1"); // warm a FRESH snapshot at FixedNow
+        _relationshipSource.ShouldThrow = true;
+        _time.Advance(ChatLimits.RelationshipCacheTtl + TimeSpan.FromMinutes(1));
+
+        var result = await BuildHub("conn-owner").AddGroupMember(channel.Id, "newbie#3");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Throttled), "a STALE relationship snapshot fails closed (retriable) — the group add friends-gate requires freshness, unlike the 1:1 delivery block-check");
+        Assert.That(result.RetryAfterSeconds, Is.EqualTo(ChatLimits.RelationshipRetryAfterSeconds));
+        Assert.That(await _membershipRepository.Load(channel.Id, "newbie#3"), Is.Null, "no membership persisted on a stale-snapshot reject");
+    }
+
+    [Test]
+    public async Task Remove_ByOwner_TargetPushThrows_StillOk_MembershipGone()
+    {
+        // PROD FIX 2 (SEC-Low-3, push fault isolation): a torn-down TARGET connection throwing from the
+        // ChannelRemoved push must NOT propagate out of RemoveGroupMember — the durable delete already
+        // succeeded and the registry/focus were already cleared (both precede the wrapped send), so the
+        // owner still gets Ok and the dropped notification heals via SessionState on the target's reconnect.
+        // Without PROD FIX 2 the raw SendAsync would throw straight out of RemoveGroupMember and fail here.
+        var channel = await SeedGroupChannel();
+        await SeedMembership(channel.Id, "owner#1", MembershipRole.Owner, Now);
+        await SeedMembership(channel.Id, "victim#2", MembershipRole.Member, Now);
+        PutOnline("conn-owner", channel.Id, "owner#1");
+        PutOnline("conn-victim", channel.Id, "victim#2");
+        await BuildHub("conn-victim").FocusChannel(channel.Id); // so the Unfocus assertion below is meaningful
+        _harness.ThrowOnSend("conn-victim"); // the target's live connection faults on the ChannelRemoved push
+
+        var result = await BuildHub("conn-owner").RemoveGroupMember(channel.Id, "victim#2");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "the push fault is isolated — the owner still gets Ok after the durable delete");
+        Assert.That(await _membershipRepository.Load(channel.Id, "victim#2"), Is.Null, "the removed member's row is gone despite the push fault");
+        Assert.That(_onlineMemberRegistry.IsMember("conn-victim", channel.Id), Is.False, "the registry Leave ran (it precedes the wrapped send)");
+        Assert.That(_focusRegistry.GetFocusedChannels("conn-victim"), Is.Empty, "the focus Unfocus ran (it precedes the wrapped send)");
+    }
 }
