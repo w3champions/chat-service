@@ -72,6 +72,7 @@ public class MuteReconciliationTests : IntegrationTestBase
             new SessionStateAssembler(
                 new MembershipRepository(MongoClient, _channelRepository),
                 _channelRepository,
+                new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
                 _muteRepository,
                 chatAuthService.Object,
                 _onlineMemberRegistry,

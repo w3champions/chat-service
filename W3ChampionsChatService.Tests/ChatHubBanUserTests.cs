@@ -72,6 +72,7 @@ public class ChatHubBanUserTests : IntegrationTestBase
             new SessionStateAssembler(
                 _membershipRepository,
                 _channelRepository,
+                _messageRepository,
                 _muteRepository,
                 chatAuthService.Object,
                 _onlineMemberRegistry,

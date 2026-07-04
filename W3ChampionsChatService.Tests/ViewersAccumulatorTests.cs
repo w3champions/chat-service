@@ -288,6 +288,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
+            new MessageRepository(MongoClient),
             _muteRepository,
             _authService.Object,
             _onlineMemberRegistry,

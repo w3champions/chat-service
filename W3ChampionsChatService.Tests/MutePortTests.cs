@@ -119,7 +119,7 @@ public class MutePortTests : IntegrationTestBase
     // ── Hub construction ─────────────────────────────────────────────────────────
 
     private SessionStateAssembler NewAssembler(IMuteRepository muteRepository) =>
-        new(_membershipRepository, _channelRepository, muteRepository, _authService.Object, _onlineMemberRegistry, _connectionMapping);
+        new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _authService.Object, _onlineMemberRegistry, _connectionMapping);
 
     private ChatHub NewHub(SessionStateAssembler assembler, ViewersAccumulator viewers, IHubCallerClients clients, HubCallerContext context)
     {

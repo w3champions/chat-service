@@ -82,6 +82,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
         var assembler = new SessionStateAssembler(
             new MembershipRepository(MongoClient, _channelRepository),
             _channelRepository,
+            _messageRepository,
             _muteRepository,
             chatAuthenticationService.Object,
             _onlineMemberRegistry,

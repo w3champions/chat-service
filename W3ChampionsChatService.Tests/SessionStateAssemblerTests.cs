@@ -10,6 +10,7 @@ using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
 
@@ -26,6 +27,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
 {
     private ChannelRepository _channelRepository;
     private MembershipRepository _membershipRepository;
+    private MessageRepository _messageRepository;
     private MuteRepository _muteRepository;
     private Mock<IChatAuthenticationService> _chatAuthService;
     private OnlineMemberRegistry _onlineMemberRegistry;
@@ -37,6 +39,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     {
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
+        _messageRepository = new MessageRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _connectionMapping = new ConnectionMapping();
@@ -58,6 +61,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
+            _messageRepository,
             _muteRepository,
             _chatAuthService.Object,
             _onlineMemberRegistry,
@@ -91,6 +95,23 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             JoinedAt = DateTime.UtcNow,
         });
 
+    // Seeds a durable message row with an explicit Seq and visibility class, so a test can assert the
+    // D7 count-based unread against a KNOWN mix of visible / foreign-shadow / soft-deleted rows. Seq is
+    // set explicitly (not via AllocateSeq) so the row's position relative to a member's read cursor is
+    // deterministic and independent of channel.LastSeq — the whole point of D7 is that unread no longer
+    // derives from LastSeq.
+    private Task InsertMessage(string channelId, string senderBattleTag, long seq, bool shadow = false, bool deleted = false) =>
+        _messageRepository.Insert(new ChannelMessage
+        {
+            ChannelId = channelId,
+            Seq = seq,
+            Sender = new MessageSender { BattleTag = senderBattleTag, Name = senderBattleTag.Split('#')[0] },
+            Content = $"msg-{seq}",
+            SentAt = DateTime.UtcNow,
+            Shadow = shadow,
+            Deleted = deleted ? new MessageDeletion { By = "admin#1", At = DateTime.UtcNow } : null,
+        });
+
     private Task FullBan(string battleTag, DateTime endDate) =>
         _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
@@ -120,6 +141,19 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         await InsertMembership(chanA.Id, identity.BattleTag, lastReadSeq: 4, level: NotificationLevel.Mentions, role: MembershipRole.Owner);
         await InsertMembership(chanB.Id, identity.BattleTag, lastReadSeq: 5, level: NotificationLevel.All, role: MembershipRole.Member); // LastReadSeq > LastSeq: clamp
 
+        // D7 (Amendment 3): unread is now the COUNT of user-visible rows after the read cursor, so the
+        // channels must carry real message rows for it to be non-zero (the old LastSeq−LastReadSeq
+        // formula ignored the rows entirely). Every row here is plain/visible, so the count still equals
+        // the old seq delta — pinning that D7 is a REFINEMENT of the formula, not a rewrite.
+        for (var seq = 1L; seq <= 10; seq++)
+        {
+            await InsertMessage(chanA.Id, identity.BattleTag, seq);
+        }
+        for (var seq = 1L; seq <= 3; seq++)
+        {
+            await InsertMessage(chanB.Id, identity.BattleTag, seq);
+        }
+
         var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow);
 
         Assert.AreEqual(2, dto.Channels.Count);
@@ -129,13 +163,117 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         Assert.AreEqual(NotificationLevel.Mentions, a.Membership.NotificationLevel);
         Assert.AreEqual(4L, a.Membership.LastReadSeq);
         Assert.AreEqual(MembershipRole.Owner, a.Membership.Role);
-        Assert.AreEqual(6L, a.UnreadCount, "unreadCount = channel.LastSeq(10) - membership.LastReadSeq(4)");
+        Assert.AreEqual(6L, a.UnreadCount, "D7: unread = count of visible rows after LastReadSeq(4) = 6 (equals the old LastSeq(10)−LastReadSeq(4) on a clean channel)");
         Assert.IsTrue(a.HasUnread);
 
         var b = dto.Channels.Single(c => c.Channel.Id == chanB.Id);
-        Assert.AreEqual(0L, b.UnreadCount, "unreadCount must clamp to 0, never go negative");
+        Assert.AreEqual(0L, b.UnreadCount, "no visible rows after LastReadSeq(5) (max seq is 3) — unread is naturally 0, never negative");
         Assert.IsFalse(b.HasUnread);
         Assert.AreEqual(MembershipRole.Member, b.Membership.Role);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // D7 (Amendment 3) — connect-time unread is the COUNT of USER-VISIBLE rows after the read cursor,
+    // NOT channel.LastSeq − membership.LastReadSeq. This deliberately REVISES C3's provisional formula
+    // so a shadow-banned author's message (or a soft-deleted message) generates NO phantom unread for
+    // OTHER members on reconnect (pinned acceptance 2 — the reconnect leg of "shadow messages generate
+    // NO unread for others").
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Assemble_Unread_ExcludesForeignShadowRows()
+    {
+        // Member B reconnects after A's shadow send. The shadow row advanced channel.LastSeq (so the old
+        // LastSeq−LastReadSeq formula would report 1 phantom unread), but it is invisible to B — the
+        // count-based unread must be 0.
+        var chan = await InsertChannel(ChannelType.Public, "General", lastSeq: 1);
+        var viewer = Identity("Bravo#2");
+        await InsertMembership(chan.Id, viewer.BattleTag, lastReadSeq: 0);
+        await InsertMessage(chan.Id, "Alpha#1", seq: 1, shadow: true);
+
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-b", DateTime.UtcNow);
+
+        var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
+        Assert.AreEqual(0L, c.UnreadCount, "a foreign author's shadow row must generate NO unread for other members");
+        Assert.IsFalse(c.HasUnread);
+    }
+
+    [Test]
+    public async Task Assemble_Unread_ExcludesSoftDeletedRows()
+    {
+        // A moderator soft-deleted the only message after B's cursor. It still advanced LastSeq (old
+        // formula → 1 phantom), but a soft-deleted row is invisible to everyone — unread must be 0.
+        var chan = await InsertChannel(ChannelType.Public, "General", lastSeq: 1);
+        var viewer = Identity("Bravo#2");
+        await InsertMembership(chan.Id, viewer.BattleTag, lastReadSeq: 0);
+        await InsertMessage(chan.Id, "Alpha#1", seq: 1, deleted: true);
+
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-b", DateTime.UtcNow);
+
+        var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
+        Assert.AreEqual(0L, c.UnreadCount, "a soft-deleted row must generate NO phantom unread after a purge");
+        Assert.IsFalse(c.HasUnread);
+    }
+
+    [Test]
+    public async Task Assemble_Unread_IncludesViewersOwnShadowRows()
+    {
+        // Symmetric illusion: a shadow-banned author must still see their OWN message as delivered, so
+        // their own shadow row DOES count toward THEIR own unread (CountUserVisibleAfter includes it via
+        // the sender == viewer disjunct).
+        var author = Identity("Alpha#1");
+        var chan = await InsertChannel(ChannelType.Public, "General", lastSeq: 1);
+        await InsertMembership(chan.Id, author.BattleTag, lastReadSeq: 0);
+        await InsertMessage(chan.Id, author.BattleTag, seq: 1, shadow: true);
+
+        var (dto, _) = await _assembler.AssembleAndSeed(author, "conn-a", DateTime.UtcNow);
+
+        var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
+        Assert.AreEqual(1L, c.UnreadCount, "the viewer's OWN shadow rows count toward their own unread — the symmetric illusion");
+        Assert.IsTrue(c.HasUnread);
+    }
+
+    [Test]
+    public async Task Assemble_Unread_PlainMessages_MatchesLastSeqMath()
+    {
+        // Equivalence pin: on a CLEAN channel (no shadow/deleted rows) the count-based unread equals the
+        // old channel.LastSeq − membership.LastReadSeq — proving D7 is a refinement, not a rewrite.
+        const long lastSeq = 5;
+        const long lastReadSeq = 2;
+        var chan = await InsertChannel(ChannelType.Public, "General", lastSeq: lastSeq);
+        var viewer = Identity("Peter#123");
+        await InsertMembership(chan.Id, viewer.BattleTag, lastReadSeq: lastReadSeq);
+        for (var seq = 1L; seq <= lastSeq; seq++)
+        {
+            await InsertMessage(chan.Id, viewer.BattleTag, seq);
+        }
+
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-1", DateTime.UtcNow);
+
+        var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
+        Assert.AreEqual(lastSeq - lastReadSeq, c.UnreadCount, "on a clean channel the count-based unread equals LastSeq − LastReadSeq");
+        Assert.AreEqual(3L, c.UnreadCount);
+        Assert.IsTrue(c.HasUnread);
+    }
+
+    [Test]
+    public async Task Assemble_Unread_ClampedNonNegative()
+    {
+        // A read cursor ahead of every existing row (e.g. after MarkRead clamped to a LastSeq whose top
+        // rows are invisible) yields a count of 0 — never a negative unread.
+        var chan = await InsertChannel(ChannelType.Public, "General", lastSeq: 3);
+        var viewer = Identity("Peter#123");
+        await InsertMembership(chan.Id, viewer.BattleTag, lastReadSeq: 5);
+        for (var seq = 1L; seq <= 3; seq++)
+        {
+            await InsertMessage(chan.Id, viewer.BattleTag, seq);
+        }
+
+        var (dto, _) = await _assembler.AssembleAndSeed(viewer, "conn-1", DateTime.UtcNow);
+
+        var c = dto.Channels.Single(x => x.Channel.Id == chan.Id);
+        Assert.AreEqual(0L, c.UnreadCount, "no rows after the cursor → unread 0, never negative");
+        Assert.IsFalse(c.HasUnread);
     }
 
     [Test]

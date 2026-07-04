@@ -123,6 +123,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
+            _messageRepository,
             _muteRepository,
             _authService.Object,
             _onlineMemberRegistry,

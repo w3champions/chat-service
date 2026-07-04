@@ -94,6 +94,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
+            new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             _muteRepository,
             _authService.Object,
             _onlineMemberRegistry,

@@ -91,6 +91,7 @@ public class ChatHubMarkReadTests : IntegrationTestBase
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
+            _messageRepository,
             _muteRepository,
             _authService.Object,
             _onlineMemberRegistry,
@@ -328,6 +329,41 @@ public class ChatHubMarkReadTests : IntegrationTestBase
 
         var channelDto = dto.Channels.Single(c => c.Channel.Id == channel.Id);
         Assert.AreEqual(0L, channelDto.UnreadCount);
+        Assert.IsFalse(channelDto.HasUnread);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // D7 × MarkRead's clamp coexist (Task 6 does NOT change MarkRead) — a reconnect-assembled unread
+    // still reads 0 after an inflated MarkRead clamps to channel.LastSeq.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task MarkRead_ClampToLastSeq_ThenAssemble_UnreadZero()
+    {
+        var channel = await CreateChannel();
+        await SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 1; i <= 4; i++)
+        {
+            await SeedMessage(channel.Id, BattleTag, $"seed-{i}");
+        }
+
+        // An inflated MarkRead clamps to the channel's actual LastSeq (4) — the clamp Task 6 leaves
+        // untouched; clamping to a seq whose rows are all visible-and-read is harmless.
+        var markReadResult = await hub.MarkRead(channel.Id, seq: 1000);
+        Assert.AreEqual(ChatResultCode.Ok, markReadResult.Code);
+
+        var persisted = await _membershipRepository.Load(channel.Id, BattleTag);
+        Assert.AreEqual(4L, persisted.LastReadSeq, "an inflated MarkRead must clamp to the channel's actual LastSeq");
+
+        // A fresh reconnect assembles SessionState straight from the durable stores — the count-based
+        // (D7) unread reads 0 because every visible row is at or below the clamped cursor.
+        var identity = new W3CUserAuthentication { BattleTag = BattleTag, Name = BattleTag.Split('#')[0] };
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-reconnect", Now);
+
+        var channelDto = dto.Channels.Single(c => c.Channel.Id == channel.Id);
+        Assert.AreEqual(0L, channelDto.UnreadCount, "clamp + count-based unread coexist — unread is 0 after the clamped MarkRead");
         Assert.IsFalse(channelDto.HasUnread);
     }
 

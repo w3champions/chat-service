@@ -8,6 +8,7 @@ using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 
 namespace W3ChampionsChatService.Protocol;
@@ -33,6 +34,7 @@ namespace W3ChampionsChatService.Protocol;
 public class SessionStateAssembler(
     MembershipRepository membershipRepository,
     ChannelRepository channelRepository,
+    MessageRepository messageRepository,
     IMuteRepository muteRepository,
     IChatAuthenticationService chatAuthenticationService,
     OnlineMemberRegistry onlineMemberRegistry,
@@ -71,10 +73,19 @@ public class SessionStateAssembler(
             .Where(m => channelsById.ContainsKey(m.ChannelId))
             .ToList();
 
+        // D7 (Amendment 3): unread is computed per channel as the COUNT of user-visible rows after the
+        // member's read cursor (see ToChannelDto) — an async, index-bounded Mongo count per membership.
+        // Sequential await (not Task.WhenAll): memberships are bounded (the public+semiPublic cap plus
+        // DMs/groups/match), and each count is a fast indexed range count, so the simpler sequential loop
+        // is preferred over parallelizing across the Mongo connection pool.
+        var channelDtos = new List<ChannelDto>(channelBackedMemberships.Count);
+        foreach (var membership in channelBackedMemberships)
+        {
+            channelDtos.Add(await ToChannelDto(channelsById[membership.ChannelId], membership, identity.BattleTag));
+        }
+
         var dto = new SessionStateDto(
-            Channels: channelBackedMemberships
-                .Select(m => ToChannelDto(channelsById[m.ChannelId], m))
-                .ToList(),
+            Channels: channelDtos,
             PublicCatalog: effectivePublicCatalog,
             PendingDmRequests: Array.Empty<object>(),
             MentionUnreadCount: 0,
@@ -95,9 +106,26 @@ public class SessionStateAssembler(
         return mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
     }
 
-    private static ChannelDto ToChannelDto(ChatChannel channel, ChannelMembership membership)
+    private async Task<ChannelDto> ToChannelDto(ChatChannel channel, ChannelMembership membership, string viewerBattleTag)
     {
-        var unreadCount = Math.Max(0L, channel.LastSeq - membership.LastReadSeq);
+        // D7 (Amendment 3): unread is the COUNT of USER-VISIBLE rows after the member's read cursor —
+        // NOT channel.LastSeq − membership.LastReadSeq. That raw-seq delta counts INVISIBLE rows
+        // (foreign-author shadow rows + soft-deleted rows), so on reconnect it produced PHANTOM unread
+        // for a shadow-banned author's message or a purged message — the exact defect pinned acceptance 2
+        // ("shadow messages generate NO unread for others") forbids. CountUserVisibleAfter applies the
+        // UserVisible predicate (Deleted == null AND (Shadow == false OR sender == viewer)) with
+        // Seq > LastReadSeq, index-bounded on ux_channelId_seq. The viewer's OWN shadow rows still count
+        // toward THEIR own unread (via the sender == viewer disjunct) — the symmetric illusion.
+        //
+        // KNOWN LIVE-PATH RESIDUAL (documented here, deliberately NOT fixed — a launcher/L4 concern, out
+        // of C4 scope, and self-healing): this fixes the CONNECT-time snapshot only. A shadow/soft-deleted
+        // row still advances channel.LastSeq. The server pushes NO ChannelActivity for a shadow message
+        // (C3 constraint), but when a LATER real message fires ChannelActivity{lastSeq}, the client's live
+        // math (lastSeq − lastReadSeq, spec §7) transiently OVER-counts by the number of invisible rows in
+        // the unread gap — until the next MarkRead (sets lastReadSeq to the max VISIBLE seq the member
+        // rendered → the count returns to correct) or the next reconnect (re-baselines via this D7
+        // snapshot). Bounded, rare (shadow bans are rare), and self-healing.
+        var unreadCount = await messageRepository.CountUserVisibleAfter(channel.Id, viewerBattleTag, membership.LastReadSeq);
         return new ChannelDto(
             channel,
             MembershipDto.From(membership),

@@ -31,8 +31,11 @@ public record SessionStateDto(
 /// One entry of the caller's channel list: channel metadata (the raw <see cref="ChatChannel"/> —
 /// nothing on it is boundary-private, mirroring the existing <c>JoinChannelResult</c> precedent of
 /// reusing domain types directly in a wire DTO) plus this user's own membership projection and
-/// computed unread state. <see cref="UnreadCount"/> = max(0, channel.LastSeq -
-/// membership.LastReadSeq); <see cref="HasUnread"/> = UnreadCount &gt; 0.
+/// computed unread state. D7 (Amendment 3): <see cref="UnreadCount"/> is the COUNT of USER-VISIBLE rows
+/// after the member's read cursor (<c>MessageRepository.CountUserVisibleAfter</c>) — NOT the raw
+/// channel.LastSeq − membership.LastReadSeq delta, which would count invisible foreign-author shadow
+/// rows and soft-deleted rows and so generate phantom unread on reconnect. <see cref="HasUnread"/> =
+/// UnreadCount &gt; 0.
 /// </summary>
 public record ChannelDto(
     ChatChannel Channel,
