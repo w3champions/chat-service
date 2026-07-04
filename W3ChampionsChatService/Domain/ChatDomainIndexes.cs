@@ -5,6 +5,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Domain;
 
@@ -32,6 +33,7 @@ public static class ChatDomainIndexes
         await EnsureMembershipIndexes(db);
         await EnsureMessageIndexes(db);
         await EnsureMentionInboxIndexes(db);
+        await EnsureUserDirectoryIndexes(db);
     }
 
     private static async Task EnsureChannelIndexes(IMongoDatabase db)
@@ -129,6 +131,25 @@ public static class ChatDomainIndexes
             new CreateIndexModel<MentionInboxEntry>(
                 Builders<MentionInboxEntry>.IndexKeys.Ascending(e => e.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
+        ]);
+    }
+
+    /// <summary>
+    /// C6 T2 (C1 amendment 2 — the one domain index C1 missed): backs the tiered mention search's
+    /// tier-3 directory scan (<see cref="Users.UserDirectoryRepository.SearchByNormalizedPrefix"/>) —
+    /// the compound key lets a NormalizedName prefix bound AND the 90d LastSeenAt activity gate both
+    /// stay index-served in one scan. Non-unique (defensive: legacy/test stub rows could collide on
+    /// name-only values; battle.net tags are case-insensitively unique in reality, and the collection's
+    /// real uniqueness is already enforced by the lowercased <c>_id</c>).
+    /// </summary>
+    private static async Task EnsureUserDirectoryIndexes(IMongoDatabase db)
+    {
+        var directory = db.GetCollection<UserDirectoryEntry>(ChatCollections.UserDirectory);
+        await directory.Indexes.CreateManyAsync(
+        [
+            new CreateIndexModel<UserDirectoryEntry>(
+                Builders<UserDirectoryEntry>.IndexKeys.Ascending(e => e.NormalizedName).Descending(e => e.LastSeenAt),
+                new CreateIndexOptions { Name = "ix_normalizedName_lastSeenAt" }),
         ]);
     }
 }

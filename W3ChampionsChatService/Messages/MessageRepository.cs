@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using W3ChampionsChatService.Domain;
 
@@ -28,9 +30,34 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         return filter.And(
             filter.Eq(m => m.ChannelId, channelId),
             filter.Eq(m => m.Deleted, null),
-            filter.Or(
-                filter.Eq(m => m.Shadow, false),
-                filter.Eq(m => m.Sender.BattleTag, viewerBattleTag)));
+            ShadowVisibleToSelf(viewerBattleTag));
+    }
+
+    /// <summary>
+    /// C6 T2 (D8, C5 handoff): the shadow-self disjunct of <see cref="UserVisible"/> /
+    /// <see cref="CountUserVisibleAfter"/> — a message is visible if it is NOT shadow-banned, OR its
+    /// sender IS the viewer. The self-match leg is an ANCHORED case-insensitive regex
+    /// (<c>^escaped$</c>, option "i") rather than a plain <c>==</c>, because <c>viewerBattleTag</c> (the
+    /// caller's JWT casing) and the stored <see cref="MessageSender.BattleTag"/> snapshot (the sender's
+    /// JWT casing AT SEND TIME) can legitimately differ in case for the SAME user — a case-sensitive
+    /// compare could hide a user's own shadow-banned messages from themselves. Deliberately NOT a
+    /// query-level <see cref="FindOptions.Collation"/>: a collation on this query would force Mongo to
+    /// pick an index sharing that exact collation for EVERY predicate, breaking the <c>ChannelId</c>
+    /// equality's use of <c>ux_channelId_seq</c> (which has no collation) and silently falling back to a
+    /// full collection scan — the anchored regex is evaluated as a residual predicate AFTER the index
+    /// has already bounded the scan by ChannelId, so index selection is untouched. This ONLY ever
+    /// widens visibility in the self-match direction (a viewer now sees more of their OWN shadow rows
+    /// than an exact-casing match found) — the <c>Deleted == null</c> leg and the "shadow==false is
+    /// visible to everyone" leg are completely unchanged, so a DIFFERENT user's shadow-banned messages
+    /// remain exactly as hidden as before.
+    /// </summary>
+    private static FilterDefinition<ChannelMessage> ShadowVisibleToSelf(string viewerBattleTag)
+    {
+        var filter = Builders<ChannelMessage>.Filter;
+        var anchoredCaseInsensitiveSelfMatch = new BsonRegularExpression($"^{Regex.Escape(viewerBattleTag)}$", "i");
+        return filter.Or(
+            filter.Eq(m => m.Shadow, false),
+            filter.Regex(m => m.Sender.BattleTag, anchoredCaseInsensitiveSelfMatch));
     }
 
     public Task<List<ChannelMessage>> LoadForUser(string channelId, string viewerBattleTag) =>
@@ -116,9 +143,7 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             filterBuilder.Eq(m => m.ChannelId, channelId),
             filterBuilder.Gt(m => m.Seq, afterSeq),
             filterBuilder.Eq(m => m.Deleted, null),
-            filterBuilder.Or(
-                filterBuilder.Eq(m => m.Shadow, false),
-                filterBuilder.Eq(m => m.Sender.BattleTag, viewerBattleTag)));
+            ShadowVisibleToSelf(viewerBattleTag));
 
         return Messages.CountDocumentsAsync(filter);
     }

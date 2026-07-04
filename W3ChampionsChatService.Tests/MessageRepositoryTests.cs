@@ -128,6 +128,76 @@ public class MessageRepositoryTests : IntegrationTestBase
         CollectionAssert.AreEqual(new[] { 1L }, othersView.Select(m => m.Seq).ToArray());
     }
 
+    // ── C6 T2 (D8, C5 handoff) — shadow-self disjunct becomes case-insensitive (visibility boundary) ──
+
+    [Test]
+    public async Task UserVisible_OwnShadowRow_VisibleRegardlessOfViewerCasing()
+    {
+        // The self-match leg is now an anchored case-insensitive regex: a viewer must see their OWN
+        // shadow-banned messages even when their connection's casing differs from the sender snapshot
+        // casing captured at send time. The foreign shadow row must remain hidden.
+        var repo = new MessageRepository(MongoClient);
+        var ownShadow = NewMessage("chan1", 1, "Peter#123");
+        ownShadow.Shadow = true;
+        var foreignShadow = NewMessage("chan1", 2, "Wolf#456");
+        foreignShadow.Shadow = true;
+
+        await repo.Insert(ownShadow);
+        await repo.Insert(foreignShadow);
+
+        var petersView = await repo.LoadForUser("chan1", "peter#123"); // differs in case from stored "Peter#123"
+
+        CollectionAssert.AreEqual(new[] { 1L }, petersView.Select(m => m.Seq).ToArray(),
+            "the viewer's own shadow row must be visible despite the casing mismatch; the foreign shadow row must stay hidden");
+    }
+
+    [Test]
+    public async Task CountUserVisibleAfter_SameCasingRule()
+    {
+        var repo = new MessageRepository(MongoClient);
+        var ownShadow = NewMessage("chan1", 1, "Peter#123");
+        ownShadow.Shadow = true;
+        var foreignShadow = NewMessage("chan1", 2, "Wolf#456");
+        foreignShadow.Shadow = true;
+
+        await repo.Insert(ownShadow);
+        await repo.Insert(foreignShadow);
+
+        var count = await repo.CountUserVisibleAfter("chan1", "peter#123", 0);
+
+        Assert.AreEqual(1, count, "CountUserVisibleAfter must apply the same case-insensitive self-match rule as UserVisible");
+    }
+
+    [Test]
+    public async Task UserVisible_DeletedAndForeignShadow_StillExcluded()
+    {
+        // Regression pin: the case-insensitive self-match fix must ONLY ever affect the viewer's own
+        // shadow rows. It must never widen visibility into (a) soft-deleted rows or (b) another
+        // sender's shadow rows — including the adversarial casing/prefix case below, which proves the
+        // regex is EXACT-match anchored (^...$) rather than a bare prefix match.
+        var repo = new MessageRepository(MongoClient);
+        var normal = NewMessage("chan1", 1, "Peter#123");
+        var deleted = NewMessage("chan1", 2, "Peter#123");
+        var foreignShadow = NewMessage("chan1", 3, "Wolf#456");
+        foreignShadow.Shadow = true;
+        // Anchoring edge case: the viewer's tag "Peter#12" is a strict PREFIX of this shadow row's
+        // sender "Peter#123" (a DIFFERENT user) — an unanchored (missing trailing $) regex would
+        // incorrectly match here and leak a stranger's shadow row.
+        var prefixCollisionShadow = NewMessage("chan1", 4, "Peter#123");
+        prefixCollisionShadow.Shadow = true;
+
+        await repo.Insert(normal);
+        await repo.Insert(deleted);
+        await repo.Insert(foreignShadow);
+        await repo.Insert(prefixCollisionShadow);
+        await repo.MarkDeleted(deleted.Id, "Mod#1", DateTime.UtcNow);
+
+        var view = await repo.LoadForUser("chan1", "Peter#12");
+
+        CollectionAssert.AreEqual(new[] { 1L }, view.Select(m => m.Seq).ToArray(),
+            "a viewer whose tag is merely a prefix of another shadow sender's tag must not see it — the anchor must be exact");
+    }
+
     [Test]
     public async Task ModeratorRead_IncludesEverything_WithFlagsIntact()
     {
