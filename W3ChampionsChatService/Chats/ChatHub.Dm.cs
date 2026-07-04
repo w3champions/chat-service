@@ -347,8 +347,10 @@ public partial class ChatHub
 
     // ================================================================================================
     // C5 (Task 4): send-path private-lane gates + shared helpers. SendMessage (ChatHub.Messaging.cs)
-    // calls into these between the channel load and the persist step (step 5.5), and again post-persist
-    // for Dm recipient materialization.
+    // calls into these between the channel load and the persist step (step 5.5 — since C6 Task 4, this
+    // runs AFTER the content-intrinsic mention-markup validation gate at step 5.25, never before it: a
+    // blocked sender's invalid mention content must be rejected identically to an unblocked sender's, not
+    // silently short-circuited here first), and again post-persist for Dm recipient materialization.
     // ================================================================================================
 
     /// <summary>
@@ -409,7 +411,9 @@ public partial class ChatHub
     /// <summary>
     /// Step 5.5 of the send pipeline (private-lane gates), invoked from
     /// <see cref="SendMessage(string, string)"/> ONLY for <see cref="ChannelType.Dm"/>/
-    /// <see cref="ChannelType.GroupDm"/> channels, between the channel load and the mute gate. Returns a
+    /// <see cref="ChannelType.GroupDm"/> channels, between the mention-markup validation gate (step 5.25 —
+    /// C6 Task 4, D2; deliberately upstream of THIS gate so a blocked sender never gets a different
+    /// outcome than an unblocked sender for the same invalid content) and the mute gate. Returns a
     /// SHORT-CIRCUIT <see cref="SendMessageResult"/> to return immediately (a silent <see cref="FakeSendAck"/>,
     /// or the one fail-closed <see cref="ChatResultCode.Throttled"/>), or <c>null</c> to proceed to persist.
     /// May flip <paramref name="channel"/>'s in-memory <see cref="ChatChannel.RequestState"/> to

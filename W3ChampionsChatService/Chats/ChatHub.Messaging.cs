@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.SignalR;
 using Serilog;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 
@@ -47,6 +48,26 @@ public partial class ChatHub
     /// <see cref="ChatEvents.ThrottleNotice"/> to the caller.</item>
     /// <item>Channel load; missing → <see cref="ChatResultCode.NotFound"/> (the member-of-a-deleted-
     /// channel edge).</item>
+    /// <item>Mention markup validation (C6 Task 4, step 5.25 — D1/D2):
+    /// <see cref="Mentions.MentionMarkup.ExtractTags"/> extracts the message's <c>&lt;@BattleTag#123&gt;</c>
+    /// tokens (deduped case-insensitively, first-occurrence order — a target mentioned N times counts
+    /// ONCE toward the cap). More than <see cref="ChatLimits.MaxMentionsPerMessage"/> distinct tags, or
+    /// any tag with no <see cref="Users.UserDirectoryRepository.Load"/> hit (case-insensitive), →
+    /// <see cref="ChatResultCode.TooLong"/> (the pinned 7-member enum has no InvalidContent value — same
+    /// C3 precedent as empty-after-trim). This step is content-intrinsic and deterministic, so it runs
+    /// BEFORE the private-lane gates and the mute gate below BY DESIGN: a blocked sender and an unblocked
+    /// sender must see an IDENTICAL outcome for the same invalid content (running it after the private-
+    /// lane gate's silent short-circuit would let a fake-Ok mask a TooLong reject and leak block state),
+    /// and a shadow/full-muted sender's invalid markup must still be rejected normally (a rejection does
+    /// not break either illusion). No 90-day activity gate and no membership check here — resolvability
+    /// ≠ selectability (that is <c>SearchMentionCandidates</c>' job) and mentioning a resolvable
+    /// non-member is legal content (Task 5's fan-out step alone decides who is actually notified). The
+    /// validated tag list is kept in a local and threads forward to the (Task 5) mention fan-out call
+    /// site.</item>
+    /// <item>Private-lane gates (C5 Task 4, step 5.5) — <see cref="ChannelType.Dm"/>/
+    /// <see cref="ChannelType.GroupDm"/> ONLY: block/consent/cap handling that may silently short-circuit
+    /// with a fabricated <see cref="ChatResultCode.Ok"/> (<c>FakeSendAck</c>) or the one fail-closed
+    /// <see cref="ChatResultCode.Throttled"/> — see <see cref="ApplyPrivateLaneGates"/>.</item>
     /// <item>Mute gate — PUBLIC channels ONLY (guardrail: semiPublic/system/dm are exempt, preserving
     /// the legacy mute-scope). Reads <see cref="ConnectionMapping.GetEffectiveMuteStatus"/> (cache-only,
     /// zero DB): <see cref="MuteStatus.Full"/> → <see cref="ChatResultCode.Muted"/>;
@@ -126,6 +147,37 @@ public partial class ChatHub
         if (channel == null)
         {
             return new SendMessageResult(ChatResultCode.NotFound);
+        }
+
+        // 5.25 Mention markup validation (C6 Task 4, D1/D2). MUST run BEFORE the private-lane gates
+        // (5.5) and the mute gate (6) below: it is content-intrinsic and deterministic, so a blocked
+        // sender and an unblocked sender get IDENTICAL validation outcomes for the same invalid content —
+        // running it after 5.5 would let that step's silent fake-Ok short-circuit mask a TooLong reject
+        // and leak block state (the C5 block-invisibility concern). Likewise a shadow/full-muted sender's
+        // invalid markup must still be rejected normally; a rejection does not break either illusion.
+        // Placement is POST-rate-limit (step 4), so the bounded directory reads below can never be
+        // amplified by a throttled looper.
+        // ExtractTags dedupes case-insensitively (D1) — a target mentioned 6 times counts ONCE toward the
+        // cap, checked BEFORE any directory read. Zero cost on the hot path: no `<@tag>` tokens means the
+        // cap check and the loop below are both skipped entirely — the common case (most messages have no
+        // mentions) pays nothing. Resolvability is directory-cache-only (T2's case-insensitive Load) — no
+        // 90-day activity gate (resolvability ≠ selectability; that's SearchMentionCandidates' job later)
+        // and no membership check (mentioning a resolvable non-member is legal content; Task 5's fan-out
+        // step alone decides who is actually notified). Both rejection legs map to TooLong (the pinned
+        // 7-member enum has no InvalidContent — same C3 precedent as empty-after-trim).
+        // mentionTags threads forward, unconsumed by this task, to the (Task 5) mention fan-out call site
+        // that will land after DM materialization (7.5) and before FanOutEngine.OnMessagePersisted (8).
+        var mentionTags = MentionMarkup.ExtractTags(content);
+        if (mentionTags.Count > ChatLimits.MaxMentionsPerMessage)
+        {
+            return new SendMessageResult(ChatResultCode.TooLong);
+        }
+        foreach (var tag in mentionTags)
+        {
+            if (await _userDirectory.Load(tag) == null)
+            {
+                return new SendMessageResult(ChatResultCode.TooLong);
+            }
         }
 
         // 5.5 Private-lane gates (C5 Task 4) — Dm/GroupDm ONLY. Runs BEFORE persist so a silent-drop or

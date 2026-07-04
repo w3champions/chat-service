@@ -58,8 +58,10 @@ public class UserDirectoryRepository(MongoClient mongoClient) : MongoDbRepositor
             e => e.BattleTag == normalized.BattleTag, normalized, new ReplaceOptions { IsUpsert = true });
     }
 
-    /// <summary>Case-insensitive point read on the lowercased key (see class doc).</summary>
-    public Task<UserDirectoryEntry> Load(string battleTag)
+    /// <summary>Case-insensitive point read on the lowercased key (see class doc). Virtual solely so
+    /// tests can spy/count calls (no interface seam exists here, unlike <c>IMuteRepository</c>) — e.g.
+    /// C6 Task 4's zero-directory-reads-on-the-hot-path pin.</summary>
+    public virtual Task<UserDirectoryEntry> Load(string battleTag)
     {
         var tag = NormalizeTag(battleTag);
         return Directory.Find(e => e.BattleTag == tag).FirstOrDefaultAsync();
