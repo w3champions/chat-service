@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Driver;
 using W3ChampionsChatService.Channels;
@@ -59,8 +60,14 @@ public class CleanupJobs(MongoClient mongoClient) : MongoDbRepositoryBase(mongoC
             .ToListAsync();
         if (idleBattleTags.Count == 0) return 0;
 
+        // The durable membership battleTag key is stored lowercased (C5 T4 — see MembershipRepository's
+        // class doc), while the directory's own BattleTag casing is verbatim JWT casing (directory
+        // normalization is C6's concern). Lowercase the directory-sourced idle tags before matching them
+        // against the membership key — otherwise a mixed-case (majority) directory tag would match no
+        // membership row and idle pruning would silently no-op.
+        var idleMembershipKeys = idleBattleTags.Select(t => t.ToLowerInvariant()).ToList();
         var result = await memberships.DeleteManyAsync(
-            Builders<ChannelMembership>.Filter.In(m => m.BattleTag, idleBattleTags));
+            Builders<ChannelMembership>.Filter.In(m => m.BattleTag, idleMembershipKeys));
         return result.DeletedCount;
     }
 }

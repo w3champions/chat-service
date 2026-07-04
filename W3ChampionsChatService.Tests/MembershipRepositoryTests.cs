@@ -137,7 +137,9 @@ public class MembershipRepositoryTests : IntegrationTestBase
         var count = await repo.CountForChannel("chan1");
 
         Assert.AreEqual(2, members.Count);
-        CollectionAssert.AreEquivalent(new[] { "Peter#123", "Wolf#456" }, members.Select(m => m.BattleTag).ToList());
+        // The durable membership battleTag key is stored lowercased (C5 T4 — casing-agnostic key
+        // convention, see MembershipRepository's class doc), so the persisted rows read back lowercased.
+        CollectionAssert.AreEquivalent(new[] { "peter#123", "wolf#456" }, members.Select(m => m.BattleTag).ToList());
         Assert.AreEqual(2, count);
     }
 

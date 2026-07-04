@@ -561,4 +561,58 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That((persisted.ExpiresAt.Value - Now.AddDays(90)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
             "a Dm MESSAGE gets the 90d retention window (ForChannelMessage Dm leg)");
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // battleTag casing — the durable membership key must be casing-agnostic (C5 T4 fix)
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task DmSend_MixedCaseRecipient_VisibleInRecipientSessionStateAndTray_NoDuplicateMembership()
+    {
+        // A real Battle.net recipient whose JWT carries UPPERCASE. DmPairKey lowercases both tags, so the
+        // materialized counterpart membership is keyed lowercased — but the recipient's OWN reads use their
+        // verbatim JWT casing against a case-sensitive Mongo $eq. Without membership-key normalization those
+        // casings disagree: the DM is invisible to the recipient on reconnect and a later JWT-cased
+        // self-OpenDm inserts a DUPLICATE row.
+        const string mixedRecipient = "Wolf#456";       // verbatim (uppercase) JWT casing
+        const string mixedRecipientConn = "conn-recip-mixed";
+
+        var channel = await _channelRepository.FindOrCreateDm(
+            Initiator, mixedRecipient, Initiator, DmRequestState.Pending, Now);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        // dmPrivacy is read under the normalized (lowercased) counterpart in the send path, so seed it there.
+        await SeedPrivacy(mixedRecipient.ToLowerInvariant(), DmPrivacy.Everyone);
+
+        // (1) The initiator's first DM materializes the recipient's membership (keyed off the pair-key).
+        var send = await BuildHub(InitiatorConn).SendMessage(channel.Id, "hi, new here");
+        Assert.That(send.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        // (2) The recipient's OWN reads (verbatim JWT casing) must resolve the materialized row.
+        var loadedForUser = await _membershipRepository.LoadForUser(mixedRecipient);
+        Assert.That(loadedForUser.Select(m => m.ChannelId), Does.Contain(channel.Id),
+            "LoadForUser under the recipient's verbatim JWT casing must find their lowercased-stored membership");
+        Assert.That(await _membershipRepository.Load(channel.Id, mixedRecipient), Is.Not.Null,
+            "Load under the recipient's JWT casing resolves the lowercased-stored row");
+
+        // (3) Reassembling the recipient's SessionState under their JWT-cased identity must surface the DM
+        // in Channels AND seed their OnlineMemberRegistry (GetMessages/FocusChannel/tray all depend on this).
+        var recipientIdentity = new W3CUserAuthentication { BattleTag = mixedRecipient, Name = "Wolf" };
+        var (dto, _) = await _assembler.AssembleAndSeed(recipientIdentity, mixedRecipientConn, Now);
+        Assert.That(dto.Channels.Select(c => c.Channel.Id), Does.Contain(channel.Id),
+            "the DM appears in the recipient's SessionState.Channels on reconnect");
+        Assert.That(_onlineMemberRegistry.IsMember(mixedRecipientConn, channel.Id), Is.True,
+            "SessionState seeds the recipient's OnlineMemberRegistry for the DM (drives the tray + GetMessages)");
+
+        // (4) The recipient then OpenDm's the initiator under their JWT casing — the existing shell must
+        // resolve to their EXISTING (lowercased) membership, never a second row.
+        RegisterSession(mixedRecipientConn, mixedRecipient);
+        var open = await BuildHub(mixedRecipientConn).OpenDm(Initiator);
+        Assert.That(open.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        var recipientRows = (await _membershipRepository.LoadForChannel(channel.Id))
+            .Where(m => string.Equals(m.BattleTag, mixedRecipient, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        Assert.That(recipientRows.Count, Is.EqualTo(1),
+            "exactly ONE recipient membership — the JWT-cased self-OpenDm did not insert a duplicate row");
+    }
 }
