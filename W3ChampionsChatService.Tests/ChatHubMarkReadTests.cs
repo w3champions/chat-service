@@ -115,7 +115,8 @@ public class ChatHubMarkReadTests : IntegrationTestBase
             _messageRepository,
             _fanOutEngine,
             ViewersAccumulatorTestFactory.CreateIgnored(),
-            new NoOpMentionInboxCleaner());
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

@@ -23,6 +23,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -62,6 +63,11 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
 
+    // C5 (Task 1): the connect-time relationship prefetch dep. A REAL provider over a fake source so the
+    // fire-and-forget prefetch's call (and its non-fatal handling) is observable end-to-end.
+    private FakeRelationshipSource _relationshipSource;
+    private IRelationshipProvider _relationshipProvider;
+
     // Shared, ORDERED capture of every per-target signal AND every abort, across all connections, so
     // the event-before-close ordering (acceptance 4) is asserted on ONE deterministic sequence:
     // Clients.Client(id)/Caller sends append (id, method); each Context.Abort() appends (id, "ABORT").
@@ -89,6 +95,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
+        _relationshipSource = new FakeRelationshipSource();
+        _relationshipProvider = new RelationshipProvider(_relationshipSource, TimeProvider.System);
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -121,7 +129,8 @@ public class ChatHubConnectionTests : IntegrationTestBase
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             FanOutEngineTestFactory.CreateIgnored(),
             ViewersAccumulatorTestFactory.CreateIgnored(),
-            new NoOpMentionInboxCleaner());
+            new NoOpMentionInboxCleaner(),
+            _relationshipProvider);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -431,5 +440,58 @@ public class ChatHubConnectionTests : IntegrationTestBase
             "OnlineMemberRegistry must hold no entry for the connection after disconnect");
         Assert.AreEqual(0, _messageRateLimiter.TrackedChannelCount("conn-1"),
             "MessageRateLimiter must hold no bucket state for the connection after disconnect");
+    }
+
+    [Test]
+    public async Task Connect_PrefetchesOwnSnapshot_NonFatalOnFailure()
+    {
+        // C5 (Task 1, spec §6): connect warms the relationship cache with the CONNECTING user's own
+        // snapshot. It is fire-and-forget and NON-FATAL — even when the source throws, the connect still
+        // succeeds (session registered + SessionState pushed), and the source is called exactly once with
+        // the connecting battleTag.
+        _relationshipSource.ShouldThrow = true;
+
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-rel", ticket);
+
+        await hub.OnConnectedAsync();
+
+        Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-rel", out _),
+            "a failing relationship prefetch must NOT fail the connect — the session is still registered");
+        Assert.IsTrue(_sends.Contains(("conn-rel", ChatEvents.SessionState)),
+            "the caller still receives its SessionState snapshot despite the prefetch failure");
+
+        // The prefetch is fire-and-forget; await its completion signal (bounded) rather than racing it.
+        var observed = await Task.WhenAny(_relationshipSource.FirstFetch, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(_relationshipSource.FirstFetch, observed,
+            "the connect-time prefetch must call the relationship source");
+        Assert.AreEqual(BattleTag, await _relationshipSource.FirstFetch,
+            "the prefetch must fetch the CONNECTING user's own snapshot");
+        Assert.AreEqual(1, _relationshipSource.FetchCount, "connect prefetches exactly one snapshot");
+    }
+
+    [Test]
+    public async Task Connect_RelationshipPrefetch_DoesNotBlockConnect()
+    {
+        // C5 (Task 1): the prefetch is fire-and-forget — a slow/unreachable wb read must NOT add latency
+        // to (or stall) a connect. Hold the fetch open for the whole connect via an unreleased gate; if
+        // OnConnectedAsync awaited the prefetch this would deadlock the test. It returns instead, with the
+        // session registered and SessionState pushed, while the fetch is still in flight.
+        var gate = new TaskCompletionSource();
+        _relationshipSource.ReleaseGate = gate.Task;
+
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (hub, _) = BuildConnection("conn-rel-nb", ticket);
+
+        await hub.OnConnectedAsync();
+
+        Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-rel-nb", out _),
+            "the connect must complete without waiting on the relationship fetch");
+        Assert.IsTrue(_sends.Contains(("conn-rel-nb", ChatEvents.SessionState)),
+            "the caller receives its SessionState snapshot even while the prefetch is still in flight");
+        Assert.IsTrue(_relationshipSource.FirstFetch.IsCompleted,
+            "the prefetch was launched (the fetch started) even though the connect did not await it");
+
+        gate.SetResult(); // release the background fetch so it can finish cleanly
     }
 }

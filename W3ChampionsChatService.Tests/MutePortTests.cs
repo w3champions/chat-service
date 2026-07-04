@@ -138,7 +138,8 @@ public class MutePortTests : IntegrationTestBase
             _messageRepository,
             FanOutEngineTestFactory.CreateIgnored(),
             viewers,
-            new NoOpMentionInboxCleaner())
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored())
         {
             Clients = clients,
             Context = context,

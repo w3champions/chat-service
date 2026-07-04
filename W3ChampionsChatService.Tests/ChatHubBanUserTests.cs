@@ -86,7 +86,8 @@ public class ChatHubBanUserTests : IntegrationTestBase
             _messageRepository,
             FanOutEngineTestFactory.CreateIgnored(),
             ViewersAccumulatorTestFactory.CreateIgnored(),
-            new NoOpMentionInboxCleaner());
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored());
 
         _clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

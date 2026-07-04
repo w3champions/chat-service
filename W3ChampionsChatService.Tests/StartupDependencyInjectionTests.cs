@@ -15,6 +15,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -287,6 +288,37 @@ public class StartupDependencyInjectionTests
         Assert.IsInstanceOf<NoOpMentionInboxCleaner>(first,
             "IMentionInboxCleaner must resolve to the no-op placeholder until C6 swaps the registration");
         Assert.AreSame(first, second, "IMentionInboxCleaner MUST be a singleton");
+    }
+
+    [Test]
+    public void RelationshipProvider_IsSingleton_SharedAcrossResolutions()
+    {
+        // C5 Task 1 (D1/D19): the relationship provider holds the in-memory friends/blocked cache every
+        // hub invocation shares (block/friend gates, connect-time warm prefetch, C7's Invalidate) — a
+        // transient would fragment the cache and defeat both the TTL and the last-known fallback.
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<IRelationshipProvider>();
+        var second = provider.GetRequiredService<IRelationshipProvider>();
+
+        Assert.AreSame(first, second, "IRelationshipProvider MUST be a singleton");
+        Assert.IsInstanceOf<RelationshipProvider>(first,
+            "IRelationshipProvider must resolve to the concrete RelationshipProvider");
+    }
+
+    [Test]
+    public void IRelationshipSource_ResolvesToWebsiteBackendRelationshipSource_Transient()
+    {
+        // C5 Task 1 (D2): the wb read side is a swappable seam. Transient — the singleton provider
+        // captures one instance for its lifetime; the source is stateless behind a shared static client.
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<IRelationshipSource>();
+        var second = provider.GetRequiredService<IRelationshipSource>();
+
+        Assert.IsInstanceOf<WebsiteBackendRelationshipSource>(first,
+            "IRelationshipSource must resolve to the concrete WebsiteBackendRelationshipSource");
+        Assert.AreNotSame(first, second, "IRelationshipSource is registered transient");
     }
 
     [Test]

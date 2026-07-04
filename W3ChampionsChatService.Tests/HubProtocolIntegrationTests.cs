@@ -163,7 +163,8 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
             _messageRepository,
             _fanOutEngine,
             _viewersAccumulator,
-            new NoOpMentionInboxCleaner());
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored());
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

@@ -83,4 +83,18 @@ public static class ChatLimits
     public const int AutoThrottleViolationThreshold = 5;
     public static readonly TimeSpan AutoThrottleWindow = TimeSpan.FromSeconds(60);
     public static readonly TimeSpan AutoThrottleDuration = TimeSpan.FromSeconds(60);
+
+    /// <summary>Relationship (friends/blocked) snapshot cache TTL (C5 plan decision, T1 — not spec §13).
+    /// The provider serves a cached snapshot without refetching for this long; spec §6 notes the
+    /// relationship view "self-heals in minutes", so a stale snapshot after a wb-side change corrects
+    /// within one TTL even if a change-ping (C7) is missed. Chosen at 5 minutes: long enough to keep the
+    /// per-connect warm fetch and the per-decision reads off the wire, short enough that block/friend
+    /// changes take effect quickly.</summary>
+    public static readonly TimeSpan RelationshipCacheTtl = TimeSpan.FromMinutes(5);
+
+    /// <summary>Retriable back-off (seconds) surfaced when a relationship-gated action fails closed
+    /// because no usable snapshot is available (C5 plan decision, T1 — not spec §13). Carried on the
+    /// typed <c>Throttled</c> reject so the client retries after the provider has had a chance to
+    /// re-fetch (≈ one wb round-trip plus jitter), rather than being silently dropped.</summary>
+    public const int RelationshipRetryAfterSeconds = 30;
 }

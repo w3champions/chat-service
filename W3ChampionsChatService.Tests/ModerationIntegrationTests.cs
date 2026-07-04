@@ -178,7 +178,8 @@ public class ModerationIntegrationTests : IntegrationTestBase
             _messageRepository,
             _fanOutEngine,
             _viewersAccumulator,
-            _mentionCleaner);
+            _mentionCleaner,
+            RelationshipProviderTestFactory.CreateIgnored());
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

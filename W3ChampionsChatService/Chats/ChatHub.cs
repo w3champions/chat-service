@@ -12,6 +12,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 using Serilog;
@@ -56,7 +57,14 @@ public partial class ChatHub(
     // ONLY constructor change this task: the durable soft-delete purges any mention-inbox entries that
     // reference a deleted message, without C4 reaching into C6's inbox internals. Resolves to
     // NoOpMentionInboxCleaner until C6 swaps the DI registration (see IMentionInboxCleaner).
-    IMentionInboxCleaner mentionInboxCleaner) : Hub
+    IMentionInboxCleaner mentionInboxCleaner,
+    // C5 (Task 1, D1): the relationship (friends/blocked) provider. Added to the hub ctor HERE — one task
+    // ahead of D19's planned T3 growth — because the connect-time warm prefetch below needs it, and
+    // ctor injection is the only way OnConnectedAsync obtains a collaborator (there is no service locator
+    // in this hub). T3 adds the remaining two DM deps (UserSettingsRepository, DmInitiationTracker) in a
+    // single sweep. Singleton (Startup); the prefetch below is the FIRST and ONLY T1 consumer — no gating
+    // reads it yet (later tasks gate block/friend/consent on it).
+    IRelationshipProvider relationshipProvider) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
@@ -82,6 +90,9 @@ public partial class ChatHub(
     private readonly ViewersAccumulator _viewersAccumulator = viewersAccumulator;
     // C4 (Task 3): the mention-inbox cleanup hook called by the durable DeleteMessage pipeline.
     private readonly IMentionInboxCleaner _mentionInboxCleaner = mentionInboxCleaner;
+    // C5 (Task 1): the relationship provider — connect-time warm prefetch below; gating consumers land in
+    // later C5 tasks.
+    private readonly IRelationshipProvider _relationshipProvider = relationshipProvider;
 
     public override async Task OnConnectedAsync()
     {
@@ -119,6 +130,14 @@ public partial class ChatHub(
         var now = _timeProvider.GetUtcNow().UtcDateTime;
         await UpsertDirectoryStub(identity, now);
 
+        // C5 (Task 1, spec §6): warm the relationship cache with the CONNECTING user's OWN snapshot so the
+        // block/friend gates (later C5 tasks) and friend-presence (C6) start hot. Fire-and-forget and
+        // NON-FATAL: it is deliberately NOT awaited (a slow/unreachable wb read must never add latency to,
+        // or fail, a connect), and any failure is swallowed + logged exactly like UpsertDirectoryStub. The
+        // task touches only the singleton provider + the captured battleTag, so it is safe even after this
+        // hub instance is disposed; a cache miss simply self-heals on the first gated action.
+        _ = PrefetchRelationshipSnapshot(identity.BattleTag);
+
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
         // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
         // snapshot to the CALLER only — it is that connection's private state rebuild (spec acceptance
@@ -155,6 +174,23 @@ public partial class ChatHub(
         catch (Exception ex)
         {
             Log.Warning(ex, "Failed to upsert user_directory stub for {BattleTag}", identity.BattleTag);
+        }
+    }
+
+    // C5 (Task 1): best-effort connect-time relationship prefetch. Deliberately fire-and-forget — the
+    // caller does NOT await it, so a slow/unreachable wb read never adds latency to (or fails) a connect.
+    // Any failure is swallowed and logged exactly like UpsertDirectoryStub; on success the provider caches
+    // the snapshot. References only the singleton provider + the captured battleTag, so it is safe to run
+    // to completion after this hub instance is disposed.
+    private async Task PrefetchRelationshipSnapshot(string battleTag)
+    {
+        try
+        {
+            await _relationshipProvider.GetSnapshotAsync(battleTag);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to prefetch relationship snapshot for {BattleTag}", battleTag);
         }
     }
 

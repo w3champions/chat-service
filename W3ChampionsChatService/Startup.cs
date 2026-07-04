@@ -16,6 +16,7 @@ using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -142,6 +143,17 @@ public class Startup
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();
+
+        // C5 (Task 1, D1/D2/D19): the relationship (friends/blocked) provider + its swappable read source.
+        // The provider is a SINGLETON — it holds the in-memory friends/blocked cache that every hub
+        // invocation (block/friend gates in later C5 tasks, the connect-time warm prefetch, and C7's
+        // Invalidate change-ping) must share; a transient would fragment the cache and defeat both the TTL
+        // and the last-known fallback. The source is transient (the singleton provider captures one
+        // instance for its lifetime; WebsiteBackendRelationshipSource is stateless behind a shared static
+        // HttpClient). The wb route the source targets does not exist yet (W2) — until it lands,
+        // relationship-gated paths fail closed retriable.
+        services.AddSingleton<IRelationshipProvider, RelationshipProvider>();
+        services.AddTransient<IRelationshipSource, WebsiteBackendRelationshipSource>();
         Log.Information("Services added");
     }
 

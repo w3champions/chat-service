@@ -101,7 +101,8 @@ public class ChatHubMembershipTests : IntegrationTestBase
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
             FanOutEngineTestFactory.CreateIgnored(),
             ViewersAccumulatorTestFactory.CreateIgnored(),
-            new NoOpMentionInboxCleaner());
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

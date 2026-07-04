@@ -102,7 +102,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _messageRepository,
             fanOutEngine,
             ViewersAccumulatorTestFactory.CreateIgnored(),
-            _mentionCleaner);
+            _mentionCleaner,
+            RelationshipProviderTestFactory.CreateIgnored());
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

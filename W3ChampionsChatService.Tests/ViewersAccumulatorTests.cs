@@ -312,7 +312,8 @@ public class ViewersAccumulatorTests : IntegrationTestBase
             new MessageRepository(MongoClient),
             FanOutEngineTestFactory.CreateIgnored(),
             _accumulator,
-            new NoOpMentionInboxCleaner());
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored());
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
         var context = new Mock<HubCallerContext>();
