@@ -327,18 +327,19 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
-    public void MentionInboxCleaner_IsRegisteredSingleton_NoOp()
+    public void MentionInboxCleaner_IsRegisteredSingleton_Real()
     {
-        // C4 Task 1 (D10): the ONLY coordination point between C4 (moderation deletes/purges) and C6
-        // (mention inbox) — C4 calls IMentionInboxCleaner, C6 swaps this registration for the real
-        // implementation later. Task 1 registers the no-op only; nothing calls it yet.
+        // C4 Task 1 (D10) / C6 Task 7: the ONLY coordination point between C4 (moderation
+        // deletes/purges) and C6 (mention inbox) — C4 calls IMentionInboxCleaner. C6 Task 1 registered
+        // the NoOp placeholder; C6 Task 7 swapped this registration for the real MentionInboxCleaner
+        // (a mention_inbox DeleteMany), now load-bearing for both DeleteMessage and PurgeMessagesFromUser.
         using var provider = BuildProvider();
 
         var first = provider.GetRequiredService<IMentionInboxCleaner>();
         var second = provider.GetRequiredService<IMentionInboxCleaner>();
 
-        Assert.IsInstanceOf<NoOpMentionInboxCleaner>(first,
-            "IMentionInboxCleaner must resolve to the no-op placeholder until C6 swaps the registration");
+        Assert.IsInstanceOf<MentionInboxCleaner>(first,
+            "IMentionInboxCleaner must resolve to the real MentionInboxCleaner now that C6 Task 7 has landed it");
         Assert.AreSame(first, second, "IMentionInboxCleaner MUST be a singleton");
     }
 

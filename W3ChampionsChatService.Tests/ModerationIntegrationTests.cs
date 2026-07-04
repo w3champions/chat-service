@@ -77,6 +77,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
     private MembershipRepository _membershipRepository;
     private MessageRepository _messageRepository;
     private MentionInboxRepository _mentionInboxRepository;
+    private MentionFanOut _mentionFanOut;
     private CapturingMentionInboxCleaner _mentionCleaner;
     private SessionStateAssembler _assembler;
     private Mock<IChatAuthenticationService> _authService;
@@ -114,7 +115,13 @@ public class ModerationIntegrationTests : IntegrationTestBase
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
         _messageRepository = new MessageRepository(MongoClient);
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
-        _mentionCleaner = new CapturingMentionInboxCleaner();
+        // The REAL C6 T5 writer (D3/D4), shared with the hubs' own membership/session state, so tests
+        // can seed genuine mention-inbox entries the same way the send pipeline would (C6 Task 7).
+        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        // Wraps the REAL C6 Task 7 cleaner (MentionInboxCleaner) so DeleteMessage/PurgeMessagesFromUser
+        // physically remove mention-inbox rows in this suite too, while still recording each call's exact
+        // id batch for the pre-existing spy assertions below.
+        _mentionCleaner = new CapturingMentionInboxCleaner(new MentionInboxCleaner(MongoClient));
 
         _authService = new Mock<IChatAuthenticationService>();
         _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
@@ -287,6 +294,17 @@ public class ModerationIntegrationTests : IntegrationTestBase
             JoinedAt = T0,
         });
 
+    // Directory row (mirrors ChatHubSendMessageTests' SeedDirectory) — the send pipeline's step-5.25
+    // mention markup gate resolves a target through this collection (resolvability-only).
+    private Task SeedDirectory(string battleTag) =>
+        _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = battleTag,
+            DisplayBattleTag = battleTag,
+            NormalizedName = battleTag.ToLowerInvariant(),
+            LastSeenAt = T0,
+        });
+
     // Seeds a durable message via the SAME seq-allocation path the real send pipeline uses, so the
     // channel's LastSeq stays consistent with directly-seeded history.
     private async Task<ChannelMessage> SeedMessage(string channelId, string senderBattleTag, string content, DateTime? expiresAt = null, bool shadow = false)
@@ -377,6 +395,14 @@ public class ModerationIntegrationTests : IntegrationTestBase
         await SeedMembership(channel.Id, BTag, NotificationLevel.All);
         await SeedMembership(channel.Id, MTag, NotificationLevel.All);
 
+        // B and M are directory-resolvable (C6 Task 7 re-assertion): the send pipeline's step-5.25
+        // markup gate only accepts a mention whose target resolves via the directory, so A's shadow
+        // send below can carry GENUINE mention markup of both — real, eligible targets (durable
+        // membership + NotificationLevel.All, seeded above) that WOULD receive an entry for a normal,
+        // non-shadow message. That is what makes the "zero entries" assertions below non-vacuous.
+        await SeedDirectory(BTag);
+        await SeedDirectory(MTag);
+
         // Shadow-ban A via the REST POST path (ApplyBanAsync persists; no live connection yet to reconcile).
         var banResult = await _muteController.AddLoungeMute(new LoungeMuteRequest
         {
@@ -399,8 +425,10 @@ public class ModerationIntegrationTests : IntegrationTestBase
         Assert.AreEqual(ChatResultCode.Ok, (await mHub.FocusChannel(channel.Id)).Code);
 
         // A sends to the PUBLIC channel — the shadow mute gate flags it and persists it (returns Ok, the
-        // illusion). seq 1.
-        var send = await aHub.SendMessage(channel.Id, "am I invisible?");
+        // illusion). seq 1. The content carries REAL mention markup of B and M (C6 Task 7 re-assertion) —
+        // both resolvable, both durable members with NotificationLevel.All — so the mentions leg below
+        // is a genuine end-to-end proof of the shadow guardrail, not a vacuous absence-of-the-feature.
+        var send = await aHub.SendMessage(channel.Id, $"am I invisible? <@{BTag}> <@{MTag}>");
         Assert.AreEqual(ChatResultCode.Ok, send.Code, "a shadow send still returns Ok (the illusion)");
         Assert.AreEqual(1L, send.Seq);
 
@@ -446,15 +474,23 @@ public class ModerationIntegrationTests : IntegrationTestBase
         Assert.AreEqual(1, restPage.Messages.Count);
         Assert.IsTrue(restPage.Messages[0].Shadow, "the REST moderation-history row carries the real shadow flag");
 
-        // MENTIONS LEG (documented C6 boundary): shadow messages must create NO mention-inbox entries for
-        // OTHER members. The mention INBOX WRITE path is C6's and is NOT built yet — the send pipeline has
-        // no mention-inbox write at all — so the "no mentions for others" leg is STRUCTURALLY satisfied:
-        // (a) the only mention-inbox coordination surface that exists is the IMentionInboxCleaner hook,
-        // and a shadow SEND never invokes it; (b) the mention-inbox collection has no rows for B or M.
-        // When C6 lands the inbox writer, this leg must be re-asserted against a real inbox write.
+        // MENTIONS LEG (C6 Task 7 re-assertion — the C4/C6 handoff item): A's message carries REAL
+        // mention markup of B and M, both genuinely eligible (durable membership + NotificationLevel.All,
+        // resolvable in the directory, neither is the sender) — a normal, non-shadow send with this exact
+        // content WOULD create a real inbox entry + MentionNotified for each of them (this is precisely
+        // the eligibility the C6 Task 5 fan-out grants). Because A's send is shadow, the pipeline must
+        // still produce LITERALLY ZERO entries for anyone: the SendMessage call-site skip
+        // (`!isShadow && mentionTags.Count > 0`) never invokes MentionFanOut.NotifyAsync at all, and even
+        // if that skip were ever dropped, NotifyAsync's own defense-in-depth `message.Shadow` early-return
+        // (C6 Task 5) would still stop it. This is now a genuine, non-vacuous end-to-end proof of the
+        // shadow guardrail (C6 Task 5's own unit-level `ShadowSender_MentionsOthers_...` test proves the
+        // same rule in isolation; this is the moderation-pipeline, real-write-path proof) — breaking
+        // either guard would flip either assertion below from empty to non-empty.
         Assert.IsEmpty(_mentionCleaner.Calls, "a shadow send must never touch the mention-inbox cleaner hook");
-        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser(BTag), "no mention-inbox entry is created for B (no inbox writes exist until C6)");
-        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser(MTag), "no mention-inbox entry is created for M");
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser(BTag),
+            "a shadow send must create NO mention-inbox entry for a genuinely eligible, mentioned member (B)");
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser(MTag),
+            "a shadow send must create NO mention-inbox entry for a genuinely eligible, mentioned moderator (M)");
 
         // ---- FULL RECONNECT (fresh ticket + new connectionId through the SAME shared singletons) ----
 
@@ -517,6 +553,25 @@ public class ModerationIntegrationTests : IntegrationTestBase
         // focused connection is EXCLUDED from the BulkMessagesDeleted).
         await SeedMembership(pub.Id, TargetTag, NotificationLevel.All);
 
+        // MENTION SCOPE WALL (C6 Task 7 — acceptance 3 + the cleaner/purge scope-wall parity): seed a
+        // REAL mention-inbox entry for each of the target's four messages via the actual T5 writer
+        // (MentionFanOut), including the DM one. After the purge, the three eligible-channel entries
+        // must be PHYSICALLY REMOVED by the real cleaner, while the DM entry — never in the cleaner's
+        // batch, never eligible — must SURVIVE untouched: the same scope wall the message purge itself
+        // already honors (Dm/GroupDm/clan/lobby are never purged).
+        const string MentionedTag = "mentioned#321";
+        await SeedMembership(pub.Id, MentionedTag, NotificationLevel.All);
+        await SeedMembership(semi.Id, MentionedTag, NotificationLevel.All);
+        await SeedMembership(match.Id, MentionedTag, NotificationLevel.All);
+        await SeedMembership(dm.Id, MentionedTag, NotificationLevel.All);
+        await _mentionFanOut.NotifyAsync(pub, tInPub, new[] { MentionedTag }, T0);
+        await _mentionFanOut.NotifyAsync(semi, tInSemi, new[] { MentionedTag }, T0);
+        await _mentionFanOut.NotifyAsync(match, tInMatch, new[] { MentionedTag }, T0);
+        await _mentionFanOut.NotifyAsync(dm, tInDm, new[] { MentionedTag }, T0);
+        var beforePurgeEntries = await _mentionInboxRepository.LoadForUser(MentionedTag);
+        Assert.AreEqual(4, beforePurgeEntries.Count,
+            "sanity: the real T5 writer created one genuine entry per message before the purge runs");
+
         var readerHub = await Connect("conn-reader", ReaderTag);
         var targetHub = await Connect("conn-target", TargetTag);
         var modHub = await ConnectModerator("conn-mod", ModTag);
@@ -568,6 +623,15 @@ public class ModerationIntegrationTests : IntegrationTestBase
         Assert.AreEqual(1, _mentionCleaner.Calls.Count, "the cleaner is invoked exactly once with the whole eligible batch");
         Assert.That(_mentionCleaner.Calls[0], Is.EquivalentTo(new[] { tInPub.Id, tInSemi.Id, tInMatch.Id }),
             "the cleaner receives exactly the soft-deleted eligible ids — never the untouched DM id");
+
+        // The REAL cleaner (C6 Task 7) PHYSICALLY REMOVED the three eligible-channel entries; the DM
+        // entry — out of the purge's scope wall — SURVIVES untouched (scope-wall parity between the
+        // message purge and the mention-inbox cleanup).
+        var afterPurgeEntries = await _mentionInboxRepository.LoadForUser(MentionedTag);
+        Assert.AreEqual(1, afterPurgeEntries.Count,
+            "only the DM (ineligible-channel) mention-inbox entry survives the purge — the other three are physically gone");
+        Assert.AreEqual(tInDm.Id, afterPurgeEntries[0].MessageId,
+            "the surviving entry is the DM one — the purge/cleaner scope wall holds");
 
         // MODERATOR REST history shows the purged rows FLAGGED (deleted + attribution).
         var pubHistory = await RestModerationHistory(pub.Id);
@@ -736,6 +800,56 @@ public class ModerationIntegrationTests : IntegrationTestBase
     }
 
     // ============================================================================================
+    // Scenario 5 — C6 Task 7 acceptance 3: a real mention-inbox entry created by a genuine send is
+    // PHYSICALLY REMOVED once the moderator soft-deletes the mentioning message — the real cleaner,
+    // end-to-end, with the audit-before-cleaner ordering left completely untouched.
+    // ============================================================================================
+
+    [Test]
+    public async Task DeleteMessage_WithMentions_RemovesEntries_EndToEnd()
+    {
+        const string AuthorTag = "mentauthor#1";
+        const string MentionedTag = "mentioned#2";
+        const string ModTag = "delmentmod#1";
+
+        var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
+        await SeedMembership(channel.Id, AuthorTag, NotificationLevel.All);
+        await SeedMembership(channel.Id, MentionedTag, NotificationLevel.All);
+        await SeedDirectory(MentionedTag);
+
+        var authorHub = await Connect("conn-mentauthor", AuthorTag);
+        var modHub = await ConnectModerator("conn-delmentmod", ModTag);
+
+        // A real, non-shadow send carrying genuine mention markup — the REAL T5 writer fans it out and
+        // creates a real mention-inbox entry for the eligible target.
+        var send = await authorHub.SendMessage(channel.Id, $"hey <@{MentionedTag}>");
+        Assert.AreEqual(ChatResultCode.Ok, send.Code);
+
+        var beforeDeleteEntries = await _mentionInboxRepository.LoadForUser(MentionedTag);
+        Assert.AreEqual(1, beforeDeleteEntries.Count,
+            "sanity: sending a real mention creates a real inbox entry (precondition for this test)");
+        Assert.AreEqual(send.MessageId, beforeDeleteEntries[0].MessageId);
+
+        // ---- MODERATOR DELETE ----
+        var del = await modHub.DeleteMessage(send.MessageId);
+        Assert.AreEqual(ChatResultCode.Ok, del.Code);
+
+        // The audit-before-cleaner ordering (C4, untouched by this task) already committed the
+        // soft-delete before the cleaner ran — both effects are observable here.
+        var reloaded = await _messageRepository.Load(send.MessageId);
+        Assert.IsNotNull(reloaded.Deleted, "the message is soft-deleted — the audit-backed write committed");
+
+        // The REAL cleaner (C6 Task 7) physically removed the mention-inbox entry the delete referenced
+        // — C4's mentions leg is now load-bearing (acceptance 3).
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser(MentionedTag),
+            "DeleteMessage's real IMentionInboxCleaner must physically remove the referenced mention-inbox entry");
+
+        // The spy still recorded the exact call (the pre-existing capture contract, untouched).
+        Assert.AreEqual(1, _mentionCleaner.Calls.Count);
+        Assert.That(_mentionCleaner.Calls[0], Is.EquivalentTo(new[] { send.MessageId }));
+    }
+
+    // ============================================================================================
     // Helpers
     // ============================================================================================
 
@@ -761,15 +875,20 @@ public class ModerationIntegrationTests : IntegrationTestBase
     /// to purge (D10), so the purge scenario can assert the cleaner received exactly the eligible ids and
     /// the shadow-send scenario can assert it was never invoked. Mirrors the private spy in
     /// <see cref="ChatHubDeletionTests"/> (which is not accessible across files).
+    /// <para>
+    /// C6 Task 7: also DELEGATES to a real <paramref name="inner"/> cleaner after recording, so this
+    /// suite's DeleteMessage/PurgeMessagesFromUser scenarios can assert PHYSICAL removal from
+    /// mention_inbox (acceptance 3), not just that the hook was called with the right ids.
+    /// </para>
     /// </summary>
-    private sealed class CapturingMentionInboxCleaner : IMentionInboxCleaner
+    private sealed class CapturingMentionInboxCleaner(IMentionInboxCleaner inner) : IMentionInboxCleaner
     {
         public List<IReadOnlyCollection<string>> Calls { get; } = new();
 
-        public Task RemoveForMessages(IReadOnlyCollection<string> messageIds)
+        public async Task RemoveForMessages(IReadOnlyCollection<string> messageIds)
         {
             Calls.Add(messageIds);
-            return Task.CompletedTask;
+            await inner.RemoveForMessages(messageIds);
         }
     }
 }

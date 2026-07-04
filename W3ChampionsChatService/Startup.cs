@@ -74,11 +74,13 @@ public class Startup
         services.AddHostedService<ChatDomainBootstrap>();   // indexes + catalog seeding at boot
         services.AddHostedService<WeeklyCleanupService>();  // weekly GC + membership pruning
 
-        // C4 Task 1 (D10): the ONLY coordination point between moderation deletes/purges (later C4
-        // tasks) and the mention inbox (C6). Singleton is cosmetic here (the no-op holds no state) but
-        // matches what C6's eventual real implementation will need if it caches anything. C6 swaps this
-        // registration for its real implementation later — do not add a second registration.
-        services.AddSingleton<IMentionInboxCleaner, NoOpMentionInboxCleaner>();
+        // C4 Task 1 (D10) / C6 Task 7: the ONLY coordination point between moderation deletes/purges
+        // (ChatHub.DeleteMessage/PurgeMessagesFromUser) and the mention inbox (C6). Registered as the
+        // real MentionInboxCleaner (a straightforward mention_inbox DeleteMany) — C4's NoOpMentionInboxCleaner
+        // placeholder is kept around only for tests that don't care about mention-inbox behavior and
+        // construct a hub directly with it; it is no longer the production registration. Singleton:
+        // holds no state, matches the sibling repository registrations' lifetime.
+        services.AddSingleton<IMentionInboxCleaner, MentionInboxCleaner>();
 
         // C2 auth v2
         // Singletons: both hold in-memory state that the mint (REST AuthSessionController) and

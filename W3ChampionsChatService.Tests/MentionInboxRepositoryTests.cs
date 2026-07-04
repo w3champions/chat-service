@@ -206,5 +206,7 @@ public class MentionInboxRepositoryTests : IntegrationTestBase
 
         Assert.AreEqual(1, indexes.Single(i => i["name"] == "ix_battleTag")["key"]["BattleTag"].ToInt32());
         Assert.AreEqual(0, indexes.Single(i => i["name"] == "ttl_expiresAt")["expireAfterSeconds"].ToDouble());
+        // C6 Task 7 (D7): backs MentionInboxCleaner.RemoveForMessages' DeleteMany(MessageId ∈ ids).
+        Assert.AreEqual(1, indexes.Single(i => i["name"] == "ix_messageId")["key"]["MessageId"].ToInt32());
     }
 }

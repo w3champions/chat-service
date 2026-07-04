@@ -131,6 +131,12 @@ public static class ChatDomainIndexes
             new CreateIndexModel<MentionInboxEntry>(
                 Builders<MentionInboxEntry>.IndexKeys.Ascending(e => e.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
+            // C6 Task 7 (D7): backs MentionInboxCleaner.RemoveForMessages' DeleteMany(MessageId ∈ ids) —
+            // moderation's DeleteMessage/PurgeMessagesFromUser cleanup hook. Without this, every
+            // moderation delete/purge would COLLSCAN mention_inbox looking for entries to remove.
+            new CreateIndexModel<MentionInboxEntry>(
+                Builders<MentionInboxEntry>.IndexKeys.Ascending(e => e.MessageId),
+                new CreateIndexOptions { Name = "ix_messageId" }),
         ]);
     }
 

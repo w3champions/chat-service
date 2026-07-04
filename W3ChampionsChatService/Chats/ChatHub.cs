@@ -55,8 +55,8 @@ public partial class ChatHub(
     ViewersAccumulator viewersAccumulator,
     // C4 (Task 3, D10): the mention-inbox cleanup hook — DeleteMessage is its FIRST caller. This is the
     // ONLY constructor change this task: the durable soft-delete purges any mention-inbox entries that
-    // reference a deleted message, without C4 reaching into C6's inbox internals. Resolves to
-    // NoOpMentionInboxCleaner until C6 swaps the DI registration (see IMentionInboxCleaner).
+    // reference a deleted message, without C4 reaching into C6's inbox internals. Resolves to the real
+    // MentionInboxCleaner since C6 Task 7 swapped the DI registration (see IMentionInboxCleaner).
     IMentionInboxCleaner mentionInboxCleaner,
     // C5 (Task 1, D1): the relationship (friends/blocked) provider. Added to the hub ctor HERE — one task
     // ahead of D19's planned T3 growth — because the connect-time warm prefetch below needs it, and
