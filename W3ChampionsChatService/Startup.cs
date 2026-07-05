@@ -204,6 +204,12 @@ public class Startup
 
         services.AddSingleton(new InternalCallerSecrets(internalSecretMm, internalSecretWb));
 
+        // C7 Task 6: the match-channel domain core (idempotent CreateOrGet + the one-match-channel-per-user
+        // AddMemberWithInvariant) the later /internal/* match endpoints drive. Singleton — mirrors FanOutEngine
+        // (a ctor dep): it holds no per-call state, and its ChannelRepository/MembershipRepository deps are
+        // stateless MongoClient wrappers, so capturing them for the singleton's lifetime is safe.
+        services.AddSingleton<MatchChannelService>();
+
         Log.Information("Services added");
     }
 

@@ -257,9 +257,10 @@ public class FanOutEngine(
 
     /// <summary>
     /// Pushes a newly-added channel to <paramref name="membership"/>'s owning user's LIVE connection
-    /// (spec §11 <c>ChannelAdded</c>). CONTRACT COMPLETENESS ONLY (Task 18): C5/C7 trigger this — e.g.
-    /// an auto-join on lobby/ladder load, or an invite acceptance — C3 only defines the shape and
-    /// provides this emit helper; there are no production callers yet, only tests.
+    /// (spec §11 <c>ChannelAdded</c>). Defined in Task 18 (C3) as CONTRACT COMPLETENESS; C5/C7 now wire the
+    /// real triggers. Live production callers: C5's <c>ChatHub.OpenDm</c> (DM first-message materialization),
+    /// <c>ChatHub.CreateGroup</c> and <c>ChatHub.AddGroupMember</c> (GroupDm), plus C7's
+    /// <c>MatchChannelService.AddMemberWithInvariant</c> (System-match auto-join / one-match-channel swap).
     /// <list type="bullet">
     /// <item>Resolves the target connection via <see cref="ISessionRegistry.GetByBattleTag"/> — NOT
     /// via <see cref="FocusRegistry"/>/<see cref="OnlineMemberRegistry"/>, since the user may not have
