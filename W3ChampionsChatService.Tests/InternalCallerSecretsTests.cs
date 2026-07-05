@@ -37,6 +37,18 @@ public class InternalCallerSecretsTests
         {
             (InternalCaller.Wb, "wb-secret")
         }), "a whitespace-only Mm secret is treated the same as null/unset");
+
+        var wbNullOnly = new InternalCallerSecrets("mm-secret", null);
+        Assert.That(wbNullOnly.Configured, Is.EqualTo(new List<(InternalCaller, string)>
+        {
+            (InternalCaller.Mm, "mm-secret")
+        }), "a null Wb secret omits Wb but keeps the configured Mm entry");
+
+        var wbWhitespaceOnly = new InternalCallerSecrets("mm-secret", "   ");
+        Assert.That(wbWhitespaceOnly.Configured, Is.EqualTo(new List<(InternalCaller, string)>
+        {
+            (InternalCaller.Mm, "mm-secret")
+        }), "a whitespace-only Wb secret is treated the same as null/unset");
     }
 
     [Test]
