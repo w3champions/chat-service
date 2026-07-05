@@ -66,7 +66,17 @@ public class FanOutEngine(
     // BEFORE their offline early-returns (an interest update must land even when the changed user is
     // offline); (2) PushPresenceChanged reads it to target the derived-interest set on an online/offline
     // transition. Shared singleton (Startup) — the SAME instance the hub mutates via focus/leave.
-    PresenceInterestRegistry presenceInterestRegistry)
+    PresenceInterestRegistry presenceInterestRegistry,
+    // C7 (Task 5): the batched ViewersChanged sink + the trusted server clock. Added so a FORCED channel
+    // removal (PushChannelRemoved) of a currently-focused viewer of a ROSTER-PARTICIPATING channel
+    // (Public/SemiPublic/System) can route the removed battleTag through ViewersAccumulator.RecordChange
+    // BEFORE FocusRegistry.Unfocus — mirroring ChatHub.LeaveChannel's ordering so remaining viewers get a
+    // ViewersChanged{left} rather than a ghost in the roster. Both are the SAME singletons the hub holds
+    // (Startup): the accumulator the flush hosted service drains, and the injectable clock every other
+    // fan-out path reads. Private lanes (Dm/GroupDm) are excluded from the viewer-roster system, so this
+    // pair is left untouched for them (the D11 guard in PushChannelRemoved below).
+    ViewersAccumulator viewersAccumulator,
+    TimeProvider timeProvider)
 {
     // The SignalR delivery channel — pushes the full MessageReceived payload to targeted connections.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
@@ -92,6 +102,11 @@ public class FanOutEngine(
 
     // C6 (Task 9, D11): the presence-interest index — see the ctor param doc comment.
     private readonly PresenceInterestRegistry _presenceInterestRegistry = presenceInterestRegistry;
+
+    // C7 (Task 5): the batched ViewersChanged sink + the trusted server clock — see the ctor param doc
+    // comment. Read ONLY by PushChannelRemoved's forced-removal roster-delta routing (non-private lanes).
+    private readonly ViewersAccumulator _viewersAccumulator = viewersAccumulator;
+    private readonly TimeProvider _timeProvider = timeProvider;
 
     /// <summary>
     /// Called by the send pipeline AFTER the message is durably persisted (seq allocated + inserted).
@@ -306,9 +321,10 @@ public class FanOutEngine(
 
     /// <summary>
     /// Tells <paramref name="battleTag"/>'s LIVE connection to drop <paramref name="channelId"/> from
-    /// its channel list (spec §11 <c>ChannelRemoved</c>). CONTRACT COMPLETENESS ONLY (Task 18): C5/C7
-    /// trigger this — C3 only defines the shape and provides this emit helper; there are no production
-    /// callers yet, only tests.
+    /// its channel list (spec §11 <c>ChannelRemoved</c>). The forced-removal counterpart of the
+    /// user-initiated <c>ChatHub.LeaveChannel</c>: the live production caller is
+    /// <c>ChatHub.RemoveGroupMember</c> (a GroupDm owner kicking a member — a PRIVATE lane), and C7's
+    /// one-match-channel swap + DELETE teardown drive it for System-match channels.
     /// <list type="bullet">
     /// <item>NO-OP if the user is currently offline — the membership row is already durably removed by
     /// the caller BEFORE this is invoked, so an offline user's next <c>SessionState</c> on connect
@@ -316,20 +332,27 @@ public class FanOutEngine(
     /// <item>Cleans the <see cref="OnlineMemberRegistry"/> and <see cref="FocusRegistry"/> entries for
     /// (channelId, connection) so this connection is never fanned out to (activity or focus) after the
     /// removal.</item>
+    /// <item>For a ROSTER-PARTICIPATING channel (Public/SemiPublic/System), routes the removed viewer's
+    /// roster change through <see cref="ViewersAccumulator.RecordChange"/> BEFORE
+    /// <see cref="FocusRegistry.Unfocus"/> so the channel's remaining viewers get a
+    /// <c>ViewersChanged{left}</c> — see the WIRING NOTE below.</item>
     /// </list>
     /// <para>
-    /// C5/C7 WIRING NOTE — DELIBERATE SCOPE BOUNDARY (Task 18): this cleans the
-    /// <see cref="OnlineMemberRegistry"/>/<see cref="FocusRegistry"/> ONLY. Unlike
-    /// <c>ChatHub.LeaveChannel</c> (Task 14's fix), it does NOT route the removal through
-    /// <see cref="ViewersAccumulator"/> — so a forced removal of a CURRENTLY-FOCUSED viewer will NOT
-    /// emit a <c>ViewersChanged{left}</c> to the channel's remaining viewers. This is the SAME class of
-    /// gap Task 14 fixed for the user-initiated <c>LeaveChannel</c>, deliberately left open here
-    /// because there is no caller yet to exercise it and no clock/accumulator dependency to justify
-    /// wiring speculatively (YAGNI). WHEN C5/C7 wire the trigger, they (or a future revision of this
-    /// helper) MUST decide whether a forced removal should emit <c>ViewersChanged{left}</c> to
-    /// remaining viewers — if so, route the removed battleTag through
-    /// <see cref="ViewersAccumulator.RecordChange"/> BEFORE calling <see cref="FocusRegistry.Unfocus"/>
-    /// below, mirroring <c>ChatHub.LeaveChannel</c>'s ordering exactly.
+    /// C5/C7 WIRING NOTE — OBLIGATION DISCHARGED (C7 Task 5): the Task-18 scope boundary (this helper
+    /// once cleaned the <see cref="OnlineMemberRegistry"/>/<see cref="FocusRegistry"/> ONLY, deferring
+    /// the roster delta to the eventual caller) is now resolved. Per the C3 amendment (spec §9 — the
+    /// roster IS the set of active viewers), a FORCED removal of a CURRENTLY-FOCUSED viewer of a
+    /// roster-participating channel MUST emit a <c>ViewersChanged{left}</c> to the remaining viewers,
+    /// otherwise they keep a ghost in the roster. So — mirroring <c>ChatHub.LeaveChannel</c>'s ordering
+    /// EXACTLY — this captures the member's <see cref="MemberState.ChannelType"/> via
+    /// <see cref="OnlineMemberRegistry.TryGetMember"/> BEFORE <see cref="OnlineMemberRegistry.Leave"/>
+    /// destroys the entry, then routes the removed battleTag through
+    /// <see cref="ViewersAccumulator.RecordChange"/> (pre-window baseline = VIEWING, still focused)
+    /// BEFORE <see cref="FocusRegistry.Unfocus"/>. D11 PRIVATE-LANE GUARD: Dm/GroupDm are excluded from
+    /// the viewer-roster system entirely, so this SKIPS <c>RecordChange</c> for them — which is exactly
+    /// what keeps the live <c>RemoveGroupMember</c> (GroupDm) caller byte-identical: a forced
+    /// private-lane removal emits no <c>ViewersChanged</c> (structurally satisfying the C3 amendment for
+    /// private lanes, OQ-1), its presence being member-presence via the C6 interest index.
     /// </para>
     /// </summary>
     public async Task PushChannelRemoved(string channelId, string battleTag)
@@ -347,12 +370,27 @@ public class FanOutEngine(
             return;
         }
 
-        // AUTHORITATIVE — must always run (they precede the best-effort send): clearing the registry/focus
-        // is what guarantees this connection is never fanned out to (activity or focus) after the removal.
-        // C5/C7 WIRING NOTE: see the doc comment above — a currently-focused viewer's removal does not
-        // route through ViewersAccumulator.RecordChange here, so remaining viewers get no ViewersChanged
-        // {left} for this forced removal (Task 14 parity gap, deliberately deferred to the eventual caller).
+        // C7 (Task 5): capture the member's ChannelType BEFORE Leave destroys the entry — the D11
+        // private-lane guard below needs it to decide whether this forced removal emits a roster delta.
+        var hadMember = _onlineMemberRegistry.TryGetMember(channelId, session.ConnectionId, out var memberState);
+
+        // AUTHORITATIVE — must always run (it precedes the best-effort send): clearing the registry is
+        // what guarantees this connection is never fanned out to (activity) after the removal.
         _onlineMemberRegistry.Leave(channelId, session.ConnectionId);
+
+        // C7 (Task 5) — discharges the C5/C7 WIRING NOTE / C3 amendment (see the doc comment above).
+        // Mirroring ChatHub.LeaveChannel EXACTLY: route the removed viewer's roster change through the
+        // accumulator BEFORE the FocusRegistry.Unfocus below, so the captured pre-window baseline is
+        // VIEWING (the viewer is still focused at this point) and the flush emits a ViewersChanged{left}
+        // to the channel's remaining viewers. D11 private-lane guard: SKIP for Dm/GroupDm — private lanes
+        // never enter the viewer-roster system, which is what keeps the RemoveGroupMember (GroupDm) caller
+        // byte-identical (no RecordChange, hence no ViewersChanged). A member with no live registry entry
+        // (hadMember false) has no ChannelType to consult and was not an active roster member, so skip it.
+        if (hadMember && memberState.ChannelType is not (ChannelType.Dm or ChannelType.GroupDm))
+        {
+            _viewersAccumulator.RecordChange(channelId, battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        }
+
         _focusRegistry.Unfocus(session.ConnectionId, channelId);
         // C6 (Task 9, D11): the removed user is no longer a member, so revoke THEIR OWN interest that was
         // derived from focusing this channel too — a kicked user must not keep learning the presence of

@@ -93,7 +93,7 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
         // capture harness so ChannelAdded/MessageReceived pushes are observable.
         _harness = new HubPushCaptureHarness();
         _coalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry());
+        _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry(), ViewersAccumulatorTestFactory.CreateIgnored(), _time);
 
         _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
             tag,

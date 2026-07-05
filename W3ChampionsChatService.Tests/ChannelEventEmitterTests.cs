@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -45,7 +46,7 @@ public class ChannelEventEmitterTests
         var members = new OnlineMemberRegistry();
         var sessions = new SessionRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, sessions, new PresenceInterestRegistry());
+        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, sessions, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus), TimeProvider.System);
         return (harness, focus, members, sessions, engine);
     }
 

@@ -154,9 +154,9 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         // SAME PresenceInterestRegistry the hubs mutate, so RegisterFocus (hub) and GetInterestedConnections
         // (engine's PushPresenceChanged) see one consistent index.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _fanOutEngine = new FanOutEngine(
-            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry);
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _fanOutEngine = new FanOutEngine(
+            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
 
         _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
             tag,

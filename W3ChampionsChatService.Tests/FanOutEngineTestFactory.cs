@@ -1,3 +1,4 @@
+using System;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Sessions;
 
@@ -21,13 +22,16 @@ internal static class FanOutEngineTestFactory
     internal static FanOutEngine CreateIgnored()
     {
         var harness = new HubPushCaptureHarness();
+        var focus = new FocusRegistry();
         var members = new OnlineMemberRegistry();
         return new FanOutEngine(
             harness.HubContext,
-            new FocusRegistry(),
+            focus,
             members,
             new ActivityCoalescer(harness.HubContext, members),
             new SessionRegistry(),
-            new PresenceInterestRegistry());
+            new PresenceInterestRegistry(),
+            new ViewersAccumulator(harness.HubContext, focus),
+            TimeProvider.System);
     }
 }

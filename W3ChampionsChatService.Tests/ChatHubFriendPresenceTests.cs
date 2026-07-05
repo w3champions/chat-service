@@ -136,9 +136,9 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         // The engine shares the SAME SessionRegistry every hub registers into — PushFriendPresenceChanged
         // resolves each friend's live connection through it.
-        _fanOutEngine = new FanOutEngine(
-            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry);
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _fanOutEngine = new FanOutEngine(
+            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
     }
 
     // ---- fixture plumbing (mirrors ChatHubPresenceTests / ChatHubPresenceReadTests) -------------------

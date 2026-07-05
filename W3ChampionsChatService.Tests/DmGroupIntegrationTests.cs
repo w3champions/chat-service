@@ -128,9 +128,9 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         // The three fan-out sinks ALL push through the ONE shared harness and read the SHARED registries
         // the hubs mutate, so every push lands in a single ordered capture.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _fanOutEngine = new FanOutEngine(
-            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry());
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _fanOutEngine = new FanOutEngine(
+            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry(), _viewersAccumulator, _time);
 
         // One shared provider over a controllable fake source (reads the per-tag dicts, OrdinalIgnoreCase),
         // SHARING the FakeTimeProvider so snapshot freshness and the hub clock agree.

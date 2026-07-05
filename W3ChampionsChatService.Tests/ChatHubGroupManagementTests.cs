@@ -103,7 +103,7 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
         _harness = new HubPushCaptureHarness();
         _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
         _coalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry());
+        _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry(), _accumulator, _time);
 
         _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
             tag,

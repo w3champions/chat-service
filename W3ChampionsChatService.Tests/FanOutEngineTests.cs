@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
@@ -68,7 +69,7 @@ public class FanOutEngineTests
     {
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry, new PresenceInterestRegistry());
+        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
     }
 
     // A SessionRegistry seeded with the given (connection, battleTag, isModerator) entries. A moderator
@@ -117,7 +118,7 @@ public class FanOutEngineTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
         return (harness, engine);
     }
 
@@ -367,7 +368,7 @@ public class FanOutEngineTests
         // UNFOCUSED level-All member who, for a NON-shadow message, WOULD receive a ChannelActivity.
         var members = new OnlineMemberRegistry();
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
 
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
@@ -553,7 +554,7 @@ public class FanOutEngineTests
         members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -575,7 +576,7 @@ public class FanOutEngineTests
         // An unfocused level-All recipient of an ACCEPTED Dm — suppression is lifted, so activity resumes.
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -593,7 +594,7 @@ public class FanOutEngineTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -705,7 +706,7 @@ public class FanOutEngineTests
         var groupMembers = new OnlineMemberRegistry();
         groupMembers.Join(ChannelId, GroupMemberConn, new MemberState(GroupMemberTag, NotificationLevel.All, 0, ChannelType.GroupDm));
         var groupEngine = new FanOutEngine(
-            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry(), new PresenceInterestRegistry());
+            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(groupHarness.HubContext, groupFocus), TimeProvider.System);
         var groupChannel = new ChatChannel { Id = ChannelId, Type = ChannelType.GroupDm };
 
         await groupEngine.OnMessagePersisted(groupChannel, Message(), AuthorConnection, isShadow: false, Now);
@@ -721,7 +722,7 @@ public class FanOutEngineTests
         var publicMembers = new OnlineMemberRegistry();
         publicMembers.Join(ChannelId, PublicMemberConn, new MemberState(PublicMemberTag, NotificationLevel.All, 0, ChannelType.Public));
         var publicEngine = new FanOutEngine(
-            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry(), new PresenceInterestRegistry());
+            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(publicHarness.HubContext, publicFocus), TimeProvider.System);
 
         await publicEngine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
@@ -740,7 +741,7 @@ public class FanOutEngineTests
         members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry());
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(content: "a pending message"), InitiatorConnection, isShadow: false, Now);
 
@@ -749,5 +750,148 @@ public class FanOutEngineTests
         // so an unsurfaced request's content can never leak via a preview.
         Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ChannelActivity),
             "a pending Dm must produce zero ChannelActivity — no preview can ever surface for an unsurfaced request");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // C7 (Task 5) FORCED-REMOVAL viewer-roster routing — PushChannelRemoved. Discharges the C3
+    // amendment: a forced removal of a currently-FOCUSED viewer of a ROSTER-PARTICIPATING channel
+    // (Public/SemiPublic/System) must emit a ViewersChanged{left} to the channel's REMAINING focused
+    // viewers — routed through ViewersAccumulator.RecordChange BEFORE FocusRegistry.Unfocus (pre-window
+    // baseline VIEWING), mirroring ChatHub.LeaveChannel. A PRIVATE lane (Dm/GroupDm) records nothing
+    // (D11), an offline target no-ops, and an unfocused member nets to no delta. A SHARED
+    // ViewersAccumulator + FakeTimeProvider + real registries drive FlushDue directly (no timers),
+    // exactly like ViewersAccumulatorTests.
+    // ---------------------------------------------------------------------------------------------
+
+    private const string VictimBattleTag = "Victim#9";
+    private const string VictimConnection = "conn-victim";
+    private const string SurvivorBattleTag = "Survivor#3";
+    private const string SurvivorConnection = "conn-survivor";
+    private static readonly TimeSpan ViewersFlush = ChatLimits.ViewersChangedFlush;
+
+    // Builds a forced-removal fixture: a SURVIVOR is always a focused viewer of ChannelId (the remaining
+    // viewer that should — or, for a private lane, should NOT — receive the ViewersChanged{left}). The
+    // engine's clock is a FakeTimeProvider pinned at Now, so the accumulator window opens at Now and a
+    // FlushDue(Now + ViewersFlush) is due. victimChannelType is the type the D11 guard reads from the
+    // victim's OnlineMemberRegistry entry; focusVictim seeds the victim into the live roster; a false
+    // registerVictimOnline models an OFFLINE target (no live session ⇒ PushChannelRemoved early-returns).
+    private static (HubPushCaptureHarness harness, FocusRegistry focus, OnlineMemberRegistry members, SessionRegistry sessions, ViewersAccumulator accumulator, FanOutEngine engine)
+        NewForcedRemovalFixture(ChannelType victimChannelType, bool focusVictim, bool registerVictimOnline = true)
+    {
+        var harness = new HubPushCaptureHarness();
+        var focus = new FocusRegistry();
+        var members = new OnlineMemberRegistry();
+        var sessions = new SessionRegistry();
+        var accumulator = new ViewersAccumulator(harness.HubContext, focus);
+        var time = new FakeTimeProvider(new DateTimeOffset(Now, TimeSpan.Zero));
+        var engine = new FanOutEngine(
+            harness.HubContext, focus, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry(), accumulator, time);
+
+        sessions.Register(SurvivorConnection, Identity(SurvivorBattleTag, false), null);
+        members.Join(ChannelId, SurvivorConnection, new MemberState(SurvivorBattleTag, NotificationLevel.All, 0, victimChannelType));
+        focus.Focus(SurvivorConnection, ChannelId, SurvivorBattleTag);
+
+        if (registerVictimOnline)
+        {
+            sessions.Register(VictimConnection, Identity(VictimBattleTag, false), null);
+            members.Join(ChannelId, VictimConnection, new MemberState(VictimBattleTag, NotificationLevel.All, 0, victimChannelType));
+            if (focusVictim)
+            {
+                focus.Focus(VictimConnection, ChannelId, VictimBattleTag);
+            }
+        }
+
+        return (harness, focus, members, sessions, accumulator, engine);
+    }
+
+    private static bool ContainsTag(IEnumerable<string> tags, string battleTag) =>
+        tags.Any(t => string.Equals(t, battleTag, StringComparison.OrdinalIgnoreCase));
+
+    [Test]
+    public async Task PushChannelRemoved_FocusedSystemChannelViewer_EmitsViewersLeftToRemainingViewers()
+    {
+        var (harness, _, _, _, accumulator, engine) = NewForcedRemovalFixture(ChannelType.System, focusVictim: true);
+
+        await engine.PushChannelRemoved(ChannelId, VictimBattleTag);
+        await accumulator.FlushDue(Now + ViewersFlush);
+
+        // The removed viewer is told to drop the channel...
+        Assert.AreEqual(1, harness.SignalCount(VictimConnection, ChatEvents.ChannelRemoved));
+        // ...and the REMAINING focused viewer receives a ViewersChanged reporting the victim as `left`.
+        var batch = harness.PayloadFor(SurvivorConnection, ChatEvents.ViewersChanged) as ViewersChangedDto;
+        Assert.IsNotNull(batch, "a forced removal of a focused System-channel viewer must emit ViewersChanged to remaining viewers");
+        Assert.AreEqual(ChannelId, batch.ChannelId);
+        Assert.IsTrue(ContainsTag(batch.Left, VictimBattleTag), "the removed viewer must be reported as `left`");
+        Assert.IsEmpty(batch.Joined);
+    }
+
+    [Test]
+    public async Task PushChannelRemoved_RecordsChangeBeforeUnfocus_BaselineIsViewing()
+    {
+        var (harness, focus, _, _, accumulator, engine) = NewForcedRemovalFixture(ChannelType.System, focusVictim: true);
+
+        await engine.PushChannelRemoved(ChannelId, VictimBattleTag);
+
+        // Ordering proof, part 1: FocusRegistry.Unfocus already ran (the victim is no longer viewing)...
+        Assert.IsFalse(ContainsTag(focus.GetRoster(ChannelId), VictimBattleTag), "PushChannelRemoved must Unfocus the removed viewer");
+        // ...and exactly one roster change was recorded (the victim's) — captured BEFORE that Unfocus.
+        Assert.AreEqual(1, accumulator.PendingChangeCount(ChannelId), "the forced removal must record exactly one roster change");
+
+        // Ordering proof, part 2: because RecordChange ran BEFORE Unfocus, the captured pre-window baseline
+        // was VIEWING, so the flush computes a `left`. A post-Unfocus RecordChange would have captured a
+        // not-viewing baseline and netted to NO delta — this `left` IS the RecordChange-before-Unfocus proof.
+        await accumulator.FlushDue(Now + ViewersFlush);
+        var batch = harness.PayloadFor(SurvivorConnection, ChatEvents.ViewersChanged) as ViewersChangedDto;
+        Assert.IsNotNull(batch, "baseline VIEWING must yield a `left` at flush — proving RecordChange ran before Unfocus");
+        Assert.IsTrue(ContainsTag(batch.Left, VictimBattleTag));
+    }
+
+    [Test]
+    public async Task PushChannelRemoved_GroupDmMember_DoesNotRecordViewerChange()
+    {
+        var (harness, _, _, _, accumulator, engine) = NewForcedRemovalFixture(ChannelType.GroupDm, focusVictim: true);
+
+        await engine.PushChannelRemoved(ChannelId, VictimBattleTag);
+        await accumulator.FlushDue(Now + ViewersFlush);
+        await accumulator.FlushDue(Now + ViewersFlush + ViewersFlush);
+
+        // The victim still gets the ChannelRemoved + registry/focus cleanup (regression parity with the
+        // live RemoveGroupMember caller)...
+        Assert.AreEqual(1, harness.SignalCount(VictimConnection, ChatEvents.ChannelRemoved));
+        // ...but a PRIVATE lane never enters the viewer-roster system (D11): no RecordChange, hence no
+        // ViewersChanged to any remaining member.
+        Assert.AreEqual(0, accumulator.PendingChangeCount(ChannelId), "a GroupDm forced removal must record no viewer change (D11 private-lane guard)");
+        Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ViewersChanged),
+            "a forced private-lane removal must emit no ViewersChanged to any remaining member");
+    }
+
+    [Test]
+    public async Task PushChannelRemoved_OfflineUser_StillNoOps()
+    {
+        var (harness, _, _, _, accumulator, engine) = NewForcedRemovalFixture(ChannelType.System, focusVictim: false, registerVictimOnline: false);
+
+        await engine.PushChannelRemoved(ChannelId, VictimBattleTag);
+        await accumulator.FlushDue(Now + ViewersFlush);
+
+        // Offline target (no live session) → GetByBattleTag null → early return: nothing pushed, nothing
+        // recorded, the remaining viewer sees no ViewersChanged.
+        Assert.IsEmpty(harness.AllSignals, "an offline forced-removal target must produce no pushes at all");
+        Assert.AreEqual(0, accumulator.PendingChangeCount(ChannelId), "an offline forced removal records no viewer change");
+    }
+
+    [Test]
+    public async Task PushChannelRemoved_UnfocusedMember_EmitsNoViewersChanged()
+    {
+        var (harness, _, _, _, accumulator, engine) = NewForcedRemovalFixture(ChannelType.System, focusVictim: false);
+
+        await engine.PushChannelRemoved(ChannelId, VictimBattleTag);
+        await accumulator.FlushDue(Now + ViewersFlush);
+
+        // The victim still gets its ChannelRemoved...
+        Assert.AreEqual(1, harness.SignalCount(VictimConnection, ChatEvents.ChannelRemoved));
+        // ...but an UNFOCUSED member was never in the roster, so the current-vs-baseline delta is empty
+        // (not-viewing == not-viewing): removing a non-viewer changes no roster, so no ViewersChanged fires.
+        Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ViewersChanged),
+            "removing an unfocused member emits no ViewersChanged — it was never a viewer");
     }
 }

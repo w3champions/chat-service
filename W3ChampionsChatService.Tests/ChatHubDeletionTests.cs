@@ -75,7 +75,9 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _onlineMemberRegistry,
             new ActivityCoalescer(_pushHarness.HubContext, _onlineMemberRegistry),
             _sessionRegistry,
-            new PresenceInterestRegistry());
+            new PresenceInterestRegistry(),
+            ViewersAccumulatorTestFactory.CreateIgnored(),
+            TimeProvider.System);
 
         var assembler = new SessionStateAssembler(
             new MembershipRepository(MongoClient, _channelRepository),

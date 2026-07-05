@@ -129,9 +129,9 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         // registries the hubs mutate — so every push lands in a single ordered capture and the
         // coalescer/accumulator see the live roster/membership/read-state the hubs produce.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _fanOutEngine = new FanOutEngine(
-            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry());
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _fanOutEngine = new FanOutEngine(
+            _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry(), _viewersAccumulator, _time);
     }
 
     // ============================================================================================
