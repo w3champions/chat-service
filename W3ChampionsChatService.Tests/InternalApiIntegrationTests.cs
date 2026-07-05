@@ -608,6 +608,31 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         };
         await _messageRepository.Insert(message);
 
+        // Also seed a soft-deleted AND a shadow-banned message into the SAME match channel (mirroring
+        // MessageRepositoryTests.DeleteAllForChannel_RemovesSoftDeletedAndShadowMessagesToo's C4 fields/
+        // flags) — the hard teardown must physically purge these too, not just the plain message above.
+        var softDeletedMessage = new ChannelMessage
+        {
+            ChannelId = channelDto.Id,
+            Seq = 2,
+            Sender = new MessageSender { BattleTag = bob, Name = "BobAC6" },
+            Content = "gg",
+            SentAt = _time.GetUtcNow().UtcDateTime,
+        };
+        await _messageRepository.Insert(softDeletedMessage);
+        await _messageRepository.MarkDeleted(softDeletedMessage.Id, "Mod#1", _time.GetUtcNow().UtcDateTime);
+
+        var shadowMessage = new ChannelMessage
+        {
+            ChannelId = channelDto.Id,
+            Seq = 3,
+            Sender = new MessageSender { BattleTag = alice, Name = "AliceAC6" },
+            Content = "shadowed",
+            SentAt = _time.GetUtcNow().UtcDateTime,
+            Shadow = true,
+        };
+        await _messageRepository.Insert(shadowMessage);
+
         var deleteResult = await DeleteChannelThroughFilter("match-ac6", MmSecret, NowTimestamp());
         Assert.That(deleteResult, Is.InstanceOf<OkResult>());
 
@@ -617,6 +642,12 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         Assert.That(removedDto?.ChannelId, Is.EqualTo(channelDto.Id));
 
         Assert.That(await _messageRepository.Load(message.Id), Is.Null, "the message is hard-purged");
+        // Load() is the repository's unfiltered-by-id read — no Deleted/Shadow predicate — so it would
+        // still find these rows if the hard teardown respected moderation state instead of purging it.
+        Assert.That(await _messageRepository.Load(softDeletedMessage.Id), Is.Null,
+            "a soft-deleted row is still a physical row pending its 30d TTL — the hard teardown must purge it too, not just the plain message");
+        Assert.That(await _messageRepository.Load(shadowMessage.Id), Is.Null,
+            "a shadow-banned row is an ordinary physical row too — the hard teardown must purge it just like any other message");
         Assert.That(await _membershipRepository.LoadForChannel(channelDto.Id), Is.Empty, "every membership is removed");
         Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-ac6"), Is.Null, "the channel doc itself is removed");
     }
