@@ -10,10 +10,12 @@ using W3ChampionsChatService.Memberships;
 namespace W3ChampionsChatService.Internal;
 
 /// <summary>
-/// C7 Task 6 — the match-channel domain core the /internal/* match endpoints (later C7 tasks) drive.
-/// Owns two things: <see cref="CreateOrGet"/> (idempotent System+Match find-or-create + display-name
-/// backfill) and the shared <see cref="AddMemberWithInvariant"/> that enforces the
-/// ONE-MATCH-CHANNEL-PER-USER invariant — every add path reuses it.
+/// C7 Tasks 6-7 — the match-channel domain core the /internal/* match endpoints drive. Owns
+/// <see cref="CreateOrGet"/> (idempotent System+Match find-or-create + display-name backfill, the
+/// <c>PUT /internal/channels/{ref}</c>-style upsert), <see cref="ApplyMembersDelta"/> (the
+/// <c>PUT /internal/channels/{ref}/members</c> delta — tolerant of arriving before the create), and the
+/// shared <see cref="AddMemberWithInvariant"/> that enforces the ONE-MATCH-CHANNEL-PER-USER invariant —
+/// every add path (both public methods) reuses it.
 /// <para>
 /// Singleton (registered in <see cref="Startup"/>, matching <see cref="FanOutEngine"/>'s lifetime): it
 /// holds no per-call state; its <see cref="ChannelRepository"/>/<see cref="MembershipRepository"/> deps are
@@ -122,6 +124,52 @@ public class MatchChannelService(
         };
         var persisted = await membershipRepository.InsertIfAbsent(membership);
         await fanOutEngine.PushChannelAdded(channel, persisted, focus);
+    }
+
+    /// <summary>
+    /// <c>PUT /internal/channels/{ref}/members</c> domain logic (C7 Task 7) — applies an mm-driven
+    /// membership delta to the System+Match channel keyed by <paramref name="systemRef"/>, tolerant of the
+    /// delta arriving BEFORE the channel's own create (M1 — never a hard 404).
+    /// <list type="number">
+    /// <item>CREATE-ON-DEMAND (§3.3): if no channel exists yet for <paramref name="systemRef"/>, find-or-create
+    /// a shell via <see cref="ChannelRepository.FindOrCreateSystem"/> with a PLACEHOLDER name equal to the ref
+    /// itself. The shell's 24h expiry is anchored to its OWN creation time (set by <c>FindOrCreateSystem</c>
+    /// via <c>$setOnInsert</c>); a later real <see cref="CreateOrGet"/> backfills the display name and — per
+    /// that method's own idempotent $setOnInsert semantics — does NOT reset this expiry.</item>
+    /// <item><paramref name="add"/> is processed FIRST, each battleTag via the shared
+    /// <see cref="AddMemberWithInvariant"/> — so the one-match-channel-per-user invariant (swap) and the
+    /// focus-hinted <c>ChannelAdded</c> push fire on this path exactly as they do from <see cref="CreateOrGet"/>.</item>
+    /// <item><paramref name="remove"/> is processed AFTER: per battleTag, <see cref="MembershipRepository.Load"/>
+    /// — ABSENT is a silent no-op (no push, mm's delta can legitimately race a membership that already left);
+    /// PRESENT is <see cref="MembershipRepository.Delete"/> then <see cref="FanOutEngine.PushChannelRemoved"/>,
+    /// whose <see cref="FanOut.FocusRegistry.Unfocus"/> tail IS the server force-unfocus of the removed user's
+    /// connection (acceptance 4).</item>
+    /// </list>
+    /// A battleTag appearing in BOTH lists ends up REMOVED — adds run before removes, so this is
+    /// deterministic even though mm never legitimately sends such an overlapping delta.
+    /// </summary>
+    public async Task ApplyMembersDelta(string systemRef, IReadOnlyList<string> add, IReadOnlyList<string> remove, bool focus)
+    {
+        var now = timeProvider.GetUtcNow().UtcDateTime;
+
+        var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef)
+            ?? await channelRepository.FindOrCreateSystem(SystemChannelKind.Match, systemRef, systemRef, now);
+
+        foreach (var battleTag in add)
+        {
+            await AddMemberWithInvariant(channel, battleTag, focus, now);
+        }
+
+        foreach (var battleTag in remove)
+        {
+            if (await membershipRepository.Load(channel.Id, battleTag) == null)
+            {
+                continue;
+            }
+
+            await membershipRepository.Delete(channel.Id, battleTag);
+            await fanOutEngine.PushChannelRemoved(channel.Id, battleTag);
+        }
     }
 
     /// <summary>
