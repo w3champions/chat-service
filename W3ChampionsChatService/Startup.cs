@@ -10,6 +10,7 @@ using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Internal;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
@@ -178,6 +179,26 @@ public class Startup
         // transitions (T4/T6) free; a transient would fragment each initiator's counter across hub
         // invocations, defeating the cap (the ChannelCreationRateLimiter singleton rationale).
         services.AddSingleton<DmInitiationTracker>();
+
+        // C7 Task 1 (brief Design decision 2): the env-only per-caller HMAC secret surface for the
+        // /internal/* REST endpoints (later C7 tasks). Deliberately NO `?? fallback` unlike the
+        // mongoConnectionString read above — an unset secret must disable that caller, never
+        // silently become an empty/guessable one. Singleton: it is immutable, read-only config
+        // resolved once at startup and shared by every request through the later HMAC filter.
+        var internalSecretMm = Environment.GetEnvironmentVariable("INTERNAL_SECRET_MM");
+        if (string.IsNullOrWhiteSpace(internalSecretMm))
+        {
+            Log.Warning("INTERNAL_SECRET_MM is not set — the mm caller of the /internal/* API is disabled");
+        }
+
+        var internalSecretWb = Environment.GetEnvironmentVariable("INTERNAL_SECRET_WB");
+        if (string.IsNullOrWhiteSpace(internalSecretWb))
+        {
+            Log.Warning("INTERNAL_SECRET_WB is not set — the wb caller of the /internal/* API is disabled");
+        }
+
+        services.AddSingleton(new InternalCallerSecrets(internalSecretMm, internalSecretWb));
+
         Log.Information("Services added");
     }
 

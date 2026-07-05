@@ -136,4 +136,25 @@ public static class ChatLimits
     /// <summary>GetPresence/GetPresenceDetails battleTag-array size cap (C6 plan decision, D14 —
     /// not spec §13; requests above this are rejected with <c>HubException</c>).</summary>
     public const int PresenceQueryMaxBattleTags = 200;
+
+    /// <summary>C7 HMAC freshness window (brief Design decision 2): a request is rejected when
+    /// |now − timestamp| exceeds this window. Pinned default — M1/W2 build against this exact 300s
+    /// value as a cross-repo contract, so a test asserts it verbatim.</summary>
+    public static readonly TimeSpan InternalSignatureFreshnessWindow = TimeSpan.FromSeconds(300);
+
+    /// <summary>C7 internal-endpoint raw-body size cap (Task 3's HMAC filter hard-stops buffering
+    /// here before signature verification) — defense-in-depth against an oversized frame forcing
+    /// needless allocation ahead of validation (same rationale as the SignalR receive-size cap in
+    /// Startup.cs). Not itself brief-pinned text; hard-coded, adjust here only.</summary>
+    public const int InternalMaxBodyBytes = 64 * 1024;
+
+    /// <summary>C7 `members`/`add`/`remove` array size cap per internal-API call (brief Design
+    /// decision 3's endpoint bodies) — plan decision, not itself brief-pinned text; hard-coded,
+    /// adjust here only.</summary>
+    public const int InternalMaxMembersPerCall = 64;
+
+    /// <summary>C7 `{ref}` length cap backing the dot-segment defense regex
+    /// <c>^[A-Za-z0-9_-]{1,64}$</c> (M1 security finding): callers URL-encode a <c>nanoid(10)</c>,
+    /// but the server independently re-validates every ref rather than trusting the caller.</summary>
+    public const int InternalRefMaxLength = 64;
 }
