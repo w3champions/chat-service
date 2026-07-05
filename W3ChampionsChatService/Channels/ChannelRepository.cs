@@ -168,6 +168,62 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
+    /// Find-or-create for System channel shells (match/lobby/clan, C7 Task 4), keyed by
+    /// (SystemKind, SystemRef) — mirrors <see cref="FindOrCreateDm"/>'s $setOnInsert-upsert +
+    /// duplicate-key-retry-once idiom VERBATIM, backed by the unique partial index
+    /// <c>ux_systemKind_systemRef</c> (Type == System). <c>ExpiresAt</c> is computed via
+    /// <see cref="ExpiryCalculator.ForChannelShell"/> against <paramref name="kind"/> — THIS is the
+    /// C1-amendment wiring this task closes: a Match shell gets <c>now + RetentionPeriods.MatchChannel</c>
+    /// (24h), while a Clan shell (permanent) computes null. A null result is deliberately left OUT of
+    /// the $setOnInsert chain entirely rather than set explicitly — <see cref="ChatChannel.ExpiresAt"/>
+    /// is <c>[BsonIgnoreIfNull]</c> and must stay ABSENT on a permanent document (an explicit
+    /// <c>$setOnInsert: {ExpiresAt: null}</c> would write the field with a null value instead of
+    /// omitting it, which the TTL convention documented on <see cref="Domain.ChatDomainIndexes"/>
+    /// requires). Two concurrent calls for the SAME (kind, ref) resolve to exactly one document.
+    /// </summary>
+    public async Task<ChatChannel> FindOrCreateSystem(SystemChannelKind kind, string systemRef, string name, DateTime now)
+    {
+        var expiresAt = ExpiryCalculator.ForChannelShell(new ChatChannel { Type = ChannelType.System, SystemKind = kind }, now);
+
+        var filter = Builders<ChatChannel>.Filter.Where(c =>
+            c.Type == ChannelType.System && c.SystemKind == kind && c.SystemRef == systemRef);
+        var update = Builders<ChatChannel>.Update
+            .SetOnInsert(c => c.Id, ObjectId.GenerateNewId().ToString())
+            .SetOnInsert(c => c.SystemKind, kind)
+            .SetOnInsert(c => c.SystemRef, systemRef)
+            .SetOnInsert(c => c.Name, name)
+            .SetOnInsert(c => c.LastSeq, 0L)
+            .SetOnInsert(c => c.LastMessageAt, now);
+        if (expiresAt.HasValue)
+        {
+            update = update.SetOnInsert(c => c.ExpiresAt, expiresAt.Value);
+        }
+
+        var options = new FindOneAndUpdateOptions<ChatChannel>
+        {
+            IsUpsert = true,
+            ReturnDocument = ReturnDocument.After,
+        };
+
+        try
+        {
+            return await Channels.FindOneAndUpdateAsync(filter, update, options);
+        }
+        catch (MongoCommandException ex) when (IsDuplicateKey(ex))
+        {
+            return await Channels.FindOneAndUpdateAsync(filter, update, options);
+        }
+    }
+
+    /// <summary>
+    /// Loads an existing System channel shell by (SystemKind, SystemRef), if any — the lookup
+    /// counterpart of <see cref="FindOrCreateSystem"/> for call sites that only need an existence
+    /// check (mirrors <see cref="LoadByPairKey"/>'s shape).
+    /// </summary>
+    public Task<ChatChannel> LoadBySystemRef(SystemChannelKind kind, string systemRef) =>
+        Channels.Find(c => c.Type == ChannelType.System && c.SystemKind == kind && c.SystemRef == systemRef).FirstOrDefaultAsync();
+
+    /// <summary>
     /// Consent-machine accept transition (C5 D3/D10): a conditional write that flips
     /// <c>RequestState</c> Pending → Accepted ONLY when it is currently Pending, and in the same
     /// atomic update sets <c>ExpiresAt</c> to the +1y accepted-shell expiry. Returns false (no-op)

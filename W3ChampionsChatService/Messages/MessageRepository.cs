@@ -222,6 +222,17 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
+    /// Channel-teardown hard purge (C7 internal DELETE, brief Decision-3) — DISTINCT from moderation
+    /// soft-delete (<see cref="MarkDeleted"/>/<see cref="MarkDeletedMany"/>), which stays TTL-physical.
+    /// Dm/GroupDm teardown intentionally does NOT call this. Mirrors
+    /// <see cref="Memberships.MembershipRepository.DeleteAllForChannel"/>'s shape.
+    /// COUPLING: this is the ONE hard-delete method allowlisted by the reflection guard
+    /// <c>OldProtocolRemovedTests.ModerationNeverHardDeletes</c> — that guard still fails the build for
+    /// any OTHER delete-verb method, so a moderation physical-delete path can never sneak in past it.
+    /// </summary>
+    public Task DeleteAllForChannel(string channelId) => Messages.DeleteManyAsync(m => m.ChannelId == channelId);
+
+    /// <summary>
     /// Requested limits above the page-size cap are clamped down, never rejected. The lower
     /// bound of 1 is load-bearing: MongoDB.Driver's <c>.Limit(0)</c> means "no limit" (returns
     /// every matching document), so a limit of 0 must never reach <c>.Limit()</c> unchanged.

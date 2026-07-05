@@ -61,6 +61,19 @@ public static class ChatDomainIndexes
                     PartialFilterExpression = Builders<ChatChannel>.Filter.In(
                         c => c.Type, [ChannelType.Public, ChannelType.SemiPublic]),
                 }),
+            // C7 Task 4: backs ChannelRepository.FindOrCreateSystem/LoadBySystemRef — mirrors
+            // ux_pairKey_dm's partial-unique shape exactly (Type == System instead of Type == Dm).
+            // System channels (match/lobby/clan shells) are keyed by (SystemKind, SystemRef); this
+            // guarantees exactly one channel document per (kind, ref) pair even under a genuine
+            // concurrent find-or-create race.
+            new CreateIndexModel<ChatChannel>(
+                Builders<ChatChannel>.IndexKeys.Ascending(c => c.SystemKind).Ascending(c => c.SystemRef),
+                new CreateIndexOptions<ChatChannel>
+                {
+                    Name = "ux_systemKind_systemRef",
+                    Unique = true,
+                    PartialFilterExpression = Builders<ChatChannel>.Filter.Eq(c => c.Type, ChannelType.System),
+                }),
             new CreateIndexModel<ChatChannel>(
                 Builders<ChatChannel>.IndexKeys.Ascending(c => c.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),

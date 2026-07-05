@@ -146,32 +146,41 @@ public class OldProtocolRemovedTests
     }
 
     /// <summary>
-    /// C4 Task 9 (final sweep) guardrail. Message deletion in this service is TTL-only physical
-    /// removal — moderator delete/purge only ever soft-deletes (sets <c>Deleted{By,At}</c> via
-    /// <see cref="MessageRepository.MarkDeleted"/> / <see cref="MessageRepository.MarkDeletedMany"/>).
+    /// C4 Task 9 (final sweep) guardrail, narrowly amended by C7 Task 4. No <em>moderation</em>
+    /// hard-delete API — moderation stays soft-delete + TTL (sets <c>Deleted{By,At}</c> via
+    /// <see cref="MessageRepository.MarkDeleted"/> / <see cref="MessageRepository.MarkDeletedMany"/>),
+    /// which the shadow-ban illusion and retention windows both depend on. The one intentional
+    /// exception is channel-teardown purge (<see cref="MessageRepository.DeleteAllForChannel"/>, the
+    /// C7 internal DELETE): when a match/lobby channel is disbanded the whole channel is physically
+    /// removed, so its messages are hard-purged with it. This is NOT a moderation path.
     /// This is a reflection pin on <see cref="MessageRepository"/>'s PUBLIC surface: no method whose
-    /// name contains a delete/remove/drop verb is allowed to exist EXCEPT the two known soft-delete
-    /// methods. A future public <c>DeleteMessagePermanently</c> (or similarly named hard-delete API)
-    /// added to <see cref="MessageRepository"/> fails this test loudly instead of silently
-    /// reintroducing a physical-delete path that TTL/retention assumptions don't expect.
+    /// name contains a delete/remove/drop verb is allowed to exist EXCEPT the two soft-delete methods
+    /// and that one teardown-purge exception. A future public <c>DeleteMessagePermanently</c> (or
+    /// similarly named hard-delete API) added to <see cref="MessageRepository"/> still fails this test
+    /// loudly instead of silently reintroducing a moderation physical-delete path that TTL/retention
+    /// assumptions don't expect.
     /// </summary>
     [Test]
     public void ModerationNeverHardDeletes()
     {
-        var allowedSoftDeleteNames = new HashSet<string> { "MarkDeleted", "MarkDeletedMany" };
+        // MarkDeleted/MarkDeletedMany = soft-delete (moderation). DeleteAllForChannel = the ONE
+        // intentional hard-delete exception (C7 channel teardown, NOT moderation) — see its doc on
+        // MessageRepository. Do not broaden this allowlist for any other method.
+        var allowedNames = new HashSet<string> { "MarkDeleted", "MarkDeletedMany", "DeleteAllForChannel" };
 
         var suspiciousMethods = typeof(MessageRepository)
             .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
             .Where(m => !m.IsSpecialName)
             .Where(m => ContainsDeleteVerb(m.Name))
-            .Where(m => !allowedSoftDeleteNames.Contains(m.Name))
+            .Where(m => !allowedNames.Contains(m.Name))
             .Select(m => m.Name)
             .ToList();
 
         Assert.That(suspiciousMethods, Is.Empty,
-            "MessageRepository must expose NO message hard-delete API. Found suspicious public " +
-            $"method(s): [{string.Join(", ", suspiciousMethods)}]. Physical message removal is " +
-            "TTL-only (ExpiresAt) — use MarkDeleted/MarkDeletedMany (soft-delete, $set) instead.");
+            "MessageRepository must expose NO moderation hard-delete API. Found suspicious public " +
+            $"method(s): [{string.Join(", ", suspiciousMethods)}]. Moderation physical removal is " +
+            "TTL-only (ExpiresAt) — use MarkDeleted/MarkDeletedMany (soft-delete, $set) instead. The " +
+            "only permitted hard-delete is DeleteAllForChannel (C7 channel teardown, not moderation).");
     }
 
     private static bool ContainsDeleteVerb(string methodName) =>

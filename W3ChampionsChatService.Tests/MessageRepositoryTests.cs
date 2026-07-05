@@ -668,4 +668,47 @@ public class MessageRepositoryTests : IntegrationTestBase
         Assert.AreEqual("FirstMod#1", reloadedAlready.Deleted.By, "the already-deleted row keeps its original attribution");
         Assert.AreEqual(firstAt, reloadedAlready.Deleted.At);
     }
+
+    // ── C7 Task 4 — channel-teardown hard purge (net-new; DISTINCT from moderation soft-delete) ──
+
+    [Test]
+    public async Task DeleteAllForChannel_RemovesOnlyThatChannelsMessages()
+    {
+        var repo = new MessageRepository(MongoClient);
+        var target1 = NewMessage("chan1", 1);
+        var target2 = NewMessage("chan1", 2);
+        var otherChannel = NewMessage("chan2", 1);
+        await repo.Insert(target1);
+        await repo.Insert(target2);
+        await repo.Insert(otherChannel);
+
+        await repo.DeleteAllForChannel("chan1");
+
+        Assert.IsNull(await repo.Load(target1.Id));
+        Assert.IsNull(await repo.Load(target2.Id));
+        Assert.IsNotNull(await repo.Load(otherChannel.Id), "a different channel's messages must be untouched");
+    }
+
+    [Test]
+    public async Task DeleteAllForChannel_RemovesSoftDeletedAndShadowMessagesToo()
+    {
+        // This is a HARD purge (channel teardown), distinct from moderation soft-delete: soft-deleted
+        // rows are still physically present pending the 30d TTL, and shadow-banned rows are ordinary
+        // physical rows too — both must be removed just like any other row in the channel.
+        var repo = new MessageRepository(MongoClient);
+        var normal = NewMessage("chan1", 1);
+        var softDeleted = NewMessage("chan1", 2);
+        var shadow = NewMessage("chan1", 3, "Wolf#456");
+        shadow.Shadow = true;
+        await repo.Insert(normal);
+        await repo.Insert(softDeleted);
+        await repo.Insert(shadow);
+        await repo.MarkDeleted(softDeleted.Id, "Mod#1", DateTime.UtcNow);
+
+        await repo.DeleteAllForChannel("chan1");
+
+        Assert.IsNull(await repo.Load(normal.Id));
+        Assert.IsNull(await repo.Load(softDeleted.Id), "soft-deleted rows are still physical rows and must be hard-purged too");
+        Assert.IsNull(await repo.Load(shadow.Id), "shadow-banned rows are still physical rows and must be hard-purged too");
+    }
 }
