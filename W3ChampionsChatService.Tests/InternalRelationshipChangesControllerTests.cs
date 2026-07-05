@@ -136,6 +136,8 @@ public class InternalRelationshipChangesControllerTests
     [TestCase("Actor\r#1", "Target#2")]  // carriage return
     [TestCase("Actor#1", "Target\t#2")]  // tab
     [TestCase("Actor\0#1", "Target#2")] // NUL
+    [TestCase("Actor#1 \u2028[FATAL] fake alert", "Target#2")]  // U+2028 LINE SEPARATOR — not char.IsControl, but must still be rejected
+    [TestCase("Actor#1", "Target#2 \u2029[FATAL] fake alert")] // U+2029 PARAGRAPH SEPARATOR — same class of gap
     public void Post_ControlCharInActorOrTarget_400_NoInvalidateCalls(string actor, string target)
     {
         var result = _controller.Post(ValidRequest(actor: actor, target: target));
