@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Threading.Tasks;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
@@ -55,29 +56,45 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task FindOrCreateSystem_ConcurrentDuplicateKey_RetriesOnce()
+    public async Task FindOrCreateSystem_ConcurrentCalls_YieldOneChannel()
     {
         await ChatDomainIndexes.EnsureAllAsync(MongoClient);
         var repo = new ChannelRepository(MongoClient);
-        // Simulates the losing half of a genuine race: a doc already exists under the same
-        // (SystemKind, SystemRef) by the time the upsert's own insert half is attempted, which must
-        // surface as a duplicate-key MongoCommandException on ux_systemKind_systemRef and be retried
-        // once (mirroring FindOrCreateSemiPublic/FindOrCreateDm's retry idiom).
-        var preInserted = new ChatChannel
-        {
-            Type = ChannelType.System,
-            SystemKind = SystemChannelKind.Match,
-            SystemRef = "match-1",
-            Name = "Pre-existing",
-            LastSeq = 0,
-        };
-        await repo.Insert(preInserted);
+        // Genuine race — 8 parallel calls against a NOT-yet-existing (kind, ref) — mirrors
+        // FindOrCreateDm_ConcurrentCalls_YieldOneDocument / FindOrCreateSemiPublic_ConcurrentCalls_YieldOneChannel
+        // verbatim. Exactly one of the 8 upserts wins the insert half; the other 7 hit the unique
+        // partial index ux_systemKind_systemRef, surface as a duplicate-key MongoCommandException, and
+        // must resolve via the retry-once path in ChannelRepository.FindOrCreateSystem's catch block —
+        // unlike the pre-inserted-doc variant this replaces, the insert half is actually attempted here.
+        var tasks = Enumerable.Range(0, 8)
+            .Select(_ => Task.Run(() => repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now)));
+        var results = await Task.WhenAll(tasks);
 
-        var result = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        var distinctIds = results.Select(c => c.Id).Distinct().ToList();
+        Assert.That(distinctIds.Count, Is.EqualTo(1), "concurrent find-or-creates for the same (kind, ref) must resolve to exactly one document");
 
-        Assert.That(result.Id, Is.EqualTo(preInserted.Id));
         var all = await repo.LoadAllOfType(ChannelType.System);
         Assert.That(all.Count, Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task FindOrCreateSystem_ClanKind_OmitsExpiresAt()
+    {
+        var repo = new ChannelRepository(MongoClient);
+
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Clan, "clan-1", "Clan Chat", Now);
+
+        Assert.That(channel.ExpiresAt, Is.Null);
+
+        // Raw-BSON assertion (mirrors ChannelRepositoryTests.Channel_RoundTrips_WithEnumsAsStrings, lines
+        // 36-40): a permanent System kind (Clan) must leave ExpiresAt genuinely ABSENT from the BSON
+        // document, not written as an explicit null — FindOrCreateSystem's `if (expiresAt.HasValue)`
+        // guard is load-bearing for this, since an unconditional $setOnInsert of a null value would
+        // write the field instead of omitting it, breaking the TTL-absence convention.
+        var raw = await MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName)
+            .GetCollection<BsonDocument>(ChatCollections.Channels)
+            .Find(new BsonDocument("_id", channel.Id)).FirstAsync();
+        Assert.That(raw.Contains("ExpiresAt"), Is.False, "Clan (permanent) System channels must never have ExpiresAt written, not even as null");
     }
 
     [Test]
