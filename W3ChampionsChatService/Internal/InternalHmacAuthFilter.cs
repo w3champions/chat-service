@@ -117,7 +117,7 @@ public class InternalHmacAuthFilter(InternalCallerSecrets secrets, TimeProvider 
     /// body exceeds it (never buffers past the cap). Reads through a fixed 8&#160;KB scratch buffer, so
     /// memory is bounded by the cap regardless of a spoofed/absent Content-Length.
     /// </summary>
-    private static async Task<byte[]?> TryReadCappedBodyAsync(Stream body)
+    private static async Task<byte[]> TryReadCappedBodyAsync(Stream body)
     {
         using var buffered = new MemoryStream();
         var scratch = new byte[8192];
