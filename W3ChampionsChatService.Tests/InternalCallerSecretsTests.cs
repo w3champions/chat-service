@@ -70,4 +70,31 @@ public class InternalCallerSecretsTests
         // cross-repo contract.
         Assert.That(ChatLimits.InternalSignatureFreshnessWindow, Is.EqualTo(TimeSpan.FromSeconds(300)));
     }
+
+    [Test]
+    public void Ctor_Throws_WhenBothSecretsIdentical()
+    {
+        // Security guard: an identical Mm/Wb secret (e.g. ops copy-pasting one vault entry into both
+        // env vars) would collapse caller identity in HmacSignatureVerifier's "first secret that
+        // verifies" resolution — every request signed with the shared secret would resolve as Mm.
+        // Fail hard at construction rather than silently misresolving at request time.
+        Assert.That(
+            () => new InternalCallerSecrets("shared-secret", "shared-secret"),
+            Throws.InvalidOperationException);
+    }
+
+    [Test]
+    public void Ctor_DoesNotThrow_WhenSecretsDifferOnlyByCase()
+    {
+        // Ordinal comparison — "abc" and "ABC" are distinct secrets, not a collapse. This must not
+        // throw and both callers must remain configured.
+        InternalCallerSecrets secrets = null;
+        Assert.That(() => secrets = new InternalCallerSecrets("shared-secret", "SHARED-SECRET"), Throws.Nothing);
+
+        Assert.That(secrets.Configured, Is.EqualTo(new List<(InternalCaller, string)>
+        {
+            (InternalCaller.Mm, "shared-secret"),
+            (InternalCaller.Wb, "SHARED-SECRET")
+        }));
+    }
 }

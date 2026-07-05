@@ -67,7 +67,7 @@ public class InternalHmacAuthFilter(InternalCallerSecrets secrets, TimeProvider 
         // 2. Buffer the raw body so downstream System.Text.Json model binding can re-read the IDENTICAL
         //    bytes after we rewind. Read is HARD-capped: an over-cap body cannot be verified without
         //    unbounded buffering, so it fails closed (never read unbounded into memory).
-        request.EnableBuffering();
+        request.EnableBuffering(bufferThreshold: ChatLimits.InternalMaxBodyBytes);
         var rawBody = await TryReadCappedBodyAsync(request.Body);
         if (rawBody is null)
         {

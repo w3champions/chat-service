@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace W3ChampionsChatService.Internal;
@@ -20,6 +21,20 @@ public class InternalCallerSecrets
 
     public InternalCallerSecrets(string mmSecret, string wbSecret)
     {
+        // Guard: if both callers are configured with the IDENTICAL secret (e.g. ops copy-pasting the
+        // same vault entry into both env vars), the "first secret whose MAC matches" resolution in
+        // HmacSignatureVerifier collapses caller identity — every request signed with that shared
+        // secret resolves as Mm (privilege escalation for whoever holds the Wb secret), and genuine Wb
+        // traffic mis-resolves as Mm and fails the Wb allow-list (self-inflicted DoS). Fail hard here,
+        // at startup DI construction, rather than silently misresolving at request time.
+        if (!string.IsNullOrWhiteSpace(mmSecret)
+            && !string.IsNullOrWhiteSpace(wbSecret)
+            && string.Equals(mmSecret, wbSecret, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "INTERNAL_SECRET_MM and INTERNAL_SECRET_WB must be distinct — identical secrets collapse caller identity");
+        }
+
         var configured = new List<(InternalCaller Caller, string Secret)>();
 
         if (!string.IsNullOrWhiteSpace(mmSecret))
