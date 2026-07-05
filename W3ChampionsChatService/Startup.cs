@@ -62,6 +62,11 @@ public class Startup
         services.AddTransient<IMuteRepository, MuteRepository>();
         services.AddTransient<UserHasPermissionFilter>();
         services.AddTransient<ChatHubPermissionFilter>();
+        // C7 Task 3: the /internal/* HMAC auth-realm boundary. Transient (mirrors the two filters above)
+        // — InternalHmacAuthAttribute (an IFilterFactory) resolves a fresh instance per request and stamps
+        // its per-endpoint caller allow-list before the filter runs. Its deps (InternalCallerSecrets,
+        // TimeProvider) are the singletons registered below / at line ~101.
+        services.AddTransient<InternalHmacAuthFilter>();
 
         // C1 chat domain foundation
         services.AddTransient<ChannelRepository>();
