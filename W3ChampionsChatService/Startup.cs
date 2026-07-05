@@ -168,14 +168,30 @@ public class Startup
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();
 
+        // C5 (Task 1, D1/D2/D19) / W2: the shared outbound secret WebsiteBackendRelationshipSource attaches
+        // to its wb relationship-read call (header x-chat-relationships-secret), mirroring wb's own
+        // fail-closed ChatServiceSecretAuthFilter. This value MUST equal wb's CHAT_RELATIONSHIPS_API_SECRET
+        // env var — they are two ends of one shared secret, set independently in each service's deployment
+        // config. Deliberately NO fallback default (mirrors INTERNAL_SECRET_MM/WB below): an unset secret
+        // means outbound relationship fetches go out with NO auth header, wb 401s, and the existing
+        // IRelationshipProvider fail-closed path takes over — the safe state, not a crash. Singleton:
+        // immutable, read-only config resolved once at startup.
+        var relationshipsSourceSecret = Environment.GetEnvironmentVariable("STATISTIC_SERVICE_RELATIONSHIPS_SECRET");
+        if (string.IsNullOrWhiteSpace(relationshipsSourceSecret))
+        {
+            Log.Warning(
+                "STATISTIC_SERVICE_RELATIONSHIPS_SECRET is not set — outbound relationship fetches to wb " +
+                "will be unauthenticated; wb will reject them with 401 and relationship-gated paths fail closed");
+        }
+        services.AddSingleton(new RelationshipsSourceAuthSettings(relationshipsSourceSecret));
+
         // C5 (Task 1, D1/D2/D19): the relationship (friends/blocked) provider + its swappable read source.
         // The provider is a SINGLETON — it holds the in-memory friends/blocked cache that every hub
         // invocation (block/friend gates in later C5 tasks, the connect-time warm prefetch, and C7's
         // Invalidate change-ping) must share; a transient would fragment the cache and defeat both the TTL
         // and the last-known fallback. The source is transient (the singleton provider captures one
         // instance for its lifetime; WebsiteBackendRelationshipSource is stateless behind a shared static
-        // HttpClient). The wb route the source targets does not exist yet (W2) — until it lands,
-        // relationship-gated paths fail closed retriable.
+        // HttpClient plus the RelationshipsSourceAuthSettings singleton it takes as a constructor dep).
         services.AddSingleton<IRelationshipProvider, RelationshipProvider>();
         services.AddTransient<IRelationshipSource, WebsiteBackendRelationshipSource>();
 
