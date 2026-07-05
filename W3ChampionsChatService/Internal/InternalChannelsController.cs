@@ -25,7 +25,8 @@ namespace W3ChampionsChatService.Internal;
 /// </para>
 /// <para>
 /// VALIDATION: every action re-validates <c>ref</c> against the M1 dot-segment defense
-/// (<c>^[A-Za-z0-9_-]{1,64}$</c>, compiled) independent of what the HMAC filter already checked —
+/// (<c>\A[A-Za-z0-9_-]{1,64}\z</c>, compiled — <c>\A</c>/<c>\z</c> rather than <c>^</c>/<c>$</c> so a
+/// trailing newline cannot slip through) independent of what the HMAC filter already checked —
 /// defense-in-depth against a signed-but-malformed ref reaching Mongo as a lookup key. All validation
 /// failures return <see cref="ErrorResult"/> with a GENERIC message (never echoing back which rule
 /// failed) via a plain 400. Unexpected exceptions from the domain layer are logged once (caller, verb,
@@ -40,8 +41,11 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
     private const string MatchKind = "match";
     private const string GenericValidationError = "Invalid request.";
 
+    // \A/\z (absolute start/end), NOT ^/$ — .NET's `$` also matches immediately before a single
+    // trailing '\n' when RegexOptions.Multiline is NOT set, so "abc123\n" would otherwise pass this
+    // character-class check despite containing a newline (log-injection + distinct Mongo key risk).
     private static readonly Regex RefPattern =
-        new($@"^[A-Za-z0-9_-]{{1,{ChatLimits.InternalRefMaxLength}}}$", RegexOptions.Compiled);
+        new($@"\A[A-Za-z0-9_-]{{1,{ChatLimits.InternalRefMaxLength}}}\z", RegexOptions.Compiled);
 
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] InternalChannelCreateRequest request)
@@ -57,7 +61,7 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         }
 
         var name = request.Name?.Trim();
-        if (string.IsNullOrEmpty(name) || name.Length > 100)
+        if (string.IsNullOrEmpty(name) || name.Length > ChatLimits.InternalChannelNameMaxLength)
         {
             return BadRequest(new ErrorResult(GenericValidationError));
         }

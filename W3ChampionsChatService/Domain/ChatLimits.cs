@@ -154,7 +154,14 @@ public static class ChatLimits
     public const int InternalMaxMembersPerCall = 64;
 
     /// <summary>C7 `{ref}` length cap backing the dot-segment defense regex
-    /// <c>^[A-Za-z0-9_-]{1,64}$</c> (M1 security finding): callers URL-encode a <c>nanoid(10)</c>,
-    /// but the server independently re-validates every ref rather than trusting the caller.</summary>
+    /// <c>\A[A-Za-z0-9_-]{1,64}\z</c> (M1 security finding; anchored with <c>\A</c>/<c>\z</c> rather
+    /// than <c>^</c>/<c>$</c> so a trailing newline cannot bypass the character class): callers
+    /// URL-encode a <c>nanoid(10)</c>, but the server independently re-validates every ref rather than
+    /// trusting the caller.</summary>
     public const int InternalRefMaxLength = 64;
+
+    /// <summary>C7 internal-endpoint channel <c>name</c> length cap (chars) — brief Design decision 3's
+    /// endpoint bodies pin this field; plan decision, not itself brief-pinned text; hard-coded, adjust
+    /// here only.</summary>
+    public const int InternalChannelNameMaxLength = 100;
 }

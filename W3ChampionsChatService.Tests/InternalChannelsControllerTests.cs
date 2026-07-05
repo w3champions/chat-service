@@ -140,6 +140,13 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         yield return "a/b"; // path separator
         yield return new string('a', 65); // over the 64-char cap
         yield return ""; // empty
+        // Trailing-newline bypass (M1 regression guard): without RegexOptions.Multiline, .NET's `$`
+        // also matches immediately before a single trailing '\n', so an anchor of ^...$ would let
+        // these through despite the character class forbidding newlines — log-injection into the
+        // Serilog {Ref} sink plus a distinct (polluted) Mongo systemRef key. \A...\z closes this.
+        yield return "abc123\n";
+        yield return "abc123\r\n";
+        yield return "a\nb";
     }
 
     [TestCaseSource(nameof(InvalidRefs))]
@@ -240,10 +247,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         Assert.That(removed, Is.Empty, "the remove must have been applied");
     }
 
-    [Test]
-    public async Task Put_RefWithDotSegments_400()
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task Put_RefWithDotSegments_400(string badRef)
     {
-        var result = await _controller.UpdateMembers("..", new InternalMembersDeltaRequest());
+        var result = await _controller.UpdateMembers(badRef, new InternalMembersDeltaRequest());
 
         AssertBadRequest(result);
     }
@@ -282,10 +289,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         Assert.That(loaded, Is.Null, "the channel must be hard-deleted");
     }
 
-    [Test]
-    public async Task Delete_RefWithDotSegments_400()
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task Delete_RefWithDotSegments_400(string badRef)
     {
-        var result = await _controller.Delete("a/b");
+        var result = await _controller.Delete(badRef);
 
         AssertBadRequest(result);
     }
@@ -304,6 +311,12 @@ public class InternalChannelsControllerTests : IntegrationTestBase
             .Where(IsInternalController)
             .ToList();
 
+    // ASSUMPTION (documented, not enforced by this method): this only inspects a CLASS-LEVEL
+    // [Route] attribute. A future internal controller that declared its "internal/..." path solely
+    // via an action-level [HttpGet("internal/...")] AND lived outside the InternalChannelsController
+    // namespace would slip past the routesUnderInternal check. The namespace check is the intended
+    // backstop — internal controllers are expected to live in the Internal namespace and/or carry a
+    // class-level internal/ [Route], per this sweep's design.
     private static bool IsInternalController(Type controllerType)
     {
         var routeTemplate = controllerType.GetCustomAttribute<RouteAttribute>()?.Template;
