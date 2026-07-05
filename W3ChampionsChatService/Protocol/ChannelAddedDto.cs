@@ -19,8 +19,10 @@ namespace W3ChampionsChatService.Protocol;
 /// client to focus the channel immediately (e.g. a lobby-join or ladder-load auto-open); <c>false</c>
 /// just adds it to the list without switching the client's active view.
 /// </para>
-/// CONTRACT COMPLETENESS (C3 Task 18): C5/C7 own the actual trigger (channel creation / invite-join
-/// flows) — C3 only pins this shape and provides the emit helper; there are no production callers
-/// yet, only tests.
+/// CONTRACT COMPLETENESS (C3 Task 18): C3 pins this shape and provides the emit helper
+/// (<see cref="FanOut.FanOutEngine.PushChannelAdded"/>); C5/C7 now drive it in production — C5's
+/// <c>ChatHub.OpenDm</c> (DM first-message materialization), <c>ChatHub.CreateGroup</c> and
+/// <c>ChatHub.AddGroupMember</c> (GroupDm), plus C7's <c>MatchChannelService.AddMemberWithInvariant</c>
+/// (System-match auto-join / one-match-channel swap).
 /// </summary>
 public record ChannelAddedDto(ChatChannel Channel, MembershipDto Membership, bool Focus);

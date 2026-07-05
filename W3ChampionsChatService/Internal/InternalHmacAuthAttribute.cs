@@ -24,7 +24,7 @@ public class InternalHmacAuthAttribute(params InternalCaller[] allowedCallers) :
 
     public IFilterMetadata CreateInstance(IServiceProvider serviceProvider)
     {
-        var filter = serviceProvider.GetService<InternalHmacAuthFilter>();
+        var filter = serviceProvider.GetRequiredService<InternalHmacAuthFilter>();
         filter.AllowedCallers = AllowedCallers;
         return filter;
     }

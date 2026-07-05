@@ -19,10 +19,11 @@ namespace W3ChampionsChatService.Internal;
 /// arriving before the create too), and the shared <see cref="AddMemberWithInvariant"/> that enforces the
 /// ONE-MATCH-CHANNEL-PER-USER invariant — every add path (both public add methods) reuses it.
 /// <para>
-/// Singleton (registered in <see cref="Startup"/>, matching <see cref="FanOutEngine"/>'s lifetime): it
-/// holds no per-call state; its <see cref="ChannelRepository"/>/<see cref="MembershipRepository"/>/
-/// <see cref="MessageRepository"/> deps are stateless MongoClient wrappers, so capturing them for the
-/// singleton's lifetime is safe.
+/// Singleton (registered in <see cref="Startup"/>): it holds no per-call state. Its
+/// <see cref="ChannelRepository"/>/<see cref="MembershipRepository"/>/<see cref="MessageRepository"/> deps
+/// are themselves registered TRANSIENT (<see cref="Startup"/>), so this singleton captures them as a
+/// captive dependency — safe ONLY because all three are stateless <c>MongoClient</c> wrappers with no
+/// per-call state of their own to leak across calls.
 /// </para>
 /// <para>
 /// SWAP CONSISTENCY — best-effort ordered, NOT DB-atomic. Memberships are separate documents and the repo

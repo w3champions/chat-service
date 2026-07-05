@@ -55,7 +55,7 @@ public class InternalRelationshipChangesController(IRelationshipProvider relatio
 
         Log.Information(
             "Internal relationship change {Caller} type={Type} actor={Actor} target={Target}",
-            ResolveCaller(), request.Type, request.Actor, request.Target);
+            InternalHmacAuthFilter.ResolveCaller(HttpContext), request.Type, request.Actor, request.Target);
 
         return Ok();
     }
@@ -76,9 +76,4 @@ public class InternalRelationshipChangesController(IRelationshipProvider relatio
     // explicitly here.
     private static bool IsValidParticipant(string value) =>
         !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
-
-    /// <summary>The HMAC filter's resolved caller, stashed on <c>HttpContext.Items</c> — used only for the
-    /// log line above, never for authorization (the filter already enforced the Wb-only allow-list).</summary>
-    private object ResolveCaller() =>
-        HttpContext.Items.TryGetValue(InternalHmacAuthFilter.InternalCallerItemKey, out var caller) ? caller : null;
 }

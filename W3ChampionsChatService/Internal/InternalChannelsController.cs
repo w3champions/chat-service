@@ -77,7 +77,7 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
 
             Log.Information(
                 "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount}",
-                ResolveCaller(), "POST", request.Ref, request.Members.Count);
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count);
 
             return Ok(InternalChannelDto.FromChannel(channel));
         }
@@ -112,7 +112,7 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
 
             Log.Information(
                 "Internal channel members-delta succeeded {Caller} {Verb} {Ref} addCount={AddCount} removeCount={RemoveCount}",
-                ResolveCaller(), "PUT", @ref, add.Count, remove.Count);
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref, add.Count, remove.Count);
 
             return Ok();
         }
@@ -136,7 +136,7 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             await matchChannelService.DeleteChannel(@ref);
 
             Log.Information(
-                "Internal channel delete succeeded {Caller} {Verb} {Ref}", ResolveCaller(), "DELETE", @ref);
+                "Internal channel delete succeeded {Caller} {Verb} {Ref}", InternalHmacAuthFilter.ResolveCaller(HttpContext), "DELETE", @ref);
 
             return Ok();
         }
@@ -154,11 +154,6 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         && members.Count <= ChatLimits.InternalMaxMembersPerCall
         && members.All(m => !string.IsNullOrWhiteSpace(m));
 
-    /// <summary>The HMAC filter's resolved caller, stashed on <c>HttpContext.Items</c> — used only for
-    /// the log lines below, never for authorization (the filter already enforced the allow-list).</summary>
-    private object ResolveCaller() =>
-        HttpContext.Items.TryGetValue(InternalHmacAuthFilter.InternalCallerItemKey, out var caller) ? caller : null;
-
     private void LogUnexpected(Exception ex, string verb, string @ref) =>
-        Log.Error(ex, "Internal channels endpoint failed {Caller} {Verb} {Ref}", ResolveCaller(), verb, @ref);
+        Log.Error(ex, "Internal channels endpoint failed {Caller} {Verb} {Ref}", InternalHmacAuthFilter.ResolveCaller(HttpContext), verb, @ref);
 }

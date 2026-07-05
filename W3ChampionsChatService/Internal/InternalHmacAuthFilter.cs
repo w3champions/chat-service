@@ -51,6 +51,12 @@ public class InternalHmacAuthFilter(InternalCallerSecrets secrets, TimeProvider 
     /// NOT in this set is still rejected.</summary>
     public IReadOnlyList<InternalCaller> AllowedCallers { get; set; } = Array.Empty<InternalCaller>();
 
+    /// <summary>Reads the resolved caller stashed on success (see <see cref="InternalCallerItemKey"/>) for
+    /// structured logging only — never for authorization (the filter already enforced the allow-list).
+    /// Returns <c>null</c> if absent.</summary>
+    public static object ResolveCaller(HttpContext httpContext) =>
+        httpContext.Items.TryGetValue(InternalCallerItemKey, out var caller) ? caller : null;
+
     public async Task OnResourceExecutionAsync(ResourceExecutingContext context, ResourceExecutionDelegate next)
     {
         var request = context.HttpContext.Request;
