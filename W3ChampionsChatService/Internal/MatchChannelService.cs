@@ -6,20 +6,23 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Internal;
 
 /// <summary>
-/// C7 Tasks 6-7 — the match-channel domain core the /internal/* match endpoints drive. Owns
+/// C7 Tasks 6-8 — the match-channel domain core the /internal/* match endpoints drive. Owns
 /// <see cref="CreateOrGet"/> (idempotent System+Match find-or-create + display-name backfill, the
 /// <c>PUT /internal/channels/{ref}</c>-style upsert), <see cref="ApplyMembersDelta"/> (the
-/// <c>PUT /internal/channels/{ref}/members</c> delta — tolerant of arriving before the create), and the
-/// shared <see cref="AddMemberWithInvariant"/> that enforces the ONE-MATCH-CHANNEL-PER-USER invariant —
-/// every add path (both public methods) reuses it.
+/// <c>PUT /internal/channels/{ref}/members</c> delta — tolerant of arriving before the create),
+/// <see cref="DeleteChannel"/> (the <c>DELETE /internal/channels/{ref}</c> hard-teardown — tolerant of
+/// arriving before the create too), and the shared <see cref="AddMemberWithInvariant"/> that enforces the
+/// ONE-MATCH-CHANNEL-PER-USER invariant — every add path (both public add methods) reuses it.
 /// <para>
 /// Singleton (registered in <see cref="Startup"/>, matching <see cref="FanOutEngine"/>'s lifetime): it
-/// holds no per-call state; its <see cref="ChannelRepository"/>/<see cref="MembershipRepository"/> deps are
-/// stateless MongoClient wrappers, so capturing them for the singleton's lifetime is safe.
+/// holds no per-call state; its <see cref="ChannelRepository"/>/<see cref="MembershipRepository"/>/
+/// <see cref="MessageRepository"/> deps are stateless MongoClient wrappers, so capturing them for the
+/// singleton's lifetime is safe.
 /// </para>
 /// <para>
 /// SWAP CONSISTENCY — best-effort ordered, NOT DB-atomic. Memberships are separate documents and the repo
@@ -39,6 +42,7 @@ namespace W3ChampionsChatService.Internal;
 public class MatchChannelService(
     ChannelRepository channelRepository,
     MembershipRepository membershipRepository,
+    MessageRepository messageRepository,
     FanOutEngine fanOutEngine,
     TimeProvider timeProvider)
 {
@@ -168,6 +172,47 @@ public class MatchChannelService(
             }
 
             await membershipRepository.Delete(channel.Id, battleTag);
+            await fanOutEngine.PushChannelRemoved(channel.Id, battleTag);
+        }
+    }
+
+    /// <summary>
+    /// <c>DELETE /internal/channels/{ref}</c> domain logic (C7 Task 8) — hard-tears-down the System+Match
+    /// channel keyed by <paramref name="systemRef"/>: its membership rows AND its messages (a HARD purge,
+    /// distinct from moderation's TTL-only soft-delete — see <see cref="MessageRepository.DeleteAllForChannel"/>),
+    /// then best-effort pushes <c>ChannelRemoved</c> to every member who was online at teardown time.
+    /// <list type="number">
+    /// <item>TOLERANT OF DELETE-BEFORE-CREATE (§3.3, M1): if no channel exists for <paramref name="systemRef"/>,
+    /// return — the controller maps this to a no-op 200 rather than a hard 404 (a 404 would only trigger a
+    /// pointless mm retry).</item>
+    /// <item>Capture the member list FIRST via <see cref="MembershipRepository.LoadForChannel"/> — their
+    /// battleTags are needed for the live pushes below, which must happen AFTER the membership rows (and
+    /// hence this read) are gone.</item>
+    /// <item>DB teardown, authoritative-first: <see cref="MessageRepository.DeleteAllForChannel"/> →
+    /// <see cref="MembershipRepository.DeleteAllForChannel"/> → <see cref="ChannelRepository.Delete"/>.</item>
+    /// <item>Then best-effort live pushes: <see cref="FanOutEngine.PushChannelRemoved"/> for each captured
+    /// member — the in-memory session/focus/online-member registries are unaffected by the DB deletes above,
+    /// and the push itself no-ops for a member who is offline.</item>
+    /// </list>
+    /// </summary>
+    public async Task DeleteChannel(string systemRef)
+    {
+        var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef);
+        if (channel == null)
+        {
+            return;
+        }
+
+        var memberBattleTags = (await membershipRepository.LoadForChannel(channel.Id))
+            .Select(m => m.BattleTag)
+            .ToList();
+
+        await messageRepository.DeleteAllForChannel(channel.Id);
+        await membershipRepository.DeleteAllForChannel(channel.Id);
+        await channelRepository.Delete(channel.Id);
+
+        foreach (var battleTag in memberBattleTags)
+        {
             await fanOutEngine.PushChannelRemoved(channel.Id, battleTag);
         }
     }

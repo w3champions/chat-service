@@ -10,6 +10,7 @@ using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Internal;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
 
@@ -38,6 +39,7 @@ public class MatchChannelServiceTests : IntegrationTestBase
     private FanOutEngine _fanOutEngine;
     private ChannelRepository _channelRepository;
     private MembershipRepository _membershipRepository;
+    private MessageRepository _messageRepository;
     private MatchChannelService _service;
 
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
@@ -63,7 +65,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
             _time);
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
-        _service = new MatchChannelService(_channelRepository, _membershipRepository, _fanOutEngine, _time);
+        _messageRepository = new MessageRepository(MongoClient);
+        _service = new MatchChannelService(_channelRepository, _membershipRepository, _messageRepository, _fanOutEngine, _time);
     }
 
     // Registers a live session for battleTag under connectionId — the RegisterOnline idiom
@@ -75,6 +78,16 @@ public class MatchChannelServiceTests : IntegrationTestBase
             null);
 
     private static IReadOnlyList<string> Members(params string[] battleTags) => battleTags;
+
+    // Mirrors MessageRepositoryTests.NewMessage — a minimal valid ChannelMessage for seeding.
+    private static ChannelMessage NewMessage(string channelId, long seq, string sender = "Peter#123") => new()
+    {
+        ChannelId = channelId,
+        Seq = seq,
+        Sender = new MessageSender { BattleTag = sender, Name = sender.Split('#')[0] },
+        Content = "hello",
+        SentAt = DateTime.UtcNow,
+    };
 
     // ============================================================================================
     // CreateOrGet — new channel shape (acceptance 8)
@@ -453,5 +466,114 @@ public class MatchChannelServiceTests : IntegrationTestBase
 
         Assert.That(await _membershipRepository.Load(channel.Id, bt), Is.Null,
             "adds run first, then removes — a battleTag in both lists ends up removed");
+    }
+
+    // ============================================================================================
+    // C7 Task 8 — DeleteChannel: hard-delete teardown (messages + memberships + channel), including
+    // physically-present soft-deleted/shadow rows; another channel's data is untouched (acceptance 6a)
+    // ============================================================================================
+
+    [Test]
+    public async Task Delete_RemovesChannelMembershipsAndMessages()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice, bob), focus: false);
+
+        // Seed messages INCLUDING one soft-deleted + one shadow row — both are still PHYSICAL rows
+        // (soft-delete is TTL-only; shadow is a visibility flag), so a hard teardown purge must remove
+        // them just like any other message in the channel.
+        var normal = NewMessage(channel.Id, 1, alice);
+        var softDeleted = NewMessage(channel.Id, 2, alice);
+        var shadow = NewMessage(channel.Id, 3, bob);
+        shadow.Shadow = true;
+        await _messageRepository.Insert(normal);
+        await _messageRepository.Insert(softDeleted);
+        await _messageRepository.Insert(shadow);
+        await _messageRepository.MarkDeleted(softDeleted.Id, "Mod#1", Now);
+
+        // Another channel's messages/memberships/channel doc must be completely untouched.
+        var otherChannel = await _service.CreateOrGet("match-2", "Match 2", Members(alice), focus: false);
+        var otherMessage = NewMessage(otherChannel.Id, 1, alice);
+        await _messageRepository.Insert(otherMessage);
+
+        await _service.DeleteChannel("match-1");
+
+        Assert.That(await _messageRepository.Load(normal.Id), Is.Null, "the normal message is hard-purged");
+        Assert.That(await _messageRepository.Load(softDeleted.Id), Is.Null,
+            "the SOFT-DELETED message is still a physical row pending TTL and must be hard-purged too");
+        Assert.That(await _messageRepository.Load(shadow.Id), Is.Null,
+            "the SHADOW message is still a physical row and must be hard-purged too");
+        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Is.Empty,
+            "every membership of the deleted channel is removed");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1"), Is.Null,
+            "the channel doc itself is removed");
+
+        Assert.That(await _messageRepository.Load(otherMessage.Id), Is.Not.Null, "a different channel's messages are untouched");
+        Assert.That(await _membershipRepository.LoadForChannel(otherChannel.Id), Has.Count.EqualTo(1),
+            "a different channel's memberships are untouched");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-2"), Is.Not.Null,
+            "a different channel is untouched");
+    }
+
+    // ============================================================================================
+    // DeleteChannel — online members receive ChannelRemoved (acceptance 6b)
+    // ============================================================================================
+
+    [Test]
+    public async Task Delete_OnlineMembers_ReceiveChannelRemoved()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice, bob), focus: false);
+
+        await _service.DeleteChannel("match-1");
+
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1),
+            "the first online member receives ChannelRemoved");
+        Assert.That(_harness.SignalCount("conn-bob", ChatEvents.ChannelRemoved), Is.EqualTo(1),
+            "the second online member receives ChannelRemoved");
+
+        var dtoAlice = _harness.PayloadFor("conn-alice", ChatEvents.ChannelRemoved) as ChannelRemovedDto;
+        Assert.That(dtoAlice, Is.Not.Null);
+        Assert.That(dtoAlice.ChannelId, Is.EqualTo(channel.Id));
+    }
+
+    // ============================================================================================
+    // DeleteChannel — delete-before-create: no channel for the ref is a silent no-op, zero pushes
+    // ============================================================================================
+
+    [Test]
+    public async Task Delete_UnknownRef_NoOp_NoPushes()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+
+        await _service.DeleteChannel("never-existed");
+
+        Assert.That(_harness.AllSignals, Is.Empty,
+            "no channel exists for the ref — DELETE arriving before the create is a silent no-op, never a hard 404");
+    }
+
+    // ============================================================================================
+    // DeleteChannel — offline members: no push, no error, teardown still completes
+    // ============================================================================================
+
+    [Test]
+    public async Task Delete_OfflineMembers_NoPush_NoError()
+    {
+        const string offline = "Offline#1";
+        // Deliberately NOT registered online — no live connection.
+
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(offline), focus: false);
+
+        Assert.DoesNotThrowAsync(async () => await _service.DeleteChannel("match-1"));
+
+        Assert.That(_harness.AllSignals, Is.Empty, "an offline member receives zero live signals, and no error is thrown");
+        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Is.Empty, "the teardown still completes for an offline-only channel");
     }
 }
