@@ -294,8 +294,10 @@ public class ModerationIntegrationTests : IntegrationTestBase
             JoinedAt = T0,
         });
 
-    // Directory row (mirrors ChatHubSendMessageTests' SeedDirectory) — the send pipeline's step-5.25
-    // mention markup gate resolves a target through this collection (resolvability-only).
+    // Directory row (mirrors ChatHubSendMessageTests' SeedDirectory). NOTE: the send pipeline's step-5.25
+    // gate no longer consults the directory (the "strip & deliver as plain" amendment removed the
+    // resolvability check — a mention's eligibility is decided SOLELY by durable membership in the
+    // fan-out). Seeding is retained only for realism; it does not affect whether a mention send is accepted.
     private Task SeedDirectory(string battleTag) =>
         _userDirectory.Upsert(new UserDirectoryEntry
         {
@@ -395,11 +397,12 @@ public class ModerationIntegrationTests : IntegrationTestBase
         await SeedMembership(channel.Id, BTag, NotificationLevel.All);
         await SeedMembership(channel.Id, MTag, NotificationLevel.All);
 
-        // B and M are directory-resolvable (C6 Task 7 re-assertion): the send pipeline's step-5.25
-        // markup gate only accepts a mention whose target resolves via the directory, so A's shadow
-        // send below can carry GENUINE mention markup of both — real, eligible targets (durable
-        // membership + NotificationLevel.All, seeded above) that WOULD receive an entry for a normal,
-        // non-shadow message. That is what makes the "zero entries" assertions below non-vacuous.
+        // B and M are genuinely eligible mention targets purely by their DURABLE membership (seeded above,
+        // NotificationLevel.All) — the send gate no longer checks resolvability (strip & deliver as plain),
+        // so A's shadow send below can carry GENUINE mention markup of both: real, eligible targets that
+        // WOULD receive an entry for a normal, non-shadow message. That is what makes the "zero entries"
+        // assertions below non-vacuous. (The directory rows seeded next are vestigial for the send path and
+        // kept only for realism.)
         await SeedDirectory(BTag);
         await SeedDirectory(MTag);
 
@@ -476,7 +479,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
 
         // MENTIONS LEG (C6 Task 7 re-assertion — the C4/C6 handoff item): A's message carries REAL
         // mention markup of B and M, both genuinely eligible (durable membership + NotificationLevel.All,
-        // resolvable in the directory, neither is the sender) — a normal, non-shadow send with this exact
+        // neither is the sender) — a normal, non-shadow send with this exact
         // content WOULD create a real inbox entry + MentionNotified for each of them (this is precisely
         // the eligibility the C6 Task 5 fan-out grants). Because A's send is shadow, the pipeline must
         // still produce LITERALLY ZERO entries for anyone: the SendMessage call-site skip

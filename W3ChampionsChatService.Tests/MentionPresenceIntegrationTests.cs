@@ -319,8 +319,11 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             JoinedAt = Now,
         });
 
-    // Directory row — resolvability for the mention-markup gate + the tier-3 search universe. LastSeenAt
-    // defaults to the fixed clock; the search legs pass an explicit value to exercise the 90d gate.
+    // Directory row — the tier-3 search universe (SearchMentionCandidates). NOTE: the send-side mention
+    // gate no longer consults the directory (the "strip & deliver as plain" amendment removed the
+    // resolvability check — mention eligibility is decided SOLELY by durable membership in the fan-out), so
+    // seeding here is only load-bearing for the search legs. LastSeenAt defaults to the fixed clock; the
+    // search legs pass an explicit value to exercise the 90d gate.
     private Task SeedDirectory(string battleTag, DateTime? lastSeenAt = null, ChatProfile profile = null) =>
         _userDirectory.Upsert(new UserDirectoryEntry
         {
@@ -386,7 +389,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
         await SeedMembership(channel.Id, ATag);
         await SeedMembership(channel.Id, BTag);
-        await SeedDirectory(BTag); // resolvability for the markup gate
+        await SeedDirectory(BTag); // search universe only; B's mention eligibility comes from durable membership
 
         var aHub = await Connect("conn-a", ATag);
         var bHub = await Connect("conn-b", BTag); // B is UNFOCUSED (never calls FocusChannel)
@@ -519,8 +522,9 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
 
     // ============================================================================================
     // Slate 3 — MentionValidation_EndToEnd (acceptance 4).
-    // >5 distinct rejected; unresolvable rejected; exactly 5 valid mentions fan out to EXACTLY those 5
-    // members (a co-present non-mentioned member and the sender get nothing); a mentioned resolvable
+    // >5 distinct rejected (the COUNT cap); an unresolvable mention is NOT rejected — it delivers verbatim
+    // and simply notifies nobody (strip & deliver as plain); exactly 5 valid mentions fan out to EXACTLY
+    // those 5 members (a co-present non-mentioned member and the sender get nothing); a mentioned resolvable
     // NON-member gets no notification (the membership wall).
     // ============================================================================================
 
@@ -553,17 +557,25 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         }
         await Connect("conn-stranger", NonMemberTag);
 
-        // --- Reject leg 1: SIX distinct mentions → TooLong, nothing persists.
+        // --- Reject leg (the ONE retained reject): SIX distinct mentions → TooLong (the COUNT cap), nothing persists.
         var sixDistinct = string.Join(" ", Enumerable.Range(1, ChatLimits.MaxMentionsPerMessage + 1).Select(i => Mention($"ghost{i}#{i}")));
         var overCap = await aHub.SendMessage(channel.Id, sixDistinct);
         Assert.That(overCap.Code, Is.EqualTo(ChatResultCode.TooLong), "more than 5 distinct mentions is rejected");
-
-        // --- Reject leg 2: an UNRESOLVABLE mention → TooLong.
-        var unresolvable = await aHub.SendMessage(channel.Id, $"who is <@nobody#404>");
-        Assert.That(unresolvable.Code, Is.EqualTo(ChatResultCode.TooLong), "an unresolvable battleTag is rejected");
-
         Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(0L),
-            "neither rejected send allocated a seq or persisted");
+            "the over-cap send allocated no seq and persisted nothing");
+
+        // --- Strip & deliver as plain: an UNRESOLVABLE mention is NOT rejected — it delivers VERBATIM and
+        // simply notifies nobody (the fan-out membership wall drops the non-member target). NOT TooLong.
+        var unresolvableContent = "who is <@nobody#404>";
+        var unresolvable = await aHub.SendMessage(channel.Id, unresolvableContent);
+        Assert.That(unresolvable.Code, Is.EqualTo(ChatResultCode.Ok),
+            "an unresolvable battleTag is legal content — the send is never rejected for resolvability");
+        Assert.That((await _messageRepository.Load(unresolvable.MessageId)).Content, Is.EqualTo(unresolvableContent),
+            "the message delivers verbatim — the invalid <@…> token is kept as plain text");
+        Assert.That(await _mentionInboxRepository.LoadForUser("nobody#404"), Is.Empty,
+            "the unresolvable target gets no inbox entry (nobody is a member)");
+        Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(1L),
+            "the unresolvable send DID persist (seq 1) — it is a normal, deliverable message");
 
         // --- Fan-out leg: exactly 5 valid mentions fan out to EXACTLY those 5 members.
         _time.Advance(TimeSpan.FromSeconds(2));

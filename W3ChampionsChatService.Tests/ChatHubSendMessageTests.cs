@@ -696,4 +696,90 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-3", ChatEvents.MentionNotified),
             "the OTHER target is unaffected by the dead socket — event delivered");
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // C6 "strip & deliver as plain" (Marco decision 3): a message is NEVER rejected because of its
+    // mentions' access/resolvability. An unresolvable/garbage tag, or a tag naming a NON-member, delivers
+    // VERBATIM (the client renders the invalid <@…> as plain) and simply produces no inbox entry + no
+    // notification — the membership wall in MentionFanOut is the sole authority on who is notified. These
+    // exercise the full SendMessage pipeline end-to-end (real MentionFanOut + inbox repo + push harness).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Mention_GarbageTag_Ok_DeliveredVerbatim_NoInboxEntry()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        // "ghost#999" resolves to nobody (no directory row, no session, no membership) — a garbage mention.
+        var content = $"hey {Mention("ghost#999")} are you real?";
+        var result = await hub.SendMessage(channel.Id, content);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "an unresolvable/garbage <@tag> must NEVER reject the send");
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsNotNull(persisted, "the message is durably persisted");
+        Assert.AreEqual(content, persisted.Content, "the message delivers verbatim — the client renders the invalid <@…> as plain text");
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("ghost#999"), "a garbage mention writes NO inbox entry");
+        Assert.IsEmpty(_mentionPushHarness.AllSignals, "and pushes nothing");
+    }
+
+    [Test]
+    public async Task Mention_ResolvableNonMemberOfPublicChannel_Ok_NoInboxEntry()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);
+        // stranger is online AND directory-resolvable but is NOT a member of this public channel.
+        RegisterSession("conn-stranger", "stranger#1");
+        await SeedDirectory("stranger#1");
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention("stranger#1")}");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "mentioning a resolvable non-member of a public channel is legal — no reject");
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("stranger#1"),
+            "a non-member of a Public channel gets NO inbox entry — the uniform membership wall applies to every channel type");
+        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
+            "and no MentionNotified push");
+        Assert.IsEmpty(_mentionPushHarness.AllSignals, "the only mention target was a non-member — nobody is notified");
+    }
+
+    [Test]
+    public async Task Mention_NonMemberInGroupDm_Ok_DeliveredVerbatim_NonMemberGetsNothing_MemberControlNotified()
+    {
+        // Marco's headline case: a GroupDm (a PRIVATE conversation). The sender mentions BOTH an outsider
+        // who is NOT a member of the group AND a real member (wolf). The send is NOT rejected — it delivers
+        // VERBATIM — but the excerpt PRIVACY WALL means the non-member outsider gets NO inbox entry and NO
+        // MentionNotified (a private conversation's ~120-char excerpt must never reach a non-participant),
+        // while the member control still gets both (so this fails against a do-nothing stub too).
+        var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastSeq = 0, LastMessageAt = Now, ExpiresAt = Now.AddDays(365) };
+        await _channelRepository.Insert(group);
+        SeedMember("conn-1", BattleTag, group.Id);                     // sender (a member)
+        await SeedMentionTarget("conn-wolf", "wolf#456", group.Id);    // member control: session + directory + durable membership
+
+        // The outsider is ONLINE (a leak would be observable) but is NOT a member of the group.
+        RegisterSession("conn-outsider", "outsider#1");
+        var hub = BuildHub("conn-1");
+
+        var content = $"secret plans {Mention("outsider#1")} and {Mention("wolf#456")}";
+        var result = await hub.SendMessage(group.Id, content);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "a mention of a non-member must NEVER reject the send (strip & deliver as plain)");
+
+        // The message delivered VERBATIM — persisted with the exact content, including the <@outsider#1> token.
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsNotNull(persisted, "the message is durably persisted");
+        Assert.AreEqual(content, persisted.Content, "the message text delivers verbatim — the invalid <@…> token is kept as plain text");
+
+        // The excerpt PRIVACY WALL: the non-member outsider gets NO inbox entry and NO MentionNotified —
+        // a private (GroupDm) conversation's excerpt NEVER reaches a non-participant.
+        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("outsider#1"),
+            "a non-member of a private GroupDm gets NO mention-inbox entry — the excerpt never reaches a non-participant");
+        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-outsider", ChatEvents.MentionNotified),
+            "and NO MentionNotified push to the non-member");
+
+        // The member control proves the send DID fan out to the eligible participant.
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("wolf#456")).Count, "the member control still gets an entry");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-wolf", ChatEvents.MentionNotified), "the member control still gets the event");
+    }
 }

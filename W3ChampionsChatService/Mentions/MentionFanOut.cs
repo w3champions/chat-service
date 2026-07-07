@@ -30,8 +30,10 @@ namespace W3ChampionsChatService.Mentions;
 /// <item>The target has an actual <c>channel_memberships</c> row for THIS channel
 /// (<see cref="MembershipRepository.Load"/>). For Dm/GroupDm this is the hard PRIVACY WALL: an inbox
 /// entry carries a ~120-char content excerpt, and a private conversation's excerpt must NEVER reach a
-/// non-participant. Mentioning a resolvable non-member is legal content (the Task 4 gate checks only
-/// resolvability, not membership) — it simply notifies nobody.</item>
+/// non-participant. This wall is the SOLE authority on who is notified: the send-side gate (step 5.25)
+/// validates only the mention COUNT cap — never resolvability or membership — so mentioning a non-member
+/// (or an unresolvable/garbage tag) is legal content that delivers verbatim and simply notifies nobody
+/// here.</item>
 /// <item>The target's membership <see cref="ChannelMembership.NotificationLevel"/> is not
 /// <see cref="NotificationLevel.None"/> — "none: silence" (spec §7) is an explicit opt-out that outranks
 /// mentions, not just level-All activity.</item>
