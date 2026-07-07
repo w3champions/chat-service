@@ -233,8 +233,9 @@ public class MuteReconciliationTests : IntegrationTestBase
     [Test]
     public async Task ControllerDelete_MixedCaseBattleTag_ActuallyDeletesRow_AndReturnsOk()
     {
-        // Casing fix: the row is stored lowercased (AddLoungeMute), so a mixed-case DELETE must still
-        // match and remove it — and report 200 OK, not a false 404.
+        // Casing fix: the row is stored with the moderator-entered DISPLAY casing ("Victim#123"), but its
+        // match key is the lowercased _id, so a DELETE under a THIRD casing ("VICTIM#123") still resolves
+        // { _id: "victim#123" }, removes the row, and reports 200 OK — not a false 404.
         await _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
             battleTag = "Victim#123",
@@ -247,7 +248,7 @@ public class MuteReconciliationTests : IntegrationTestBase
         var result = await _controller.DeleteLoungeMute("VICTIM#123");
 
         Assert.IsInstanceOf<OkObjectResult>(result,
-            "A mixed-case DELETE that matches a stored (lowercased) mute must return 200 OK");
+            "A mixed-case DELETE that matches a stored mute (via the lowercased _id) must return 200 OK");
         Assert.IsNull(await _muteRepository.GetMutedPlayer("victim#123"),
             "A mixed-case DELETE must actually remove the stored row (casing fix)");
     }

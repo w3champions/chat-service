@@ -75,7 +75,12 @@ public class LoungeMuteRestContractTests : IntegrationTestBase
 
         // wb byte-compat: the exact business field set MuteRepository.AddLoungeMute/GetMutedPlayer
         // round-trips through the REST surface unchanged.
-        Assert.AreEqual("target#123", mute.battleTag, "AddLoungeMute lowercases the stored battleTag");
+        // Case-sensitivity decision: AddLoungeMute now PRESERVES the moderator-entered display casing in
+        // the battleTag FIELD (so the admin list shows the real tag), while the case-insensitive match key
+        // is the LOWERCASED _id (LoungeMute.Id). The two are decoupled — the field keeps "Target#123", the
+        // id serializes as the lowercased "target#123".
+        Assert.AreEqual("Target#123", mute.battleTag, "AddLoungeMute preserves the original-case battleTag (display casing)");
+        Assert.AreEqual("target#123", mute.Id, "LoungeMute.Id (the Mongo _id) is the lowercased match key, decoupled from the display battleTag");
         Assert.AreEqual("mod#1", mute.author);
         Assert.AreEqual("spam", mute.reason);
         Assert.IsTrue(mute.isShadowBan);
