@@ -13,20 +13,45 @@ public class W3CAuthenticationService : IW3CAuthenticationService
 {
     private static readonly string JwtPublicKey = Regex.Unescape(Environment.GetEnvironmentVariable("JWT_PUBLIC_KEY") ?? "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA6N6yiNe392lG5W+4LKDD\nNOr53vvolpC7098x6tWbw0E3Jkg8n3Y8A1qC9+7tFYXV8I5UlQdT1Oy/BxbPuNR0\nS/zr93WeYkLCWlfh7yjFKwNbRSoWXL36lFhy85H+5HNGfjKpTm5HLTXKRH1P4lLk\n3Gfz0p84OXeumUs9cDRz7WSSEeGTpD4oA3qGgS18F2U394No/YfNIOyJCOzDRaN9\nMx8H2VcsOvZnGqeCWKtY+7fh1YQQqR2ebZb1eA0qziloxnXhI2sUXUnjK68YIV3d\nXaFhYuSsJQoXuHzIA1opcFkGhkQI+wVyLzaAPhWiU0MCvoRf+kxfmW8gaUdT+2ar\no2C2lXp5Y/0xyrl3w0bzinQ79n+PH0pixu00r4/892IksS5SexdZ1Ka5TaHdnWGR\njM1p1DmFqyKvm98wsoq4ZsgYVrMHOY3qDRdb4ss93HjgA5gh6q3rnLFdUC8T+FgL\nkwZIsRm4+a0by3xwglHgWBOu81Pzy4F1dQOV3C31cgLsMZvBW0D01I7F/Y5YFU1A\nlLgKocWLLDEnWMh+078H3PyRH9W3vuQGfD6CAfEu8jbETgZeZqiyR45yDGeyZlWE\nbtiZjF00dkblGb5z5BFRtYHwL2Cfi6XJnby77NYHPTUH1GrfdL+sp7QEDe9k/4h6\nsYbv9oAYja2AuGxDba1MJHUCAwEAAQ==\n-----END PUBLIC KEY-----\n");
 
+    private readonly string _publicKey;
+
+    public W3CAuthenticationService() : this(JwtPublicKey) { }
+
+    // Test seam (assembly has InternalsVisibleTo): inject a generated key instead of the env/static one.
+    internal W3CAuthenticationService(string publicKeyPem) => _publicKey = publicKeyPem;
+
     public W3CUserAuthentication GetUserByToken(string jwt)
     {
-        return W3CUserAuthentication.FromJWT(jwt, JwtPublicKey);
+        return W3CUserAuthentication.FromJWT(jwt, _publicKey);
+    }
+
+    // Mint-only policy (contract §3): signature + exp. Issuer/audience stay unvalidated (tokens carry neither).
+    // Expiry (like every other validation failure) swallows to null here → the mint path returns 401, never 500.
+    public W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt)
+    {
+        return W3CUserAuthentication.FromJWT(jwt, _publicKey, validateLifetime: true);
+    }
+
+    // item 7: exp-enforcing validation that RETHROWS an expired token when rethrowExpiry is true, so the
+    // moderation REST filter (UserHasPermissionFilter) can distinguish an expired token (→ AUTH_TOKEN_EXPIRED
+    // 401, aligning with wb's BearerHasPermissionFilter) from any other invalid token (→ generic 401). The
+    // zero-arg overload above keeps swallowing expiry to null for the ticket-mint path (401, not 500).
+    public W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt, bool rethrowExpiry)
+    {
+        return W3CUserAuthentication.FromJWT(jwt, _publicKey, validateLifetime: true, rethrowExpiry: rethrowExpiry);
     }
 }
 
 public interface IW3CAuthenticationService
 {
     W3CUserAuthentication GetUserByToken(string jwt);
+    W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt);
+    W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt, bool rethrowExpiry);
 }
 
 public class W3CUserAuthentication
 {
-    public static W3CUserAuthentication FromJWT(string jwt, string publicKey)
+    public static W3CUserAuthentication FromJWT(string jwt, string publicKey, bool validateLifetime = false, bool rethrowExpiry = false)
     {
         try
         {
@@ -37,7 +62,7 @@ public class W3CUserAuthentication
             {
                 ValidateIssuer = false,
                 ValidateAudience = false,
-                ValidateLifetime = false,
+                ValidateLifetime = validateLifetime,
                 ValidateTokenReplay = false,
                 ValidateActor = false,
                 ValidateIssuerSigningKey = true,
@@ -69,6 +94,15 @@ public class W3CUserAuthentication
                 Permissions = permissions
             };
         }
+        catch (SecurityTokenExpiredException) when (rethrowExpiry)
+        {
+            // item 7 (opt-in only): the moderation REST filter enforces exp and needs to tell an EXPIRED
+            // token apart from any other invalid one, so — and ONLY when the caller opts in — rethrow
+            // instead of swallowing to null. Every other failure below still swallows to null; every
+            // default (rethrowExpiry:false) caller — notably the ticket-mint path — is byte-for-byte
+            // unaffected and keeps returning null on expiry (→ its existing 401, never a 500).
+            throw;
+        }
         catch (Exception ex)
         {
             // Never swallow silently: a swallowed exception here surfaces only as a generic
@@ -79,8 +113,8 @@ public class W3CUserAuthentication
         }
     }
 
-    public string BattleTag { get; set; }
-    public string Name { get; set; }
-    public bool IsAdmin { get; set; }
-    public HashSet<EPermission> Permissions { get; set; } = new HashSet<EPermission>();
+    public string BattleTag { get; init; }
+    public string Name { get; init; }
+    public bool IsAdmin { get; init; }
+    public IReadOnlySet<EPermission> Permissions { get; init; } = new HashSet<EPermission>();
 }

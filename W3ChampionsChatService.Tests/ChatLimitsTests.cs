@@ -1,0 +1,71 @@
+using System;
+using NUnit.Framework;
+using W3ChampionsChatService.Domain;
+
+namespace W3ChampionsChatService.Tests;
+
+public class ChatLimitsTests
+{
+    [Test]
+    public void Values_MatchSpecSection13Verbatim()
+    {
+        Assert.AreEqual(512, ChatLimits.MaxMessageLength);
+        Assert.AreEqual(5, ChatLimits.PerChannelBurst);
+        Assert.AreEqual(TimeSpan.FromSeconds(1), ChatLimits.PerChannelSustainedInterval);
+        Assert.AreEqual(10, ChatLimits.GlobalMessageBurst);
+        Assert.AreEqual(TimeSpan.FromSeconds(5), ChatLimits.GlobalMessageWindow);
+        Assert.AreEqual(10, ChatLimits.StrangerDmInitiationCap);
+        Assert.AreEqual(TimeSpan.FromHours(8), ChatLimits.StrangerDmInitiationWindow);
+        Assert.AreEqual(25, ChatLimits.PendingConversationMaxMessages);
+        Assert.AreEqual(5, ChatLimits.MaxMentionsPerMessage);
+        Assert.AreEqual(100, ChatLimits.MaxGroupSize);
+        Assert.AreEqual(5, ChatLimits.ChannelCreationPerHour);
+        Assert.AreEqual(10, ChatLimits.MaxFocusedChannels);
+        Assert.AreEqual(50, ChatLimits.MaxPublicMembershipsPerUser);
+        Assert.AreEqual(1, ChatLimits.MaxConnectionsPerBattleTag);
+        Assert.AreEqual(TimeSpan.FromSeconds(5), ChatLimits.MarkReadThrottle);
+        Assert.AreEqual(TimeSpan.FromSeconds(10), ChatLimits.ChannelActivityCoalesce);
+        Assert.AreEqual(100, ChatLimits.ChannelActivitySuppressUnreadThreshold);
+        Assert.AreEqual(TimeSpan.FromSeconds(5), ChatLimits.ViewersChangedFlush);
+        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.TicketTtl);
+    }
+
+    [Test]
+    public void MintRateLimitConstants_MatchC2PlanDecision3()
+    {
+        // C2 plan decision 3 — NOT spec §13; hard-coded, adjust here only.
+        Assert.AreEqual(10, ChatLimits.TicketMintPerBattleTagLimit);
+        Assert.AreEqual(30, ChatLimits.TicketMintPerIpLimit);
+        Assert.AreEqual(TimeSpan.FromMinutes(1), ChatLimits.TicketMintWindow);
+    }
+
+    [Test]
+    public void MessagePageSizeAndAutoThrottleConstants_MatchC3PlanDecisionTask1()
+    {
+        // C3 plan decision (Task 1) — NOT spec §13; hard-coded, adjust here only.
+        Assert.AreEqual(100, ChatLimits.MessagePageSize);
+        Assert.AreEqual(5, ChatLimits.AutoThrottleViolationThreshold);
+        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleWindow);
+        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleDuration);
+    }
+
+    [Test]
+    public void ChannelCreationWindow_MatchesC3PlanDecisionTask10()
+    {
+        // C3 plan decision (Task 10) — the window backing ChannelCreationPerHour's "per hour" (not
+        // itself spec §13 text, mirrors TicketMintWindow's role for the mint limits above).
+        Assert.AreEqual(TimeSpan.FromHours(1), ChatLimits.ChannelCreationWindow);
+    }
+
+    [Test]
+    public void MentionAndPresenceConstants_MatchC6PlanDecisionTask1D14()
+    {
+        // Spec-pinned (§7: "lastSeenAt ≥ now−90d") — Tier 3 (directory) search results only.
+        Assert.AreEqual(TimeSpan.FromDays(90), ChatLimits.MentionCandidateActivityWindow);
+        // Plan decisions (C6 plan Task 1, D14) — NOT spec §13 text; hard-coded, adjust here only.
+        Assert.AreEqual(20, ChatLimits.MentionSearchMaxResults);
+        Assert.AreEqual(100, ChatLimits.MentionAckBatchMax);
+        Assert.AreEqual(200, ChatLimits.MentionInboxMaxEntries);
+        Assert.AreEqual(200, ChatLimits.PresenceQueryMaxBattleTags);
+    }
+}

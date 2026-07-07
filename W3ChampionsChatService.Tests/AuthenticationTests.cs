@@ -102,7 +102,8 @@ public class AuthenticationTests
     /// element on read. Returns the token plus the matching public-key PEM that
     /// <see cref="W3CUserAuthentication.FromJWT"/> validates against.
     /// </summary>
-    private static (string jwt, string publicKeyPem) CreateSignedJwt(string battleTag, bool isAdmin, IEnumerable<string> permissions)
+    private static (string jwt, string publicKeyPem) CreateSignedJwt(
+        string battleTag, bool isAdmin, IEnumerable<string> permissions, DateTime? expires = null)
     {
         using var rsa = RSA.Create(2048);
         var publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
@@ -121,7 +122,7 @@ public class AuthenticationTests
                 new Claim("permissions", JsonSerializer.Serialize(permissions.ToList()), JsonClaimValueTypes.JsonArray),
             },
             signingCredentials: signingCredentials,
-            expires: DateTime.UtcNow.AddDays(7));
+            expires: expires ?? DateTime.UtcNow.AddDays(7));
 
         return (new JwtSecurityTokenHandler().WriteToken(token), publicKeyPem);
     }
@@ -154,5 +155,128 @@ public class AuthenticationTests
 
         Assert.IsNotNull(result);
         CollectionAssert.AreEquivalent(new[] { EPermission.Moderation, EPermission.Queue }, result.Permissions);
+    }
+
+    // ── Exp-enforcing JWT validation path for ticket mint ──────────────────────────────────
+    //
+    // The REST/MVC path (/api/loungeMute) keeps validating WITHOUT lifetime enforcement — that
+    // policy must not change. The mint endpoint needs a NEW path that DOES enforce `exp`. These
+    // tests pin both behaviors so they can't regress into each other.
+
+    [Test]
+    public void FromJWT_ExpiredToken_WithLifetimeEnforcement_ReturnsNull()
+    {
+        // -10 minutes: must clear the DEFAULT 5-minute ClockSkew (a -1s expiry would still validate).
+        var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", false, new[] { "Moderation" },
+            expires: DateTime.UtcNow.AddMinutes(-10));
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem, validateLifetime: true);
+
+        Assert.IsNull(result, "An expired JWT must be rejected by the mint validation path");
+    }
+
+    [Test]
+    public void FromJWT_ExpiredToken_WithoutLifetimeEnforcement_StillAuthenticates()
+    {
+        // REGRESSION PIN: the REST/MVC path (/api/loungeMute) keeps today's no-lifetime policy.
+        var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" },
+            expires: DateTime.UtcNow.AddMinutes(-10));
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem);
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual("peter#123", result.BattleTag);
+    }
+
+    [Test]
+    public void FromJWT_ValidToken_WithLifetimeEnforcement_ReturnsUser()
+    {
+        var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" });
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem, validateLifetime: true);
+
+        Assert.IsNotNull(result);
+        Assert.AreEqual("peter#123", result.BattleTag);
+        Assert.IsTrue(result.IsAdmin);
+        Assert.IsTrue(result.Permissions.Contains(EPermission.Moderation));
+    }
+
+    [Test]
+    public void FromJWT_UnknownPermission_WithLifetimeEnforcement_StillAuthenticates()
+    {
+        // Acceptance 2 through the NEW mint path — mirrors
+        // FromJWT_TokenWithPermissionUnknownToChatService_StillAuthenticates (PR #32).
+        var (jwt, publicKeyPem) = CreateSignedJwt("moderator#123", true, new[] { "Moderation", "Warnings" });
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem, validateLifetime: true);
+
+        Assert.IsNotNull(result);
+        Assert.IsTrue(result.Permissions.Contains(EPermission.Moderation));
+        Assert.AreEqual(1, result.Permissions.Count, "Unknown 'Warnings' must be dropped, not crash the parse");
+    }
+
+    [Test]
+    public void GetUserByTokenEnforcingLifetime_UsesInjectedKey_AndRejectsExpired()
+    {
+        var (validJwt, publicKeyPem) = CreateSignedJwt("peter#123", false, new[] { "Moderation" });
+        var (expiredJwt, _) = CreateSignedJwt("peter#123", false, new[] { "Moderation" },
+            expires: DateTime.UtcNow.AddMinutes(-10));
+        var service = new W3CAuthenticationService(publicKeyPem); // internal test ctor
+
+        Assert.IsNotNull(service.GetUserByTokenEnforcingLifetime(validJwt));
+        Assert.IsNull(service.GetUserByTokenEnforcingLifetime(expiredJwt)); // signed by a DIFFERENT key AND expired
+    }
+
+    // ── item 7: opt-in rethrow of expiry for the moderation REST filter ─────────────────────────────
+    //
+    // The moderation REST surface must enforce `exp` AND tell an EXPIRED token (→ AUTH_TOKEN_EXPIRED)
+    // apart from any other invalid token (→ generic 401). FromJWT/GetUserByTokenEnforcingLifetime gain
+    // an opt-in `rethrowExpiry`: ONLY when set does an expired token rethrow instead of swallowing to
+    // null. Every other failure still swallows to null, and the default-false callers (the mint path)
+    // are byte-for-byte unaffected — pinned by the existing tests above.
+
+    [Test]
+    public void FromJWT_ExpiredToken_WithRethrowExpiry_ThrowsSecurityTokenExpired()
+    {
+        // -10 minutes clears the default 5-minute ClockSkew, so the token is genuinely, provably expired.
+        var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", false, new[] { "Moderation" },
+            expires: DateTime.UtcNow.AddMinutes(-10));
+
+        Assert.Throws<SecurityTokenExpiredException>(
+            () => W3CUserAuthentication.FromJWT(jwt, publicKeyPem, validateLifetime: true, rethrowExpiry: true),
+            "with rethrowExpiry, an expired token must surface SecurityTokenExpiredException, not swallow to null");
+    }
+
+    [Test]
+    public void FromJWT_BadSignature_WithRethrowExpiry_StillSwallowsToNull()
+    {
+        // rethrowExpiry rethrows ONLY expiry; a NON-expiry failure (here a signature mismatch — the token
+        // is validated against a different key) must still swallow to null so the caller maps it to a
+        // GENERIC 401, never AUTH_TOKEN_EXPIRED.
+        var (jwt, _) = CreateSignedJwt("peter#123", false, new[] { "Moderation" });
+        var (_, otherKeyPem) = CreateSignedJwt("someoneElse#1", false, Array.Empty<string>());
+
+        var result = W3CUserAuthentication.FromJWT(jwt, otherKeyPem, validateLifetime: true, rethrowExpiry: true);
+
+        Assert.IsNull(result, "a non-expiry validation failure must still swallow to null even under rethrowExpiry");
+    }
+
+    [Test]
+    public void GetUserByTokenEnforcingLifetime_WithRethrowExpiry_RethrowsExpired_AndReturnsValidUser()
+    {
+        var (validJwt, validKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" });
+        // Sign the expired token AND key the service to its matching key, so the failure is EXPIRY, not signature.
+        var (expiredJwt, expiredKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" },
+            expires: DateTime.UtcNow.AddMinutes(-10));
+
+        var validService = new W3CAuthenticationService(validKeyPem);
+        var user = validService.GetUserByTokenEnforcingLifetime(validJwt, rethrowExpiry: true);
+        Assert.IsNotNull(user, "a valid non-expired token still returns the user under rethrowExpiry");
+        Assert.AreEqual("peter#123", user.BattleTag);
+
+        var expiredService = new W3CAuthenticationService(expiredKeyPem);
+        Assert.Throws<SecurityTokenExpiredException>(
+            () => expiredService.GetUserByTokenEnforcingLifetime(expiredJwt, rethrowExpiry: true),
+            "the exp-enforcing overload rethrows an expired (validly-signed) token when rethrowExpiry is true");
     }
 }

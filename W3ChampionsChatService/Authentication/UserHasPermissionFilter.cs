@@ -22,7 +22,18 @@ public class UserHasPermissionFilter(IW3CAuthenticationService authService) : IA
         try
         {
             var token = GetToken(context.HttpContext.Request.Headers[HeaderNames.Authorization]);
-            var res = _authService.GetUserByToken(token);
+            // item 7: enforce JWT lifetime on the moderation REST surface, aligning with wb's
+            // BearerHasPermissionFilter (GetUserByToken(token, true)). rethrowExpiry:true makes an EXPIRED
+            // token surface as SecurityTokenExpiredException → the AUTH_TOKEN_EXPIRED branch below (now
+            // REACHABLE, previously dead because FromJWT swallowed expiry to null). Any OTHER invalid
+            // token still swallows to null in FromJWT, so guard it into a generic 401 via the
+            // catch(Exception) branch rather than NRE-ing on res.Permissions (also fixes the latent
+            // bad-signature NRE on the pre-existing path).
+            var res = _authService.GetUserByTokenEnforcingLifetime(token, rethrowExpiry: true);
+            if (res == null)
+            {
+                throw new SecurityTokenValidationException("Invalid token");
+            }
             var hasPermission = res.Permissions.Contains(Permission);
             if (!string.IsNullOrEmpty(res.BattleTag) && res.IsAdmin && hasPermission)
             {

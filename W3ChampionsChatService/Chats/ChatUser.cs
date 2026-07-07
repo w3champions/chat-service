@@ -13,22 +13,20 @@ public class ChatUser(string battleTag, bool isAdmin, string clanTag, ProfilePic
     public ChatColor ChatColor { get; set; } = chatColor;
     public ChatIcon[] ChatIcons { get; set; } = chatIcons;
 
-    /// <summary>
-    /// Generates a fake user with the name "SYSTEM" that is based on this user.
-    /// This approach is necessary in order to ensure that we do not break backwards compatibility
-    /// with the old launcher. This way, a user can click on the "SYSTEM" user and won't get a 404
-    /// because the Battle Tag has not been found.
-    /// </summary>
-    /// <returns>A ChatUser object representing the derived fake system user.</returns>
-    public ChatUser GenerateFakeSystemUser()
-    {
-        var systemUser = new ChatUser(this.BattleTag, this.IsAdmin, this.ClanTag, this.ProfilePicture, null, null);
-        // Manually set the name to "SYSTEM" because the constructor does not set it.
-        // This will allow BattleTag to be the same as the original user to allow clicking it while
-        // showing [SYSTEM] as the name in the chat.
-        systemUser.Name = "[SYSTEM]";
-        return systemUser;
-    }
+    // D9: additive rank/league enrichment (W1 amendment) — plain settable properties (NOT primary-ctor
+    // params) so every pre-existing 6-arg `new ChatUser(...)` call site across the test suite keeps
+    // compiling unchanged. Populated by ChatAuthenticationService.GetUserFromIdentity from the wb
+    // ChatDetailsDto.Rank sub-object (or the cached ChatProfile on the directory-cache fallback tier);
+    // null until then. Mirrors the same fields on Domain.ChatProfile (see ChatProfileMapper).
+    public int? LeagueId { get; set; }
+    public string LeagueName { get; set; }
+    public int? LeagueOrder { get; set; }
+    public int? LeagueDivision { get; set; }
+    public int? RankNumber { get; set; }
+    public int? GameMode { get; set; }
+    public int? GateWay { get; set; }
+    public int? GamesPlayed { get; set; }
+    public int? Season { get; set; }
 }
 
 public class ProfilePicture

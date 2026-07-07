@@ -5,9 +5,17 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Mentions;
+using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mutes;
-using W3ChampionsChatService.Settings;
+using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -30,7 +38,12 @@ public class MuteReconciliationTests : IntegrationTestBase
     private Mock<HubCallerContext> _hubCallerContext;
     private Mock<ISingleClientProxy> _callerProxy;
     private Mock<IClientProxy> _groupProxy;
-    private int _groupSendCount;
+
+    // New-pipeline deps hoisted to fields so the migrated SendMessage(channelId, content) tests can
+    // seed a live session + channel membership the same way the connect path does.
+    private ChannelRepository _channelRepository;
+    private OnlineMemberRegistry _onlineMemberRegistry;
+    private SessionRegistry _sessionRegistry;
 
     [SetUp]
     public void SetupBeforeEach()
@@ -43,26 +56,51 @@ public class MuteReconciliationTests : IntegrationTestBase
         _controller = new MuteController(_muteRepository, _harness.Service);
 
         var chatAuthService = new Mock<IChatAuthenticationService>();
-        chatAuthService.Setup(m => m.GetUser(It.IsAny<string>()))
-            .ReturnsAsync(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null));
+        chatAuthService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync(new ChatUserResolution(new ChatUser("victim#123", false, null, new ProfilePicture(), null, null), true));
 
+        _channelRepository = new ChannelRepository(MongoClient);
+        _onlineMemberRegistry = new OnlineMemberRegistry();
+        _sessionRegistry = new SessionRegistry();
         _chatHub = new ChatHub(
-            chatAuthService.Object,
-            _muteRepository,
-            new SettingsRepository(MongoClient),
             _connectionMapping,
-            new ChatHistory(),
             _harness.Service,
-            null);
+            new TicketStore(),
+            _sessionRegistry,
+            new UserDirectoryRepository(MongoClient),
+            new SessionStateAssembler(
+                new MembershipRepository(MongoClient, _channelRepository),
+                _channelRepository,
+                new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
+                _muteRepository,
+                _onlineMemberRegistry,
+                _connectionMapping,
+                new MentionInboxRepository(MongoClient)),
+            new FocusRegistry(),
+            _onlineMemberRegistry,
+            new MessageRateLimiter(),
+            TimeProvider.System,
+            _channelRepository,
+            new MembershipRepository(MongoClient, _channelRepository),
+            new ChannelCreationRateLimiter(),
+            new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
+            FanOutEngineTestFactory.CreateIgnored(),
+            ViewersAccumulatorTestFactory.CreateIgnored(),
+            new NoOpMentionInboxCleaner(),
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker(),
+            chatAuthService.Object,
+            MentionFanOutTestFactory.CreateIgnored(MongoClient),
+            new PresenceInterestRegistry(),
+            new MentionInboxRepository(MongoClient));
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();
         _callerProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _groupSendCount = 0;
         _groupProxy = new Mock<IClientProxy>();
         _groupProxy.Setup(x => x.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
-            .Callback<string, object[], CancellationToken>((_, _, _) => _groupSendCount++)
             .Returns(Task.CompletedTask);
         _clients.Setup(c => c.Caller).Returns(_callerProxy.Object);
         _clients.Setup(c => c.Group(It.IsAny<string>())).Returns(_groupProxy.Object);
@@ -77,10 +115,12 @@ public class MuteReconciliationTests : IntegrationTestBase
     [Test]
     public async Task ControllerBan_FullBan_TakesEffectOnLiveConnection_WithoutDbRead()
     {
-        // A live, unmuted user seated in a public room.
+        // A live, unmuted member of a public channel (new-pipeline: session + membership + channel).
+        var channel = await CreateLoungeChannel();
         var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.None, DateTime.MinValue);
+        SeedVictimSessionAndMembership(channel.Id);
 
         // Moderator issues a FULL ban via the REST controller.
         var result = await _controller.AddLoungeMute(new LoungeMuteRequest
@@ -103,10 +143,11 @@ public class MuteReconciliationTests : IntegrationTestBase
         // Now wipe the DB so a DB read would find NO ban — proving enforcement is cache-only.
         await _muteRepository.DeleteLoungeMute("victim#123");
 
-        await _chatHub.SendMessage("should be rejected");
+        // The NEW send pipeline must reject from the reconciled cache alone (no DB read).
+        var sendResult = await _chatHub.SendMessage(channel.Id, "should be rejected");
 
-        Assert.AreEqual(0, _groupSendCount,
-            "After a controller ban, the next SendMessage in a public room is rejected from the cache (no DB read)");
+        Assert.AreEqual(ChatResultCode.Muted, sendResult.Code,
+            "After a controller ban, the next SendMessage in a public channel is rejected from the cache (no DB read)");
     }
 
     [Test]
@@ -135,10 +176,12 @@ public class MuteReconciliationTests : IntegrationTestBase
     [Test]
     public async Task ControllerUnban_ClearsCache_UserCanSendAgain_WithoutReconnect()
     {
-        // A live, fully-banned user seated in a public room.
+        // A live, fully-banned member of a public channel (new-pipeline: session + membership + channel).
+        var channel = await CreateLoungeChannel();
         var liveUser = new ChatUser("victim#123", false, null, new ProfilePicture(), null, null);
         _connectionMapping.Add("VictimConn", "W3C Lounge", liveUser);
         _connectionMapping.SetMute("VictimConn", MuteStatus.Full, DateTime.UtcNow.AddDays(1));
+        SeedVictimSessionAndMembership(channel.Id);
         await _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
             battleTag = "victim#123",
@@ -156,17 +199,43 @@ public class MuteReconciliationTests : IntegrationTestBase
         Assert.AreEqual(MuteStatus.None, cached.Status,
             "Controller unban must clear the live connection's cached mute to None");
 
-        await _chatHub.SendMessage("I can talk again");
+        var sendResult = await _chatHub.SendMessage(channel.Id, "I can talk again");
 
-        Assert.AreEqual(1, _groupSendCount,
-            "After a controller unban, the user can send again in a public room without reconnecting");
+        Assert.AreEqual(ChatResultCode.Ok, sendResult.Code,
+            "After a controller unban, the user can send again in a public channel without reconnecting");
+    }
+
+    private async Task<ChatChannel> CreateLoungeChannel()
+    {
+        var channel = new ChatChannel
+        {
+            Type = ChannelType.Public,
+            Name = "W3C Lounge",
+            NormalizedName = ChannelNames.Normalize("W3C Lounge"),
+        };
+        await _channelRepository.Insert(channel);
+        return channel;
+    }
+
+    // Seeds the victim connection the SAME way the connect path does — a live session + an
+    // OnlineMemberRegistry membership — so the NEW SendMessage(channelId, content) pipeline reaches its
+    // (public-channel) mute gate. The mute cache itself is reconciled by the controller in each test.
+    private void SeedVictimSessionAndMembership(string channelId)
+    {
+        _sessionRegistry.Register(
+            "VictimConn",
+            new W3CUserAuthentication { BattleTag = "victim#123", Name = "victim" },
+            null);
+        _onlineMemberRegistry.Join(channelId, "VictimConn",
+            new MemberState("victim#123", NotificationLevel.Mentions, 0, ChannelType.Public));
     }
 
     [Test]
     public async Task ControllerDelete_MixedCaseBattleTag_ActuallyDeletesRow_AndReturnsOk()
     {
-        // Casing fix: the row is stored lowercased (AddLoungeMute), so a mixed-case DELETE must still
-        // match and remove it — and report 200 OK, not a false 404.
+        // Casing fix: the row is stored with the moderator-entered DISPLAY casing ("Victim#123"), but its
+        // match key is the lowercased _id, so a DELETE under a THIRD casing ("VICTIM#123") still resolves
+        // { _id: "victim#123" }, removes the row, and reports 200 OK — not a false 404.
         await _muteRepository.AddLoungeMute(new LoungeMuteRequest
         {
             battleTag = "Victim#123",
@@ -179,7 +248,7 @@ public class MuteReconciliationTests : IntegrationTestBase
         var result = await _controller.DeleteLoungeMute("VICTIM#123");
 
         Assert.IsInstanceOf<OkObjectResult>(result,
-            "A mixed-case DELETE that matches a stored (lowercased) mute must return 200 OK");
+            "A mixed-case DELETE that matches a stored mute (via the lowercased _id) must return 200 OK");
         Assert.IsNull(await _muteRepository.GetMutedPlayer("victim#123"),
             "A mixed-case DELETE must actually remove the stored row (casing fix)");
     }

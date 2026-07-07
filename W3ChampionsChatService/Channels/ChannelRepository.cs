@@ -1,0 +1,265 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using W3ChampionsChatService.Domain;
+
+namespace W3ChampionsChatService.Channels;
+
+public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
+{
+    private IMongoCollection<ChatChannel> Channels => CreateCollection<ChatChannel>(ChatCollections.Channels);
+
+    public Task Insert(ChatChannel channel) => Channels.InsertOneAsync(channel);
+
+    public Task<ChatChannel> Load(string id) => Channels.Find(c => c.Id == id).FirstOrDefaultAsync();
+
+    public Task<List<ChatChannel>> LoadByIds(IEnumerable<string> ids) =>
+        Channels.Find(Builders<ChatChannel>.Filter.In(c => c.Id, ids.ToList())).ToListAsync();
+
+    public Task<ChatChannel> LoadByNormalizedName(ChannelType type, string normalizedName) =>
+        Channels.Find(c => c.Type == type && c.NormalizedName == normalizedName).FirstOrDefaultAsync();
+
+    /// <summary>
+    /// Finds a name-joinable channel by normalized name across ALL types (not scoped to one
+    /// ChannelType) — backs the join resolution order: a name match on an existing
+    /// non-name-joinable type (e.g. System) must be distinguishable from "no match" so the
+    /// caller can reject with PermissionDenied instead of falling through to implicit create.
+    /// </summary>
+    public Task<ChatChannel> LoadAnyByNormalizedName(string normalizedName) =>
+        Channels.Find(c => c.NormalizedName == normalizedName).FirstOrDefaultAsync();
+
+    public Task<List<ChatChannel>> LoadAllOfType(ChannelType type) =>
+        Channels.Find(c => c.Type == type).ToListAsync();
+
+    /// <summary>
+    /// Atomically allocates the next per-channel sequence number via findOneAndUpdate $inc
+    /// on the channel doc, also stamping LastMessageAt (C1 amendment: lastSeq + lastMessageAt
+    /// maintained on every message-insert path). Strictly monotonic under concurrency —
+    /// guaranteed by MongoDB single-document $inc atomicity, so it holds regardless of
+    /// service-instance count (the service also runs single-instance by design).
+    /// <paramref name="shellExpiresAt"/> (C5 D10): when non-null, the SAME atomic write also
+    /// $sets ExpiresAt — the caller passes <c>ExpiryCalculator.ForChannelShell(channel, now)</c> for
+    /// Dm/GroupDm sends so the shell TTL is maintained on every message without a second round-trip.
+    /// When null (the default — every pre-C5 caller), ExpiresAt is left completely untouched: public/
+    /// semiPublic/System channels must never have this field written (they are creation-anchored or
+    /// permanent, never message-anchored).
+    /// </summary>
+    public async Task<long> AllocateSeq(string channelId, DateTime now, DateTime? shellExpiresAt = null)
+    {
+        var update = Builders<ChatChannel>.Update
+            .Inc(c => c.LastSeq, 1)
+            .Set(c => c.LastMessageAt, now);
+        if (shellExpiresAt.HasValue)
+        {
+            update = update.Set(c => c.ExpiresAt, shellExpiresAt.Value);
+        }
+
+        var updated = await Channels.FindOneAndUpdateAsync<ChatChannel>(
+            c => c.Id == channelId,
+            update,
+            new FindOneAndUpdateOptions<ChatChannel> { ReturnDocument = ReturnDocument.After });
+
+        if (updated == null)
+        {
+            throw new InvalidOperationException($"Cannot allocate seq: channel {channelId} does not exist");
+        }
+
+        return updated.LastSeq;
+    }
+
+    /// <summary>
+    /// Implicit find-or-create for semiPublic channels (join resolution — acceptance 9a):
+    /// $setOnInsert upsert keyed (Type=SemiPublic, NormalizedName), mirroring
+    /// PublicChannelSeeder's idempotent pattern. Backed by the unique partial index
+    /// ux_type_normalizedName (ChatDomainIndexes.EnsureChannelIndexes). A genuine concurrent
+    /// race — two joiners implicitly creating the same brand-new name at once — can make the
+    /// losing upsert's insert half violate that index (surfaces as MongoCommandException,
+    /// Code 11000/"DuplicateKey" — findAndModify is a single command, not a bulk-write op, so
+    /// this is NOT MongoWriteException, which only wraps the insert/update/delete write-command
+    /// family); retried once, after which the winner's row is visible and the retry resolves
+    /// as a plain match.
+    /// </summary>
+    public async Task<ChatChannel> FindOrCreateSemiPublic(string name, DateTime now)
+    {
+        var normalized = ChannelNames.Normalize(name);
+        var filter = Builders<ChatChannel>.Filter.Where(c => c.Type == ChannelType.SemiPublic && c.NormalizedName == normalized);
+        var update = Builders<ChatChannel>.Update
+            .SetOnInsert(c => c.Id, ObjectId.GenerateNewId().ToString())
+            .SetOnInsert(c => c.Name, name)
+            .SetOnInsert(c => c.LastSeq, 0L)
+            .SetOnInsert(c => c.LastMessageAt, now);
+        var options = new FindOneAndUpdateOptions<ChatChannel>
+        {
+            IsUpsert = true,
+            ReturnDocument = ReturnDocument.After,
+        };
+
+        return await RetryOnceOnDuplicateKey(() => Channels.FindOneAndUpdateAsync(filter, update, options));
+    }
+
+    /// <summary>
+    /// Find-or-create for 1:1 Dm shells, keyed by <see cref="DmPairKey"/> (C5 T2) — mirrors
+    /// <see cref="FindOrCreateSemiPublic"/>'s $setOnInsert-upsert + duplicate-key-retry-once idiom
+    /// VERBATIM, backed by the unique partial index <c>ux_pairKey_dm</c> (Type == Dm). Guards its
+    /// battleTag args against null/empty (C1 amendment 2): <see cref="DmPairKey.For"/> NREs on a null
+    /// argument via its internal <c>.Trim()</c>, so callers get a clear, typed failure here instead.
+    /// On insert, <paramref name="initiator"/> is stamped as <c>RequestInitiatedBy</c> and
+    /// <c>ExpiresAt</c> is computed via <see cref="ExpiryCalculator.ForChannelShell"/> against
+    /// <paramref name="state"/> (+30d Pending / +1y Accepted-at-birth for friends, D10) — the
+    /// C1-amendment gap this task closes. Two concurrent calls for the SAME pair (either argument
+    /// order, either direction) resolve to exactly one document.
+    /// </summary>
+    public async Task<ChatChannel> FindOrCreateDm(
+        string battleTagA, string battleTagB, string initiator, DmRequestState state, DateTime now)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(battleTagA);
+        ArgumentException.ThrowIfNullOrWhiteSpace(battleTagB);
+        ArgumentException.ThrowIfNullOrWhiteSpace(initiator);
+
+        var pairKey = DmPairKey.For(battleTagA, battleTagB);
+        var expiresAt = ExpiryCalculator.ForChannelShell(new ChatChannel { Type = ChannelType.Dm, RequestState = state }, now);
+
+        var filter = Builders<ChatChannel>.Filter.Where(c => c.Type == ChannelType.Dm && c.PairKey == pairKey);
+        var update = Builders<ChatChannel>.Update
+            .SetOnInsert(c => c.Id, ObjectId.GenerateNewId().ToString())
+            .SetOnInsert(c => c.PairKey, pairKey)
+            .SetOnInsert(c => c.RequestState, state)
+            .SetOnInsert(c => c.RequestInitiatedBy, initiator)
+            .SetOnInsert(c => c.LastSeq, 0L)
+            .SetOnInsert(c => c.LastMessageAt, now)
+            .SetOnInsert(c => c.ExpiresAt, expiresAt);
+        var options = new FindOneAndUpdateOptions<ChatChannel>
+        {
+            IsUpsert = true,
+            ReturnDocument = ReturnDocument.After,
+        };
+
+        return await RetryOnceOnDuplicateKey(() => Channels.FindOneAndUpdateAsync(filter, update, options));
+    }
+
+    /// <summary>
+    /// Loads an existing Dm shell by pair-key, if any — a cheap existence check that skips the
+    /// upsert write path entirely (used by call sites that only need to know "does a conversation
+    /// already exist" without also find-or-creating one, e.g. the stranger-cap skip in T3).
+    /// Equality on <c>PairKey</c> is an indexed point lookup — backed by the unique partial index
+    /// <c>ux_pairKey_dm</c> (<see cref="Domain.ChatDomainIndexes"/>) — so this is efficient, not a scan.
+    /// </summary>
+    public Task<ChatChannel> LoadByPairKey(string battleTagA, string battleTagB)
+    {
+        var pairKey = DmPairKey.For(battleTagA, battleTagB);
+        return Channels.Find(c => c.Type == ChannelType.Dm && c.PairKey == pairKey).FirstOrDefaultAsync();
+    }
+
+    /// <summary>
+    /// Find-or-create for System channel shells (match/lobby/clan, C7 Task 4), keyed by
+    /// (SystemKind, SystemRef) — mirrors <see cref="FindOrCreateDm"/>'s $setOnInsert-upsert +
+    /// duplicate-key-retry-once idiom VERBATIM, backed by the unique partial index
+    /// <c>ux_systemKind_systemRef</c> (Type == System). <c>ExpiresAt</c> is computed via
+    /// <see cref="ExpiryCalculator.ForChannelShell"/> against <paramref name="kind"/> — THIS is the
+    /// C1-amendment wiring this task closes: a Match shell gets <c>now + RetentionPeriods.MatchChannel</c>
+    /// (24h), while a Clan shell (permanent) computes null. A null result is deliberately left OUT of
+    /// the $setOnInsert chain entirely rather than set explicitly — <see cref="ChatChannel.ExpiresAt"/>
+    /// is <c>[BsonIgnoreIfNull]</c> and must stay ABSENT on a permanent document (an explicit
+    /// <c>$setOnInsert: {ExpiresAt: null}</c> would write the field with a null value instead of
+    /// omitting it, which the TTL convention documented on <see cref="Domain.ChatDomainIndexes"/>
+    /// requires). Two concurrent calls for the SAME (kind, ref) resolve to exactly one document.
+    /// </summary>
+    public async Task<ChatChannel> FindOrCreateSystem(SystemChannelKind kind, string systemRef, string name, DateTime now)
+    {
+        var expiresAt = ExpiryCalculator.ForChannelShell(new ChatChannel { Type = ChannelType.System, SystemKind = kind }, now);
+
+        var filter = Builders<ChatChannel>.Filter.Where(c =>
+            c.Type == ChannelType.System && c.SystemKind == kind && c.SystemRef == systemRef);
+        var update = Builders<ChatChannel>.Update
+            .SetOnInsert(c => c.Id, ObjectId.GenerateNewId().ToString())
+            .SetOnInsert(c => c.SystemKind, kind)
+            .SetOnInsert(c => c.SystemRef, systemRef)
+            .SetOnInsert(c => c.Name, name)
+            .SetOnInsert(c => c.LastSeq, 0L)
+            .SetOnInsert(c => c.LastMessageAt, now);
+        if (expiresAt.HasValue)
+        {
+            update = update.SetOnInsert(c => c.ExpiresAt, expiresAt.Value);
+        }
+
+        var options = new FindOneAndUpdateOptions<ChatChannel>
+        {
+            IsUpsert = true,
+            ReturnDocument = ReturnDocument.After,
+        };
+
+        return await RetryOnceOnDuplicateKey(() => Channels.FindOneAndUpdateAsync(filter, update, options));
+    }
+
+    /// <summary>
+    /// Loads an existing System channel shell by (SystemKind, SystemRef), if any — the lookup
+    /// counterpart of <see cref="FindOrCreateSystem"/> for call sites that only need an existence
+    /// check (mirrors <see cref="LoadByPairKey"/>'s shape).
+    /// </summary>
+    public Task<ChatChannel> LoadBySystemRef(SystemChannelKind kind, string systemRef) =>
+        Channels.Find(c => c.Type == ChannelType.System && c.SystemKind == kind && c.SystemRef == systemRef).FirstOrDefaultAsync();
+
+    /// <summary>
+    /// Consent-machine accept transition (C5 D3/D10): a conditional write that flips
+    /// <c>RequestState</c> Pending → Accepted ONLY when it is currently Pending, and in the same
+    /// atomic update sets <c>ExpiresAt</c> to the +1y accepted-shell expiry. Returns false (no-op)
+    /// when the channel is already Accepted or missing — the accept-race guard: a reply-accept
+    /// racing an explicit AcceptRequest (or two AcceptRequest calls) can only ever win once.
+    /// </summary>
+    public async Task<bool> SetRequestAccepted(string channelId, DateTime now)
+    {
+        var expiresAt = ExpiryCalculator.ForChannelShell(new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted }, now);
+
+        var filter = Builders<ChatChannel>.Filter.Where(c =>
+            c.Id == channelId && c.Type == ChannelType.Dm && c.RequestState == DmRequestState.Pending);
+        var update = Builders<ChatChannel>.Update
+            .Set(c => c.RequestState, DmRequestState.Accepted)
+            .Set(c => c.ExpiresAt, expiresAt);
+
+        var result = await Channels.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Hard-deletes a channel doc (C5 D12 — e.g. the last group member leaving; residual
+    /// memberships are cleaned up separately via <see cref="Memberships.MembershipRepository.DeleteAllForChannel"/>).
+    /// Messages are left to the 90d message TTL — no reader exists for a deleted channel's history
+    /// and moderators are scope-walled out of Dm/GroupDm entirely.</summary>
+    public Task Delete(string channelId) => Channels.DeleteOneAsync(c => c.Id == channelId);
+
+    /// <summary>
+    /// Renames a channel — sets the display <see cref="ChatChannel.Name"/> ONLY, NEVER
+    /// <see cref="ChatChannel.NormalizedName"/> (C5 D16, group rename via <c>ChatHub.RenameGroup</c>). A
+    /// GroupDm deliberately keeps a null <c>NormalizedName</c> so its display name can never collide into
+    /// <see cref="LoadAnyByNormalizedName"/>'s join-resolution path (which would block implicit semiPublic
+    /// creation of the same display name); mutating only <c>Name</c> preserves that invariant on rename.
+    /// </summary>
+    public Task SetName(string channelId, string name) =>
+        Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Name, name));
+
+    /// <summary>
+    /// C4 Task 7 (D9): the eligible-channel list backing GET /api/moderation/channels — the
+    /// channelId-resolution surface the website-backend's moderation proxy needs (the OLD
+    /// ChatHistory-backed GET /api/chat/{chatroom} took room NAMEs directly; channels are the new unit).
+    /// Eligible types mirror <see cref="ChannelModeration.IsModeratable"/> EXACTLY (Public / SemiPublic /
+    /// System+Match) — expressed here as an explicit Mongo filter (a C# predicate can't be pushed into a
+    /// query), so keep both definitions in sync if the scope wall ever changes. Sorted by LastMessageAt
+    /// DESCENDING (most recently active first); <paramref name="limit"/> is clamped to
+    /// [1, <see cref="ChatLimits.ModerationChannelsPageSize"/>] — never MongoDB's Limit(0) "no limit".
+    /// </summary>
+    public Task<List<ChatChannel>> LoadModeratableChannels(int limit)
+    {
+        var effectiveLimit = Math.Clamp(limit, 1, ChatLimits.ModerationChannelsPageSize);
+        var filterBuilder = Builders<ChatChannel>.Filter;
+        var filter = filterBuilder.Or(
+            filterBuilder.Eq(c => c.Type, ChannelType.Public),
+            filterBuilder.Eq(c => c.Type, ChannelType.SemiPublic),
+            filterBuilder.And(
+                filterBuilder.Eq(c => c.Type, ChannelType.System),
+                filterBuilder.Eq(c => c.SystemKind, SystemChannelKind.Match)));
+
+        return Channels.Find(filter).SortByDescending(c => c.LastMessageAt).Limit(effectiveLimit).ToListAsync();
+    }
+}

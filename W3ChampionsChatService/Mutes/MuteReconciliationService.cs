@@ -62,19 +62,19 @@ public class MuteReconciliationService(
 
     /// <summary>
     /// Applies a mute to every live connection of <paramref name="battleTag"/>: updates the cached
-    /// status/expiry so the next SendMessage/SwitchRoom enforces from the cache (zero DB read), and
-    /// for a FULL ban pushes <c>PlayerBannedFromChat</c> (expiry only) to each connection. A SHADOW
+    /// status/expiry so the next public send or channel join enforces from the cache (zero DB read),
+    /// and for a FULL ban pushes <c>PlayerBannedFromChat</c> (expiry only) to each connection. A SHADOW
     /// ban stays completely silent to the target (preserve the illusion). Never aborts a connection.
     /// </summary>
     public async Task ApplyMuteToLiveConnections(string battleTag, MuteStatus status, DateTime endDate)
     {
-        // Match the DB convention (GetMutedPlayer/AddLoungeMute lowercase the battleTag) by lowercasing
-        // the lookup arg too. GetConnectionIdsForUser also compares case-insensitively, so the reconcile
+        // Match the DB key convention (the mute _id is battleTag.ToLowerInvariant()) by folding the lookup
+        // arg the same way. GetConnectionIdsForUser also compares case-insensitively, so the reconcile
         // works even on a casing mismatch.
-        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag.ToLower());
+        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag.ToLowerInvariant());
         foreach (var connId in liveConnectionIds)
         {
-            // Update the cache so the next SendMessage/SwitchRoom enforces from the cache (no DB read).
+            // Update the cache so the next public send or channel join enforces from the cache (no DB read).
             _connections.SetMute(connId, status, endDate);
 
             if (status == MuteStatus.Full)
@@ -106,7 +106,7 @@ public class MuteReconciliationService(
     /// </summary>
     public Task ClearMuteOnLiveConnections(string battleTag)
     {
-        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag.ToLower());
+        var liveConnectionIds = _connections.GetConnectionIdsForUser(battleTag.ToLowerInvariant());
         foreach (var connId in liveConnectionIds)
         {
             _connections.SetMute(connId, MuteStatus.None, DateTime.MinValue);

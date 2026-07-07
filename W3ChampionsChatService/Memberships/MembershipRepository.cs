@@ -1,0 +1,193 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using MongoDB.Bson;
+using MongoDB.Driver;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Domain;
+
+namespace W3ChampionsChatService.Memberships;
+
+/// <summary>
+/// Durable (channel, user) membership store.
+/// <para>
+/// BATTLETAG KEY CONVENTION (C5 T4): the persisted <see cref="ChannelMembership.BattleTag"/> is ALWAYS
+/// stored lowercased, and every read/update lowercases its incoming <c>battleTag</c> argument before
+/// building the Mongo filter (Mongo <c>$eq</c> is case-SENSITIVE — there is no collation or CI index).
+/// This conforms membership storage to the same lowercased-key convention the rest of the DM machinery
+/// already assumes: <see cref="DmPairKey.For"/> (sorted, lowercased pair-key), the relationship provider
+/// and <see cref="Mutes.MuteRepository"/> (both lowercase their keys), and <see cref="Sessions.SessionRegistry"/>
+/// (whose "the DB lowercases battleTags" note documents the intended convention). Without it, a DM
+/// counterpart membership materialized under the pair-key's lowercased tag would be invisible to the
+/// recipient — whose own reads use their VERBATIM (often uppercase) JWT casing — silently dropping the
+/// DM from their reconnect SessionState, tray, and GetMessages/FocusChannel, and letting a later
+/// JWT-cased self-OpenDm insert a DUPLICATE row past the case-sensitive <c>ux_channelId_battleTag</c>
+/// unique index. Normalizing here at the single durable choke point also makes that unique index dedupe
+/// case-insensitively.
+/// </para>
+/// </summary>
+public class MembershipRepository(MongoClient mongoClient, ChannelRepository channelRepository) : MongoDbRepositoryBase(mongoClient)
+{
+    private IMongoCollection<ChannelMembership> Memberships =>
+        CreateCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+
+    /// <summary>Lowercases a battleTag to the durable membership key convention (see the class doc).</summary>
+    private static string NormalizeTag(string battleTag) => battleTag.ToLowerInvariant();
+
+    // Persists a lowercased-BattleTag COPY without mutating the caller's object (immutability). NOTE:
+    // keep this field list in sync with ChannelMembership — a new field must be copied here too.
+    private static ChannelMembership WithNormalizedBattleTag(ChannelMembership membership) =>
+        new ChannelMembership
+        {
+            Id = membership.Id,
+            ChannelId = membership.ChannelId,
+            BattleTag = NormalizeTag(membership.BattleTag),
+            Role = membership.Role,
+            NotificationLevel = membership.NotificationLevel,
+            LastReadSeq = membership.LastReadSeq,
+            JoinedAt = membership.JoinedAt,
+            DeclinedUntil = membership.DeclinedUntil,
+        };
+
+    public Task Insert(ChannelMembership membership) =>
+        Memberships.InsertOneAsync(WithNormalizedBattleTag(membership));
+
+    public Task<ChannelMembership> Load(string channelId, string battleTag)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.Find(m => m.ChannelId == channelId && m.BattleTag == tag).FirstOrDefaultAsync();
+    }
+
+    public Task<List<ChannelMembership>> LoadForUser(string battleTag)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.Find(m => m.BattleTag == tag).ToListAsync();
+    }
+
+    public Task Delete(string channelId, string battleTag)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.DeleteOneAsync(m => m.ChannelId == channelId && m.BattleTag == tag);
+    }
+
+    /// <summary>Monotonic read-state advance ($max) — a lower/stale seq from an out-of-order
+    /// or duplicate MarkRead call never regresses LastReadSeq.</summary>
+    public Task UpdateLastReadSeq(string channelId, string battleTag, long seq)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.UpdateOneAsync(
+            m => m.ChannelId == channelId && m.BattleTag == tag,
+            Builders<ChannelMembership>.Update.Max(m => m.LastReadSeq, seq));
+    }
+
+    public Task SetNotificationLevel(string channelId, string battleTag, NotificationLevel level)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.UpdateOneAsync(
+            m => m.ChannelId == channelId && m.BattleTag == tag,
+            Builders<ChannelMembership>.Update.Set(m => m.NotificationLevel, level));
+    }
+
+    /// <summary>
+    /// Membership cap gate (acceptance 10) — counts only name-joinable (Public + SemiPublic)
+    /// memberships; System/Dm/GroupDm never count against the cap. KISS at realistic
+    /// per-user scale (a user's channel count is bounded, in practice far under 50):
+    /// LoadForUser + ChannelRepository.LoadByIds type filter, no new aggregation pipeline.
+    /// </summary>
+    public async Task<int> CountNameJoinableMembershipsForUser(string battleTag)
+    {
+        var memberships = await LoadForUser(battleTag);
+        if (memberships.Count == 0) return 0;
+
+        // Reuses the injected ChannelRepository so the type filter reuses LoadByIds rather than
+        // duplicating its query.
+        var channels = await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId));
+        var nameJoinableChannelIds = channels
+            .Where(c => c.Type == ChannelType.Public || c.Type == ChannelType.SemiPublic)
+            .Select(c => c.Id)
+            .ToHashSet();
+
+        return memberships.Count(m => nameJoinableChannelIds.Contains(m.ChannelId));
+    }
+
+    /// <summary>All memberships of one channel (C5 D12) — legitimate here: the never-enumerate-
+    /// channel→users guardrail on <see cref="ChannelMembership"/> is about PUBLIC channels; groups
+    /// are ACL-bound and capped at <see cref="ChatLimits.MaxGroupSize"/>, so enumerating a group's
+    /// members (roster, owner lookups, auto-promotion) is the intended access pattern.</summary>
+    // virtual: a test seam (mirroring UserDirectoryRepository.Load / MentionInboxRepository.Insert) so a
+    // subclass can interpose a deterministic concurrent membership mutation between this read and a caller's
+    // subsequent commit — used to reproduce the FocusChannel read→commit TOCTOU without timing/sleeps.
+    public virtual Task<List<ChannelMembership>> LoadForChannel(string channelId) =>
+        Memberships.Find(m => m.ChannelId == channelId).ToListAsync();
+
+    /// <summary>Member count for a single channel (C5 D12 — group size bounds, last-member-leaves
+    /// detection). Uses the same ux_channelId_battleTag-backed collection scan as
+    /// <see cref="LoadForChannel"/> but returns a bare count.</summary>
+    public async Task<int> CountForChannel(string channelId) =>
+        (int)await Memberships.CountDocumentsAsync(m => m.ChannelId == channelId);
+
+    public Task SetRole(string channelId, string battleTag, MembershipRole role)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.UpdateOneAsync(
+            m => m.ChannelId == channelId && m.BattleTag == tag,
+            Builders<ChannelMembership>.Update.Set(m => m.Role, role));
+    }
+
+    /// <summary>C5 D3: stamps the RECIPIENT's own decline-suppression window. Never touches the
+    /// channel doc or any other member's row.</summary>
+    public Task SetDeclinedUntil(string channelId, string battleTag, DateTime declinedUntil)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.UpdateOneAsync(
+            m => m.ChannelId == channelId && m.BattleTag == tag,
+            Builders<ChannelMembership>.Update.Set(m => m.DeclinedUntil, declinedUntil));
+    }
+
+    /// <summary>C5 D3/T4: clears a resolved decline window — called when the suppression period has
+    /// elapsed and a fresh request is about to resurface, or when the conversation is accepted.</summary>
+    public Task ClearDeclinedUntil(string channelId, string battleTag)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.UpdateOneAsync(
+            m => m.ChannelId == channelId && m.BattleTag == tag,
+            Builders<ChannelMembership>.Update.Unset(m => m.DeclinedUntil));
+    }
+
+    /// <summary>Residual-row cleanup when a channel is deleted (C5 D12 — last group member leaves).</summary>
+    public Task DeleteAllForChannel(string channelId) =>
+        Memberships.DeleteManyAsync(m => m.ChannelId == channelId);
+
+    /// <summary>
+    /// Idempotent membership upsert (C5 T2) — mirrors <see cref="Channels.ChannelRepository.FindOrCreateSemiPublic"/>'s
+    /// $setOnInsert-upsert + duplicate-key-retry-once idiom, backed by the unique
+    /// <c>ux_channelId_battleTag</c> index. Used for lazy recipient materialization (a DM's recipient
+    /// membership is created on first successfully-delivered message, D4) where a genuine race —
+    /// e.g. two concurrent sends both trying to materialize the same recipient — must resolve to
+    /// exactly one row rather than surfacing a raw duplicate-key write exception. The BattleTag is
+    /// lowercased in BOTH the match filter and the $setOnInsert (see the class doc) so a JWT-cased
+    /// caller resolves to the same row a pair-key-cased materialization created — never a duplicate.
+    /// </summary>
+    public async Task<ChannelMembership> InsertIfAbsent(ChannelMembership membership)
+    {
+        var tag = NormalizeTag(membership.BattleTag);
+        var filter = Builders<ChannelMembership>.Filter.Where(m =>
+            m.ChannelId == membership.ChannelId && m.BattleTag == tag);
+        var update = Builders<ChannelMembership>.Update
+            .SetOnInsert(m => m.Id, membership.Id ?? ObjectId.GenerateNewId().ToString())
+            .SetOnInsert(m => m.ChannelId, membership.ChannelId)
+            .SetOnInsert(m => m.BattleTag, tag)
+            .SetOnInsert(m => m.Role, membership.Role)
+            .SetOnInsert(m => m.NotificationLevel, membership.NotificationLevel)
+            .SetOnInsert(m => m.LastReadSeq, membership.LastReadSeq)
+            .SetOnInsert(m => m.JoinedAt, membership.JoinedAt);
+        var options = new FindOneAndUpdateOptions<ChannelMembership>
+        {
+            IsUpsert = true,
+            ReturnDocument = ReturnDocument.After,
+        };
+
+        return await RetryOnceOnDuplicateKey(() => Memberships.FindOneAndUpdateAsync(filter, update, options));
+    }
+}

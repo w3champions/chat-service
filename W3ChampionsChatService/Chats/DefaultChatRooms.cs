@@ -1,11 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
+﻿using System.Collections.Generic;
 
 namespace W3ChampionsChatService.Chats;
 
 public class DefaultChatRooms()
 {
+    /// <summary>
+    /// The hardcoded public catalog — fed into <c>Channels/PublicChannelSeeder.cs</c> at startup.
+    /// Catalog changes remain deploy-only by explicit product decision.
+    /// </summary>
     public static List<string> Rooms { get; } = [
         "W3C Lounge",
         "1 vs 1",
@@ -20,11 +22,4 @@ public class DefaultChatRooms()
         "Risk Europe",
         "Mini Dota",
     ];
-
-    /// <summary>
-    /// True only for the official public lounge/ladder rooms in <see cref="Rooms"/> (case-insensitive).
-    /// These are the only rooms where lounge mutes (full/shadow bans) apply. Any other room —
-    /// clan rooms, game-lobby rooms, or any dynamic room — is a private/exempt room and returns false.
-    /// </summary>
-    public static bool IsPublicRoom(string room) => Rooms.Contains(room, StringComparer.OrdinalIgnoreCase);
 }

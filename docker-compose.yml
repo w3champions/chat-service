@@ -1,0 +1,47 @@
+# Use this docker-compose file to run chat-service locally.
+#
+# It builds this service plus a throwaway Mongo and joins the shared external network
+# `w3c-network-local`, so it can talk to a locally-run website-backend (statistic-service) and
+# matchmaking-service by container name, and a locally-run launcher can reach it at
+# http://127.0.0.1:6124. Env config lives in ./environments/local-compose.env.
+#
+#   docker network create w3c-network-local   # once — shared by all local W3C services
+#   docker compose up -d --build
+#
+# AUTH IS HYBRID: log in through the TEST identification-service (a real W3C JWT); this service
+# validates that JWT with its built-in test public key. No local identification-service and no
+# Battle.net credentials are needed.
+services:
+  chat-service:
+    container_name: chat-service-local
+    depends_on:
+      - mongo-db
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - '127.0.0.1:6124:80'
+    env_file:
+      - ./environments/local-compose.env
+
+  mongo-db:
+    image: mongo:8.0.19
+    container_name: mongodb-chat-service-local-compose
+    restart: always
+    ports:
+      - '127.0.0.1:3511:27017'
+    command: --wiredTigerCacheSizeGB=0.5
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=w3champions
+      - MONGO_INITDB_ROOT_PASSWORD=w3champions
+    volumes:
+      - vol-mongodb-chat-service-local-compose:/data/db
+
+networks:
+  default:
+    name: w3c-network-local
+    external: true
+
+volumes:
+  vol-mongodb-chat-service-local-compose:
