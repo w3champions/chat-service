@@ -28,7 +28,12 @@ public class LoungeMute : IIdentifiable
     /// <c>_id</c> from the display <c>battleTag</c> is a pure semantics change, not a shape change.
     /// </para>
     /// </summary>
-    public string Id => battleTag?.ToLower();
+    // ToLowerInvariant (not ToLower): the _id key must be culture-INDEPENDENT so a mute can never be
+    // evaded by a Turkish/Azeri dotted/dotless-I fold mismatch between the write and read sides, and so it
+    // matches the ToLowerInvariant key convention used everywhere else in the service (MembershipRepository,
+    // MentionFanOut, mention inbox). Prod _ids are pure-lowercase ASCII, so this is byte-identical for real
+    // battle.net tags and changes no existing key.
+    public string Id => battleTag?.ToLowerInvariant();
     public string battleTag { get; set; }
     public DateTime endDate { get; set; }
     public DateTime insertDate { get; set; }
