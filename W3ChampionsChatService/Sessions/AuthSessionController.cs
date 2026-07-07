@@ -21,22 +21,38 @@ public class AuthSessionController(
     public IActionResult MintTicket()
     {
         var now = DateTime.UtcNow;
-        // Per-IP shield FIRST (cheap, pre-validation). UseForwardedHeaders (Startup) already
-        // rewrites RemoteIpAddress from X-Forwarded-For, so this keys on the real client IP.
+        // Per-IP shield FIRST (cheap, pre-validation). UseForwardedHeaders (Startup) rewrites
+        // RemoteIpAddress from X-Forwarded-For when the forwarding proxy is trusted (the trust
+        // boundary is env-configurable — see Startup.BuildForwardedHeadersOptions / A2), so this
+        // keys on the real client IP; behind an UNtrusted proxy every client collapses to the proxy IP.
         var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-        if (!rateLimiter.TryAcquire($"ip:{ip}", ChatLimits.TicketMintPerIpLimit, now))
+        var ipKey = $"ip:{ip}";
+
+        // F1 reconnect-storm rework: the per-IP budget counts ONLY REJECTED mint attempts, never
+        // successful ones (see the Record() calls below vs the success path, which does NOT charge it).
+        // WHY successful mints aren't charged: a legitimate mass reconnect of thousands of DISTINCT
+        // valid battleTags behind ONE shared proxy IP must not be IP-throttled — each valid user is
+        // already bounded by the per-battleTag 10/min cap. The pre-validation DoS shield is preserved:
+        // after TicketMintPerIpLimit REJECTIONS per window per IP, further attempts short-circuit here
+        // BEFORE the expensive RSA validation. IsAtLimit is a pure read; the charge is deferred to the
+        // specific rejection branches so the whole valid path stays IP-charge-free.
+        if (rateLimiter.IsAtLimit(ipKey, ChatLimits.TicketMintPerIpLimit, now))
             return StatusCode(StatusCodes.Status429TooManyRequests);
 
         string token;
         try { token = UserHasPermissionFilter.GetToken(Request.Headers[HeaderNames.Authorization]); }
-        catch (SecurityTokenValidationException) { return Unauthorized(); }
+        catch (SecurityTokenValidationException) { rateLimiter.Record(ipKey, now); return Unauthorized(); }
 
         var identity = authService.GetUserByTokenEnforcingLifetime(token);
-        if (identity == null) return Unauthorized();
+        if (identity == null) { rateLimiter.Record(ipKey, now); return Unauthorized(); }
 
         if (!rateLimiter.TryAcquire($"bt:{identity.BattleTag}", ChatLimits.TicketMintPerBattleTagLimit, now))
+        {
+            rateLimiter.Record(ipKey, now);
             return StatusCode(StatusCodes.Status429TooManyRequests);
+        }
 
+        // Success: mint and return WITHOUT charging the per-IP budget (F1 — see the shield comment above).
         return Ok(new TicketResponse
         {
             Ticket = ticketStore.Mint(identity, now),

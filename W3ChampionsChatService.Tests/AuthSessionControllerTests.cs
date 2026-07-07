@@ -35,7 +35,17 @@ public class AuthSessionControllerTests
     {
         using var rsa = RSA.Create(2048);
         var publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
+        return (SignJwt(rsa, battleTag, isAdmin, permissions, expires), publicKeyPem);
+    }
 
+    /// <summary>
+    /// Signs one token with an EXISTING keypair so a test can mint MANY distinct battleTags that all
+    /// validate against a single <see cref="W3CAuthenticationService"/> (the per-key-per-token
+    /// <see cref="CreateSignedJwt"/> can't do that — each of its calls generates a fresh keypair).
+    /// </summary>
+    private static string SignJwt(
+        RSA rsa, string battleTag, bool isAdmin, IEnumerable<string> permissions, DateTime? expires = null)
+    {
         var signingCredentials = new SigningCredentials(new RsaSecurityKey(rsa), SecurityAlgorithms.RsaSha256)
         {
             CryptoProviderFactory = new CryptoProviderFactory { CacheSignatureProviders = false },
@@ -52,7 +62,7 @@ public class AuthSessionControllerTests
             signingCredentials: signingCredentials,
             expires: expires ?? DateTime.UtcNow.AddDays(7));
 
-        return (new JwtSecurityTokenHandler().WriteToken(token), publicKeyPem);
+        return new JwtSecurityTokenHandler().WriteToken(token);
     }
 
     private static DefaultHttpContext BuildHttpContext(string authorizationHeader, string remoteIp)
@@ -209,7 +219,8 @@ public class AuthSessionControllerTests
     public void IpLimitExhausted_Returns429_BeforeJwtValidation()
     {
         // Pins BOTH the per-IP limit AND the check ordering: the per-IP shield runs before any JWT
-        // work, so a GARBAGE Authorization header must still surface as 429, never 401.
+        // work, so a GARBAGE Authorization header must still surface as 429, never 401. F1: the budget
+        // is now filled via Record() (how a REJECTION charges it in production), not TryAcquire.
         var (_, publicKeyPem) = CreateSignedJwt("unused#1", false, Array.Empty<string>());
         var authService = new W3CAuthenticationService(publicKeyPem);
         var ticketStore = new TicketStore();
@@ -218,9 +229,10 @@ public class AuthSessionControllerTests
 
         for (var i = 0; i < ChatLimits.TicketMintPerIpLimit; i++)
         {
-            Assert.IsTrue(limiter.TryAcquire("ip:127.0.0.1", ChatLimits.TicketMintPerIpLimit, now),
-                $"pre-exhaust call {i + 1} should be allowed");
+            limiter.Record("ip:127.0.0.1", now);
         }
+        Assert.IsTrue(limiter.IsAtLimit("ip:127.0.0.1", ChatLimits.TicketMintPerIpLimit, now),
+            "the per-IP budget must be at limit after TicketMintPerIpLimit recorded rejections");
 
         var controller = BuildController(authService, ticketStore, limiter, "Bearer garbage.garbage.garbage");
 
@@ -230,5 +242,92 @@ public class AuthSessionControllerTests
         Assert.AreEqual(StatusCodes.Status429TooManyRequests, ((StatusCodeResult)result).StatusCode,
             "Must be 429, not 401 — proves the IP shield runs before JWT validation");
         Assert.AreEqual(0, ticketStore.Count);
+    }
+
+    // ── F1 reconnect-storm rework: the per-IP budget counts ONLY REJECTED mint attempts ────────────
+    //
+    // A SUCCESSFUL mint (valid, non-expired JWT under the per-battleTag cap) must NOT charge the per-IP
+    // budget, so a legitimate mass reconnect of many DISTINCT valid battleTags behind one shared proxy
+    // IP is never IP-throttled. Only auth failures and per-battleTag-throttled attempts charge it,
+    // keeping the pre-validation DoS shield intact.
+
+    [Test]
+    public void ManyDistinctValidBattleTags_FromOneIp_AllMint_PastTheOldPerIpCap()
+    {
+        // The core F1 acceptance: mint from FAR MORE distinct valid battleTags than the old per-IP cap
+        // (30), all from ONE IP. Because successful mints never charge the per-IP budget, every one
+        // succeeds — each is bounded only by the per-battleTag 10/min cap (one mint per tag here).
+        using var rsa = RSA.Create(2048);
+        var publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
+        var authService = new W3CAuthenticationService(publicKeyPem);
+        var ticketStore = new TicketStore();
+        var limiter = new MintRateLimiter();
+        const string sharedProxyIp = "10.0.0.9";
+
+        var total = ChatLimits.TicketMintPerIpLimit + 10; // 40 > the old 30 per-IP cap
+        for (var i = 0; i < total; i++)
+        {
+            var jwt = SignJwt(rsa, $"player{i}#{i}", isAdmin: false, new[] { "Moderation" });
+            var result = BuildController(authService, ticketStore, limiter, $"Bearer {jwt}", sharedProxyIp).MintTicket();
+            Assert.IsInstanceOf<OkObjectResult>(result,
+                $"valid mint {i + 1} of {total} from one IP must succeed — successful mints never charge the per-IP budget");
+        }
+
+        Assert.AreEqual(total, ticketStore.Count, "every distinct valid battleTag minted a ticket");
+        Assert.IsFalse(limiter.IsAtLimit($"ip:{sharedProxyIp}", ChatLimits.TicketMintPerIpLimit, DateTime.UtcNow),
+            "the per-IP budget must remain unspent after a storm of SUCCESSFUL mints");
+    }
+
+    [Test]
+    public void InvalidTokens_FromOneIp_ChargeTheBudget_ThenBlockPreValidation()
+    {
+        // The shield is preserved: rejected attempts (garbage tokens → 401) DO charge the per-IP budget.
+        // After TicketMintPerIpLimit rejections from one IP, the next attempt short-circuits with 429
+        // BEFORE any JWT parsing — even though its header is garbage (which in isolation is a 401).
+        var (_, publicKeyPem) = CreateSignedJwt("unused#1", false, Array.Empty<string>());
+        var authService = new W3CAuthenticationService(publicKeyPem);
+        var ticketStore = new TicketStore();
+        var limiter = new MintRateLimiter();
+        const string attackerIp = "203.0.113.5";
+
+        for (var i = 0; i < ChatLimits.TicketMintPerIpLimit; i++)
+        {
+            var rejected = BuildController(authService, ticketStore, limiter, "Bearer garbage.garbage.garbage", attackerIp).MintTicket();
+            Assert.IsInstanceOf<UnauthorizedResult>(rejected, $"rejection {i + 1} returns 401 and charges the per-IP budget");
+        }
+
+        var blocked = BuildController(authService, ticketStore, limiter, "Bearer garbage.garbage.garbage", attackerIp).MintTicket();
+
+        Assert.IsInstanceOf<StatusCodeResult>(blocked, "after the budget is exhausted by rejections, further attempts are blocked pre-validation");
+        Assert.AreEqual(StatusCodes.Status429TooManyRequests, ((StatusCodeResult)blocked).StatusCode);
+        Assert.AreEqual(0, ticketStore.Count, "no ticket is ever minted for these invalid tokens");
+    }
+
+    [Test]
+    public void PerBattleTagThrottledMint_ChargesThePerIpBudget()
+    {
+        // A per-battleTag-throttled attempt is itself a REJECTION, so it charges the per-IP budget too —
+        // while the 10 SUCCESSFUL mints that exhausted the per-battleTag cap did not charge it at all.
+        var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" });
+        var authService = new W3CAuthenticationService(publicKeyPem);
+        var ticketStore = new TicketStore();
+        var limiter = new MintRateLimiter();
+        const string ip = "198.51.100.7";
+
+        for (var i = 0; i < ChatLimits.TicketMintPerBattleTagLimit; i++)
+        {
+            Assert.IsInstanceOf<OkObjectResult>(
+                BuildController(authService, ticketStore, limiter, $"Bearer {jwt}", ip).MintTicket(),
+                $"successful mint {i + 1} within the per-battleTag cap");
+        }
+        Assert.IsFalse(limiter.IsAtLimit($"ip:{ip}", 1, DateTime.UtcNow),
+            "10 SUCCESSFUL mints must not have charged the per-IP budget at all (no window for the IP key)");
+
+        var throttled = BuildController(authService, ticketStore, limiter, $"Bearer {jwt}", ip).MintTicket();
+
+        Assert.IsInstanceOf<StatusCodeResult>(throttled, "the 11th mint is per-battleTag-throttled");
+        Assert.AreEqual(StatusCodes.Status429TooManyRequests, ((StatusCodeResult)throttled).StatusCode);
+        Assert.IsTrue(limiter.IsAtLimit($"ip:{ip}", 1, DateTime.UtcNow),
+            "the per-battleTag-throttled rejection must have charged the per-IP budget once");
     }
 }

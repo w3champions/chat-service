@@ -59,9 +59,19 @@ public static class ChatLimits
     /// <summary>Auth ticket TTL (one-time).</summary>
     public static readonly TimeSpan TicketTtl = TimeSpan.FromSeconds(60);
 
-    /// <summary>Ticket mint rate limit (C2): fixed window per validated battleTag and per source IP.
-    /// Values are a C2 plan decision (not spec §13): 10/min per battleTag tolerates reconnect
-    /// flapping; 30/min per IP tolerates NAT'd LAN venues.</summary>
+    /// <summary>Ticket mint rate limit (C2): fixed window (<see cref="TicketMintWindow"/>). Values are a
+    /// C2 plan decision (not spec §13). <see cref="TicketMintPerBattleTagLimit"/> = 10/min caps
+    /// SUCCESSFUL-or-not mint attempts per validated battleTag, tolerating reconnect flapping while
+    /// bounding per-user abuse.
+    ///
+    /// <para><see cref="TicketMintPerIpLimit"/> = 30/window is a pre-validation DoS shield that, after the
+    /// F1 reconnect-storm rework, caps ONLY REJECTED mint attempts per source IP — auth failures
+    /// (bad/expired token) and per-battleTag-throttled attempts. A SUCCESSFUL mint (valid, non-expired
+    /// JWT under the per-battleTag cap) does NOT charge this budget, so a legitimate mass reconnect of
+    /// thousands of DISTINCT valid battleTags behind one shared/NAT'd proxy IP is never IP-throttled
+    /// (each is still bounded by the per-battleTag cap). It stays a hard-coded const by the ChatLimits
+    /// philosophy — NOT env-configurable; the env knobs live at the forwarded-headers TRUST boundary
+    /// (Startup) so the shield keys on the real client IP, not on how many rejections to allow.</para></summary>
     public const int TicketMintPerBattleTagLimit = 10;
     public const int TicketMintPerIpLimit = 30;
     public static readonly TimeSpan TicketMintWindow = TimeSpan.FromMinutes(1);

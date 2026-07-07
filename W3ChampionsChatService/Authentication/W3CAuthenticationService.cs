@@ -26,9 +26,19 @@ public class W3CAuthenticationService : IW3CAuthenticationService
     }
 
     // Mint-only policy (contract §3): signature + exp. Issuer/audience stay unvalidated (tokens carry neither).
+    // Expiry (like every other validation failure) swallows to null here → the mint path returns 401, never 500.
     public W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt)
     {
         return W3CUserAuthentication.FromJWT(jwt, _publicKey, validateLifetime: true);
+    }
+
+    // item 7: exp-enforcing validation that RETHROWS an expired token when rethrowExpiry is true, so the
+    // moderation REST filter (UserHasPermissionFilter) can distinguish an expired token (→ AUTH_TOKEN_EXPIRED
+    // 401, aligning with wb's BearerHasPermissionFilter) from any other invalid token (→ generic 401). The
+    // zero-arg overload above keeps swallowing expiry to null for the ticket-mint path (401, not 500).
+    public W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt, bool rethrowExpiry)
+    {
+        return W3CUserAuthentication.FromJWT(jwt, _publicKey, validateLifetime: true, rethrowExpiry: rethrowExpiry);
     }
 }
 
@@ -36,11 +46,12 @@ public interface IW3CAuthenticationService
 {
     W3CUserAuthentication GetUserByToken(string jwt);
     W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt);
+    W3CUserAuthentication GetUserByTokenEnforcingLifetime(string jwt, bool rethrowExpiry);
 }
 
 public class W3CUserAuthentication
 {
-    public static W3CUserAuthentication FromJWT(string jwt, string publicKey, bool validateLifetime = false)
+    public static W3CUserAuthentication FromJWT(string jwt, string publicKey, bool validateLifetime = false, bool rethrowExpiry = false)
     {
         try
         {
@@ -82,6 +93,15 @@ public class W3CUserAuthentication
                 IsAdmin = isAdmin,
                 Permissions = permissions
             };
+        }
+        catch (SecurityTokenExpiredException) when (rethrowExpiry)
+        {
+            // item 7 (opt-in only): the moderation REST filter enforces exp and needs to tell an EXPIRED
+            // token apart from any other invalid one, so — and ONLY when the caller opts in — rethrow
+            // instead of swallowing to null. Every other failure below still swallows to null; every
+            // default (rethrowExpiry:false) caller — notably the ticket-mint path — is byte-for-byte
+            // unaffected and keeps returning null on expiry (→ its existing 401, never a 500).
+            throw;
         }
         catch (Exception ex)
         {
