@@ -7,6 +7,7 @@ using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
 using MongoDB.Driver;
+using IPNetwork = Microsoft.AspNetCore.HttpOverrides.IPNetwork;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
@@ -234,13 +235,17 @@ public class Startup
     public void Configure(IApplicationBuilder app)
     {
         Log.Information("Configuring service");
-        // without that, nginx forwarding in docker wont work. F1/A2: the TRUST boundary (which upstream
-        // proxies may set X-Forwarded-For) is env-configurable via BuildForwardedHeadersOptions below;
-        // when the env vars are unset the ASP.NET defaults are left untouched, so today's behavior is
-        // the safe default. This matters for the F1 per-IP mint shield: only a trusted proxy's XFF is
-        // honored, so the shield keys on the real client IP instead of collapsing every client to the
-        // proxy IP behind an untrusted hop.
-        app.UseForwardedHeaders(BuildForwardedHeadersOptions());
+        // without that, nginx forwarding in docker wont work. Matches the sibling services' hardcoded
+        // trust boundary (identification-service/website-backend): only the Russia gateway proxy and the
+        // Docker network are trusted to set X-Forwarded-For. This matters for the F1 per-IP mint shield:
+        // only a trusted proxy's XFF is honored, so the shield keys on the real client IP instead of
+        // collapsing every client to the proxy IP behind an untrusted hop.
+        app.UseForwardedHeaders(new ForwardedHeadersOptions
+        {
+            ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto,
+            KnownNetworks = { new IPNetwork(IPAddress.Parse("172.18.0.0"), 16) }, // Docker network
+            KnownProxies = { IPAddress.Parse("212.60.5.180") } // Russia gateway
+        });
         app.UseRouting();
         app.UseCors(builder =>
             builder
@@ -255,136 +260,5 @@ public class Startup
             endpoints.MapHub<ChatHub>("/chatHub");
         });
         Log.Information("Chat Service started");
-    }
-
-    /// <summary>
-    /// F1/A2: builds the <see cref="ForwardedHeadersOptions"/> for <c>UseForwardedHeaders</c>, layering
-    /// an OPTIONAL, env-configurable TRUST boundary on top of the existing XFF/XFProto behavior. Reads
-    /// three optional env vars; when one is unset/blank the corresponding ASP.NET default is left
-    /// untouched (current behavior stays the safe default):
-    /// <list type="bullet">
-    /// <item><c>FORWARDED_KNOWN_PROXIES</c> — comma-separated IPs, each ADDED to <c>KnownProxies</c>
-    /// (the loopback default is NOT cleared).</item>
-    /// <item><c>FORWARDED_KNOWN_NETWORKS</c> — comma-separated CIDRs (e.g. <c>10.0.0.0/8</c>), each ADDED
-    /// to <c>KnownNetworks</c>.</item>
-    /// <item><c>FORWARDED_LIMIT</c> — integer <c>ForwardLimit</c> (hop count).</item>
-    /// </list>
-    /// The CONCRETE production values (which proxy IPs/networks to trust and the hop count) are an
-    /// I2/ops responsibility — the real topology is edge gateway → Traefik passthrough → nginx-proxy in
-    /// Docker, whose addresses are deployment-specific. This app deliberately ships only the KNOBS plus
-    /// safe defaults and hardcodes NO prod IPs. A malformed entry is logged as a Warning and skipped —
-    /// it must never crash startup.
-    /// </summary>
-    internal static ForwardedHeadersOptions BuildForwardedHeadersOptions()
-    {
-        var options = new ForwardedHeadersOptions
-        {
-            ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
-        };
-
-        ApplyForwardedHeadersTrustConfig(
-            options,
-            Environment.GetEnvironmentVariable("FORWARDED_KNOWN_PROXIES"),
-            Environment.GetEnvironmentVariable("FORWARDED_KNOWN_NETWORKS"),
-            Environment.GetEnvironmentVariable("FORWARDED_LIMIT"));
-
-        return options;
-    }
-
-    /// <summary>
-    /// Pure function of its inputs (reads no process env), so it is unit-testable without mutating real
-    /// environment variables and without cross-test interference. Applies the parsed trust config onto
-    /// <paramref name="options"/>; a null/blank input is a no-op for that knob, and any malformed entry
-    /// is logged and skipped. Adds to the ASP.NET defaults rather than replacing them.
-    /// </summary>
-    internal static void ApplyForwardedHeadersTrustConfig(
-        ForwardedHeadersOptions options, string knownProxiesCsv, string knownNetworksCsv, string forwardLimitRaw)
-    {
-        var appliedProxies = 0;
-        foreach (var entry in SplitCsv(knownProxiesCsv))
-        {
-            if (IPAddress.TryParse(entry, out var proxy))
-            {
-                options.KnownProxies.Add(proxy);
-                appliedProxies++;
-            }
-            else
-            {
-                Log.Warning("FORWARDED_KNOWN_PROXIES entry '{Entry}' is not a valid IP address — skipping", entry);
-            }
-        }
-
-        var appliedNetworks = 0;
-        foreach (var entry in SplitCsv(knownNetworksCsv))
-        {
-            if (TryParseCidr(entry, out var network))
-            {
-                options.KnownNetworks.Add(network);
-                appliedNetworks++;
-            }
-            else
-            {
-                Log.Warning(
-                    "FORWARDED_KNOWN_NETWORKS entry '{Entry}' is not a valid CIDR (expected e.g. 10.0.0.0/8) — skipping", entry);
-            }
-        }
-
-        string forwardLimitApplied = "default (unchanged)";
-        if (!string.IsNullOrWhiteSpace(forwardLimitRaw))
-        {
-            if (int.TryParse(forwardLimitRaw.Trim(), out var forwardLimit))
-            {
-                options.ForwardLimit = forwardLimit;
-                forwardLimitApplied = forwardLimit.ToString();
-            }
-            else
-            {
-                Log.Warning(
-                    "FORWARDED_LIMIT '{Entry}' is not a valid integer — leaving ForwardLimit at its default", forwardLimitRaw);
-            }
-        }
-
-        // Boot-time confirmation line so ops can verify the trust config that was actually applied.
-        Log.Information(
-            "Forwarded-headers trust config applied: {ProxyCount} known prox(y/ies) added, {NetworkCount} known network(s) added, ForwardLimit={ForwardLimit}",
-            appliedProxies, appliedNetworks, forwardLimitApplied);
-    }
-
-    private static string[] SplitCsv(string csv) =>
-        string.IsNullOrWhiteSpace(csv)
-            ? Array.Empty<string>()
-            : csv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-    /// <summary>
-    /// Parses a <c>prefix/bits</c> CIDR into the exact type <see cref="ForwardedHeadersOptions.KnownNetworks"/>
-    /// holds in .NET 8 — <see cref="Microsoft.AspNetCore.HttpOverrides.IPNetwork"/>, fully qualified to
-    /// disambiguate from the unrelated <c>System.Net.IPNetwork</c> struct also in scope here. Returns
-    /// false (never throws) for anything malformed, including an out-of-range prefix length for the
-    /// address family, which the IPNetwork ctor would otherwise reject.
-    /// </summary>
-    private static bool TryParseCidr(string cidr, out Microsoft.AspNetCore.HttpOverrides.IPNetwork network)
-    {
-        network = null;
-        var slash = cidr.IndexOf('/');
-        if (slash <= 0 || slash == cidr.Length - 1)
-        {
-            return false;
-        }
-
-        if (!IPAddress.TryParse(cidr[..slash], out var prefix) || !int.TryParse(cidr[(slash + 1)..], out var bits))
-        {
-            return false;
-        }
-
-        try
-        {
-            network = new Microsoft.AspNetCore.HttpOverrides.IPNetwork(prefix, bits);
-            return true;
-        }
-        catch (ArgumentException)
-        {
-            // Negative or out-of-range prefix length for the address family (e.g. /40 on IPv4) — malformed.
-            return false;
-        }
     }
 }

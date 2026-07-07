@@ -70,8 +70,8 @@ public static class ChatLimits
     /// JWT under the per-battleTag cap) does NOT charge this budget, so a legitimate mass reconnect of
     /// thousands of DISTINCT valid battleTags behind one shared/NAT'd proxy IP is never IP-throttled
     /// (each is still bounded by the per-battleTag cap). It stays a hard-coded const by the ChatLimits
-    /// philosophy — NOT env-configurable; the env knobs live at the forwarded-headers TRUST boundary
-    /// (Startup) so the shield keys on the real client IP, not on how many rejections to allow.</para></summary>
+    /// philosophy; the forwarded-headers TRUST boundary (Startup) is likewise hardcoded to the sibling
+    /// services' convention, so the shield keys on the real client IP.</para></summary>
     public const int TicketMintPerBattleTagLimit = 10;
     public const int TicketMintPerIpLimit = 30;
     public static readonly TimeSpan TicketMintWindow = TimeSpan.FromMinutes(1);

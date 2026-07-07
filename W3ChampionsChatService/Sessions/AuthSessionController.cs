@@ -22,8 +22,8 @@ public class AuthSessionController(
     {
         var now = DateTime.UtcNow;
         // Per-IP shield FIRST (cheap, pre-validation). UseForwardedHeaders (Startup) rewrites
-        // RemoteIpAddress from X-Forwarded-For when the forwarding proxy is trusted (the trust
-        // boundary is env-configurable — see Startup.BuildForwardedHeadersOptions / A2), so this
+        // RemoteIpAddress from X-Forwarded-For when the forwarding proxy is trusted (the hardcoded
+        // trust boundary — Russia gateway + Docker network, see Startup.Configure), so this
         // keys on the real client IP; behind an UNtrusted proxy every client collapses to the proxy IP.
         var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
         var ipKey = $"ip:{ip}";
