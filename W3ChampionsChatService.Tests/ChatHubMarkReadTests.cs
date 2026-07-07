@@ -244,6 +244,42 @@ public class ChatHubMarkReadTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Marco's question: lastSeq can never regress via two sequential CLIENT-DRIVEN MarkRead calls.
+    // MarkRead_LowerSeq_DoesNotRegress (above) proves the guard holds against a state SEEDED directly
+    // at 10; this test instead drives BOTH advances through the real hub method — first a genuine
+    // MarkRead(5), then a stale/out-of-order MarkRead(2) — to pin the end-to-end invariant a client
+    // would actually observe across two calls, not just the monotonic primitives in isolation.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task MarkRead_SecondCallWithLowerSeq_DoesNotRegressEitherStore()
+    {
+        var channel = await CreateChannel();
+        await SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 1; i <= 10; i++)
+        {
+            await SeedMessage(channel.Id, BattleTag, $"seed-{i}");
+        }
+
+        var firstResult = await hub.MarkRead(channel.Id, 5);
+        Assert.AreEqual(ChatResultCode.Ok, firstResult.Code);
+
+        var secondResult = await hub.MarkRead(channel.Id, 2);
+        Assert.AreEqual(ChatResultCode.Ok, secondResult.Code, "a stale MarkRead is still acknowledged Ok — it's a no-op, not an error");
+
+        // (a) the durable Mongo membership row must stay at 5 — UpdateLastReadSeq's own $max already
+        // guarantees this; asserted here as part of the whole end-to-end sequence.
+        var persisted = await _membershipRepository.Load(channel.Id, BattleTag);
+        Assert.AreEqual(5L, persisted.LastReadSeq, "a later lower-seq MarkRead must not regress the durable DB cursor below the earlier MarkRead(5)");
+
+        // (b) the in-memory registry must stay at 5 too — AdvanceLastReadSeq's Math.Max guarantees this.
+        Assert.IsTrue(_onlineMemberRegistry.TryGetMember(channel.Id, "conn-1", out var member));
+        Assert.AreEqual(5L, member.LastReadSeq, "a later lower-seq MarkRead must not regress the in-memory registry cursor below the earlier MarkRead(5)");
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Clamp to channel.LastSeq
     // ---------------------------------------------------------------------------------------------
 

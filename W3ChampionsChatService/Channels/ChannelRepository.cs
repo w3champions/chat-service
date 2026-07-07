@@ -97,17 +97,8 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             ReturnDocument = ReturnDocument.After,
         };
 
-        try
-        {
-            return await Channels.FindOneAndUpdateAsync(filter, update, options);
-        }
-        catch (MongoCommandException ex) when (IsDuplicateKey(ex))
-        {
-            return await Channels.FindOneAndUpdateAsync(filter, update, options);
-        }
+        return await RetryOnceOnDuplicateKey(() => Channels.FindOneAndUpdateAsync(filter, update, options));
     }
-
-    private static bool IsDuplicateKey(MongoCommandException ex) => ex.Code == 11000;
 
     /// <summary>
     /// Find-or-create for 1:1 Dm shells, keyed by <see cref="DmPairKey"/> (C5 T2) — mirrors
@@ -146,20 +137,15 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             ReturnDocument = ReturnDocument.After,
         };
 
-        try
-        {
-            return await Channels.FindOneAndUpdateAsync(filter, update, options);
-        }
-        catch (MongoCommandException ex) when (IsDuplicateKey(ex))
-        {
-            return await Channels.FindOneAndUpdateAsync(filter, update, options);
-        }
+        return await RetryOnceOnDuplicateKey(() => Channels.FindOneAndUpdateAsync(filter, update, options));
     }
 
     /// <summary>
     /// Loads an existing Dm shell by pair-key, if any — a cheap existence check that skips the
     /// upsert write path entirely (used by call sites that only need to know "does a conversation
     /// already exist" without also find-or-creating one, e.g. the stranger-cap skip in T3).
+    /// Equality on <c>PairKey</c> is an indexed point lookup — backed by the unique partial index
+    /// <c>ux_pairKey_dm</c> (<see cref="Domain.ChatDomainIndexes"/>) — so this is efficient, not a scan.
     /// </summary>
     public Task<ChatChannel> LoadByPairKey(string battleTagA, string battleTagB)
     {
@@ -205,14 +191,7 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             ReturnDocument = ReturnDocument.After,
         };
 
-        try
-        {
-            return await Channels.FindOneAndUpdateAsync(filter, update, options);
-        }
-        catch (MongoCommandException ex) when (IsDuplicateKey(ex))
-        {
-            return await Channels.FindOneAndUpdateAsync(filter, update, options);
-        }
+        return await RetryOnceOnDuplicateKey(() => Channels.FindOneAndUpdateAsync(filter, update, options));
     }
 
     /// <summary>

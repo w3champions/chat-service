@@ -188,15 +188,6 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
             ReturnDocument = ReturnDocument.After,
         };
 
-        try
-        {
-            return await Memberships.FindOneAndUpdateAsync(filter, update, options);
-        }
-        catch (MongoCommandException ex) when (IsDuplicateKey(ex))
-        {
-            return await Memberships.FindOneAndUpdateAsync(filter, update, options);
-        }
+        return await RetryOnceOnDuplicateKey(() => Memberships.FindOneAndUpdateAsync(filter, update, options));
     }
-
-    private static bool IsDuplicateKey(MongoCommandException ex) => ex.Code == 11000;
 }

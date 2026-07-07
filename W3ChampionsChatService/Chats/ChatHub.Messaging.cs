@@ -224,6 +224,15 @@ public partial class ChatHub
         long seq;
         try
         {
+            // WHY a separate atomic $inc on the CHANNEL doc instead of folding seq allocation into the
+            // message insert below: MongoDB has no auto-increment, and the seq counter lives on the
+            // channel document while each message is its own row in a separate collection — combining
+            // "allocate the next seq" and "insert this message" into one atomic unit would need a
+            // multi-document transaction. The only gap this leaves is a crash between AllocateSeq
+            // succeeding and the Insert below running, which just burns a seq number (a permanent gap in
+            // the channel's seq sequence). That's benign: paging (GetMessages) is seq-anchored, not
+            // count-anchored, and unread is $max-guarded (MarkRead/UpdateLastReadSeq), so a skipped seq
+            // never surfaces as a missing message or a stuck unread count.
             seq = await _channelRepository.AllocateSeq(channelId, now, shellExpiresAt);
         }
         catch (InvalidOperationException)

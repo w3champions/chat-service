@@ -26,6 +26,15 @@ public class WebsiteBackendRepository(IHttpClientFactory httpClientFactory) : IW
     {
         var httpClient = httpClientFactory.CreateClient();
         httpClient.BaseAddress = new Uri(StatisticServiceApiUrl);
+        // F5: a modest timeout keeps a slow (not necessarily throwing) wb from stalling this call for
+        // the .NET default of 100s — mirrors the same 2s precedent on
+        // Relationships/WebsiteBackendRelationshipSource.cs's shared HttpClient. This call sits directly
+        // on ChatHub.OnConnectedAsync's await chain (via ChatAuthenticationService.GetUserFromIdentity),
+        // so a slow/unreachable wb now throws TaskCanceledException at 2s instead of hanging ~100s during
+        // a reconnect storm; GetUserFromIdentity's existing three-tier fallback (try/catch around this
+        // call) treats that exactly like any other wb failure and degrades to the directory-cache-or-plain
+        // fallback, so the connect itself never stalls.
+        httpClient.Timeout = TimeSpan.FromSeconds(2);
         var escapeDataString = Uri.EscapeDataString(battleTag);
         var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
         var content = await result.Content.ReadAsStringAsync();

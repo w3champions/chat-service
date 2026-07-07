@@ -277,6 +277,50 @@ public class FanOutRegistryTests
         Assert.DoesNotThrow(() => _memberRegistry.SetLastReadSeq("channel-a", "conn-unknown", 42));
     }
 
+    // ---------------------------------------------------------------------
+    // OnlineMemberRegistry.AdvanceLastReadSeq — the monotonic (Math.Max) sibling of SetLastReadSeq;
+    // ChatHub.MarkRead (Task 17) calls THIS, never the plain-overwrite SetLastReadSeq, so a stale/
+    // out-of-order MarkRead can never regress the in-memory registry (see ChatHub.Messaging.cs's
+    // dual-store monotonic invariant doc comment).
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public void AdvanceLastReadSeq_HigherSeq_Advances()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 5, ChannelType.Public));
+
+        _memberRegistry.AdvanceLastReadSeq("channel-a", "conn-1", 10);
+
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10));
+    }
+
+    [Test]
+    public void AdvanceLastReadSeq_LowerSeq_DoesNotRegress()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Public));
+
+        _memberRegistry.AdvanceLastReadSeq("channel-a", "conn-1", 3);
+
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10),
+            "a lower/stale seq must be a no-op — Math.Max never regresses the tracked cursor");
+    }
+
+    [Test]
+    public void AdvanceLastReadSeq_EqualSeq_IsANoOp()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Public));
+
+        _memberRegistry.AdvanceLastReadSeq("channel-a", "conn-1", 10);
+
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10));
+    }
+
+    [Test]
+    public void AdvanceLastReadSeq_UnknownMembership_NoOps()
+    {
+        Assert.DoesNotThrow(() => _memberRegistry.AdvanceLastReadSeq("channel-a", "conn-unknown", 42));
+    }
+
     [Test]
     public void GetMembers_UnknownChannel_ReturnsEmpty()
     {

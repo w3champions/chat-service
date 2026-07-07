@@ -57,6 +57,30 @@ public class ChatAuthenticationServiceTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task Enrichment_WbTimesOut_NoCache_PlainFallback()
+    {
+        // F5: WebsiteBackendRepository.GetChatDetails now sets a 2s HttpClient.Timeout — a slow
+        // (non-throwing) wb response past that deadline surfaces as a TaskCanceledException, not a
+        // generic Exception. Pin that GetUserFromIdentity's three-tier fallback treats a timeout
+        // identically to any other wb failure (the catch clause is `catch (Exception ex)`, so this is
+        // really the same path as Enrichment_WbFails_NoCache_PlainFallback — this test just names the
+        // concrete exception type F5 introduces, rather than a generic stand-in).
+        var wb = new Mock<IWebsiteBackendRepository>();
+        wb.Setup(r => r.GetChatDetails(It.IsAny<string>()))
+            .ThrowsAsync(new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout of 2 seconds elapsing."));
+        var service = BuildService(wb.Object);
+        var identity = new W3CUserAuthentication { BattleTag = "peter#123", Name = "peter", IsAdmin = false };
+
+        var resolution = await service.GetUserFromIdentity(identity);
+
+        Assert.IsNotNull(resolution.User, "A wb timeout must NOT fail a proven-authenticated connect");
+        Assert.IsFalse(resolution.FreshFromWb, "a timed-out wb call is not a fresh enrichment — degrades like any other wb failure");
+        Assert.AreEqual("peter#123", resolution.User.BattleTag, "The fallback carries the identity's battleTag");
+        Assert.IsFalse(resolution.User.IsAdmin, "The fallback carries the identity's admin flag");
+        Assert.IsNotNull(resolution.User.ProfilePicture, "The fallback supplies a non-null placeholder ProfilePicture");
+    }
+
+    [Test]
     public async Task Enrichment_WbFails_FallsBackToDirectoryCache_FlairRestored()
     {
         // §14 row 1 pin: a wb outage falls back to the directory cache — the LAST KNOWN GOOD Profile —
