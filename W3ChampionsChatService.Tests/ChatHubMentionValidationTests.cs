@@ -126,6 +126,7 @@ public class ChatHubMentionValidationTests : IntegrationTestBase
             _connectionMapping,
             _reconcileHarness.Service,
             _ticketStore,
+            new W3CAuthenticationService(),
             _sessionRegistry,
             userDirectory ?? _userDirectory,
             _assembler,

@@ -30,10 +30,12 @@ using W3ChampionsChatService.Users;
 namespace W3ChampionsChatService.Tests;
 
 /// <summary>
-/// C2 connect-path tests: the SignalR hub now authenticates via a one-time TICKET carried in the
-/// standard <c>access_token</c> query param (hard cutover — a raw JWT is no longer accepted). Covers
-/// valid connect + single-use consumption, all rejection shapes (raw JWT / reused ticket / missing
-/// ticket → <c>AuthorizationFailed</c> + <c>Context.Abort()</c>), battleTag displacement
+/// C2 connect-path tests: the SignalR hub authenticates via a one-time TICKET carried in the
+/// standard <c>access_token</c> query param, with a TEMPORARY raw-JWT fallback bridging launchers
+/// released before the ticket flow (see ChatHub.OnConnectedAsync — remove with the bridge). Covers
+/// valid connect + single-use consumption, the fallback accept/reject split, all rejection shapes
+/// (invalid JWT / reused ticket / missing ticket → <c>AuthorizationFailed</c> +
+/// <c>Context.Abort()</c>), battleTag displacement
 /// (<c>ConnectionDisplaced</c> BEFORE close — acceptance 4), the displaced-old-socket disconnect race,
 /// and the directory stub upsert. Drives the REAL <c>Context.GetHttpContext()</c> resolution path via
 /// an <see cref="IHttpContextFeature"/> on the connection's feature collection (never
@@ -112,12 +114,17 @@ public class ChatHubConnectionTests : IntegrationTestBase
     private static W3CUserAuthentication Identity(string battleTag = BattleTag, string name = "peter", bool isAdmin = false) =>
         new() { BattleTag = battleTag, Name = name, IsAdmin = isAdmin };
 
-    private (ChatHub Hub, Mock<HubCallerContext> Context) BuildConnection(string connectionId, string accessToken)
+    private (ChatHub Hub, Mock<HubCallerContext> Context) BuildConnection(string connectionId, string accessToken, string jwtFallbackPublicKeyPem = null)
     {
+        // jwtFallbackPublicKeyPem: test seam for the raw-JWT fallback bridge. Default (null) uses the
+        // real service with the production public key, under which CreateSignedJwt tokens are invalid.
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileService,
             _ticketStore,
+            jwtFallbackPublicKeyPem == null
+                ? new W3CAuthenticationService()
+                : new W3CAuthenticationService(jwtFallbackPublicKeyPem),
             _sessionRegistry,
             _userDirectory,
             _assembler,
@@ -235,17 +242,36 @@ public class ChatHubConnectionTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task RawJwt_AsAccessToken_IsRejected()
+    public async Task RawJwt_ValidSignature_ConnectsViaFallback()
     {
-        // Acceptance 3: a client that mistakenly presents a raw (even cryptographically valid) JWT as
-        // access_token is rejected — the hub consumes ONLY one-time tickets after the hard cutover.
+        // TEMPORARY bridge (see ChatHub.OnConnectedAsync): a launcher released before the ticket
+        // flow presents its raw JWT as access_token. A signature-valid JWT must connect exactly as
+        // it did before the C2 cutover, so deploying this service cannot strand released launchers.
+        var (jwt, publicKeyPem) = CreateSignedJwt(BattleTag, isAdmin: false, new[] { "Moderation" });
+        var (hub, _) = BuildConnection("conn-jwt", jwt, jwtFallbackPublicKeyPem: publicKeyPem);
+
+        await hub.OnConnectedAsync();
+
+        Assert.IsFalse(_sends.Contains(("conn-jwt", "AuthorizationFailed")),
+            "A signature-valid raw JWT must be accepted by the fallback bridge");
+        Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-jwt", out var session),
+            "The fallback connect must register a session");
+        Assert.AreEqual(BattleTag, session.Identity.BattleTag);
+    }
+
+    [Test]
+    public async Task RawJwt_InvalidSignature_IsRejected()
+    {
+        // The bridge only widens auth to VALID JWTs: a token that is neither a ticket nor signed by
+        // the trusted key is still rejected. (BuildConnection's default auth service validates
+        // against the production key, under which this test-signed JWT is invalid.)
         var (jwt, _) = CreateSignedJwt(BattleTag, isAdmin: false, new[] { "Moderation" });
         var (hub, _) = BuildConnection("conn-jwt", jwt);
 
         await hub.OnConnectedAsync();
 
         Assert.IsTrue(_sends.Contains(("conn-jwt", "AuthorizationFailed")),
-            "A raw JWT is not a valid ticket — the caller must receive AuthorizationFailed");
+            "A JWT not signed by the trusted key must receive AuthorizationFailed");
         Assert.IsTrue(_sends.Contains(("conn-jwt", "ABORT")),
             "Connect-time auth failure is the one rejection-style abort");
         Assert.IsFalse(_sessionRegistry.TryGetByConnectionId("conn-jwt", out _),

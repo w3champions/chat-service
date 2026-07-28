@@ -66,6 +66,7 @@ public class MuteReconciliationTests : IntegrationTestBase
             _connectionMapping,
             _harness.Service,
             new TicketStore(),
+            new W3CAuthenticationService(),
             _sessionRegistry,
             new UserDirectoryRepository(MongoClient),
             new SessionStateAssembler(

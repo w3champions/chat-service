@@ -24,6 +24,10 @@ public partial class ChatHub(
     ConnectionMapping connections,
     MuteReconciliationService muteReconciliation,
     ITicketStore ticketStore,
+    // TEMPORARY bridge (see OnConnectedAsync): validates raw JWTs from launchers released before
+    // the ticket flow existed. Remove together with the fallback once the forced launcher update
+    // has rolled out.
+    IW3CAuthenticationService w3cAuthenticationService,
     ISessionRegistry sessionRegistry,
     UserDirectoryRepository userDirectory,
     SessionStateAssembler assembler,
@@ -97,6 +101,7 @@ public partial class ChatHub(
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly ITicketStore _ticketStore = ticketStore;
+    private readonly IW3CAuthenticationService _w3cAuthenticationService = w3cAuthenticationService;
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
     private readonly UserDirectoryRepository _userDirectory = userDirectory;
     // C3 (Task 8): the SessionState snapshot assembler + the in-memory fan-out registries this hub
@@ -137,15 +142,37 @@ public partial class ChatHub(
 
     public override async Task OnConnectedAsync()
     {
-        // HARD CUTOVER (C2): access_token carries a one-time TICKET minted by POST /auth/session.
-        // A raw JWT lands here too — it is simply not a valid ticket and is rejected.
+        // Ticket-first auth (C2) with a TEMPORARY raw-JWT fallback.
+        //
+        // C2 was written as a hard cutover, lock-step with a forced launcher update. That update has
+        // not shipped (latest release v1.6.5, 2026-06-16, predates the ticket flow), and deploying a
+        // ticket-only hub against it caused a fleet-wide friends/presence outage on website-backend —
+        // this fallback exists so chat-service CANNOT repeat that: whenever this deploys, released
+        // launchers keep authenticating with the raw JWT they have always sent (the pre-C2 behavior),
+        // while updated launchers take the ticket path first.
+        //
+        // REMOVE the fallback (and the IW3CAuthenticationService ctor param) once a launcher release
+        // containing the ticket mint (launcher-e #833) has shipped AND its forced-update rollout has
+        // completed.
         var ticket = Context.GetHttpContext()?.Request.Query["access_token"].ToString();
         // Deliberate wall-clock seam, NOT routed through _timeProvider: the ticket is minted with
         // DateTime.UtcNow by the REST AuthSessionController (a separate process boundary that has no
         // access to this hub's injected clock), so the consume-side check MUST compare against the
         // same wall clock the mint side used. This is intentionally decoupled from the injectable
         // fan-out clock below — TicketStore TTL correctness does not depend on TimeProvider.
-        if (string.IsNullOrEmpty(ticket) || !_ticketStore.TryConsume(ticket, DateTime.UtcNow, out var identity))
+        W3CUserAuthentication identity = null;
+        if (!string.IsNullOrEmpty(ticket))
+        {
+            if (_ticketStore.TryConsume(ticket, DateTime.UtcNow, out var ticketIdentity))
+            {
+                identity = ticketIdentity;
+            }
+            else
+            {
+                identity = _w3cAuthenticationService.GetUserByToken(ticket);
+            }
+        }
+        if (identity == null)
         {
             Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
             await Clients.Caller.SendAsync("AuthorizationFailed");

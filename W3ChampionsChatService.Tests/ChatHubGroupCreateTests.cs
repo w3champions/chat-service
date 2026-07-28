@@ -122,6 +122,7 @@ public class ChatHubGroupCreateTests : IntegrationTestBase
             _connectionMapping,
             _reconcileHarness.Service,
             _ticketStore,
+            new W3CAuthenticationService(),
             _sessionRegistry,
             _userDirectory,
             _assembler,

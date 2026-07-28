@@ -92,6 +92,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _connectionMapping,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
             new TicketStore(),
+            new W3CAuthenticationService(),
             _sessionRegistry,
             new UserDirectoryRepository(MongoClient),
             assembler,

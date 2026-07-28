@@ -134,6 +134,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
             _connectionMapping,
             _reconcileService,
             _ticketStore,
+            new W3CAuthenticationService(),
             _sessionRegistry,
             _userDirectory,
             _assembler,

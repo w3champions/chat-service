@@ -66,6 +66,7 @@ public class ChatHubBanUserTests : IntegrationTestBase
             _connectionMapping,
             _reconcileHarness.Service,
             new TicketStore(),
+            new W3CAuthenticationService(),
             _sessionRegistry,
             new UserDirectoryRepository(MongoClient),
             new SessionStateAssembler(
