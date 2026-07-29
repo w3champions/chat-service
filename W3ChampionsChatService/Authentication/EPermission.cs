@@ -13,4 +13,6 @@ public enum EPermission
     SmurfCheckerQuery,
     SmurfCheckerQueryExplanation,
     SmurfCheckerAdministration,
+    Warnings,
+    Jobs,
 }
