@@ -319,7 +319,11 @@ public partial class ChatHub
     /// channel" (<see cref="ChatResultCode.NotFound"/>) from "channel exists, caller just isn't in it"
     /// (<see cref="ChatResultCode.NotMember"/>) — EXCEPT for a <see cref="ChannelType.Public"/> channel
     /// (follow-up spec §4, the mention-inbox jump into an unjoined public room), where a non-member falls
-    /// through to the same paging step 4 uses for a member instead of being rejected.</item>
+    /// through to the same paging step 4 uses for a member instead of being rejected. That exception
+    /// itself excludes a full-banned non-member (<see cref="ConnectionMapping.GetEffectiveMuteStatus"/>
+    /// == <see cref="MuteStatus.Full"/>, mirroring <see cref="JoinChannel"/>'s gate), which still gets
+    /// <see cref="ChatResultCode.NotMember"/> — the same result a non-member got before this fallthrough
+    /// existed, so the ban is not disclosed.</item>
     /// <item>Page: <paramref name="aroundSeq"/> set → <see cref="Messages.MessageRepository.LoadPageAround"/>;
     /// otherwise → <see cref="Messages.MessageRepository.LoadPageBefore"/> (a null
     /// <paramref name="beforeSeq"/> means the latest page). Both repo methods already apply
@@ -357,6 +361,16 @@ public partial class ChatHub
         // privileged and a non-member may READ it. Pull-only and UserVisible-filtered exactly like a
         // member's read; joining stays explicit, and FocusChannel/MarkRead keep their membership
         // gates — this is a read-only context allowance, never implicit membership.
+        // A full-banned caller is excluded from that allowance: the codebase's full-ban room-scope rule
+        // already blocks a full-banned user from JOINING a Public room (ChatHub.Channels.cs's JoinChannel
+        // full-ban gate) and hides the catalog entirely (SessionStateAssembler's full-ban catalog-hiding
+        // rule) — letting the SAME user read Public history for free via this fallthrough would bypass
+        // that rule. Mirrors JoinChannel's gate style exactly (GetEffectiveMuteStatus == Full), but
+        // returns the SAME NotMember a non-member got before this task's fallthrough existed, so the ban
+        // is indistinguishable from ordinary non-membership — no new information disclosure. Shadow does
+        // NOT block reads (only Full does) — a shadow-muted caller keeps the illusion. This check is
+        // scoped strictly to the non-member Public fallthrough: a MEMBER's read (including a full-banned
+        // member's) is completely unaffected — this is a read-only gate, not a general mute check.
         if (!_onlineMemberRegistry.IsMember(connectionId, channelId))
         {
             var channel = await _channelRepository.Load(channelId);
@@ -368,15 +382,22 @@ public partial class ChatHub
             {
                 return new GetMessagesResult(ChatResultCode.NotMember);
             }
-            // Public: fall through to step 4's normal paging below.
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
+            if (_connections.GetEffectiveMuteStatus(connectionId, now) == MuteStatus.Full)
+            {
+                return new GetMessagesResult(ChatResultCode.NotMember);
+            }
+            // Public, not full-banned: fall through to step 4's normal paging below.
         }
 
         // 4. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no
         // UserVisible filter, so deleted rows and EVERY author's shadow rows come back — and projects
         // with the REAL flags (ForModerator). This is the moderator's own in-channel focused view, so
         // their OWN shadow/deleted rows are flagged too, not illusion-forced (they are a moderator). The
-        // membership gate above is UNCHANGED — a non-member is already rejected regardless of permission;
-        // the privileged any-channel read is the REST endpoint (Task 7), not this focused-view read.
+        // membership gate above is UNCHANGED for non-Public channels — a non-member is still rejected
+        // regardless of permission there. On a Public channel a non-member instead passes step 3's
+        // fallthrough (full-ban excluded) and reaches this branch same as a member would — the privileged
+        // any-channel read is still the REST endpoint (Task 7), not this focused-view read.
         //
         // This branch does NOT re-apply the {Public, SemiPublic, System+Match} scope wall that
         // single-delete/purge/the REST endpoint enforce — it is safe only emergently, by construction

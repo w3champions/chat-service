@@ -320,6 +320,49 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task GetMessages_FullBannedNonMember_PublicChannel_Denied()
+    {
+        // A full-banned caller must not be able to read Public history through the §4 non-member
+        // fallthrough — mirrors JoinChannel's full-ban gate (ChatHub.Channels.cs) and the catalog-hiding
+        // rule in SessionStateAssembler. Must resolve to the SAME NotMember a non-member got before this
+        // task's fallthrough existed — indistinguishable, no new information disclosure.
+        var channel = await CreateChannel(); // Public by default
+        await SeedMessage(channel.Id, OtherBattleTag, "hello public");
+        RegisterSession("conn-1", BattleTag);
+        // Deliberately NO membership seed — a full-banned non-member reaching the Public fallthrough.
+        // Seed the mute cache the SAME way the connect flow does (SessionStateAssembler.SeedLegacyMuteCache
+        // -> ConnectionMapping.SetMute), mirroring JoinChannel_FullBanned_PublicChannel_ReturnsPermissionDenied.
+        _connectionMapping.SetMute("conn-1", MuteStatus.Full, Now.AddDays(1));
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.NotMember, result.Code,
+            "a full-banned non-member must not read Public history via the §4 fallthrough");
+        Assert.IsNull(result.Messages);
+    }
+
+    [Test]
+    public async Task GetMessages_FullBannedNonMemberModerator_PublicChannel_Denied()
+    {
+        // The Moderation role claim must not bypass the full-ban gate: a non-member moderator who is
+        // ALSO full-banned is denied exactly like any other full-banned non-member — the ban check runs
+        // in step 3, strictly before step 4's moderator/user branch split.
+        var channel = await CreateChannel(); // Public by default
+        await SeedMessage(channel.Id, OtherBattleTag, "hello public");
+        RegisterModeratorSession("mod-conn", ModeratorBattleTag);
+        // Deliberately NO membership seed for the moderator.
+        _connectionMapping.SetMute("mod-conn", MuteStatus.Full, Now.AddDays(1));
+        var hub = BuildHub("mod-conn");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.NotMember, result.Code,
+            "a full-banned non-member moderator is still denied — the Moderation claim does not bypass the ban gate");
+        Assert.IsNull(result.Messages);
+    }
+
+    [Test]
     public async Task GetMessages_UnknownChannel_ReturnsNotFound()
     {
         RegisterSession("conn-1", BattleTag);
