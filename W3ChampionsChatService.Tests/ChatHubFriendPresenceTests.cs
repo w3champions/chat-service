@@ -398,8 +398,8 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
     {
         // Follow-up spec §6: the connect path now AWAITS one relationship fetch BEFORE assembly (the
         // bounded 1:1-DM snapshot needs the block list) and hands that ALREADY-RESOLVED snapshot straight
-        // to the fire-and-forget PrefetchRelationshipSnapshot dispatch, which no longer calls
-        // GetSnapshotAsync itself at all (see ChatHub.PrefetchRelationshipSnapshot — a duplicate wb
+        // to the fire-and-forget PushFriendPresenceFromSnapshot dispatch, which no longer calls
+        // GetSnapshotAsync itself at all (see ChatHub.PushFriendPresenceFromSnapshot — a duplicate wb
         // round-trip there would double load on wb during exactly the outage where it's least welcome).
         // That means the relationship SOURCE can no longer be gated to distinguish "connect awaits it" from
         // "the push rides behind it" — there is nothing left downstream of connect's own await that

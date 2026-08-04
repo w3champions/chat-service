@@ -611,7 +611,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
     public async Task Connect_PrefetchesOwnSnapshot_NonFatalOnFailure()
     {
         // Follow-up spec §6: connect now AWAITS one relationship fetch BEFORE assembly (the bounded
-        // 1:1-DM snapshot needs the block list). The SEPARATE fire-and-forget PrefetchRelationshipSnapshot
+        // 1:1-DM snapshot needs the block list). The SEPARATE fire-and-forget PushFriendPresenceFromSnapshot
         // dispatch is handed that SAME (here: null, since the fetch failed) resolved snapshot directly and
         // never calls GetSnapshotAsync itself — so even on a sustained outage there is exactly ONE call to
         // the source for the whole connect, by construction, never a second independent retry. NON-FATAL
@@ -668,7 +668,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
         Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-rel-await", out _));
         Assert.IsTrue(_sends.Contains(("conn-rel-await", ChatEvents.SessionState)));
 
-        // The fire-and-forget PrefetchRelationshipSnapshot dispatch (friend-presence, unchanged role) is
+        // The fire-and-forget PushFriendPresenceFromSnapshot dispatch (friend-presence, unchanged role) is
         // dispatched AFTER the awaited fetch above and handed that ALREADY-RESOLVED snapshot directly — it
         // never calls GetSnapshotAsync itself. Give it a brief moment to finish, then assert the source was
         // touched exactly once for the whole connect.

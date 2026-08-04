@@ -540,7 +540,20 @@ public partial class ChatHub
         var recipientMembership = await _membershipRepository.InsertIfAbsent(candidate);
         var newlyMaterialized = recipientMembership.Id == candidate.Id;
 
-        if (newlyMaterialized)
+        // Follow-up spec §6 (bounded-snapshot repair): the recipient's connect snapshot may have
+        // EXCLUDED this older 1:1 shell — and with it their OnlineMemberRegistry seed (registry set ==
+        // DTO set). If they are online but this connection's registry lacks the channel, RE-ANNOUNCE
+        // exactly like a first materialization: PushChannelAdded(focus:false) re-seeds the registry AND
+        // hands the client the shell — and because this hook runs BEFORE the step-8 fan-out, the
+        // activity for THIS very message reaches them. An already-seeded recipient is untouched (no
+        // ChannelAdded on ordinary messages); ChannelAdded is an upsert client-side, so a client that
+        // somehow still knows the shell just refreshes it.
+        var recipientSession = _sessionRegistry.GetByBattleTag(counterpart);
+        var needsReAnnounce = !newlyMaterialized
+            && recipientSession != null
+            && !_onlineMemberRegistry.IsMember(recipientSession.ConnectionId, channel.Id);
+
+        if (newlyMaterialized || needsReAnnounce)
         {
             // Seeds the recipient's OnlineMemberRegistry + pushes ChannelAdded(focus:false) if they are
             // online; a no-op for an offline recipient (their SessionState picks the channel up on connect).
@@ -568,7 +581,6 @@ public partial class ChatHub
             await _membershipRepository.ClearDeclinedUntil(channel.Id, counterpart);
         }
 
-        var recipientSession = _sessionRegistry.GetByBattleTag(counterpart);
         if (recipientSession != null)
         {
             var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now);

@@ -492,6 +492,53 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1), "ChannelAdded fires ONCE (first materialization only)");
     }
 
+    [Test]
+    public async Task DmSend_OnlineRecipient_WhoseRegistryLacksTheShell_GetsReAnnouncedChannelAdded()
+    {
+        // An ESTABLISHED conversation: both durable membership rows exist, but the recipient's bounded
+        // connect snapshot excluded this older shell — so their OnlineMemberRegistry does NOT hold it.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);   // sender: session + registry seed
+        RegisterSession(RecipientConn, Recipient);          // recipient: ONLINE but NOT registry-seeded
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "are you still there?");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null, "a snapshot-excluded shell is re-announced when a message arrives");
+        Assert.That(added.Focus, Is.False, "re-announce never auto-opens the DM");
+        Assert.That(_onlineMemberRegistry.IsMember(RecipientConn, channel.Id), Is.True,
+            "the re-announce re-seeds the recipient's registry so fan-out reaches them from this message on");
+    }
+
+    [Test]
+    public async Task DmSend_OnlineRecipient_AlreadySeeded_GetsNoReAnnounce()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        SeedMember(RecipientConn, Recipient, channel.Id);   // recipient registry ALREADY holds the shell
+
+        await BuildHub(InitiatorConn).SendMessage(channel.Id, "ordinary message");
+
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(0),
+            "no ChannelAdded spam on ordinary messages to an already-seeded recipient");
+    }
+
     // ------------------------------------------------------------------------------------------------
     // Shell-expiry maintenance (the C1-amendment gap closed) + regression pins
     // ------------------------------------------------------------------------------------------------

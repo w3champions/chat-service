@@ -192,7 +192,7 @@ public partial class ChatHub(
         // snapshot — blocked shells outside the recency window may be omitted from THIS SessionState
         // only (self-heals on the next connect); a wb outage must never fail the connect. Catches
         // Exception (not just RelationshipUnavailableException), matching every sibling wb call on this
-        // hub's connect/disconnect paths (UpsertDirectory, PrefetchRelationshipSnapshot,
+        // hub's connect/disconnect paths (UpsertDirectory, PushFriendPresenceFromSnapshot,
         // PushFriendPresenceOnDisconnect) — no provider exception type can ever hard-fail connect.
         RelationshipSnapshot relationshipSnapshot = null;
         try
@@ -207,7 +207,7 @@ public partial class ChatHub(
         // C5 (Task 1) / C6 (Task 11, D13): unchanged role (friend-presence push), now dispatched AFTER
         // the awaited fetch above and handed that ALREADY-RESOLVED snapshot directly — a wb outage means
         // one round-trip per connect, not two. Still fire-and-forget and non-fatal.
-        _ = PrefetchRelationshipSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId, relationshipSnapshot);
+        _ = PushFriendPresenceFromSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId, relationshipSnapshot);
 
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
         // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
@@ -271,7 +271,7 @@ public partial class ChatHub(
         }
     }
 
-    // C5 (Task 1): best-effort connect-time relationship prefetch. Deliberately fire-and-forget — the
+    // C5 (Task 1): best-effort connect-time friend-presence push. Deliberately fire-and-forget — the
     // caller does NOT await it, so a slow/unreachable wb read never adds latency to (or fails) a connect.
     // C6 (Task 11, D13): EXTENDED (not a second background task) so that, after a resolved snapshot, on a
     // GENUINE offline→online transition (<paramref name="wentOnline"/> — the SAME flag OnConnectedAsync
@@ -280,15 +280,16 @@ public partial class ChatHub(
     // connection. Fault-isolated per-recipient via FanOutEngine.PushFriendPresenceChanged. A displaced
     // reconnect (wentOnline == false) pushes nothing, mirroring Task 9's PresenceChanged transition guard
     // exactly.
-    // Follow-up spec §6: this method no longer fetches its own snapshot at all — <paramref
-    // name="resolvedSnapshot"/> is the connect path's ALREADY-RESOLVED pre-assembly snapshot (null when
-    // that fetch itself failed — RelationshipUnavailableException was already logged there). Calling
-    // GetSnapshotAsync again here would be a duplicate wb round-trip stacked on the one the connect path
-    // already awaited — precisely doubling load on wb during exactly the outage where it's least welcome.
-    // When null, the friend push is silently skipped: honest degradation (a later connect self-heals once
-    // wb recovers), never a retry. This makes the source call count for a whole connect exactly one, by
-    // construction — never conditional on timing or on whether the pre-assembly fetch succeeded.
-    private async Task PrefetchRelationshipSnapshot(
+    // Follow-up spec §6: this method no longer fetches its own snapshot at all (hence no longer named
+    // "Prefetch...") — <paramref name="resolvedSnapshot"/> is the connect path's ALREADY-RESOLVED
+    // pre-assembly snapshot (null when that fetch itself failed — the exception was already logged
+    // there). Calling GetSnapshotAsync again here would be a duplicate wb round-trip stacked on the one
+    // the connect path already awaited — precisely doubling load on wb during exactly the outage where
+    // it's least welcome. When null, the friend push is silently skipped: honest degradation (a later
+    // connect self-heals once wb recovers), never a retry. This makes the source call count for a whole
+    // connect exactly one, by construction — never conditional on timing or on whether the pre-assembly
+    // fetch succeeded.
+    private async Task PushFriendPresenceFromSnapshot(
         string battleTag, bool wentOnline, string connectionId, RelationshipSnapshot resolvedSnapshot)
     {
         if (resolvedSnapshot == null || !wentOnline)
@@ -433,7 +434,7 @@ public partial class ChatHub(
         }
     }
 
-    // C6 (Task 11, D13): the disconnect-side counterpart to PrefetchRelationshipSnapshot's connect-time
+    // C6 (Task 11, D13): the disconnect-side counterpart to PushFriendPresenceFromSnapshot's connect-time
     // push. A NEW fire-and-forget task (the disconnect path had no pre-existing background task to ride).
     // Fetches the disconnecting user's OWN relationship snapshot and, on success, pushes
     // FriendPresenceChanged{subject, online:false} to every currently-online friend via
