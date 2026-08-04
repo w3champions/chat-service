@@ -12,4 +12,17 @@ public static class DmPairKey
         var b = battleTagB.Trim().ToLowerInvariant();
         return string.CompareOrdinal(a, b) <= 0 ? $"{a}|{b}" : $"{b}|{a}";
     }
+
+    /// <summary>
+    /// The OTHER half of a pair-key (lowercased/normalized, matching how <see cref="For"/> built it) —
+    /// the counterpart of <paramref name="battleTag"/> in a 1:1 Dm. Mirrors the split logic
+    /// ChatHub.ResolveDmCounterpart has always used; hoisted here so the SessionStateAssembler's
+    /// blocked-shell keep (follow-up spec §6) and the hub share ONE implementation.
+    /// </summary>
+    public static string CounterpartOf(string pairKey, string battleTag)
+    {
+        var parts = pairKey.Split('|');
+        var normalized = battleTag.Trim().ToLowerInvariant();
+        return parts[0] == normalized ? parts[1] : parts[0];
+    }
 }

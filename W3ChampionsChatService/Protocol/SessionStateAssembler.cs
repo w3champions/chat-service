@@ -11,6 +11,7 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Relationships;
 
 namespace W3ChampionsChatService.Protocol;
 
@@ -71,7 +72,8 @@ public class SessionStateAssembler(
     // directory upsert); hoisting the ONE resolution into the hub and threading it through here (and
     // into the directory upsert) means a single wb round-trip serves both.
     public async Task<(SessionStateDto Dto, MuteStatus MuteStatus)> AssembleAndSeed(
-        W3CUserAuthentication identity, string connectionId, DateTime now, ChatUser chatUser)
+        W3CUserAuthentication identity, string connectionId, DateTime now, ChatUser chatUser,
+        RelationshipSnapshot relationshipSnapshot = null)
     {
         var memberships = await membershipRepository.LoadForUser(identity.BattleTag);
         var channelsById = (await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
@@ -96,13 +98,21 @@ public class SessionStateAssembler(
             .Where(m => channelsById.ContainsKey(m.ChannelId))
             .ToList();
 
+        // Follow-up spec §6: bound the 1:1-DM slice of the snapshot. The SELECTED set feeds the DTO's
+        // Channels list, the pending tray, AND the OnlineMemberRegistry seed below — the registry set
+        // must equal the DTO set (the long-standing invariant), so both are bounded TOGETHER. Excluded
+        // shells are repaired by the two §6 companion paths: an incoming message re-announces via
+        // ChannelAdded (ChatHub.MaterializeDmRecipientAndNotify), and GetConversations pages + seeds.
+        var snapshotMemberships = SelectSnapshotMemberships(
+            channelBackedMemberships, channelsById, relationshipSnapshot, identity.BattleTag);
+
         // D7 (Amendment 3): unread is computed per channel as the COUNT of user-visible rows after the
         // member's read cursor (see ToChannelDto) — an async, index-bounded Mongo count per membership.
         // Sequential await (not Task.WhenAll): memberships are bounded (the public+semiPublic cap plus
         // DMs/groups/match), and each count is a fast indexed range count, so the simpler sequential loop
         // is preferred over parallelizing across the Mongo connection pool.
-        var channelDtos = new List<ChannelDto>(channelBackedMemberships.Count);
-        foreach (var membership in channelBackedMemberships)
+        var channelDtos = new List<ChannelDto>(snapshotMemberships.Count);
+        foreach (var membership in snapshotMemberships)
         {
             channelDtos.Add(await ToChannelDto(channelsById[membership.ChannelId], membership, identity.BattleTag));
         }
@@ -115,15 +125,76 @@ public class SessionStateAssembler(
         var dto = new SessionStateDto(
             Channels: channelDtos,
             PublicCatalog: effectivePublicCatalog,
-            PendingDmRequests: BuildPendingDmTray(channelBackedMemberships, channelsById, identity.BattleTag, now),
+            PendingDmRequests: BuildPendingDmTray(snapshotMemberships, channelsById, identity.BattleTag, now),
             MentionUnreadCount: (int)mentionUnreadCount,
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
 
-        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, channelBackedMemberships, channelsById);
+        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, snapshotMemberships, channelsById);
         SeedLegacyMuteCache(connectionId, chatUser, muteStatus, mutedPlayer);
 
         return (dto, muteStatus);
+    }
+
+    /// <summary>
+    /// Follow-up spec §6 connect-snapshot bounds. Keeps: (a) every non-1:1 channel
+    /// (Public/SemiPublic/System/GroupDm — untouched by bounding); (b) every PENDING 1:1 Dm (either
+    /// direction — the tray needs the recipient's, dual-listing and the initiator's outgoing view need
+    /// the rest); (c) every 1:1 Dm whose counterpart is in the caller's block list, regardless of
+    /// recency (the Blocked tray section) — degrades to no blocked-keeps when no snapshot was
+    /// resolvable at connect (self-heals next connect); (d) the DmSnapshotRecentConversations
+    /// most-recent remaining shells by LastMessageAt; (e) any OLDER remaining shell with a POSSIBLE
+    /// unread (raw channel.LastSeq &gt; membership.LastReadSeq — the cheap candidate test; the real D7
+    /// user-visible count is computed on the selected set afterwards, so a phantom candidate rides
+    /// with UnreadCount 0: bounded over-inclusion, never an understated badge).
+    /// </summary>
+    internal static List<ChannelMembership> SelectSnapshotMemberships(
+        List<ChannelMembership> channelBackedMemberships,
+        IReadOnlyDictionary<string, ChatChannel> channelsById,
+        RelationshipSnapshot relationshipSnapshot,
+        string viewerBattleTag)
+    {
+        var kept = new List<ChannelMembership>();
+        var remainingDms = new List<(ChannelMembership Membership, ChatChannel Channel, DateTime SortTime)>();
+
+        foreach (var membership in channelBackedMemberships)
+        {
+            var channel = channelsById[membership.ChannelId];
+
+            if (channel.Type != ChannelType.Dm)
+            {
+                kept.Add(membership); // (a)
+                continue;
+            }
+            if (channel.RequestState == DmRequestState.Pending)
+            {
+                kept.Add(membership); // (b)
+                continue;
+            }
+            if (relationshipSnapshot != null
+                && relationshipSnapshot.HasBlocked(DmPairKey.CounterpartOf(channel.PairKey, viewerBattleTag)))
+            {
+                kept.Add(membership); // (c)
+                continue;
+            }
+
+            remainingDms.Add((membership, channel, channel.LastMessageAt ?? membership.JoinedAt));
+        }
+
+        var ordered = remainingDms
+            .OrderByDescending(x => x.SortTime)
+            .ThenByDescending(x => x.Channel.Id, StringComparer.Ordinal)
+            .ToList();
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            if (i < ChatLimits.DmSnapshotRecentConversations                 // (d)
+                || ordered[i].Channel.LastSeq > ordered[i].Membership.LastReadSeq) // (e)
+            {
+                kept.Add(ordered[i].Membership);
+            }
+        }
+
+        return kept;
     }
 
     private static MuteStatus ResolveMuteStatus(LoungeMute mute, DateTime now)

@@ -59,10 +59,18 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
         return Memberships.Find(m => m.ChannelId == channelId && m.BattleTag == tag).FirstOrDefaultAsync();
     }
 
+    // 2026-08-04 follow-up (carried launcher-review item): sorted JoinedAt ascending — without an
+    // explicit sort Mongo returns natural/insertion order (arbitrary, not contractual), which the
+    // launcher was silently relying on to preserve "join order" for name-joinable (SemiPublic) channels
+    // across a reconnect. SessionStateAssembler.AssembleAndSeed (and every other caller) consumes this
+    // list straight through for the non-DM slice of SessionStateDto.Channels, so sorting once here
+    // fixes the contract at the single durable choke point rather than re-sorting at every call site.
+    // The bounded, recency-ordered 1:1-DM slice (follow-up spec §6, SelectSnapshotMemberships) is
+    // unaffected — it re-sorts its own DM subset by LastMessageAt regardless of this base ordering.
     public Task<List<ChannelMembership>> LoadForUser(string battleTag)
     {
         var tag = NormalizeTag(battleTag);
-        return Memberships.Find(m => m.BattleTag == tag).ToListAsync();
+        return Memberships.Find(m => m.BattleTag == tag).SortBy(m => m.JoinedAt).ToListAsync();
     }
 
     public Task Delete(string channelId, string battleTag)

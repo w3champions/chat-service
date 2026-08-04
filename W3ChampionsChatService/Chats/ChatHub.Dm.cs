@@ -373,12 +373,8 @@ public partial class ChatHub
     /// snapshot/registry lookups; the materialized membership + settings reads). Never called for GroupDm
     /// (no pair-key).
     /// </summary>
-    private static string ResolveDmCounterpart(ChatChannel channel, string senderBattleTag)
-    {
-        var parts = channel.PairKey.Split('|');
-        var senderNormalized = senderBattleTag.Trim().ToLowerInvariant();
-        return string.Equals(parts[0], senderNormalized, StringComparison.OrdinalIgnoreCase) ? parts[1] : parts[0];
-    }
+    private static string ResolveDmCounterpart(ChatChannel channel, string senderBattleTag) =>
+        DmPairKey.CounterpartOf(channel.PairKey, senderBattleTag);
 
     /// <summary>
     /// The shared consent-accept transition used by BOTH reply-accept (a recipient's first reply) and

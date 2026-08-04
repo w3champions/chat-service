@@ -44,6 +44,30 @@ public class MembershipRepositoryTests : IntegrationTestBase
         CollectionAssert.AreEquivalent(new[] { "chan1", "chan2" }, mine.Select(m => m.ChannelId).ToList());
     }
 
+    // 2026-08-04 follow-up (carried launcher-review item): LoadForUser had no explicit sort, so
+    // SessionStateDto.Channels order was Mongo-arbitrary — the launcher relies on server order to
+    // preserve "join order" for name-joinable (SemiPublic) channels across a reconnect. Pinned here at
+    // scrambled INSERTION order against distinct, out-of-insertion-order JoinedAt stamps: the returned
+    // list must come back JoinedAt-ascending regardless of when each row was written.
+    [Test]
+    public async Task LoadForUser_ReturnsChannelsInJoinedAtAscendingOrder_RegardlessOfInsertionOrder()
+    {
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        // Inserted in scrambled order: chan3 (oldest JoinedAt) written FIRST, chan1 (newest) written LAST.
+        await repo.Insert(new ChannelMembership { ChannelId = "chan3", BattleTag = "Peter#123", JoinedAt = t0 });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = t0.AddMinutes(10) });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = t0.AddMinutes(5) });
+
+        var mine = await repo.LoadForUser("Peter#123");
+
+        CollectionAssert.AreEqual(
+            new[] { "chan3", "chan2", "chan1" },
+            mine.Select(m => m.ChannelId).ToList(),
+            "LoadForUser must return rows JoinedAt-ascending, not insertion/natural order");
+    }
+
     [Test]
     public async Task DuplicateMembership_IsRejectedByUniqueIndex()
     {

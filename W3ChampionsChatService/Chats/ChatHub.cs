@@ -184,16 +184,26 @@ public partial class ChatHub(
         var resolution = await _chatAuthenticationService.GetUserFromIdentity(identity);
         await UpsertDirectory(identity, resolution, now);
 
-        // C5 (Task 1, spec §6): warm the relationship cache with the CONNECTING user's OWN snapshot so the
-        // block/friend gates (later C5 tasks) start hot. Fire-and-forget and NON-FATAL: it is deliberately
-        // NOT awaited (a slow/unreachable wb read must never add latency to, or fail, a connect), and any
-        // failure is swallowed + logged exactly like UpsertDirectory. The task touches only the singleton
-        // provider + the captured battleTag/connectionId, so it is safe even after this hub instance is
-        // disposed; a cache miss simply self-heals on the first gated action.
-        // C6 (Task 11, D13): this SAME task now ALSO carries the friend-presence push — see
-        // PrefetchRelationshipSnapshot's doc comment below. Riding the existing fire-and-forget work
-        // (rather than adding a second background task) is what keeps this connect-latency-free: wentOnline
-        // and Context.ConnectionId are captured NOW, synchronously, before the task is dispatched.
+        // Follow-up spec §6: resolve the caller's OWN relationship snapshot BEFORE assembly — the
+        // bounded DM snapshot needs the block list to keep every blocked 1:1 shell regardless of
+        // recency. Bounded wait: the wb source self-caps at its 2s HttpClient timeout and the provider
+        // serves fresh-cache/stale tiers first (the connect path already awaits one wb round-trip —
+        // GetUserFromIdentity above). Fail-soft: with nothing cached at all, assemble WITHOUT a
+        // snapshot — blocked shells outside the recency window may be omitted from THIS SessionState
+        // only (self-heals on the next connect); a wb outage must never fail the connect.
+        RelationshipSnapshot relationshipSnapshot = null;
+        try
+        {
+            relationshipSnapshot = await _relationshipProvider.GetSnapshotAsync(identity.BattleTag);
+        }
+        catch (RelationshipUnavailableException ex)
+        {
+            Log.Warning(ex, "No relationship snapshot for {BattleTag} at connect — blocked 1:1 shells may be omitted from this SessionState", identity.BattleTag);
+        }
+
+        // C5 (Task 1) / C6 (Task 11, D13): unchanged role (cache warm + friend-presence push), now
+        // dispatched AFTER the awaited fetch above so its own GetSnapshotAsync is a warm-cache hit
+        // instead of a duplicate wb round-trip. Still fire-and-forget and non-fatal.
         _ = PrefetchRelationshipSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId);
 
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
@@ -203,7 +213,7 @@ public partial class ChatHub(
         // the connect fails — an authenticated connection with no snapshot is useless — so we do NOT
         // swallow it (unlike the non-fatal directory upsert above). The already-resolved chatUser is
         // threaded straight through — AssembleAndSeed no longer re-resolves it itself (D9).
-        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now, resolution.User);
+        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now, resolution.User, relationshipSnapshot);
         await Clients.Caller.SendAsync(ChatEvents.SessionState, dto);
 
         if (muteStatus == MuteStatus.Full)

@@ -288,7 +288,13 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
 
     // ---- Mongo seed helpers ------------------------------------------------------------------------
 
-    private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public)
+    // Follow-up spec §6: SessionStateAssembler.SelectSnapshotMemberships now reads channel.PairKey for
+    // every non-pending 1:1 Dm (the blocked-shell keep) — a REAL Dm channel always carries one
+    // (ChannelRepository.FindOrCreateDm always sets it via DmPairKey.For; the collection's unique
+    // partial index enforces Type==Dm ⇒ PairKey present). dmBattleTagA/B are therefore REQUIRED for
+    // ChannelType.Dm so this fixture can never manufacture the data-impossible shape (a Dm channel with
+    // no PairKey) that used to slip past every test that never exercised the connect snapshot's DM slice.
+    private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public, string dmBattleTagA = null, string dmBattleTagB = null)
     {
         var channel = new ChatChannel
         {
@@ -299,6 +305,11 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         };
         if (type == ChannelType.Dm)
         {
+            if (dmBattleTagA == null || dmBattleTagB == null)
+            {
+                throw new ArgumentException("CreateChannel(ChannelType.Dm, ...) requires both dmBattleTagA and dmBattleTagB to build a real PairKey");
+            }
+            channel.PairKey = DmPairKey.For(dmBattleTagA, dmBattleTagB);
             channel.RequestState = DmRequestState.Accepted;
         }
         await _channelRepository.Insert(channel);
@@ -709,7 +720,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         const string BystanderTag = "Cara#3";  // genuinely wired, focused on an UNRELATED DM
         const string YoungTag = "Young#5";
 
-        var dmAx = await CreateChannel("dm-ax", ChannelType.Dm);
+        var dmAx = await CreateChannel("dm-ax", ChannelType.Dm, AliceTag, XavierTag);
         await SeedMembership(dmAx.Id, AliceTag);
         await SeedMembership(dmAx.Id, XavierTag);
 
@@ -717,7 +728,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         await SeedMembership(grpAx.Id, AliceTag, role: MembershipRole.Owner);
         await SeedMembership(grpAx.Id, XavierTag);
 
-        var dmCy = await CreateChannel("dm-cy", ChannelType.Dm);
+        var dmCy = await CreateChannel("dm-cy", ChannelType.Dm, BystanderTag, YoungTag);
         await SeedMembership(dmCy.Id, BystanderTag);
         await SeedMembership(dmCy.Id, YoungTag);
 

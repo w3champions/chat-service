@@ -213,7 +213,13 @@ public class ChatHubPresenceTests : IntegrationTestBase
 
     // ---- Mongo seed helpers ------------------------------------------------------------------------
 
-    private async Task<ChatChannel> CreateChannel(string name, ChannelType type)
+    // Follow-up spec §6: SessionStateAssembler.SelectSnapshotMemberships now reads channel.PairKey for
+    // every non-pending 1:1 Dm (the blocked-shell keep) — a REAL Dm channel always carries one
+    // (ChannelRepository.FindOrCreateDm always sets it via DmPairKey.For; the collection's unique
+    // partial index enforces Type==Dm ⇒ PairKey present). dmBattleTagA/B are therefore REQUIRED for
+    // ChannelType.Dm so this fixture can never manufacture the data-impossible shape (a Dm channel with
+    // no PairKey) that used to slip past every test that never exercised the connect snapshot's DM slice.
+    private async Task<ChatChannel> CreateChannel(string name, ChannelType type, string dmBattleTagA = null, string dmBattleTagB = null)
     {
         var channel = new ChatChannel
         {
@@ -224,6 +230,11 @@ public class ChatHubPresenceTests : IntegrationTestBase
         };
         if (type == ChannelType.Dm)
         {
+            if (dmBattleTagA == null || dmBattleTagB == null)
+            {
+                throw new ArgumentException("CreateChannel(ChannelType.Dm, ...) requires both dmBattleTagA and dmBattleTagB to build a real PairKey");
+            }
+            channel.PairKey = DmPairKey.For(dmBattleTagA, dmBattleTagB);
             channel.RequestState = DmRequestState.Accepted;
         }
         await _channelRepository.Insert(channel);
@@ -265,7 +276,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
         const string AliceTag = "Alice#1";
         const string XavierTag = "Xavier#9";
 
-        var dm = await CreateChannel("dm-ax", ChannelType.Dm);
+        var dm = await CreateChannel("dm-ax", ChannelType.Dm, AliceTag, XavierTag);
         await SeedMembership(dm.Id, AliceTag);
         await SeedMembership(dm.Id, XavierTag);
 
@@ -296,13 +307,13 @@ public class ChatHubPresenceTests : IntegrationTestBase
         const string CharlieTag = "Charlie#7";
         const string YoungTag = "Young#5";
 
-        var dmAx = await CreateChannel("dm-ax", ChannelType.Dm);
+        var dmAx = await CreateChannel("dm-ax", ChannelType.Dm, AliceTag, XavierTag);
         await SeedMembership(dmAx.Id, AliceTag);
         await SeedMembership(dmAx.Id, XavierTag);
 
         // Charlie is GENUINELY wired: online, and focused on an UNRELATED DM (with Young), so Charlie
         // is a live watcher — just not of Xavier.
-        var dmCy = await CreateChannel("dm-cy", ChannelType.Dm);
+        var dmCy = await CreateChannel("dm-cy", ChannelType.Dm, CharlieTag, YoungTag);
         await SeedMembership(dmCy.Id, CharlieTag);
         await SeedMembership(dmCy.Id, YoungTag);
 
@@ -362,7 +373,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
         const string AliceTag = "Alice#1";
         const string XavierTag = "Xavier#9";
 
-        var dm = await CreateChannel("dm-ax", ChannelType.Dm);
+        var dm = await CreateChannel("dm-ax", ChannelType.Dm, AliceTag, XavierTag);
         await SeedMembership(dm.Id, AliceTag);
         await SeedMembership(dm.Id, XavierTag);
 

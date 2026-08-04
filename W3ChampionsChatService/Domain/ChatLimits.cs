@@ -162,6 +162,12 @@ public static class ChatLimits
     /// not spec §13; requests above this are rejected with <c>HubException</c>).</summary>
     public const int PresenceQueryMaxBattleTags = 200;
 
+    /// <summary>2026-08-04 follow-up spec §6: connect-snapshot bound for ACCEPTED, non-blocked 1:1 Dm
+    /// shells — the N most-recent ride SessionState; older ones ride only with unread > 0 (or via
+    /// GetConversations pagination). Pending requests, blocked shells, GroupDm, and every non-DM
+    /// channel are never bounded by this.</summary>
+    public const int DmSnapshotRecentConversations = 30;
+
     /// <summary>C7 HMAC freshness window (brief Design decision 2): a request is rejected when
     /// |now − timestamp| exceeds this window. Pinned default — M1/W2 build against this exact 300s
     /// value as a cross-repo contract, so a test asserts it verbatim.</summary>
