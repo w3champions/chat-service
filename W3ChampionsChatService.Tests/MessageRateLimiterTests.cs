@@ -111,37 +111,67 @@ public class MessageRateLimiterTests
             "retry-after for a per-channel throttle must not exceed the sustained interval");
     }
 
-    [Test]
-    public void RepeatedViolations_EscalateTo60sAutoThrottle()
+    // Drives one full auto-throttle trigger for Conn on Channel at `at`: spends the burst, then lands
+    // AutoThrottleViolationThreshold violations — returns the escalation decision (JustAutoThrottled true).
+    private RateLimitDecision TriggerAutoThrottle(DateTime at)
     {
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
-            Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, _t0).Allowed);
+            Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, at).Allowed, "burst send must be allowed");
         }
-
         RateLimitDecision escalation = default;
         for (var v = 0; v < ChatLimits.AutoThrottleViolationThreshold; v++)
         {
-            escalation = _limiter.TryAcquire(Conn, Channel, _t0);
-            Assert.IsFalse(escalation.Allowed, "each over-burst send is throttled");
+            escalation = _limiter.TryAcquire(Conn, Channel, at);
         }
+        Assert.IsTrue(escalation.JustAutoThrottled, "the threshold-th violation must escalate");
+        return escalation;
+    }
 
-        // The threshold-th violation flips the connection into a hard auto-throttle and signals once.
-        Assert.IsTrue(escalation.JustAutoThrottled, "reaching the violation threshold signals auto-throttle");
-        Assert.IsNotNull(escalation.RetryAfterSeconds);
-        Assert.AreEqual(ChatLimits.AutoThrottleDuration.TotalSeconds, escalation.RetryAfterSeconds.Value, 0.001);
+    [Test]
+    public void FirstAutoThrottle_Lasts10Seconds()
+    {
+        var first = TriggerAutoThrottle(_t0);
+        Assert.AreEqual(ChatLimits.AutoThrottleTierDurations[0].TotalSeconds, first.RetryAfterSeconds.Value, 0.001);
+        Assert.AreEqual(10, first.RetryAfterSeconds.Value, 0.001, "spec pin: the FIRST tier is exactly 10s");
 
-        // While hard-throttled, ALL sends are denied — even on a brand-new channel — and the notice
-        // is not re-signalled.
-        var during = _limiter.TryAcquire(Conn, "another-channel", _t0.AddSeconds(1));
-        Assert.IsFalse(during.Allowed);
-        Assert.IsFalse(during.JustAutoThrottled, "the auto-throttle notice fires exactly once");
-        Assert.IsNotNull(during.RetryAfterSeconds);
-        Assert.Greater(during.RetryAfterSeconds.Value, 0);
+        // Still denied 9s in; recovered right after the 10s tier elapses (fresh burst).
+        Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(9)).Allowed);
+        Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, _t0 + ChatLimits.AutoThrottleTierDurations[0] + TimeSpan.FromSeconds(11)).Allowed,
+            "after serving 10s (plus bucket refill time) the connection recovers");
+    }
 
-        // After serving the full duration, the connection recovers with a fresh burst.
-        var recovered = _limiter.TryAcquire(Conn, Channel, _t0 + ChatLimits.AutoThrottleDuration + TimeSpan.FromSeconds(1));
-        Assert.IsTrue(recovered.Allowed, "the connection recovers after serving the auto-throttle duration");
+    [Test]
+    public void SecondAutoThrottle_Escalates_To30Seconds()
+    {
+        TriggerAutoThrottle(_t0);
+        // Well after the first penalty (buckets refilled), still inside the 10-minute decay window.
+        var second = TriggerAutoThrottle(_t0.AddSeconds(60));
+        Assert.AreEqual(30, second.RetryAfterSeconds.Value, 0.001, "spec pin: the SECOND tier is exactly 30s");
+    }
+
+    [Test]
+    public void ThirdAndLaterAutoThrottles_CapAt60Seconds()
+    {
+        TriggerAutoThrottle(_t0);
+        TriggerAutoThrottle(_t0.AddSeconds(60));
+        var third = TriggerAutoThrottle(_t0.AddSeconds(150));
+        Assert.AreEqual(60, third.RetryAfterSeconds.Value, 0.001, "spec pin: the THIRD tier caps at 60s");
+        var fourth = TriggerAutoThrottle(_t0.AddSeconds(300));
+        Assert.AreEqual(60, fourth.RetryAfterSeconds.Value, 0.001, "the cap holds for every later trigger");
+    }
+
+    [Test]
+    public void TierLadder_ResetsAfterTenCleanMinutes()
+    {
+        TriggerAutoThrottle(_t0);
+        TriggerAutoThrottle(_t0.AddSeconds(60)); // now at tier 2 (30s served)
+
+        // 10 clean minutes (no trigger) after the SECOND trigger → the ladder resets to the first tier.
+        var afterDecay = _t0.AddSeconds(60) + ChatLimits.AutoThrottleTierDecay + TimeSpan.FromSeconds(1);
+        var reset = TriggerAutoThrottle(afterDecay);
+        Assert.AreEqual(10, reset.RetryAfterSeconds.Value, 0.001,
+            "10 clean minutes without a trigger must reset the ladder to the 10s first tier");
     }
 
     [Test]

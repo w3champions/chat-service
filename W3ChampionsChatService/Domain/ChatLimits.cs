@@ -86,13 +86,23 @@ public static class ChatLimits
     /// not messages, so a larger ceiling is appropriate.</summary>
     public const int ModerationChannelsPageSize = 500;
 
-    /// <summary>Auto-throttle escalation (C3 plan decision, Task 1). Spec §13 pins only "60s
-    /// automatic throttle"; the trigger threshold/window are NOT spec-pinned — cheap to change
-    /// (C3-plan.md Open question 3). Repeated rate-limit violations within the window escalate to
-    /// a hard per-connection throttle for the duration below, plus a moderation log entry.</summary>
+    /// <summary>Auto-throttle escalation trigger (C3 plan decision, Task 1; trigger UNCHANGED by the
+    /// 2026-08-04 follow-up spec §1): repeated rate-limit violations within the window escalate to a
+    /// hard per-user throttle, plus a moderation log entry.</summary>
     public const int AutoThrottleViolationThreshold = 5;
     public static readonly TimeSpan AutoThrottleWindow = TimeSpan.FromSeconds(60);
-    public static readonly TimeSpan AutoThrottleDuration = TimeSpan.FromSeconds(60);
+
+    /// <summary>Escalating auto-throttle tiers (2026-08-04 follow-up spec §1, hard-coded — no env
+    /// plumbing per the parent-spec rule): first trigger 10s, second 30s, third and beyond 60s (cap
+    /// — the last element applies to every later trigger). The ladder resets to the first tier after
+    /// <see cref="AutoThrottleTierDecay"/> without a new trigger.</summary>
+    public static readonly TimeSpan[] AutoThrottleTierDurations =
+    [
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromSeconds(60),
+    ];
+    public static readonly TimeSpan AutoThrottleTierDecay = TimeSpan.FromMinutes(10);
 
     /// <summary>Relationship (friends/blocked) snapshot cache TTL (C5 plan decision, T1 — not spec §13).
     /// The provider serves a cached snapshot without refetching for this long; spec §6 notes the

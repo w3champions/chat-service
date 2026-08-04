@@ -46,7 +46,10 @@ public class ChatLimitsTests
         Assert.AreEqual(100, ChatLimits.MessagePageSize);
         Assert.AreEqual(5, ChatLimits.AutoThrottleViolationThreshold);
         Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleWindow);
-        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleDuration);
+        CollectionAssert.AreEqual(
+            new[] { TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60) },
+            ChatLimits.AutoThrottleTierDurations);
+        Assert.AreEqual(TimeSpan.FromMinutes(10), ChatLimits.AutoThrottleTierDecay);
     }
 
     [Test]

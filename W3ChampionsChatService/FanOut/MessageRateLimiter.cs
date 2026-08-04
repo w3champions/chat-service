@@ -42,9 +42,9 @@ public readonly record struct RateLimitDecision(
 /// token every 0.5s).</item>
 /// </list>
 /// A send consumes one token from BOTH buckets; if either is short, the send is throttled and no
-/// token is consumed. Repeated throttles escalate to a hard per-connection auto-throttle
-/// (<see cref="ChatLimits.AutoThrottleViolationThreshold"/> violations within
-/// <see cref="ChatLimits.AutoThrottleWindow"/> → denied for <see cref="ChatLimits.AutoThrottleDuration"/>).
+/// token is consumed. Repeated throttles escalate to an escalating hard auto-throttle
+/// (<see cref="ChatLimits.AutoThrottleTierDurations"/> 10s→30s→60s cap, ladder decaying after
+/// <see cref="ChatLimits.AutoThrottleTierDecay"/>).
 /// <para>
 /// NO timers and NO wall-clock reads: every decision takes an explicit <c>now</c> and refills are
 /// derived from elapsed time, so it is fully testable without sleeping. The limiter is PURE domain
@@ -79,6 +79,7 @@ public class MessageRateLimiter
     {
         RateLimitDecision decision;
         var logAutoThrottle = false;
+        double appliedThrottleSeconds = 0;
 
         lock (_lock)
         {
@@ -117,10 +118,11 @@ public class MessageRateLimiter
             var retryAfter = Math.Max(channelBucket.SecondsUntilToken(), state.GlobalBucket.SecondsUntilToken());
 
             // 4) Record the violation in the rolling window; escalate if it crosses the threshold.
-            if (RecordViolationAndCheckEscalation(state, now))
+            if (RecordViolationAndCheckEscalation(state, now) is TimeSpan applied)
             {
                 logAutoThrottle = true;
-                decision = new RateLimitDecision(false, ChatLimits.AutoThrottleDuration.TotalSeconds, true);
+                appliedThrottleSeconds = applied.TotalSeconds;
+                decision = new RateLimitDecision(false, appliedThrottleSeconds, true);
             }
             else
             {
@@ -135,7 +137,7 @@ public class MessageRateLimiter
             Log.Warning(
                 "Auto-throttling chat connection {ConnectionId} for {DurationSeconds}s after {ViolationThreshold} rate-limit violations within {WindowSeconds}s",
                 connectionId,
-                ChatLimits.AutoThrottleDuration.TotalSeconds,
+                appliedThrottleSeconds,
                 ChatLimits.AutoThrottleViolationThreshold,
                 ChatLimits.AutoThrottleWindow.TotalSeconds);
         }
@@ -174,9 +176,10 @@ public class MessageRateLimiter
     }
 
     // Caller must already hold _lock. Records a throttle violation at now, ages out ones older than
-    // the rolling window, and returns true if the connection just crossed into hard auto-throttle
-    // (setting the deadline and clearing the counter) — false for a plain non-escalating throttle.
-    private static bool RecordViolationAndCheckEscalation(ConnectionState state, DateTime now)
+    // the rolling window, and — when the count crosses the threshold — escalates into the NEXT tier
+    // (10s → 30s → 60s cap; the ladder resets first if AutoThrottleTierDecay has passed since the
+    // last trigger), returning the applied duration. Null for a plain non-escalating throttle.
+    private static TimeSpan? RecordViolationAndCheckEscalation(ConnectionState state, DateTime now)
     {
         state.Violations.Add(now);
         var cutoff = now - ChatLimits.AutoThrottleWindow;
@@ -184,12 +187,22 @@ public class MessageRateLimiter
 
         if (state.Violations.Count < ChatLimits.AutoThrottleViolationThreshold)
         {
-            return false;
+            return null;
         }
 
-        state.HardThrottleUntil = now + ChatLimits.AutoThrottleDuration;
+        // Tier decay: 10 clean minutes since the last trigger reset the ladder to the first tier.
+        if (state.LastAutoThrottleAt is DateTime last && now - last >= ChatLimits.AutoThrottleTierDecay)
+        {
+            state.TierLevel = 0;
+        }
+
+        var tierIndex = Math.Min(state.TierLevel, ChatLimits.AutoThrottleTierDurations.Length - 1);
+        var duration = ChatLimits.AutoThrottleTierDurations[tierIndex];
+        state.HardThrottleUntil = now + duration;
+        state.LastAutoThrottleAt = now;
+        state.TierLevel++;
         state.Violations.Clear();
-        return true;
+        return duration;
     }
 
     /// <summary>
@@ -205,6 +218,10 @@ public class MessageRateLimiter
             new Dictionary<string, TokenBucket>();
         internal readonly List<DateTime> Violations = new List<DateTime>();
         internal DateTime? HardThrottleUntil;
+        // Follow-up spec §1: completed auto-throttle triggers (the ladder position) + when the last one
+        // fired (anchors the 10-minute decay). Mutated only under the limiter's lock, like every sibling.
+        internal int TierLevel;
+        internal DateTime? LastAutoThrottleAt;
 
         internal ConnectionState(DateTime now)
         {

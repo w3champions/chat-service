@@ -64,10 +64,13 @@ public class ProtocolContractTests
     {
         // Plan decision (C3-plan.md Task 1 / Open question 3) — spec §13 pins only "60s automatic
         // throttle"; the escalation trigger threshold/window are NOT spec-pinned, XML-doc'd as such
-        // at the declaration.
+        // at the declaration. Tier durations/decay are pinned by the 2026-08-04 follow-up spec §1.
         Assert.AreEqual(5, ChatLimits.AutoThrottleViolationThreshold);
         Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleWindow);
-        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleDuration);
+        CollectionAssert.AreEqual(
+            new[] { TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60) },
+            ChatLimits.AutoThrottleTierDurations);
+        Assert.AreEqual(TimeSpan.FromMinutes(10), ChatLimits.AutoThrottleTierDecay);
     }
 
     [Test]
