@@ -363,7 +363,12 @@ public partial class ChatHub(
 
             _focusRegistry.RemoveConnection(Context.ConnectionId);
             _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
-            _messageRateLimiter.RemoveConnection(Context.ConnectionId);
+            // MessageRateLimiter is deliberately NOT torn down here (2026-08-04 follow-up spec §1): its
+            // state is battleTag-keyed and must SURVIVE disconnect/reconnect (violations, the tier
+            // ladder, and an active hard throttle all persist across a relaunch) — the limiter prunes
+            // its own quiescent entries opportunistically instead. See
+            // MessageRateLimiterTests.HardThrottle_SurvivesReconnect_BecauseStateIsKeyedByBattleTag and
+            // ChatHubSendMessageTests.Send_AutoThrottle_SurvivesReconnect_SameBattleTag.
             // Task 13: also drop the connection's ChannelActivity coalescing state (routed through the
             // fan-out engine, which owns the coalescer) so the singleton can't leak past the socket.
             _fanOutEngine.OnConnectionClosed(Context.ConnectionId);

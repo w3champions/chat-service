@@ -8,16 +8,16 @@ namespace W3ChampionsChatService.Tests;
 
 /// <summary>
 /// Unit tests for <see cref="MessageRateLimiter"/> — the pure, deterministic send-path abuse control
-/// (C3 Task 6). Every decision takes an explicit <c>DateTime now</c>; refills are derived from
-/// elapsed time, so these tests never sleep and never read the wall clock. Two token buckets
-/// (per-(connection, channel) burst-then-sustained, and a per-connection global window) plus an
-/// escalation to a 60s hard auto-throttle after repeated violations.
+/// (C3 Task 6; re-keyed to battleTag by the 2026-08-04 follow-up spec §1). Every decision takes an
+/// explicit <c>DateTime now</c>; refills are derived from elapsed time, so these tests never sleep and
+/// never read the wall clock. Two token buckets (per-(user, channel) burst-then-sustained, and a
+/// per-user global window) plus an escalation to a 60s hard auto-throttle after repeated violations.
 /// </summary>
 public class MessageRateLimiterTests
 {
     private MessageRateLimiter _limiter;
     private DateTime _t0;
-    private const string Conn = "conn-1";
+    private const string User = "peter#123";
     private const string Channel = "channel-a";
 
     [SetUp]
@@ -32,13 +32,13 @@ public class MessageRateLimiterTests
     {
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
-            var allowed = _limiter.TryAcquire(Conn, Channel, _t0);
+            var allowed = _limiter.TryAcquire(User, Channel, _t0);
             Assert.IsTrue(allowed.Allowed, $"burst message {i + 1} within capacity must be allowed");
             Assert.IsNull(allowed.RetryAfterSeconds, "allowed sends carry no retry-after");
         }
 
         // 6th message well inside the sustained interval — burst is spent, no full token yet.
-        var sixth = _limiter.TryAcquire(Conn, Channel, _t0.AddMilliseconds(500));
+        var sixth = _limiter.TryAcquire(User, Channel, _t0.AddMilliseconds(500));
 
         Assert.IsFalse(sixth.Allowed, "the 6th message inside 1s exceeds the per-channel burst");
         Assert.IsNotNull(sixth.RetryAfterSeconds);
@@ -51,21 +51,21 @@ public class MessageRateLimiterTests
     {
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
-            _limiter.TryAcquire(Conn, Channel, _t0);
+            _limiter.TryAcquire(User, Channel, _t0);
         }
         // Burst spent; an immediate retry is throttled.
-        Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0).Allowed);
+        Assert.IsFalse(_limiter.TryAcquire(User, Channel, _t0).Allowed);
 
         // One sustained interval later, exactly one token has regenerated.
-        var afterOne = _limiter.TryAcquire(Conn, Channel, _t0 + ChatLimits.PerChannelSustainedInterval);
+        var afterOne = _limiter.TryAcquire(User, Channel, _t0 + ChatLimits.PerChannelSustainedInterval);
         Assert.IsTrue(afterOne.Allowed, "one token regenerates per sustained interval");
 
         // That single token is spent again — another immediate send is throttled.
-        Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0 + ChatLimits.PerChannelSustainedInterval).Allowed);
+        Assert.IsFalse(_limiter.TryAcquire(User, Channel, _t0 + ChatLimits.PerChannelSustainedInterval).Allowed);
 
         // Two intervals in, the next token is available — steady state of 1 per interval.
         var afterTwo = _limiter.TryAcquire(
-            Conn,
+            User,
             Channel,
             _t0 + ChatLimits.PerChannelSustainedInterval + ChatLimits.PerChannelSustainedInterval);
         Assert.IsTrue(afterTwo.Allowed, "sustained rate holds at 1 per interval");
@@ -75,16 +75,16 @@ public class MessageRateLimiterTests
     public void GlobalBucket_10Per5s_EnforcedAcrossChannels()
     {
         // One message across 10 DISTINCT channels: no per-channel bucket is ever the binding
-        // constraint (each has capacity 5), so only the per-connection global bucket can throttle.
+        // constraint (each has capacity 5), so only the per-user global bucket can throttle.
         for (var i = 0; i < ChatLimits.GlobalMessageBurst; i++)
         {
-            var d = _limiter.TryAcquire(Conn, $"channel-{i}", _t0);
+            var d = _limiter.TryAcquire(User, $"channel-{i}", _t0);
             Assert.IsTrue(d.Allowed, $"global send {i + 1} within the global burst must be allowed");
         }
 
         // 11th send on yet another fresh channel: its per-channel bucket is full, but the global
         // bucket is exhausted → throttled by the global limit, not the per-channel one.
-        var overflow = _limiter.TryAcquire(Conn, "channel-overflow", _t0);
+        var overflow = _limiter.TryAcquire(User, "channel-overflow", _t0);
 
         Assert.IsFalse(overflow.Allowed, "the global 10/5s cap is enforced across all channels");
         Assert.IsNotNull(overflow.RetryAfterSeconds);
@@ -97,10 +97,10 @@ public class MessageRateLimiterTests
     {
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
-            _limiter.TryAcquire(Conn, Channel, _t0);
+            _limiter.TryAcquire(User, Channel, _t0);
         }
 
-        var throttled = _limiter.TryAcquire(Conn, Channel, _t0);
+        var throttled = _limiter.TryAcquire(User, Channel, _t0);
 
         Assert.IsFalse(throttled.Allowed);
         Assert.IsNotNull(throttled.RetryAfterSeconds);
@@ -111,18 +111,18 @@ public class MessageRateLimiterTests
             "retry-after for a per-channel throttle must not exceed the sustained interval");
     }
 
-    // Drives one full auto-throttle trigger for Conn on Channel at `at`: spends the burst, then lands
+    // Drives one full auto-throttle trigger for User on Channel at `at`: spends the burst, then lands
     // AutoThrottleViolationThreshold violations — returns the escalation decision (JustAutoThrottled true).
     private RateLimitDecision TriggerAutoThrottle(DateTime at)
     {
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
-            Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, at).Allowed, "burst send must be allowed");
+            Assert.IsTrue(_limiter.TryAcquire(User, Channel, at).Allowed, "burst send must be allowed");
         }
         RateLimitDecision escalation = default;
         for (var v = 0; v < ChatLimits.AutoThrottleViolationThreshold; v++)
         {
-            escalation = _limiter.TryAcquire(Conn, Channel, at);
+            escalation = _limiter.TryAcquire(User, Channel, at);
             Assert.IsFalse(escalation.Allowed, "every violation-loop send must be denied, including the escalating one");
         }
         Assert.IsTrue(escalation.JustAutoThrottled, "the threshold-th violation must escalate");
@@ -137,16 +137,16 @@ public class MessageRateLimiterTests
         Assert.AreEqual(10, first.RetryAfterSeconds.Value, 0.001, "spec pin: the FIRST tier is exactly 10s");
 
         // Still denied 9s in; recovered right after the 10s tier elapses (fresh burst).
-        Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(9)).Allowed);
+        Assert.IsFalse(_limiter.TryAcquire(User, Channel, _t0.AddSeconds(9)).Allowed);
 
-        // The hard throttle is connection-wide, not per-channel: a SECOND, different channel on the
-        // same connection is denied too while the penalty is active, and it's not a fresh escalation.
-        var otherChannelDenial = _limiter.TryAcquire(Conn, "channel-b", _t0.AddSeconds(9));
-        Assert.IsFalse(otherChannelDenial.Allowed, "hard auto-throttle blocks every channel on the connection");
+        // The hard throttle is user-wide, not per-channel: a SECOND, different channel for the
+        // same user is denied too while the penalty is active, and it's not a fresh escalation.
+        var otherChannelDenial = _limiter.TryAcquire(User, "channel-b", _t0.AddSeconds(9));
+        Assert.IsFalse(otherChannelDenial.Allowed, "hard auto-throttle blocks every channel for the user");
         Assert.IsFalse(otherChannelDenial.JustAutoThrottled, "a denial during an active penalty is not a new escalation");
 
-        Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, _t0 + ChatLimits.AutoThrottleTierDurations[0] + TimeSpan.FromSeconds(11)).Allowed,
-            "after serving 10s (plus bucket refill time) the connection recovers");
+        Assert.IsTrue(_limiter.TryAcquire(User, Channel, _t0 + ChatLimits.AutoThrottleTierDurations[0] + TimeSpan.FromSeconds(11)).Allowed,
+            "after serving 10s (plus bucket refill time) the user recovers");
     }
 
     [Test]
@@ -185,8 +185,9 @@ public class MessageRateLimiterTests
     [Test]
     public void TierLadder_ResetsAtExactlyTheDecayBoundary()
     {
-        // Pins the `>=` comparison at MessageRateLimiter.cs:194: at EXACTLY AutoThrottleTierDecay
-        // since the last trigger, the ladder MUST already have reset (the boundary is inclusive).
+        // Pins the `>=` comparison in RecordViolationAndCheckEscalation's tier-decay check: at EXACTLY
+        // AutoThrottleTierDecay since the last trigger, the ladder MUST already have reset (the
+        // boundary is inclusive).
         TriggerAutoThrottle(_t0);
         TriggerAutoThrottle(_t0.AddSeconds(60)); // tier 2 (30s served); LastAutoThrottleAt = t0+60s
 
@@ -230,18 +231,20 @@ public class MessageRateLimiterTests
         {
             for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
             {
-                _limiter.TryAcquire(Conn, Channel, _t0);
+                _limiter.TryAcquire(User, Channel, _t0);
             }
             for (var v = 0; v < ChatLimits.AutoThrottleViolationThreshold; v++)
             {
-                _limiter.TryAcquire(Conn, Channel, _t0);
+                _limiter.TryAcquire(User, Channel, _t0);
             }
             // Further denied sends inside the hard-throttle window must NOT emit more log lines.
-            _limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(1));
-            _limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(2));
+            _limiter.TryAcquire(User, Channel, _t0.AddSeconds(1));
+            _limiter.TryAcquire(User, Channel, _t0.AddSeconds(2));
 
             Assert.AreEqual(1, capturedWarnings.Count, "auto-throttle must log exactly one moderation line");
-            StringAssert.Contains(Conn, capturedWarnings[0], "the moderation line must identify the connection");
+            // The line logs the LOWERCASED battleTag key, not the raw arg — User is already all-lowercase,
+            // but assert against the normalized form so this stays correct if User ever gains mixed casing.
+            StringAssert.Contains(User.ToLowerInvariant(), capturedWarnings[0], "the moderation line must identify the battleTag");
         }
         finally
         {
@@ -251,62 +254,59 @@ public class MessageRateLimiterTests
     }
 
     [Test]
-    public void Buckets_AreIndependent_PerConnection()
+    public void Buckets_AreIndependent_PerUser()
     {
-        // Connection A exhausts its per-channel burst on a shared channel.
+        // User A exhausts their per-channel burst on a shared channel.
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
-            Assert.IsTrue(_limiter.TryAcquire("conn-A", Channel, _t0).Allowed);
+            Assert.IsTrue(_limiter.TryAcquire("userA#1", Channel, _t0).Allowed);
         }
-        Assert.IsFalse(_limiter.TryAcquire("conn-A", Channel, _t0).Allowed, "conn-A's own burst is spent");
+        Assert.IsFalse(_limiter.TryAcquire("userA#1", Channel, _t0).Allowed, "userA's own burst is spent");
 
-        // Connection B on the SAME channel is unaffected — buckets are per (connection, channel).
+        // User B on the SAME channel is unaffected — buckets are per (user, channel).
         for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
         {
             Assert.IsTrue(
-                _limiter.TryAcquire("conn-B", Channel, _t0).Allowed,
-                $"conn-B message {i + 1} must have its own independent burst");
+                _limiter.TryAcquire("userB#2", Channel, _t0).Allowed,
+                $"userB message {i + 1} must have its own independent burst");
         }
     }
 
     [Test]
-    public void RemoveConnection_DropsState()
+    public void HardThrottle_SurvivesReconnect_BecauseStateIsKeyedByBattleTag()
     {
-        for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
-        {
-            _limiter.TryAcquire(Conn, Channel, _t0);
-        }
-        Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0).Allowed, "burst is spent before removal");
+        TriggerAutoThrottle(_t0);
 
-        _limiter.RemoveConnection(Conn);
-
-        // After removal the connection is brand-new: full burst available at the SAME instant.
-        var afterRemoval = _limiter.TryAcquire(Conn, Channel, _t0);
-        Assert.IsTrue(afterRemoval.Allowed, "RemoveConnection drops all bucket/violation state");
-        Assert.IsNull(afterRemoval.RetryAfterSeconds);
+        // A relaunch/reconnect produces a NEW connectionId but the SAME battleTag — there is no
+        // RemoveConnection any more, and TryAcquire keys on the tag, so the penalty holds.
+        var afterReconnect = _limiter.TryAcquire(User, Channel, _t0.AddSeconds(2));
+        Assert.IsFalse(afterReconnect.Allowed, "the hard throttle must survive reconnect (battleTag-keyed)");
+        Assert.IsFalse(afterReconnect.JustAutoThrottled, "no re-signal while serving the penalty");
     }
 
     [Test]
-    public void RemoveConnection_ClearsActiveHardThrottle()
+    public void BattleTagKey_IsCaseInsensitive()
     {
-        for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
-        {
-            _limiter.TryAcquire(Conn, Channel, _t0);
-        }
-        RateLimitDecision escalation = default;
-        for (var v = 0; v < ChatLimits.AutoThrottleViolationThreshold; v++)
-        {
-            escalation = _limiter.TryAcquire(Conn, Channel, _t0);
-        }
-        Assert.IsTrue(escalation.JustAutoThrottled, "precondition: the connection is now hard-throttled");
-        Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(1)).Allowed, "still inside the penalty");
+        TriggerAutoThrottle(_t0);
+        var differentCasing = _limiter.TryAcquire("PETER#123", Channel, _t0.AddSeconds(2));
+        Assert.IsFalse(differentCasing.Allowed, "casing variants of one battleTag share one throttle state");
+    }
 
-        _limiter.RemoveConnection(Conn);
+    [Test]
+    public void QuiescentEntries_ArePruned_BoundingMemory()
+    {
+        // 200 distinct users each send once at t0 — 200 live entries.
+        for (var i = 0; i < 200; i++)
+        {
+            Assert.IsTrue(_limiter.TryAcquire($"user{i}#1", Channel, _t0).Allowed);
+        }
 
-        // The same connectionId is a clean slate even mid-penalty (e.g. reconnect reusing the id).
-        var afterRemoval = _limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(1));
-        Assert.IsTrue(afterRemoval.Allowed, "RemoveConnection clears an active hard-throttle");
-        Assert.IsFalse(afterRemoval.JustAutoThrottled);
+        // One send far past the decay/prune horizon sweeps every quiescent entry.
+        var later = _t0 + ChatLimits.AutoThrottleTierDecay + TimeSpan.FromSeconds(1);
+        Assert.IsTrue(_limiter.TryAcquire(User, Channel, later).Allowed);
+
+        Assert.LessOrEqual(_limiter.TrackedUserCount, 2,
+            "entries idle past AutoThrottleTierDecay must be pruned (only the sweeping caller may remain)");
     }
 
     [Test]
@@ -321,9 +321,9 @@ public class MessageRateLimiterTests
             // The bucket has fully refilled across the >window gap → a fresh burst each epoch.
             for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
             {
-                Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, epoch).Allowed);
+                Assert.IsTrue(_limiter.TryAcquire(User, Channel, epoch).Allowed);
             }
-            var throttled = _limiter.TryAcquire(Conn, Channel, epoch);
+            var throttled = _limiter.TryAcquire(User, Channel, epoch);
             Assert.IsFalse(throttled.Allowed, "the over-burst send is throttled");
             Assert.IsFalse(
                 throttled.JustAutoThrottled,
@@ -342,12 +342,12 @@ public class MessageRateLimiterTests
         var now = _t0;
         for (var i = 0; i < 1000; i++)
         {
-            Assert.IsTrue(_limiter.TryAcquire(Conn, $"channel-{i}", now).Allowed);
+            Assert.IsTrue(_limiter.TryAcquire(User, $"channel-{i}", now).Allowed);
             now = now.AddSeconds(1);
         }
 
         Assert.LessOrEqual(
-            _limiter.TrackedChannelCount(Conn),
+            _limiter.TrackedChannelCount(User),
             ChatLimits.PerChannelBurst + 1,
             "idle per-channel buckets must be purged so the map cannot grow unboundedly");
     }

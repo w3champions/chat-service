@@ -122,19 +122,21 @@ public partial class ChatHub
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
         // 4. Rate limit BEFORE the channel load (security-review fix): reject a throttled member before
-        // paying for a DB read. JustAutoThrottled (only ever true on a denial) → push exactly one
-        // ThrottleNotice. TryAcquire only needs connectionId + channelId, both already in hand.
-        var decision = _messageRateLimiter.TryAcquire(connectionId, channelId, now);
+        // paying for a DB read. JustAutoThrottled fires once per escalation episode (the single decision
+        // that transitions the user into hard auto-throttle) → push exactly one ThrottleNotice.
+        // TryAcquire is keyed by battleTag (follow-up spec §1: violations/tier/hard-throttle survive
+        // reconnect), so it needs the durable identity, not the ephemeral connectionId.
+        var decision = _messageRateLimiter.TryAcquire(session.Identity.BattleTag, channelId, now);
         if (decision.JustAutoThrottled)
         {
-            // Moderation-attribution log: MessageRateLimiter only has the ephemeral connectionId in
-            // scope, so a reconnect-flapping spammer can't be correlated across auto-throttle episodes
-            // from its line alone. The hub has the durable battleTag (session.Identity.BattleTag) right
-            // here, so it logs its own attributed line — mirrors the battleTag-attribution style of
-            // ChatHubPermissionFilter/BanUser's moderation logs. The limiter's own connectionId-only
-            // line (MessageRateLimiter.TryAcquire) stays as-is (MessageRateLimiterTests asserts on it),
-            // so this auto-throttle episode is intentionally logged twice — once per durable identity
-            // (this line) and once from the pure limiter (connectionId only).
+            // Moderation-attribution log: the limiter's own line (MessageRateLimiter.TryAcquire) already
+            // identifies the battleTag key now that state is re-keyed by it — but it has no visibility
+            // into WHICH connection triggered this particular episode. The hub adds that connectionId
+            // here so a moderator can correlate the episode to a specific live socket — mirrors the
+            // battleTag-attribution style of ChatHubPermissionFilter/BanUser's moderation logs. The
+            // limiter's own line stays as-is (MessageRateLimiterTests asserts on it), so this auto-throttle
+            // episode is intentionally logged twice — once from the pure limiter (battleTag only) and once
+            // from the hub (battleTag + the triggering connectionId).
             Log.Warning(
                 "Auto-throttled chat connection {ConnectionId} (battleTag {BattleTag}) after repeated rate-limit violations",
                 connectionId,

@@ -585,17 +585,19 @@ public class ChatHubConnectionTests : IntegrationTestBase
     public async Task Disconnect_RemovesRegistryState()
     {
         // On disconnect the hub tears down every in-memory fan-out registry entry for the connection so
-        // nothing leaks past the socket's lifetime. FocusRegistry + MessageRateLimiter are populated by
-        // later hub methods (Tasks 9/11) and OnlineMemberRegistry is connect-seeded only when the user
-        // has channel-backed memberships (this fresh identity has none) — so seed all three directly to
-        // prove OnDisconnectedAsync removes every one.
+        // nothing leaks past the socket's lifetime. FocusRegistry is populated by a later hub method
+        // (Task 9) and OnlineMemberRegistry is connect-seeded only when the user has channel-backed
+        // memberships (this fresh identity has none) — so seed both directly to prove
+        // OnDisconnectedAsync removes every one. MessageRateLimiter is deliberately EXCLUDED from this
+        // teardown (2026-08-04 follow-up spec §1): its state is battleTag-keyed and must SURVIVE
+        // disconnect/reconnect — see MessageRateLimiterTests.HardThrottle_SurvivesReconnect_... and
+        // ChatHubSendMessageTests.Send_AutoThrottle_SurvivesReconnect_SameBattleTag for that coverage.
         var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
         var (hub, _) = BuildConnection("conn-1", ticket);
         await hub.OnConnectedAsync();
 
         _focusRegistry.Focus("conn-1", "chan-1", BattleTag);
         _onlineMemberRegistry.Join("chan-1", "conn-1", new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Public));
-        _messageRateLimiter.TryAcquire("conn-1", "chan-1", DateTime.UtcNow);
 
         await hub.OnDisconnectedAsync(null);
 
@@ -603,8 +605,6 @@ public class ChatHubConnectionTests : IntegrationTestBase
             "FocusRegistry must hold no entry for the connection after disconnect");
         Assert.IsEmpty(_onlineMemberRegistry.GetMembers("chan-1"),
             "OnlineMemberRegistry must hold no entry for the connection after disconnect");
-        Assert.AreEqual(0, _messageRateLimiter.TrackedChannelCount("conn-1"),
-            "MessageRateLimiter must hold no bucket state for the connection after disconnect");
     }
 
     [Test]

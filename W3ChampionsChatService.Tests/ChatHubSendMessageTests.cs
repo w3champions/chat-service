@@ -336,6 +336,28 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         Assert.AreEqual(1, notices, "Exactly one ThrottleNotice must be pushed on the single auto-throttle escalation");
     }
 
+    [Test]
+    public async Task Send_AutoThrottle_SurvivesReconnect_SameBattleTag()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        // Drive conn-1 into hard auto-throttle: burst, then threshold violations (frozen clock — no refill).
+        for (var i = 0; i < ChatLimits.PerChannelBurst + ChatLimits.AutoThrottleViolationThreshold; i++)
+        {
+            await hub.SendMessage(channel.Id, $"spam-{i}");
+        }
+
+        // "Relaunch": a brand-new connection, SAME battleTag. Pre-§1 this was a clean slate.
+        SeedMember("conn-2", BattleTag, channel.Id);
+        var reconnected = BuildHub("conn-2");
+        var result = await reconnected.SendMessage(channel.Id, "back for more");
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code, "the auto-throttle must survive the reconnect");
+        Assert.IsTrue(result.RetryAfterSeconds > 0);
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Membership / channel resolution
     // ---------------------------------------------------------------------------------------------
