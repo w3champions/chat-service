@@ -1,6 +1,8 @@
 using System;
 using System.Linq;
 using NUnit.Framework;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 
 namespace W3ChampionsChatService.Tests;
@@ -85,5 +87,20 @@ public class ChatLimitsTests
         Assert.AreEqual(100, ChatLimits.MentionAckBatchMax);
         Assert.AreEqual(200, ChatLimits.MentionInboxMaxEntries);
         Assert.AreEqual(200, ChatLimits.PresenceQueryMaxBattleTags);
+    }
+
+    [Test]
+    public void DefaultChatRooms_NormalizeToDistinctKeys()
+    {
+        // C3 Task 3: Guards the static SessionStateAssembler.CatalogOrder initialization invariant.
+        // If any two DefaultChatRooms.Rooms entries normalize to the same key (via ChannelNames.Normalize:
+        // trim + ToLowerInvariant), the ToDictionary call at static init throws KeyAlreadyExistsException
+        // → TypeInitializationException on every connect (full outage). This test pins the invariant at CI time.
+        Assert.IsNotEmpty(DefaultChatRooms.Rooms, "DefaultChatRooms.Rooms must be non-empty");
+        var normalizedNames = DefaultChatRooms.Rooms.Select(ChannelNames.Normalize).ToList();
+        var distinctCount = normalizedNames.Distinct().Count();
+        Assert.AreEqual(normalizedNames.Count, distinctCount,
+            "all DefaultChatRooms.Rooms entries must normalize to distinct keys, or " +
+            "SessionStateAssembler.CatalogOrder's static ToDictionary initialization will crash with TypeInitializationException");
     }
 }
