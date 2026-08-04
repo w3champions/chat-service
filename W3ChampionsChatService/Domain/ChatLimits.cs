@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace W3ChampionsChatService.Domain;
 
@@ -96,7 +97,7 @@ public static class ChatLimits
     /// plumbing per the parent-spec rule): first trigger 10s, second 30s, third and beyond 60s (cap
     /// — the last element applies to every later trigger). The ladder resets to the first tier after
     /// <see cref="AutoThrottleTierDecay"/> without a new trigger.</summary>
-    public static readonly TimeSpan[] AutoThrottleTierDurations =
+    public static readonly IReadOnlyList<TimeSpan> AutoThrottleTierDurations =
     [
         TimeSpan.FromSeconds(10),
         TimeSpan.FromSeconds(30),

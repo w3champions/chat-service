@@ -78,8 +78,7 @@ public class MessageRateLimiter
     public RateLimitDecision TryAcquire(string connectionId, string channelId, DateTime now)
     {
         RateLimitDecision decision;
-        var logAutoThrottle = false;
-        double appliedThrottleSeconds = 0;
+        TimeSpan? applied = null;
 
         lock (_lock)
         {
@@ -118,26 +117,20 @@ public class MessageRateLimiter
             var retryAfter = Math.Max(channelBucket.SecondsUntilToken(), state.GlobalBucket.SecondsUntilToken());
 
             // 4) Record the violation in the rolling window; escalate if it crosses the threshold.
-            if (RecordViolationAndCheckEscalation(state, now) is TimeSpan applied)
-            {
-                logAutoThrottle = true;
-                appliedThrottleSeconds = applied.TotalSeconds;
-                decision = new RateLimitDecision(false, appliedThrottleSeconds, true);
-            }
-            else
-            {
-                decision = new RateLimitDecision(false, retryAfter, false);
-            }
+            applied = RecordViolationAndCheckEscalation(state, now);
+            decision = applied is TimeSpan escalated
+                ? new RateLimitDecision(false, escalated.TotalSeconds, true)
+                : new RateLimitDecision(false, retryAfter, false);
         }
 
         // Emit the moderation line outside the lock. The transition it reports happened exactly once
         // (inside the lock), so this fires exactly once per hard-throttle episode.
-        if (logAutoThrottle)
+        if (applied is TimeSpan d)
         {
             Log.Warning(
                 "Auto-throttling chat connection {ConnectionId} for {DurationSeconds}s after {ViolationThreshold} rate-limit violations within {WindowSeconds}s",
                 connectionId,
-                appliedThrottleSeconds,
+                d.TotalSeconds,
                 ChatLimits.AutoThrottleViolationThreshold,
                 ChatLimits.AutoThrottleWindow.TotalSeconds);
         }
@@ -196,11 +189,13 @@ public class MessageRateLimiter
             state.TierLevel = 0;
         }
 
-        var tierIndex = Math.Min(state.TierLevel, ChatLimits.AutoThrottleTierDurations.Length - 1);
+        var tierIndex = Math.Min(state.TierLevel, ChatLimits.AutoThrottleTierDurations.Count - 1);
         var duration = ChatLimits.AutoThrottleTierDurations[tierIndex];
         state.HardThrottleUntil = now + duration;
         state.LastAutoThrottleAt = now;
-        state.TierLevel++;
+        // Saturate rather than grow unbounded: TierLevel only ever needs to reach the tier count
+        // (any further increments would be equivalent to the cap anyway, via the Math.Min above).
+        state.TierLevel = Math.Min(state.TierLevel + 1, ChatLimits.AutoThrottleTierDurations.Count);
         state.Violations.Clear();
         return duration;
     }

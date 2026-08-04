@@ -123,6 +123,7 @@ public class MessageRateLimiterTests
         for (var v = 0; v < ChatLimits.AutoThrottleViolationThreshold; v++)
         {
             escalation = _limiter.TryAcquire(Conn, Channel, at);
+            Assert.IsFalse(escalation.Allowed, "every violation-loop send must be denied, including the escalating one");
         }
         Assert.IsTrue(escalation.JustAutoThrottled, "the threshold-th violation must escalate");
         return escalation;
@@ -137,6 +138,13 @@ public class MessageRateLimiterTests
 
         // Still denied 9s in; recovered right after the 10s tier elapses (fresh burst).
         Assert.IsFalse(_limiter.TryAcquire(Conn, Channel, _t0.AddSeconds(9)).Allowed);
+
+        // The hard throttle is connection-wide, not per-channel: a SECOND, different channel on the
+        // same connection is denied too while the penalty is active, and it's not a fresh escalation.
+        var otherChannelDenial = _limiter.TryAcquire(Conn, "channel-b", _t0.AddSeconds(9));
+        Assert.IsFalse(otherChannelDenial.Allowed, "hard auto-throttle blocks every channel on the connection");
+        Assert.IsFalse(otherChannelDenial.JustAutoThrottled, "a denial during an active penalty is not a new escalation");
+
         Assert.IsTrue(_limiter.TryAcquire(Conn, Channel, _t0 + ChatLimits.AutoThrottleTierDurations[0] + TimeSpan.FromSeconds(11)).Allowed,
             "after serving 10s (plus bucket refill time) the connection recovers");
     }
@@ -172,6 +180,34 @@ public class MessageRateLimiterTests
         var reset = TriggerAutoThrottle(afterDecay);
         Assert.AreEqual(10, reset.RetryAfterSeconds.Value, 0.001,
             "10 clean minutes without a trigger must reset the ladder to the 10s first tier");
+    }
+
+    [Test]
+    public void TierLadder_ResetsAtExactlyTheDecayBoundary()
+    {
+        // Pins the `>=` comparison at MessageRateLimiter.cs:194: at EXACTLY AutoThrottleTierDecay
+        // since the last trigger, the ladder MUST already have reset (the boundary is inclusive).
+        TriggerAutoThrottle(_t0);
+        TriggerAutoThrottle(_t0.AddSeconds(60)); // tier 2 (30s served); LastAutoThrottleAt = t0+60s
+
+        var atBoundary = _t0.AddSeconds(60) + ChatLimits.AutoThrottleTierDecay;
+        var reset = TriggerAutoThrottle(atBoundary);
+        Assert.AreEqual(10, reset.RetryAfterSeconds.Value, 0.001,
+            "exactly AutoThrottleTierDecay since the last trigger must reset the ladder");
+    }
+
+    [Test]
+    public void TierLadder_DoesNotReset_JustUnderTheDecayBoundary()
+    {
+        // One second short of AutoThrottleTierDecay: the ladder must NOT reset — the trigger
+        // continues the ladder from tier 2 (index 2, the 60s cap), not back down to 10s.
+        TriggerAutoThrottle(_t0);
+        TriggerAutoThrottle(_t0.AddSeconds(60)); // tier 2 (30s served); LastAutoThrottleAt = t0+60s
+
+        var justUnder = _t0.AddSeconds(60) + ChatLimits.AutoThrottleTierDecay - TimeSpan.FromSeconds(1);
+        var notReset = TriggerAutoThrottle(justUnder);
+        Assert.AreEqual(60, notReset.RetryAfterSeconds.Value, 0.001,
+            "just under AutoThrottleTierDecay since the last trigger must NOT reset the ladder");
     }
 
     [Test]
