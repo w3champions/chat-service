@@ -131,9 +131,12 @@ public class MentionFanOut(
             // to the OTHER eligible targets. Failures log-and-continue.
             try
             {
-                // Rule (c): the excerpt PRIVACY WALL. The target must have a durable channel_memberships
-                // row for THIS channel — an inbox entry carries a ~120-char content excerpt, and a private
-                // (Dm/GroupDm) conversation's excerpt must NEVER reach a non-participant. Load lowercases
+                // Rule (c): the excerpt PRIVACY WALL — two branches. When a durable channel_memberships
+                // row exists, the target is JOINED and rules (d)/(e) below decide. When it does NOT: for
+                // every non-Public channel type (Dm/GroupDm/SemiPublic/System) the wall holds and the
+                // target is dropped — an inbox entry carries a ~120-char content excerpt, and a private
+                // conversation's excerpt must NEVER reach a non-participant; for Public specifically (§4
+                // below) the wall is replaced by a directory-resolvability check instead. Load lowercases
                 // the tag internally (C5 T4 key convention), so the display-cased mention tag matches.
                 var membership = await _membershipRepository.Load(channel.Id, tag);
                 if (membership != null)

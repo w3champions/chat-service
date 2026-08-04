@@ -370,12 +370,15 @@ public class MentionFanOutTests : IntegrationTestBase
     public async Task SemiPublicChannel_NonMember_EvenWithDirectoryRow_GetsNothing()
     {
         await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
         await SeedMembership("control#1", channelId: ChannelId);
 
         await _fanOut.NotifyAsync(Channel(ChannelType.SemiPublic), Message(), new[] { "wolf#456", "control#1" }, Now);
 
         Assert.That(await InboxOf("wolf#456"), Is.Empty,
             "§4 widens PUBLIC rooms only — SemiPublic keeps the membership wall");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0),
+            "the wall blocks the live push too, not just the inbox entry, even though wolf is online");
         Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1));
     }
 
@@ -384,11 +387,14 @@ public class MentionFanOutTests : IntegrationTestBase
     {
         await SeedDirectory("silent#1");
         await SeedMembership("silent#1", NotificationLevel.None);
+        await SeedMembership("control#1");
 
-        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "silent#1" }, Now);
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "silent#1", "control#1" }, Now);
 
         Assert.That(await InboxOf("silent#1"), Is.Empty,
             "lock-in: join + NotificationLevel.None remains the opt-out even now that non-members are mentionable");
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1),
+            "the eligible control member still gets the mention — proves this isn't vacuously true against a do-nothing fan-out");
     }
 
     // ---------------------------------------------------------------------------------------------

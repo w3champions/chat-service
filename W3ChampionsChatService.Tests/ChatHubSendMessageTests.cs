@@ -773,6 +773,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             "follow-up spec §4: a directory-resolvable non-member of a PUBLIC channel now gets an inbox entry — the membership wall is widened away for Public rooms only");
         Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
             "and the targeted MentionNotified push");
+        Assert.AreEqual(1, _mentionPushHarness.AllSignals.Count, "exactly one push — targeted at the stranger, nobody else");
     }
 
     [Test]

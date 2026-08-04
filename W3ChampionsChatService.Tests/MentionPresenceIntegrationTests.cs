@@ -566,7 +566,9 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             "the over-cap send allocated no seq and persisted nothing");
 
         // --- Strip & deliver as plain: an UNRESOLVABLE mention is NOT rejected — it delivers VERBATIM and
-        // simply notifies nobody (the fan-out membership wall drops the non-member target). NOT TooLong.
+        // simply notifies nobody. This channel is Public, so membership is not the gate here (§4) — the
+        // fan-out drops "nobody#404" because it has NO user_directory row, the directory-resolvability
+        // check §4 substitutes for the membership wall on Public rooms. NOT TooLong.
         var unresolvableContent = "who is <@nobody#404>";
         var unresolvable = await aHub.SendMessage(channel.Id, unresolvableContent);
         Assert.That(unresolvable.Code, Is.EqualTo(ChatResultCode.Ok),
@@ -574,7 +576,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That((await _messageRepository.Load(unresolvable.MessageId)).Content, Is.EqualTo(unresolvableContent),
             "the message delivers verbatim — the invalid <@…> token is kept as plain text");
         Assert.That(await _mentionInboxRepository.LoadForUser("nobody#404"), Is.Empty,
-            "the unresolvable target gets no inbox entry (nobody is a member)");
+            "the unresolvable target gets no inbox entry (nobody#404 has no user_directory row — unresolvable, not merely a non-member)");
         Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(1L),
             "the unresolvable send DID persist (seq 1) — it is a normal, deliverable message");
 

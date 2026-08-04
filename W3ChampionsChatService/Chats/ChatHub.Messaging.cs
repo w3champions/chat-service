@@ -270,8 +270,12 @@ public partial class ChatHub
         // routes a shadow message to its author only) — or when there are no mention tags (the common case:
         // `mentionTags` came from the step-5.25 gate, empty for a message with no `<@…>` markup, so the hot
         // path pays nothing). MentionFanOut is the SOLE authority on who gets an inbox entry + notification:
-        // for each ELIGIBLE target (D3: not the sender; an actual member of THIS channel — the uniform
-        // membership wall, a.k.a. the Dm/GroupDm excerpt PRIVACY WALL; NotificationLevel != None)
+        // for each ELIGIBLE target (D3: not the sender). Dm/GroupDm/SemiPublic/System keep the membership
+        // PRIVACY WALL — a real channel_memberships row is required (a.k.a. the Dm/GroupDm excerpt wall).
+        // Public rooms are the one exception (2026-08-04 follow-up §4): a target with no membership row is
+        // still eligible there provided the tag resolves to a UserDirectoryRepository row, since a public
+        // room's excerpt is public content and the membership wall protects nothing there. For a JOINED
+        // target of any channel type, NotificationLevel != None remains the opt-out.
         // NotifyAsync writes a mention-inbox entry (expiry via ExpiryCalculator.ForMentionInboxEntry — the
         // C1-amendment-1 wiring, 30d and always <= the message TTL) and pushes a targeted MentionNotified.
         // Per-target fault isolation lives inside NotifyAsync (mirrors FanOutEngine's idiom), so a dead
