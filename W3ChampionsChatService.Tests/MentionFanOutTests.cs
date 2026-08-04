@@ -28,7 +28,11 @@ namespace W3ChampionsChatService.Tests;
 /// <para>
 /// The five eligibility rules (D3): (a) message NOT shadow; (b) target ≠ sender (case-insensitive);
 /// (c) target has a <c>channel_memberships</c> row for THIS channel — the Dm/GroupDm excerpt PRIVACY
-/// WALL; (d) membership <c>NotificationLevel != None</c>; (e) membership is NOT currently
+/// WALL — EXCEPT for <see cref="ChannelType.Public"/> rooms (follow-up spec §4), where a target with NO
+/// membership row is still eligible provided the tag resolves to a <see cref="UserDirectoryRepository"/>
+/// row, since a public room's excerpt is public content and the membership wall protects nothing there;
+/// Dm/GroupDm/SemiPublic/System are unaffected and keep the membership wall exactly as before;
+/// (d) membership <c>NotificationLevel != None</c>; (e) membership is NOT currently
 /// decline-suppressed (<c>DeclinedUntil</c> unset or already elapsed vs. <c>now</c>). Every
 /// negative-eligibility test below ALSO mentions an eligible CONTROL member in the SAME call and
 /// asserts the control DID get an entry + event — so the test fails against a do-nothing stub AND

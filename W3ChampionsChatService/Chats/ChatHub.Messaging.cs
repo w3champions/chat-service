@@ -317,7 +317,9 @@ public partial class ChatHub
     /// DB) and, if the caller is a member, pages directly — no channel load. A non-member falls to the
     /// cold path: a single <see cref="Channels.ChannelRepository.Load"/> distinguishes "no such
     /// channel" (<see cref="ChatResultCode.NotFound"/>) from "channel exists, caller just isn't in it"
-    /// (<see cref="ChatResultCode.NotMember"/>).</item>
+    /// (<see cref="ChatResultCode.NotMember"/>) — EXCEPT for a <see cref="ChannelType.Public"/> channel
+    /// (follow-up spec §4, the mention-inbox jump into an unjoined public room), where a non-member falls
+    /// through to the same paging step 4 uses for a member instead of being rejected.</item>
     /// <item>Page: <paramref name="aroundSeq"/> set → <see cref="Messages.MessageRepository.LoadPageAround"/>;
     /// otherwise → <see cref="Messages.MessageRepository.LoadPageBefore"/> (a null
     /// <paramref name="beforeSeq"/> means the latest page). Both repo methods already apply
@@ -350,13 +352,23 @@ public partial class ChatHub
         var battleTag = session.Identity.BattleTag;
 
         // 3. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
-        // distinguishes NotFound from NotMember — mirrors FocusChannel's cold path exactly.
+        // distinguishes NotFound from NotMember — EXCEPT for PUBLIC channels (follow-up spec §4's
+        // mention-inbox jump): a public room is name-joinable by anyone, so its history is not
+        // privileged and a non-member may READ it. Pull-only and UserVisible-filtered exactly like a
+        // member's read; joining stays explicit, and FocusChannel/MarkRead keep their membership
+        // gates — this is a read-only context allowance, never implicit membership.
         if (!_onlineMemberRegistry.IsMember(connectionId, channelId))
         {
             var channel = await _channelRepository.Load(channelId);
-            return channel == null
-                ? new GetMessagesResult(ChatResultCode.NotFound)
-                : new GetMessagesResult(ChatResultCode.NotMember);
+            if (channel == null)
+            {
+                return new GetMessagesResult(ChatResultCode.NotFound);
+            }
+            if (channel.Type != ChannelType.Public)
+            {
+                return new GetMessagesResult(ChatResultCode.NotMember);
+            }
+            // Public: fall through to step 4's normal paging below.
         }
 
         // 4. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no

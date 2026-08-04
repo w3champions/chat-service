@@ -274,7 +274,9 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     [Test]
     public async Task GetMessages_NonMember_ReturnsNotMember()
     {
-        var channel = await CreateChannel();
+        // SemiPublic — public rooms are non-member-readable since the §4 mention-jump allowance; every
+        // other type keeps the wall.
+        var channel = await CreateChannel(type: ChannelType.SemiPublic);
         RegisterSession("conn-1", BattleTag);
         // Deliberately no membership seed — the caller has a live session but is not a member.
         var hub = BuildHub("conn-1");
@@ -283,6 +285,38 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
 
         Assert.AreEqual(ChatResultCode.NotMember, result.Code);
         Assert.IsNull(result.Messages);
+    }
+
+    [Test]
+    public async Task GetMessages_NonMember_PublicChannel_ReturnsHistory()
+    {
+        var channel = await CreateChannel(); // Public by default
+        var seeded = await SeedMessage(channel.Id, OtherBattleTag, "hello public");
+        RegisterSession("conn-1", BattleTag);
+        // Deliberately NO membership seed — the mention-inbox jump into an unjoined public room (§4).
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: seeded.Seq, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "public-room history is readable without membership");
+        Assert.AreEqual(1, result.Messages.Count);
+        Assert.AreEqual(seeded.Seq, result.Messages[0].Seq);
+    }
+
+    [Test]
+    public async Task GetMessages_NonMember_PublicChannel_StillAppliesUserVisibleFilter()
+    {
+        var channel = await CreateChannel();
+        await SeedMessage(channel.Id, OtherBattleTag, "visible");
+        await SeedMessage(channel.Id, OtherBattleTag, "shadow-hidden", shadow: true);
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, result.Messages.Count, "the non-member read uses the SAME UserVisible-filtered path");
+        Assert.AreEqual("visible", result.Messages[0].Content);
     }
 
     [Test]
@@ -457,7 +491,10 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     [Test]
     public async Task GetMessages_Moderator_NonMember_StillNotMember()
     {
-        var channel = await CreateChannel();
+        // SemiPublic — public rooms are non-member-readable since the §4 mention-jump allowance; every
+        // other type keeps the wall. On a PUBLIC channel a non-member (moderator or not) now falls
+        // through to the read path instead of NotMember.
+        var channel = await CreateChannel(type: ChannelType.SemiPublic);
         // A moderator with a live session but NO membership in the channel.
         RegisterModeratorSession("mod-conn", ModeratorBattleTag);
         var hub = BuildHub("mod-conn");
