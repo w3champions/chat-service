@@ -310,6 +310,38 @@ public class MessageRateLimiterTests
     }
 
     [Test]
+    public void QuiescentPrune_IsSelective_DoesNotEvictARecentlyTouchedEntry()
+    {
+        // Many quiescent users seeded once at t0 — idle past the decay horizon by the time of the sweep.
+        for (var i = 0; i < 50; i++)
+        {
+            Assert.IsTrue(_limiter.TryAcquire($"stale{i}#1", Channel, _t0).Allowed);
+        }
+
+        // One user keeps sending right up to (just under) the decay horizon — this entry must NOT be
+        // swept away even though the map-wide sweep timer (anchored on the very first t0 call) fires.
+        const string ActiveUser = "active#1";
+        var justUnderDecay = _t0 + ChatLimits.AutoThrottleTierDecay - TimeSpan.FromSeconds(1);
+        Assert.IsTrue(_limiter.TryAcquire(ActiveUser, Channel, justUnderDecay).Allowed);
+
+        // A distinct caller just past the decay horizon (relative to t0) triggers the time-gated sweep.
+        var sweepTime = _t0 + ChatLimits.AutoThrottleTierDecay + TimeSpan.FromSeconds(1);
+        Assert.IsTrue(_limiter.TryAcquire(User, Channel, sweepTime).Allowed);
+
+        // The 50 stale users (idle since t0, well past decay) are gone. ActiveUser (touched only 2s
+        // before the sweep) and the sweeping caller (User) survive — proving the sweep evaluates each
+        // entry's OWN idle time rather than clearing everything whenever the map-wide timer fires.
+        Assert.LessOrEqual(_limiter.TrackedUserCount, 2,
+            "a recently-touched entry must survive a sweep that evicts other, genuinely-quiescent entries");
+
+        // A count assertion alone can't distinguish "selective pruning" from a buggy "clear everyone
+        // once the gate opens" sweep (both would leave <=2 entries here) — directly confirm ActiveUser
+        // specifically is still tracked, not merely that the total count is small.
+        Assert.AreEqual(1, _limiter.TrackedChannelCount(ActiveUser),
+            "ActiveUser's own per-channel bucket state must have survived the sweep, not been evicted");
+    }
+
+    [Test]
     public void ViolationsOutsideRollingWindow_DoNotEscalate()
     {
         // One violation per epoch, epochs spaced beyond the auto-throttle window: each old violation

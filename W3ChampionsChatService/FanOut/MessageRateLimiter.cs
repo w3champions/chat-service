@@ -75,8 +75,9 @@ public class MessageRateLimiter
     /// of <paramref name="now"/>. State is keyed by LOWERCASED battleTag (follow-up spec §1) so
     /// violations, the tier ladder, and an active hard throttle survive reconnect/relaunch; entries
     /// quiescent past <see cref="ChatLimits.AutoThrottleTierDecay"/> are pruned opportunistically
-    /// (mirrors <see cref="Sessions.MintRateLimiter"/>'s stale-window purge) so the map cannot grow
-    /// unboundedly across the user population. Allowed only when the per-channel AND global buckets
+    /// (mirrors <see cref="Sessions.MintRateLimiter"/>'s stale-window purge), bounding the map to
+    /// roughly the users active within one decay window rather than letting it grow across the
+    /// service's entire historical user population. Allowed only when the per-channel AND global buckets
     /// each hold a token; otherwise throttled with a positive retry-after. A throttle counts as a
     /// violation, and crossing the escalation threshold hard-throttles the whole user (every channel,
     /// across every connection) for the auto-throttle duration, logging one moderation line and
