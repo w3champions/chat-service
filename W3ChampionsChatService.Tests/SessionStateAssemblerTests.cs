@@ -308,6 +308,45 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         Assert.IsTrue(dto.PublicCatalog.Any(c => c.Id == pub.Id));
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Follow-up spec §3 — the public catalog must come back in DefaultChatRooms seed order (deploy's
+    // hardcoded room list, "W3C Lounge" first), NOT Mongo's natural/insertion order. A legacy public
+    // channel not present in the seed list sorts after all seeded rooms, alphabetically.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PublicCatalog_ComesBackInDefaultChatRoomsSeedOrder_RegardlessOfInsertionOrder()
+    {
+        // A subset of the hardcoded catalog, inserted in DELIBERATELY scrambled order.
+        await InsertChannel(ChannelType.Public, "FFA", 0);
+        await InsertChannel(ChannelType.Public, "1 vs 1", 0);
+        await InsertChannel(ChannelType.Public, "W3C Lounge", 0);
+        await InsertChannel(ChannelType.Public, "Legion TD", 0);
+
+        var identity = Identity("peter#123");
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        CollectionAssert.AreEqual(
+            new[] { "W3C Lounge", "1 vs 1", "FFA", "Legion TD" },
+            dto.PublicCatalog.Select(c => c.Name).ToList(),
+            "catalog order must equal DefaultChatRooms seed order (W3C Lounge first), not Mongo output order");
+    }
+
+    [Test]
+    public async Task PublicCatalog_UnknownPublicChannel_SortsAfterAllSeededRooms()
+    {
+        await InsertChannel(ChannelType.Public, "Zombie Legacy Room", 0);
+        await InsertChannel(ChannelType.Public, "W3C Lounge", 0);
+
+        var identity = Identity("peter#123");
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        CollectionAssert.AreEqual(
+            new[] { "W3C Lounge", "Zombie Legacy Room" },
+            dto.PublicCatalog.Select(c => c.Name).ToList(),
+            "a legacy public channel not in the seed list sorts last, alphabetically — still deterministic");
+    }
+
     [Test]
     public async Task Assemble_Stubs_PendingDmRequestsEmpty_MentionUnreadZero()
     {

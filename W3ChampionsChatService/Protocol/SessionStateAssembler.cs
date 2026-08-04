@@ -48,6 +48,23 @@ public class SessionStateAssembler(
     private static readonly IReadOnlySet<EPermission> ChatRelevantPermissions =
         new HashSet<EPermission> { EPermission.Moderation };
 
+    // Follow-up spec §3: position of each seeded room in the hardcoded catalog (DefaultChatRooms.Rooms,
+    // "W3C Lounge" first), keyed by normalized name. Computed once — ordering and seeding read the SAME
+    // constant, so the contract "catalog order == seed list order" cannot drift.
+    private static readonly IReadOnlyDictionary<string, int> CatalogOrder = DefaultChatRooms.Rooms
+        .Select((name, index) => (Name: ChannelNames.Normalize(name), Index: index))
+        .ToDictionary(x => x.Name, x => x.Index);
+
+    /// <summary>
+    /// Orders the public catalog deterministically: seed-list position first (follow-up spec §3 —
+    /// "catalog order == seed order"); any public channel whose name is NOT in the seed list (legacy
+    /// leftover) sorts after all seeded rooms, alphabetically by normalized name.
+    /// </summary>
+    internal static List<ChatChannel> OrderByCatalog(List<ChatChannel> channels) => channels
+        .OrderBy(c => CatalogOrder.TryGetValue(c.NormalizedName ?? string.Empty, out var index) ? index : int.MaxValue)
+        .ThenBy(c => c.NormalizedName, StringComparer.Ordinal)
+        .ToList();
+
     // D9: chatUser is now RESOLVED BY THE CALLER (ChatHub, hoisted) and handed straight through — this
     // method no longer calls IChatAuthenticationService.GetUserFromIdentity itself. Before this change
     // the connect path resolved the flair TWICE per connect (once here, once again for the connect-time
@@ -59,7 +76,7 @@ public class SessionStateAssembler(
         var memberships = await membershipRepository.LoadForUser(identity.BattleTag);
         var channelsById = (await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
             .ToDictionary(c => c.Id);
-        var publicCatalog = await channelRepository.LoadAllOfType(ChannelType.Public);
+        var publicCatalog = OrderByCatalog(await channelRepository.LoadAllOfType(ChannelType.Public));
         var mutedPlayer = await muteRepository.GetMutedPlayer(identity.BattleTag);
 
         var muteStatus = ResolveMuteStatus(mutedPlayer, now);
