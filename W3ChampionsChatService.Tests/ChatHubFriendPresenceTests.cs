@@ -49,9 +49,12 @@ namespace W3ChampionsChatService.Tests;
 /// "rides the existing task, no new await" test deliberately does the OPPOSITE: it holds an UNRELEASED
 /// gate to force genuine asynchrony, proving the disconnect path itself completes without waiting on it.
 /// Follow-up spec §6 changed the CONNECT side of this story: the connect path now AWAITS one
-/// relationship fetch before assembly (the bounded 1:1-DM snapshot needs the block list), so a held-open
-/// gate now blocks connect itself rather than being invisible to it — see
-/// <c>Connect_AwaitsRelationshipFetch_ThenFriendPushRidesTheWarmCache</c>, which pins that new contract.
+/// relationship fetch before assembly (the bounded 1:1-DM snapshot needs the block list) and hands that
+/// resolved snapshot straight to the fire-and-forget dispatch, which never touches the relationship SOURCE
+/// itself anymore — so a gate on the source can no longer distinguish "connect awaits it" from "the push
+/// rides behind it". <c>Connect_AwaitsRelationshipFetch_ThenFriendPushRidesTheWarmCache</c> instead gates
+/// the push's own SignalR send (<see cref="HubPushCaptureHarness.GateSend"/>) to pin the still-true
+/// contract: connect never awaits the friend push.
 /// </para>
 /// </summary>
 public class ChatHubFriendPresenceTests : IntegrationTestBase
@@ -394,37 +397,39 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
     public async Task Connect_AwaitsRelationshipFetch_ThenFriendPushRidesTheWarmCache()
     {
         // Follow-up spec §6: the connect path now AWAITS one relationship fetch BEFORE assembly (the
-        // bounded 1:1-DM snapshot needs the block list) — a genuine change from the pre-§6 world where
-        // NOTHING on the connect path ever waited on a relationship fetch (the friend push rode a
-        // fire-and-forget task the connect path never touched). A held-open gate now blocks CONNECT
-        // ITSELF. Once released, the awaited fetch resolves and caches, and the SEPARATE fire-and-forget
-        // PrefetchRelationshipSnapshot dispatch reuses that warm cache to deliver the friend push —
-        // still without the connect path itself awaiting the push.
+        // bounded 1:1-DM snapshot needs the block list) and hands that ALREADY-RESOLVED snapshot straight
+        // to the fire-and-forget PrefetchRelationshipSnapshot dispatch, which no longer calls
+        // GetSnapshotAsync itself at all (see ChatHub.PrefetchRelationshipSnapshot — a duplicate wb
+        // round-trip there would double load on wb during exactly the outage where it's least welcome).
+        // That means the relationship SOURCE can no longer be gated to distinguish "connect awaits it" from
+        // "the push rides behind it" — there is nothing left downstream of connect's own await that
+        // touches the source. So this test gates the PUSH'S OWN SignalR send instead (HubPushCaptureHarness
+        // .GateSend) and proves connect completes and returns while that send is STILL in flight — i.e.
+        // genuinely fire-and-forget, not merely fast enough to look that way.
         const string SubjectTag = "Subject#1";
         const string FriendTag = "Friend#2";
         _friends[SubjectTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { FriendTag };
 
         await Connect("conn-friend", FriendTag);
 
-        var gate = new TaskCompletionSource();
-        _relationshipSource.ReleaseGate = gate.Task; // hold the connecting user's fetch open indefinitely
+        var pushGate = new TaskCompletionSource();
+        _harness.GateSend("conn-friend", pushGate.Task); // hold the friend-presence send open indefinitely
 
         var subjectHub = BuildHub("conn-subject", _ticketStore.Mint(Identity(SubjectTag), DateTime.UtcNow));
         var connectTask = subjectHub.OnConnectedAsync();
 
-        var stillPending = await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromMilliseconds(200)));
-        Assert.That(stillPending, Is.Not.SameAs(connectTask),
-            "connect must NOT complete while the pre-assembly relationship fetch is still gated open");
-        Assert.That(FriendPresenceFor("conn-friend"), Is.Empty,
-            "the friend push has NOT happened yet — it rides behind the same gated fetch");
-
-        gate.SetResult(); // release — the awaited fetch resolves, then the fire-and-forget push rides the warm cache
         var completed = await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5)));
-        Assert.That(completed, Is.SameAs(connectTask), "connect completes once the relationship fetch resolves");
-
+        Assert.That(completed, Is.SameAs(connectTask),
+            "connect must complete WITHOUT waiting on the friend-presence send — it is fire-and-forget");
         Assert.That(_sessionRegistry.TryGetByConnectionId("conn-subject", out _), Is.True);
+        Assert.That(FriendPresenceFor("conn-friend"), Is.Empty,
+            "the friend-presence send is still gated open at the moment connect returns — proof it was " +
+            "never awaited by the connect path, not just delivered quickly");
+
+        pushGate.SetResult(); // release — the in-flight send completes
+        await Task.Delay(TimeSpan.FromMilliseconds(50)); // let the fire-and-forget chain finish recording
         Assert.That(FriendPresenceFor("conn-friend").Count(p => p.BattleTag == SubjectTag && p.Online), Is.EqualTo(1),
-            "the friend push lands once the connect path's own gated fetch (now required) resolves");
+            "the friend push lands once its gated send is released");
     }
 
     // ================================================================================================

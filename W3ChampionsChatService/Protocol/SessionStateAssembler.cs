@@ -171,7 +171,11 @@ public class SessionStateAssembler(
                 kept.Add(membership); // (b)
                 continue;
             }
-            if (relationshipSnapshot != null
+            // Defensive — a malformed doc (null PairKey) can never come from FindOrCreateDm's
+            // DmPairKey.For + unique-index path, but if one ever exists it must degrade to "not
+            // blocked-kept", never NRE and brick connect for both members.
+            if (channel.PairKey != null
+                && relationshipSnapshot != null
                 && relationshipSnapshot.HasBlocked(DmPairKey.CounterpartOf(channel.PairKey, viewerBattleTag)))
             {
                 kept.Add(membership); // (c)
@@ -234,7 +238,7 @@ public class SessionStateAssembler(
 
     /// <summary>
     /// C5 T6 — the pending-Dm-request tray (spec §11 SessionState slot). Built ENTIRELY from the
-    /// already-loaded <paramref name="channelBackedMemberships"/> + <paramref name="channelsById"/> (zero
+    /// already-loaded <paramref name="snapshotMemberships"/> + <paramref name="channelsById"/> (zero
     /// extra Mongo reads): the connecting viewer sees one <see cref="PendingDmRequestDto"/> per channel that
     /// is a <see cref="ChannelType.Dm"/> whose <see cref="ChatChannel.RequestState"/> is
     /// <see cref="DmRequestState.Pending"/>, was initiated by SOMEONE ELSE (<see cref="ChatChannel.RequestInitiatedBy"/>
@@ -244,16 +248,18 @@ public class SessionStateAssembler(
     /// the tray for the 24h window). <see cref="PendingDmRequestDto.RequestedAt"/> is the channel's last
     /// message time, falling back to the membership's join time for a shell with no message yet. The same
     /// pending-recipient channels ALSO remain in the DTO's <see cref="SessionStateDto.Channels"/> (D4
-    /// dual-listing) — this tray is additive, never a filter on that list.
+    /// dual-listing) — this tray is additive, never a filter on that list. Follow-up spec §6: pending 1:1
+    /// Dms are always kept by <see cref="SelectSnapshotMemberships"/> regardless of recency, so bounding
+    /// never hides a pending request from this tray.
     /// </summary>
     private static IReadOnlyList<PendingDmRequestDto> BuildPendingDmTray(
-        List<ChannelMembership> channelBackedMemberships,
+        List<ChannelMembership> snapshotMemberships,
         IReadOnlyDictionary<string, ChatChannel> channelsById,
         string viewerBattleTag,
         DateTime now)
     {
         var tray = new List<PendingDmRequestDto>();
-        foreach (var membership in channelBackedMemberships)
+        foreach (var membership in snapshotMemberships)
         {
             var channel = channelsById[membership.ChannelId];
             if (channel.Type != ChannelType.Dm || channel.RequestState != DmRequestState.Pending)
@@ -310,17 +316,17 @@ public class SessionStateAssembler(
     private void SeedOnlineMemberRegistry(
         string connectionId,
         string battleTag,
-        List<ChannelMembership> channelBackedMemberships,
+        List<ChannelMembership> snapshotMemberships,
         IReadOnlyDictionary<string, ChatChannel> channelsById)
     {
-        // channelBackedMemberships is already filtered to rows whose channel exists (same filter the
-        // DTO's Channels list uses) — the registry's channel set must match the DTO's exactly, so
-        // nothing ever fans out to a channel with no row. Materialized (ToList) before crossing into
-        // the registry's locked Seed — Seed enumerates its argument while holding the lock
-        // (FanOut/OnlineMemberRegistry.cs carry-forward note). C5 (Task 5, D11): each entry's
+        // snapshotMemberships is the SAME §6-bounded selection (SelectSnapshotMemberships) that feeds the
+        // DTO's Channels list above — the registry's channel set must match the DTO's exactly, so nothing
+        // ever fans out to a channel excluded from this connection's snapshot. Materialized (ToList)
+        // before crossing into the registry's locked Seed — Seed enumerates its argument while holding
+        // the lock (FanOut/OnlineMemberRegistry.cs carry-forward note). C5 (Task 5, D11): each entry's
         // ChannelType comes from the already-loaded channelsById map (zero extra Mongo reads) so
         // ChatHub can later zero-DB-lookup whether a (channel, connection) is a Dm/GroupDm private lane.
-        var seed = channelBackedMemberships
+        var seed = snapshotMemberships
             .Select(m => (m.ChannelId, new MemberState(battleTag, m.NotificationLevel, m.LastReadSeq, channelsById[m.ChannelId].Type)))
             .ToList();
         onlineMemberRegistry.Seed(connectionId, seed);

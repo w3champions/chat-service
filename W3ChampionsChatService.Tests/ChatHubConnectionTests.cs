@@ -611,13 +611,12 @@ public class ChatHubConnectionTests : IntegrationTestBase
     public async Task Connect_PrefetchesOwnSnapshot_NonFatalOnFailure()
     {
         // Follow-up spec §6: connect now AWAITS one relationship fetch BEFORE assembly (the bounded
-        // 1:1-DM snapshot needs the block list), and the SEPARATE fire-and-forget
-        // PrefetchRelationshipSnapshot dispatch (cache-warm + friend-presence, unchanged role) still runs
-        // afterwards. NON-FATAL either way: even when the source throws for every attempt, the connect
-        // still succeeds (session registered + SessionState pushed). A failed fetch is NEVER cached
-        // (RelationshipProvider — "no negative caching"), so on a sustained outage BOTH call sites may
-        // independently retry the source — the count is therefore AT LEAST one, not pinned to exactly
-        // one the way the warm-cache happy path is (see the sibling test below).
+        // 1:1-DM snapshot needs the block list). The SEPARATE fire-and-forget PrefetchRelationshipSnapshot
+        // dispatch is handed that SAME (here: null, since the fetch failed) resolved snapshot directly and
+        // never calls GetSnapshotAsync itself — so even on a sustained outage there is exactly ONE call to
+        // the source for the whole connect, by construction, never a second independent retry. NON-FATAL
+        // either way: even when the source throws, the connect still succeeds (session registered +
+        // SessionState pushed).
         _relationshipSource.ShouldThrow = true;
 
         var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
@@ -635,8 +634,9 @@ public class ChatHubConnectionTests : IntegrationTestBase
             "the connect path must call the relationship source");
         Assert.AreEqual(BattleTag, await _relationshipSource.FirstFetch,
             "the fetch must be for the CONNECTING user's own snapshot");
-        Assert.GreaterOrEqual(_relationshipSource.FetchCount, 1,
-            "at least the required pre-assembly fetch must have called the source");
+        Assert.AreEqual(1, _relationshipSource.FetchCount,
+            "exactly ONE round-trip per connect, even on failure — the fire-and-forget dispatch never " +
+            "retries the source itself, so this holds true by construction, not by timing luck");
     }
 
     [Test]
@@ -668,13 +668,13 @@ public class ChatHubConnectionTests : IntegrationTestBase
         Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-rel-await", out _));
         Assert.IsTrue(_sends.Contains(("conn-rel-await", ChatEvents.SessionState)));
 
-        // The fire-and-forget PrefetchRelationshipSnapshot dispatch (cache-warm + friend-presence,
-        // unchanged role) is now dispatched AFTER the awaited fetch above, so its own GetSnapshotAsync
-        // call is a warm-CACHE hit rather than a second real source fetch — give it a brief moment to
-        // finish, then assert the source was touched exactly once for the whole connect.
+        // The fire-and-forget PrefetchRelationshipSnapshot dispatch (friend-presence, unchanged role) is
+        // dispatched AFTER the awaited fetch above and handed that ALREADY-RESOLVED snapshot directly — it
+        // never calls GetSnapshotAsync itself. Give it a brief moment to finish, then assert the source was
+        // touched exactly once for the whole connect.
         await Task.Delay(TimeSpan.FromMilliseconds(50));
         Assert.AreEqual(1, _relationshipSource.FetchCount,
-            "exactly ONE real source fetch for the whole connect — the fire-and-forget dispatch after " +
-            "the awaited fetch reuses the fresh cache instead of a duplicate wb round-trip");
+            "exactly ONE real source fetch for the whole connect — the fire-and-forget dispatch reuses the " +
+            "already-resolved snapshot instead of a duplicate wb round-trip");
     }
 }

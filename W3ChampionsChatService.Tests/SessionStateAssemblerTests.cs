@@ -771,10 +771,13 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i));
         }
 
+        // Mixed casing vs. the lowercased pair-key half CounterpartOf returns ("creep#666") — exercises
+        // the OrdinalIgnoreCase contract RelationshipSnapshot.HasBlocked documents, instead of a
+        // same-casing comparison that would pass even with an ordinal-exact (bugged) comparer.
         var snapshot = new RelationshipSnapshot(
             viewer,
             friends: new HashSet<string>(),
-            blocked: new HashSet<string> { "creep#666" },
+            blocked: new HashSet<string> { "Creep#666" },
             fetchedAt: t0.AddHours(1));
         var identity = Identity(viewer);
         var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity), snapshot);
