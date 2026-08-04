@@ -88,12 +88,17 @@ public class AuthenticationTests
     // ── Permission-vocabulary drift between identification-service and chat-service ────────
     //
     // identification-service can grant permissions that chat-service's EPermission enum does not yet
-    // contain (e.g. "Warnings", added id-service-side in #76 after chat-service's enum was last
-    // touched). Its JWT carries `permissions` as a serialized JSON array — the JWT handler expands it
-    // into one claim per element on read. chat-service must tolerate an unrecognized element: the user
-    // still authenticates and the permissions it DOES understand are retained. A hard Enum.Parse on an
-    // unknown value throws, is swallowed by FromJWT's catch, and the whole login silently fails with
+    // contain (historically "Warnings", added id-service-side in #76 after chat-service's enum was
+    // last touched). Its JWT carries `permissions` as a serialized JSON array — the JWT handler expands
+    // it into one claim per element on read. chat-service must tolerate an unrecognized element: the
+    // user still authenticates and the permissions it DOES understand are retained. A hard Enum.Parse on
+    // an unknown value throws, is swallowed by FromJWT's catch, and the whole login silently fails with
     // only "Receiver {ConnectionId} failed to authenticate" in the logs.
+    //
+    // The tests below use "UnknownToChatService" rather than the historical "Warnings" example: #35
+    // later added Warnings for real to chat-service's EPermission enum, so it no longer demonstrates an
+    // unknown permission. A synthetic name that can never become a real permission keeps the tests'
+    // premise intact.
 
     /// <summary>
     /// Builds a JWT signed with a freshly-generated RSA keypair, carrying the same claim shape the
@@ -130,9 +135,9 @@ public class AuthenticationTests
     [Test]
     public void FromJWT_TokenWithPermissionUnknownToChatService_StillAuthenticates()
     {
-        // Reproduces the production incident: a moderator was granted "Warnings" (unknown to chat-service).
+        // Reproduces the production incident: a moderator was granted a permission unknown to chat-service.
         var (jwt, publicKeyPem) = CreateSignedJwt("moderator#123", isAdmin: true,
-            new[] { "Moderation", "Warnings" });
+            new[] { "Moderation", "UnknownToChatService" });
 
         var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem);
 
@@ -140,7 +145,7 @@ public class AuthenticationTests
         Assert.AreEqual("moderator#123", result.BattleTag);
         Assert.IsTrue(result.IsAdmin);
         Assert.IsTrue(result.Permissions.Contains(EPermission.Moderation), "Known permissions must be retained");
-        Assert.AreEqual(1, result.Permissions.Count, "The unknown 'Warnings' permission must be dropped, not crash the parse");
+        Assert.AreEqual(1, result.Permissions.Count, "The unknown permission must be dropped, not crash the parse");
     }
 
     [Test]
@@ -206,13 +211,13 @@ public class AuthenticationTests
     {
         // Acceptance 2 through the NEW mint path — mirrors
         // FromJWT_TokenWithPermissionUnknownToChatService_StillAuthenticates (PR #32).
-        var (jwt, publicKeyPem) = CreateSignedJwt("moderator#123", true, new[] { "Moderation", "Warnings" });
+        var (jwt, publicKeyPem) = CreateSignedJwt("moderator#123", true, new[] { "Moderation", "UnknownToChatService" });
 
         var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem, validateLifetime: true);
 
         Assert.IsNotNull(result);
         Assert.IsTrue(result.Permissions.Contains(EPermission.Moderation));
-        Assert.AreEqual(1, result.Permissions.Count, "Unknown 'Warnings' must be dropped, not crash the parse");
+        Assert.AreEqual(1, result.Permissions.Count, "Unknown permission must be dropped, not crash the parse");
     }
 
     [Test]
