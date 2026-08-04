@@ -83,14 +83,32 @@ public static class ChatDomainIndexes
     private static async Task EnsureMembershipIndexes(IMongoDatabase db)
     {
         var memberships = db.GetCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+
+        // 2026-08-04 follow-up: superseded by ix_battleTag_joinedAt below — MembershipRepository.LoadForUser
+        // now sorts by JoinedAt (carried launcher-review item, see that method's doc), and a compound
+        // (BattleTag, JoinedAt) index serves that sorted read directly (index-order scan) instead of an
+        // in-memory sort behind an index-only BattleTag prefix scan. Best-effort drop, same
+        // swallow-IndexNotFound idiom as the D6 ix_sender_sentAt migration above — safe on a fresh
+        // database (nothing to drop) and on an already-migrated one (same reason).
+        try
+        {
+            await memberships.Indexes.DropOneAsync("ix_battleTag");
+        }
+        catch (MongoCommandException ex) when (IsIndexNotFound(ex))
+        {
+            // no-op: nothing to drop
+        }
+
         await memberships.Indexes.CreateManyAsync(
         [
             new CreateIndexModel<ChannelMembership>(
                 Builders<ChannelMembership>.IndexKeys.Ascending(m => m.ChannelId).Ascending(m => m.BattleTag),
                 new CreateIndexOptions { Name = "ux_channelId_battleTag", Unique = true }),
+            // Replaces ix_battleTag: BattleTag stays the selective prefix (LoadForUser's filter), JoinedAt
+            // extends it so the method's SortBy(JoinedAt) is served by the index itself.
             new CreateIndexModel<ChannelMembership>(
-                Builders<ChannelMembership>.IndexKeys.Ascending(m => m.BattleTag),
-                new CreateIndexOptions { Name = "ix_battleTag" }),
+                Builders<ChannelMembership>.IndexKeys.Ascending(m => m.BattleTag).Ascending(m => m.JoinedAt),
+                new CreateIndexOptions { Name = "ix_battleTag_joinedAt" }),
         ]);
     }
 

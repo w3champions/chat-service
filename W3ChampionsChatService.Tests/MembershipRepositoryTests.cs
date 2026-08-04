@@ -91,8 +91,34 @@ public class MembershipRepositoryTests : IntegrationTestBase
         Assert.AreEqual(1, unique["key"]["ChannelId"].ToInt32());
         Assert.AreEqual(1, unique["key"]["BattleTag"].ToInt32());
 
-        var byUser = indexes.Single(i => i["name"] == "ix_battleTag");
+        // 2026-08-04 follow-up: ix_battleTag was extended to a compound (BattleTag, JoinedAt) index so
+        // LoadForUser's JoinedAt-ascending sort (see that method's doc) is index-served rather than an
+        // in-memory sort behind an index-only BattleTag scan.
+        var byUser = indexes.Single(i => i["name"] == "ix_battleTag_joinedAt");
         Assert.AreEqual(1, byUser["key"]["BattleTag"].ToInt32());
+        Assert.AreEqual(1, byUser["key"]["JoinedAt"].ToInt32());
+
+        Assert.IsFalse(indexes.Any(i => i["name"] == "ix_battleTag"),
+            "the superseded single-field index must be gone after ensure");
+    }
+
+    [Test]
+    public async Task MembershipIndexes_EnsureIsIdempotent_AgainstPreMigrationDatabase()
+    {
+        // Simulate a database that still carries the OLD-named single-field index from before this
+        // migration — Ensure must best-effort drop it (swallowing IndexNotFound is the OTHER branch,
+        // covered by MembershipIndexes_AreCreated running against a fresh DB) and still converge on the
+        // new compound index, never throw. Mirrors MessageRepositoryTests' equivalent D6 migration test.
+        var memberships = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName).GetCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+        await memberships.Indexes.CreateOneAsync(new CreateIndexModel<ChannelMembership>(
+            Builders<ChannelMembership>.IndexKeys.Ascending(m => m.BattleTag),
+            new CreateIndexOptions { Name = "ix_battleTag" }));
+
+        Assert.DoesNotThrowAsync(() => ChatDomainIndexes.EnsureAllAsync(MongoClient));
+
+        var indexes = await (await memberships.Indexes.ListAsync()).ToListAsync();
+        Assert.IsFalse(indexes.Any(i => i["name"] == "ix_battleTag"), "the pre-existing old-named index must be dropped");
+        Assert.IsTrue(indexes.Any(i => i["name"] == "ix_battleTag_joinedAt"), "the new compound index must exist");
     }
 
     [Test]

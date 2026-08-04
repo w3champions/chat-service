@@ -395,9 +395,14 @@ public partial class ChatHub
         // with the REAL flags (ForModerator). This is the moderator's own in-channel focused view, so
         // their OWN shadow/deleted rows are flagged too, not illusion-forced (they are a moderator). The
         // membership gate above is UNCHANGED for non-Public channels — a non-member is still rejected
-        // regardless of permission there. On a Public channel a non-member instead passes step 3's
-        // fallthrough (full-ban excluded) and reaches this branch same as a member would — the privileged
-        // any-channel read is still the REST endpoint (Task 7), not this focused-view read.
+        // regardless of permission there. On a Public channel, though, a NON-MEMBER moderator DOES reach
+        // this branch (step 3's fallthrough, full-ban excluded) and gets the SAME privileged ForModerator
+        // projection a member-moderator would — a deliberate, narrow consequence of §4's non-member read
+        // allowance for Public channels, chosen rather than accidental (pinned by
+        // GetMessages_NonMemberModerator_PublicChannel_ReturnsForModeratorProjection). It stays bounded to
+        // ONE Public channel per call, keyed by the caller-supplied channelId; the privileged read across
+        // EVERY channel regardless of type/membership is still the REST endpoint (Task 7) — this method
+        // does not replace or widen that.
         //
         // This branch does NOT re-apply the {Public, SemiPublic, System+Match} scope wall that
         // single-delete/purge/the REST endpoint enforce — it is safe only emergently, by construction

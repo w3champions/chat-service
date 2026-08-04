@@ -550,6 +550,40 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         Assert.IsNull(result.Messages);
     }
 
+    // 2026-08-04 follow-up (Minor finding): step 4's comment previously read as if the privileged
+    // ForModerator view were NEVER reachable outside the REST endpoint. That is imprecise for Public
+    // channels specifically — step 3's non-member Public fallthrough (§4) lets a NON-MEMBER moderator
+    // reach step 4's moderator branch too, so they get the SAME ForModerator projection (deleted rows +
+    // every author's real shadow flag) a member-moderator would, through THIS hub method. Pinning that
+    // explicitly so the behavior is a chosen, tested outcome rather than an accidental side effect of
+    // the §4 fallthrough. The full-banned variant of this exact scenario is already covered by
+    // GetMessages_FullBannedNonMemberModerator_PublicChannel_Denied — extended here, not duplicated.
+    [Test]
+    public async Task GetMessages_NonMemberModerator_PublicChannel_ReturnsForModeratorProjection()
+    {
+        var channel = await CreateChannel(); // Public by default
+        var normal = await SeedMessage(channel.Id, BattleTag, "visible to everyone");
+        var deleted = await SeedMessage(channel.Id, BattleTag, "will be deleted");
+        var foreignShadow = await SeedMessage(channel.Id, OtherBattleTag, "shadow from someone else", shadow: true);
+        await _messageRepository.MarkDeleted(deleted.Id, "Mod#1", Now);
+
+        RegisterModeratorSession("mod-conn", ModeratorBattleTag);
+        // Deliberately NO membership seed and NO full-ban — a non-member moderator reaching the Public
+        // fallthrough (step 3) with a clean mute status.
+        var hub = BuildHub("mod-conn");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code,
+            "a non-member moderator reads a Public channel via step 3's fallthrough, then step 4's moderator branch");
+        CollectionAssert.AreEqual(
+            new[] { normal.Seq, deleted.Seq, foreignShadow.Seq },
+            result.Messages.Select(m => m.Seq).ToArray(),
+            "a non-member moderator gets the SAME ForModerator projection a member-moderator would — deleted and every author's shadow rows included");
+        Assert.IsTrue(result.Messages.Single(m => m.Seq == deleted.Seq).Deleted, "the deleted row carries the REAL deleted flag");
+        Assert.IsTrue(result.Messages.Single(m => m.Seq == foreignShadow.Seq).Shadow, "a foreign author's shadow row carries the REAL shadow flag");
+    }
+
     [Test]
     public async Task GetMessages_Moderator_Paging_SeqAnchoredAcrossFlaggedRows()
     {

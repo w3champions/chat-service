@@ -510,4 +510,90 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         CollectionAssert.DoesNotContain(ids, otherChannel.Id,
             "GetConversations must only ever page the CALLER's own memberships");
     }
+
+    // ---------------------------------------------------------------------
+    // Final-review fix round — finding 1 (Important): pins the CROSS-REPO seam between chat-service's
+    // bounded connect snapshot (SessionStateAssembler.SelectSnapshotMemberships, which the launcher-e
+    // repo renders as its initial DM conversation list) and this hub's GetConversations cursor
+    // pagination (the launcher's "load more" scroll continuation). The launcher derives its first
+    // "load more" cursor from the LAST accepted shell it rendered from the snapshot — i.e. the
+    // snapshot's 30th-newest accepted shell (ChatLimits.DmSnapshotRecentConversations == 30). This test
+    // proves that specific handoff is gapless and non-overlapping: every accepted 1:1 conversation the
+    // snapshot's top-30 recency window excludes comes back, exactly once, on the very first
+    // GetConversations page taken from that cursor — the exact contract the launcher's initial-list ->
+    // infinite-scroll transition depends on.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public async Task Handoff_SnapshotTopWindow_PlusFirstConversationsPage_CoversEveryAcceptedShell_NoGapNoDuplicate()
+    {
+        var t0 = Now;
+
+        // >= 31 accepted 1:1 shells, all fully-read (LastSeq == LastReadSeq == 0) so none of them can be
+        // kept via the snapshot's rule (e) unread carve-out — a clean, deterministic top-30/rest split
+        // purely by recency. 35 gives a comfortable margin over the required >= 31.
+        const int freshCount = 35;
+        var freshIds = new List<string>();
+        for (var i = 0; i < freshCount; i++)
+        {
+            var shell = await CreateDmShell($"{OtherPrefix}{i}#1", t0.AddMinutes(i));
+            freshIds.Add(shell.Id);
+        }
+
+        // Realism extras — a real connect snapshot is never JUST the top-30 recency window; it also
+        // mixes in the OTHER SelectSnapshotMemberships keep-rules. None of these three belong to the
+        // tracked freshIds set the coverage assertion below checks.
+        var pending = await CreateDmShell($"{OtherPrefix}pending#1", t0.AddMinutes(-1),
+            requestState: DmRequestState.Pending, initiatedBy: $"{OtherPrefix}pending#1");
+        var blockedCounterpart = $"{OtherPrefix}blocked#1";
+        _blocked[BattleTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { blockedCounterpart };
+        var blocked = await CreateDmShell(blockedCounterpart, t0.AddYears(-2));
+        var olderUnread = await CreateDmShell($"{OtherPrefix}unread-old#1", t0.AddDays(-100), lastSeq: 5, lastReadSeq: 1);
+
+        RegisterSession("conn-1", BattleTag);
+
+        // 1. Run the SAME assembler + relationship provider the real connect path uses to build the
+        // bounded snapshot.
+        var relationshipSnapshot = await _relationshipProvider.GetSnapshotAsync(BattleTag);
+        var identity = new W3CUserAuthentication { BattleTag = BattleTag, Name = "peter" };
+        var chatUser = new ChatUser(BattleTag, false, "peter", new ProfilePicture(), null, null);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", Now, chatUser, relationshipSnapshot);
+
+        var snapshotAccepted = dto.Channels
+            .Where(c => c.Channel.Type == ChannelType.Dm && c.Channel.RequestState == DmRequestState.Accepted)
+            .OrderByDescending(c => c.Channel.LastMessageAt)
+            .ThenByDescending(c => c.Channel.Id, StringComparer.Ordinal)
+            .ToList();
+
+        // Sanity check on the scenario itself: top-30 recency window, PLUS the one rule-(e) unread
+        // carve-out (olderUnread), PLUS the rule-(c) blocked-but-still-Accepted shell (blocked) — both
+        // of which sort to the very bottom (older than every fresh shell), so neither one can land at
+        // index 29 and disturb the cursor derivation below.
+        Assert.AreEqual(ChatLimits.DmSnapshotRecentConversations + 2, snapshotAccepted.Count);
+
+        // 2. Derive the cursor EXACTLY the way the launcher does: from the 30th-newest accepted shell.
+        var cursorShell = snapshotAccepted[ChatLimits.DmSnapshotRecentConversations - 1].Channel;
+
+        // 3. The launcher's own first "load more" call.
+        var hub = BuildHub("conn-1");
+        var page = await hub.GetConversations(cursorShell.LastMessageAt, cursorShell.Id, limit: ChatLimits.ConversationsPageSize);
+        Assert.AreEqual(ChatResultCode.Ok, page.Code);
+
+        // 4. Coverage: every one of the >= 31 tracked fresh shells must appear in EXACTLY ONE of
+        // (snapshot, page) — no gap, no duplicate.
+        var snapshotFreshIds = snapshotAccepted.Select(c => c.Channel.Id).Where(freshIds.Contains).ToList();
+        var pageFreshIds = page.Conversations.Select(c => c.Channel.Id).Where(freshIds.Contains).ToList();
+
+        CollectionAssert.IsNotEmpty(pageFreshIds, "the first page must actually carry some of the shells the snapshot's top-30 window excluded");
+        CollectionAssert.AllItemsAreUnique(snapshotFreshIds.Concat(pageFreshIds).ToList(),
+            "no tracked shell may appear in BOTH the snapshot and the first page — that would double-render a conversation");
+        CollectionAssert.AreEquivalent(freshIds, snapshotFreshIds.Concat(pageFreshIds).ToList(),
+            "the snapshot's top-30 window plus the first GetConversations page must cover every accepted shell exactly once — no gap");
+
+        // The pending/blocked realism extras stay exactly where the OTHER §6/GetConversations tests
+        // already pin them — never in the paged "load more" result.
+        var pageIds = page.Conversations.Select(c => c.Channel.Id).ToList();
+        CollectionAssert.DoesNotContain(pageIds, pending.Id);
+        CollectionAssert.DoesNotContain(pageIds, blocked.Id);
+    }
 }

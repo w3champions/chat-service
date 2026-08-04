@@ -96,7 +96,11 @@ public record GetPresenceDetailsResult(
 /// &lt;= <see cref="Domain.ChatLimits.ConversationsPageSize"/> for its pagination to terminate correctly
 /// — <c>ChatLimitsTests.ConversationsPageSize_IsAtLeastLauncherPageSize</c> pins this cross-repo
 /// dependency. <see cref="RetryAfterSeconds"/> carries the retry hint on a <see cref="ChatResultCode.Throttled"/>
-/// reject (a relationship-provider outage — mirrors <see cref="OpenDmResult"/>).</summary>
+/// reject (a relationship-provider outage — mirrors <see cref="OpenDmResult"/>). NOTE: as of this
+/// writing the launcher does not read this field on a Throttled GetConversations reject — it simply
+/// retries the same scroll request on the user's next scroll gesture rather than scheduling a timed
+/// retry. The field is kept for API completeness/symmetry with <see cref="OpenDmResult"/> and
+/// <see cref="SendMessageResult"/> (a future client could honor it) and costs nothing unused.</summary>
 public record GetConversationsResult(
     ChatResultCode Code,
     double? RetryAfterSeconds = null,
