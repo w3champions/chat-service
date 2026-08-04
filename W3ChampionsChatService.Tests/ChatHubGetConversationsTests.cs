@@ -16,6 +16,7 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -26,7 +27,10 @@ namespace W3ChampionsChatService.Tests;
 /// caller's OLDER 1:1 Dm shells (the ones the bounded connect snapshot, Task 6, excludes), newest-first
 /// by (LastMessageAt, ChannelId). Direct-hub-instantiation idiom; scaffolding copied VERBATIM from
 /// <see cref="ChatHubGetMessagesTests"/> (same fields, same <see cref="IntegrationTestBase"/> base, same
-/// <c>BuildHub</c> ctor list, same <c>FixedNow</c>/<c>_time</c>).
+/// <c>BuildHub</c> ctor list, same <c>FixedNow</c>/<c>_time</c>), EXTENDED (Task 8 fix round) with a REAL
+/// <see cref="RelationshipProvider"/> over a <see cref="FakeRelationshipSource"/> (mirrors
+/// <see cref="ChatHubDmSendTests"/>) so blocked-shell exclusion and the relationship-outage fail-closed
+/// path are exercisable, instead of the throwaway <see cref="RelationshipProviderTestFactory"/>.
 /// </summary>
 public class ChatHubGetConversationsTests : IntegrationTestBase
 {
@@ -54,12 +58,20 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
     private FanOutEngine _fanOutEngine;
     private FakeTimeProvider _time;
 
+    // Task 8 fix round: per-tag blocked lists, read by the fake source's snapshot factory
+    // (OrdinalIgnoreCase) — mirrors ChatHubDmSendTests. Keyed by the CALLER's own battleTag (the block
+    // check is "does the caller's snapshot list this counterpart as blocked").
+    private readonly Dictionary<string, HashSet<string>> _blocked = new(StringComparer.OrdinalIgnoreCase);
+    private FakeRelationshipSource _relationshipSource;
+    private RelationshipProvider _relationshipProvider;
+
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
     [SetUp]
     public void SetupBeforeEach()
     {
         _time = new FakeTimeProvider(FixedNow);
+        _blocked.Clear();
 
         _connectionMapping = new ConnectionMapping();
         _userDirectory = new UserDirectoryRepository(MongoClient);
@@ -89,6 +101,13 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
             _onlineMemberRegistry,
             _connectionMapping,
             new MentionInboxRepository(MongoClient));
+
+        _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
+            tag,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            _blocked.TryGetValue(tag, out var b) ? b : new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            now));
+        _relationshipProvider = new RelationshipProvider(_relationshipSource, _time);
     }
 
     private ChatHub BuildHub(string connectionId)
@@ -111,7 +130,7 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
             _fanOutEngine,
             ViewersAccumulatorTestFactory.CreateIgnored(),
             new NoOpMentionInboxCleaner(),
-            RelationshipProviderTestFactory.CreateIgnored(),
+            _relationshipProvider,
             new UserSettingsRepository(MongoClient),
             new DmInitiationTracker(),
             _authService.Object,
@@ -135,16 +154,19 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
             new W3CUserAuthentication { BattleTag = battleTag, Name = battleTag.Split('#')[0] },
             null);
 
-    // One ACCEPTED 1:1 shell (viewer + counterpart) with the viewer's own membership row.
+    // One 1:1 shell (viewer + counterpart) with the viewer's own membership row. Defaults to an
+    // ACCEPTED shell initiated by the viewer; Task 8 fix round extends this with requestState/
+    // initiatedBy so pending-shell exclusion (both directions) is testable without a second helper.
     private async Task<ChatChannel> CreateDmShell(
-        string counterpart, DateTime lastMessageAt, long lastSeq = 0, long lastReadSeq = 0)
+        string counterpart, DateTime lastMessageAt, long lastSeq = 0, long lastReadSeq = 0,
+        DmRequestState requestState = DmRequestState.Accepted, string initiatedBy = null)
     {
         var channel = new ChatChannel
         {
             Type = ChannelType.Dm,
             PairKey = DmPairKey.For(BattleTag, counterpart),
-            RequestState = DmRequestState.Accepted,
-            RequestInitiatedBy = BattleTag,
+            RequestState = requestState,
+            RequestInitiatedBy = initiatedBy ?? BattleTag,
             LastSeq = lastSeq,
             LastMessageAt = lastMessageAt,
         };
@@ -298,5 +320,188 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         var hub = BuildHub("conn-ghost");
         var page = await hub.GetConversations(null, null, limit: 10);
         Assert.AreEqual(ChatResultCode.PermissionDenied, page.Code);
+        Assert.IsNull(page.Conversations, "a PermissionDenied reject must never carry a payload");
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 8 fix round — finding 1 (CRITICAL): pending shells must never page in. Pending requests ride
+    // the connect snapshot + request tray ONLY, in EITHER direction.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public async Task GetConversations_ExcludesPendingShells_BothDirections()
+    {
+        var incoming = await CreateDmShell($"{OtherPrefix}0#1", Now.AddMinutes(-120),
+            requestState: DmRequestState.Pending, initiatedBy: $"{OtherPrefix}0#1");
+        var outgoing = await CreateDmShell($"{OtherPrefix}1#1", Now.AddMinutes(-110),
+            requestState: DmRequestState.Pending, initiatedBy: BattleTag);
+        var accepted = await CreateDmShell($"{OtherPrefix}2#1", Now.AddMinutes(-100));
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, page.Code);
+        var ids = page.Conversations.Select(c => c.Channel.Id).ToList();
+        CollectionAssert.DoesNotContain(ids, incoming.Id,
+            "an incoming pending request rides the tray only, never GetConversations");
+        CollectionAssert.DoesNotContain(ids, outgoing.Id,
+            "a caller-initiated pending request rides the tray only, never GetConversations");
+        CollectionAssert.Contains(ids, accepted.Id, "an accepted shell still pages normally");
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 8 fix round — finding 2 (CRITICAL): a blocked counterpart's shell stays Blocked-tray-only
+    // (Task 6) — it must never page in as an ordinary, live conversation. A relationship-provider outage
+    // must fail closed (Throttled) rather than serve an unfiltered page.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public async Task GetConversations_ExcludesBlockedCounterpartShells()
+    {
+        var blockedCounterpart = $"{OtherPrefix}0#1";
+        var unblockedCounterpart = $"{OtherPrefix}1#1";
+        _blocked[BattleTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { blockedCounterpart };
+        var blockedShell = await CreateDmShell(blockedCounterpart, Now.AddMonths(-24));
+        var unblockedShell = await CreateDmShell(unblockedCounterpart, Now.AddMonths(-24));
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, page.Code);
+        var ids = page.Conversations.Select(c => c.Channel.Id).ToList();
+        CollectionAssert.DoesNotContain(ids, blockedShell.Id,
+            "a blocked counterpart's shell stays Blocked-tray-only (Task 6) — never pages in as an ordinary conversation");
+        CollectionAssert.Contains(ids, unblockedShell.Id, "an unblocked sibling shell still pages normally");
+    }
+
+    [Test]
+    public async Task GetConversations_RelationshipProviderUnavailable_ReturnsThrottled()
+    {
+        await CreateDmShell($"{OtherPrefix}0#1", Now.AddMinutes(-5));
+        RegisterSession("conn-1", BattleTag);
+        _relationshipSource.ShouldThrow = true;
+        var hub = BuildHub("conn-1");
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, page.Code,
+            "no usable relationship snapshot at all must fail closed rather than risk an unfiltered page");
+        Assert.IsNull(page.Conversations);
+        Assert.AreEqual(ChatLimits.RelationshipRetryAfterSeconds, page.RetryAfterSeconds);
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 8 fix round — finding 4 (minor): a null-stamped LastMessageAt is data-impossible in
+    // production (FindOrCreateDm always stamps it) but would otherwise dead-end the client's wire
+    // cursor — such a shell must be excluded from the page.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public async Task GetConversations_ExcludesNullLastMessageAtShells()
+    {
+        var legacyChannel = new ChatChannel
+        {
+            Type = ChannelType.Dm,
+            PairKey = DmPairKey.For(BattleTag, $"{OtherPrefix}legacy#1"),
+            RequestState = DmRequestState.Accepted,
+            RequestInitiatedBy = BattleTag,
+            LastSeq = 0,
+            LastMessageAt = null,
+        };
+        await _channelRepository.Insert(legacyChannel);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = legacyChannel.Id,
+            BattleTag = BattleTag,
+            NotificationLevel = NotificationLevel.All,
+            LastReadSeq = 0,
+            JoinedAt = Now.AddYears(-1),
+        });
+        var normalShell = await CreateDmShell($"{OtherPrefix}0#1", Now.AddMinutes(-5));
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        var ids = page.Conversations.Select(c => c.Channel.Id).ToList();
+        CollectionAssert.DoesNotContain(ids, legacyChannel.Id,
+            "a null-stamped LastMessageAt is data-impossible in production but must not dead-end the wire cursor");
+        CollectionAssert.Contains(ids, normalShell.Id);
+    }
+
+    // ---------------------------------------------------------------------
+    // Task 8 fix round — finding 7 (minor): remaining test gaps called out in code review.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public async Task GetConversations_TieBreaksOnChannelId_NoSkipOrDuplicateAcrossPageBoundary()
+    {
+        var tied = Now.AddMinutes(-10);
+        var shells = new List<ChatChannel>();
+        for (var i = 0; i < 3; i++)
+        {
+            shells.Add(await CreateDmShell($"{OtherPrefix}tie{i}#1", tied));
+        }
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var expectedOrder = shells.OrderByDescending(c => c.Id, StringComparer.Ordinal).Select(c => c.Id).ToList();
+
+        var seen = new List<string>();
+        DateTime? cursorTime = null;
+        string cursorId = null;
+        while (true)
+        {
+            var page = await hub.GetConversations(cursorTime, cursorId, limit: 2);
+            Assert.AreEqual(ChatResultCode.Ok, page.Code);
+            if (page.Conversations.Count == 0) break;
+            seen.AddRange(page.Conversations.Select(c => c.Channel.Id));
+            var last = page.Conversations[^1].Channel;
+            cursorTime = last.LastMessageAt;
+            cursorId = last.Id;
+            if (page.Conversations.Count < 2) break;
+        }
+
+        CollectionAssert.AreEqual(expectedOrder, seen,
+            "identical LastMessageAt must tie-break deterministically on ChannelId with no skip or duplicate across a page boundary");
+    }
+
+    [Test]
+    public async Task GetConversations_CrossCallerIsolation_OtherUsersShellsNeverAppear()
+    {
+        var mine = await CreateDmShell($"{OtherPrefix}0#1", Now.AddMinutes(-5));
+
+        // A completely separate user's own Dm shell + membership row — never the caller's.
+        const string otherCaller = "shadow#999";
+        var otherChannel = new ChatChannel
+        {
+            Type = ChannelType.Dm,
+            PairKey = DmPairKey.For(otherCaller, $"{OtherPrefix}9#1"),
+            RequestState = DmRequestState.Accepted,
+            RequestInitiatedBy = otherCaller,
+            LastSeq = 0,
+            LastMessageAt = Now.AddMinutes(-1),
+        };
+        await _channelRepository.Insert(otherChannel);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = otherChannel.Id,
+            BattleTag = otherCaller,
+            NotificationLevel = NotificationLevel.All,
+            LastReadSeq = 0,
+            JoinedAt = Now.AddMinutes(-1),
+        });
+
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        var ids = page.Conversations.Select(c => c.Channel.Id).ToList();
+        CollectionAssert.Contains(ids, mine.Id);
+        CollectionAssert.DoesNotContain(ids, otherChannel.Id,
+            "GetConversations must only ever page the CALLER's own memberships");
     }
 }

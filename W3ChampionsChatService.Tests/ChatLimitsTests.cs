@@ -90,6 +90,20 @@ public class ChatLimitsTests
     }
 
     [Test]
+    public void ConversationsPageSize_IsAtLeastLauncherPageSize()
+    {
+        // Cross-repo contract (Task 8 fix round, finding 3): the launcher's client-side page size
+        // (CONVERSATIONS_PAGE_SIZE = 30, launcher-e chat plumbing) drives GetConversations' Count &lt;
+        // limit end-detection (see GetConversationsResult's doc comment). That end-detection is only
+        // sound when a caller's requested limit never exceeds this cap — a launcher paging at 30 while
+        // this cap ever dropped below 30 would get a silently-clamped, potentially-short page and could
+        // stop pagination early. Pinned here so a future change to either constant is caught at CI time.
+        Assert.GreaterOrEqual(ChatLimits.ConversationsPageSize, 30,
+            "the launcher's CONVERSATIONS_PAGE_SIZE = 30 depends on ChatLimits.ConversationsPageSize " +
+            "staying >= 30 for GetConversations' Count < limit end-detection to remain sound");
+    }
+
+    [Test]
     public void DefaultChatRooms_NormalizeToDistinctKeys()
     {
         // C3 Task 3: Guards the static SessionStateAssembler.CatalogOrder initialization invariant.

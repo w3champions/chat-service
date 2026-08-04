@@ -87,7 +87,17 @@ public record GetPresenceDetailsResult(
 /// <summary>GetConversations (2026-08-04 follow-up spec §6) — one page of the caller's OLDER 1:1 Dm
 /// shells, newest-first by (LastMessageAt, ChannelId). Reuses ChannelDto so a paged conversation is
 /// byte-shaped like a SessionState.Channels entry. The client derives the next cursor from the last
-/// element (channel.LastMessageAt, channel.Id) and detects the end by Count &lt; limit.</summary>
+/// element (channel.LastMessageAt, channel.Id) and detects the end by Count &lt; limit — CAVEAT: this
+/// end-detection is only SOUND when the caller's requested <c>limit</c> is at most
+/// <see cref="Domain.ChatLimits.ConversationsPageSize"/>. A caller requesting a larger limit gets a
+/// CLAMPED page (more older shells can remain even though the returned Count equals the clamp
+/// ceiling), so <c>Count &lt; limit</c> would falsely signal the end for such a caller. The launcher's
+/// client-side page size (CONVERSATIONS_PAGE_SIZE, currently 30) MUST stay
+/// &lt;= <see cref="Domain.ChatLimits.ConversationsPageSize"/> for its pagination to terminate correctly
+/// — <c>ChatLimitsTests.ConversationsPageSize_IsAtLeastLauncherPageSize</c> pins this cross-repo
+/// dependency. <see cref="RetryAfterSeconds"/> carries the retry hint on a <see cref="ChatResultCode.Throttled"/>
+/// reject (a relationship-provider outage — mirrors <see cref="OpenDmResult"/>).</summary>
 public record GetConversationsResult(
     ChatResultCode Code,
+    double? RetryAfterSeconds = null,
     IReadOnlyList<ChannelDto> Conversations = null);
