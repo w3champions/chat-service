@@ -269,13 +269,19 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         await _channelRepository.Insert(group);
         await _membershipRepository.Insert(new ChannelMembership
         {
-            ChannelId = group.Id, BattleTag = BattleTag, NotificationLevel = NotificationLevel.All, JoinedAt = Now,
+            ChannelId = group.Id,
+            BattleTag = BattleTag,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
         });
         var pub = new ChatChannel { Type = ChannelType.Public, Name = "general", NormalizedName = "general", LastMessageAt = Now };
         await _channelRepository.Insert(pub);
         await _membershipRepository.Insert(new ChannelMembership
         {
-            ChannelId = pub.Id, BattleTag = BattleTag, NotificationLevel = NotificationLevel.All, JoinedAt = Now,
+            ChannelId = pub.Id,
+            BattleTag = BattleTag,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
         });
         RegisterSession("conn-1", BattleTag);
         var hub = BuildHub("conn-1");
