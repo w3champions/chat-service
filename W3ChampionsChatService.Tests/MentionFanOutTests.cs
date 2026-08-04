@@ -13,6 +13,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -49,6 +50,7 @@ public class MentionFanOutTests : IntegrationTestBase
     private HubPushCaptureHarness _harness;
     private MentionFanOut _fanOut;
     private FakeTimeProvider _time;
+    private UserDirectoryRepository _userDirectory;
 
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
@@ -61,7 +63,8 @@ public class MentionFanOutTests : IntegrationTestBase
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
         _sessionRegistry = new SessionRegistry();
         _harness = new HubPushCaptureHarness();
-        _fanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        _userDirectory = new UserDirectoryRepository(MongoClient);
+        _fanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -86,6 +89,15 @@ public class MentionFanOutTests : IntegrationTestBase
             NotificationLevel = level,
             JoinedAt = Now,
             DeclinedUntil = declinedUntil,
+        });
+
+    private Task SeedDirectory(string battleTag) =>
+        _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = battleTag.ToLowerInvariant(),
+            DisplayBattleTag = battleTag,
+            NormalizedName = battleTag.ToLowerInvariant(),
+            LastSeenAt = Now,
         });
 
     private static ChatChannel Channel(ChannelType type = ChannelType.Public) =>
@@ -208,7 +220,9 @@ public class MentionFanOutTests : IntegrationTestBase
     [Test]
     public async Task Notify_NonMember_NoEntryNoEvent_ControlMemberStillNotified()
     {
-        // stranger#1 is resolvable content but NOT a member of this channel → no entry/event.
+        // stranger#1 has NO membership row AND no user_directory row, so it stays ineligible even
+        // now that Public rooms are membership-independent (§4): the wall this documents for Public
+        // is directory-resolvability, not membership — stranger#1 has neither.
         RegisterSession("conn-stranger", "stranger#1");
         await SeedMembership("wolf#456", NotificationLevel.All);
         RegisterSession("conn-wolf", "wolf#456");
@@ -323,6 +337,61 @@ public class MentionFanOutTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Follow-up spec §4 — PUBLIC rooms are mentionable without joining (membership-independent fan-out)
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PublicChannel_NonMember_WithDirectoryRow_GetsEntryAndPush()
+    {
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        // Deliberately NO membership row: follow-up spec §4 — public rooms are mentionable without joining.
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1),
+            "a directory-resolvable NON-member of a PUBLIC room gets a mention-inbox entry");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1), "and the targeted MentionNotified push");
+    }
+
+    [Test]
+    public async Task PublicChannel_NonMember_WithoutDirectoryRow_GetsNothing()
+    {
+        await SeedMembership("control#1");
+        // "ghost#999" has neither a membership nor a user_directory row — an unresolvable tag.
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "ghost#999", "control#1" }, Now);
+
+        Assert.That(await InboxOf("ghost#999"), Is.Empty,
+            "an unresolvable tag still notifies nobody (garbage `<@…>` markup stays inert)");
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible control member still fires");
+    }
+
+    [Test]
+    public async Task SemiPublicChannel_NonMember_EvenWithDirectoryRow_GetsNothing()
+    {
+        await SeedDirectory("wolf#456");
+        await SeedMembership("control#1", channelId: ChannelId);
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.SemiPublic), Message(), new[] { "wolf#456", "control#1" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "§4 widens PUBLIC rooms only — SemiPublic keeps the membership wall");
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public async Task PublicChannel_JoinedMember_WithNotificationLevelNone_StaysSilenced()
+    {
+        await SeedDirectory("silent#1");
+        await SeedMembership("silent#1", NotificationLevel.None);
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "silent#1" }, Now);
+
+        Assert.That(await InboxOf("silent#1"), Is.Empty,
+            "lock-in: join + NotificationLevel.None remains the opt-out even now that non-members are mentionable");
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Shadow (defense-in-depth in-method guard; the call-site skip is covered end-to-end in
     // ChatHubSendMessageTests.ShadowSender_MentionsOthers_...)
     // ---------------------------------------------------------------------------------------------
@@ -410,7 +479,7 @@ public class MentionFanOutTests : IntegrationTestBase
 
         // A repository whose Insert throws for wolf ONLY — simulating a single-target Mongo write failure.
         var throwingInbox = new ThrowingInsertRepository(MongoClient, "wolf#456");
-        var faultyFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, throwingInbox);
+        var faultyFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, throwingInbox, _userDirectory);
 
         Assert.DoesNotThrowAsync(() => faultyFanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456", "frank#789" }, Now),
             "a single target's failed insert must be fault-isolated — NotifyAsync must not throw");

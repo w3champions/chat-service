@@ -10,6 +10,7 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Mentions;
 
@@ -33,7 +34,10 @@ namespace W3ChampionsChatService.Mentions;
 /// non-participant. This wall is the SOLE authority on who is notified: the send-side gate (step 5.25)
 /// validates only the mention COUNT cap — never resolvability or membership — so mentioning a non-member
 /// (or an unresolvable/garbage tag) is legal content that delivers verbatim and simply notifies nobody
-/// here.</item>
+/// here. Follow-up spec §4 EXCEPTION: for <see cref="ChannelType.Public"/> rooms only, a target with NO
+/// membership row is still eligible provided the tag resolves to a <see cref="UserDirectoryRepository"/>
+/// row — a public room's excerpt is public content, so the membership wall protects nothing there;
+/// Dm/GroupDm/SemiPublic/System are unaffected and keep the membership wall exactly as before.</item>
 /// <item>The target's membership <see cref="ChannelMembership.NotificationLevel"/> is not
 /// <see cref="NotificationLevel.None"/> — "none: silence" (spec §7) is an explicit opt-out that outranks
 /// mentions, not just level-All activity.</item>
@@ -69,7 +73,8 @@ public class MentionFanOut(
     IHubContext<ChatHub> hubContext,
     ISessionRegistry sessionRegistry,
     MembershipRepository membershipRepository,
-    MentionInboxRepository mentionInboxRepository)
+    MentionInboxRepository mentionInboxRepository,
+    UserDirectoryRepository userDirectory)
 {
     // The SignalR delivery channel — pushes the targeted MentionNotified to a specific connection.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
@@ -82,6 +87,10 @@ public class MentionFanOut(
 
     // The offline mention-notification store — one row per eligible target per mentioning message.
     private readonly MentionInboxRepository _mentionInboxRepository = mentionInboxRepository;
+
+    // Follow-up spec §4: resolvability source for PUBLIC-room mentions of non-members — the same D14
+    // existence check OpenDm uses. Read ONLY on the public/no-membership branch below.
+    private readonly UserDirectoryRepository _userDirectory = userDirectory;
 
     /// <summary>
     /// Fans a persisted, non-shadow message's validated mention tags out to the eligible members —
@@ -127,28 +136,37 @@ public class MentionFanOut(
                 // (Dm/GroupDm) conversation's excerpt must NEVER reach a non-participant. Load lowercases
                 // the tag internally (C5 T4 key convention), so the display-cased mention tag matches.
                 var membership = await _membershipRepository.Load(channel.Id, tag);
-                if (membership == null)
+                if (membership != null)
                 {
-                    continue;
+                    // Rules (d)/(e) — unchanged for JOINED targets: an explicit NotificationLevel.None
+                    // opt-out outranks mentions, and a decline-suppressed Dm recipient is never pinged.
+                    if (membership.NotificationLevel == NotificationLevel.None)
+                    {
+                        continue;
+                    }
+                    if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
+                    {
+                        continue;
+                    }
                 }
-
-                // Rule (d): "none: silence" (spec §7) outranks mentions — an explicit opt-out suppresses
-                // the mention too, not just level-All activity.
-                if (membership.NotificationLevel == NotificationLevel.None)
+                else if (channel.Type == ChannelType.Public)
                 {
-                    continue;
+                    // Follow-up spec §4: PUBLIC rooms are mentionable WITHOUT membership — a public
+                    // room's excerpt is public content, so rule (c)'s wall protects nothing here. The
+                    // target must still be a RESOLVABLE user (a user_directory row; Load lowercases the
+                    // display-cased tag), so garbage tags keep producing nothing. v1 accepted gap: a
+                    // non-member cannot silence mentions from a room they haven't joined — join +
+                    // NotificationLevel.None (the membership branch above) is the opt-out.
+                    var directoryEntry = await _userDirectory.Load(tag);
+                    if (directoryEntry == null)
+                    {
+                        continue;
+                    }
                 }
-
-                // Rule (e): the C5 decline-suppression window (D3). A pending-Dm recipient who DECLINED
-                // keeps their membership at NotificationLevel.All — a decline sets ONLY DeclinedUntil
-                // (ChatHub.Dm.DeclineRequest) and never lowers the level — so rules (c)/(d) alone would let
-                // the initiator's pending mentions ping straight through the 24h soft-suppression window,
-                // contradicting the C5 guarantee that a declined request never pings them. Mirror
-                // SessionStateAssembler.BuildPendingDmTray's `DeclinedUntil > now` boundary against the SAME
-                // trusted `now` this send already read (not a fresh clock) — the window is temporal, so an
-                // elapsed DeclinedUntil resumes normal notification (self-heals in 24h).
-                if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
+                else
                 {
+                    // Rule (c) — UNCHANGED for every non-public type: the Dm/GroupDm excerpt PRIVACY
+                    // WALL, and SemiPublic/System keep the membership wall too (§4 widens Public only).
                     continue;
                 }
 

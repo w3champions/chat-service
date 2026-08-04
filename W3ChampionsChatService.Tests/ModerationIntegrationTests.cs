@@ -117,7 +117,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
         // The REAL C6 T5 writer (D3/D4), shared with the hubs' own membership/session state, so tests
         // can seed genuine mention-inbox entries the same way the send pipeline would (C6 Task 7).
-        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
         // Wraps the REAL C6 Task 7 cleaner (MentionInboxCleaner) so DeleteMessage/PurgeMessagesFromUser
         // physically remove mention-inbox rows in this suite too, while still recording each call's exact
         // id batch for the pre-existing spy assertions below.

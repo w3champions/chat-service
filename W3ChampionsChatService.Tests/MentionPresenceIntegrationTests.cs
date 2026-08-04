@@ -130,7 +130,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         // so a hub's own SendMessage(<@tag>) fans out a genuine mention-inbox entry AND a capturable,
         // targeted MentionNotified through the one shared capture (unlike the CreateIgnored factory the
         // moderation/DM suites use, whose push goes to a throwaway sink and whose session registry is empty).
-        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
         // The REAL C6 T7 cleaner, so a moderator DeleteMessage/PurgeMessagesFromUser physically removes the
         // referenced mention-inbox rows in this suite too (acceptance 3).
         _mentionCleaner = new MentionInboxCleaner(MongoClient);
@@ -525,7 +525,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     // >5 distinct rejected (the COUNT cap); an unresolvable mention is NOT rejected — it delivers verbatim
     // and simply notifies nobody (strip & deliver as plain); exactly 5 valid mentions fan out to EXACTLY
     // those 5 members (a co-present non-mentioned member and the sender get nothing); a mentioned resolvable
-    // NON-member gets no notification (the membership wall).
+    // NON-member of this PUBLIC channel DOES get notified (follow-up spec §4 — Public rooms are
+    // membership-independent for a directory-resolvable target).
     // ============================================================================================
 
     [Test]
@@ -595,17 +596,19 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That(await _mentionInboxRepository.LoadForUser(BystanderTag), Is.Empty, "...and gets no inbox entry");
         Assert.That(MentionNotifiedFor("conn-valauthor"), Is.Empty, "the sender is never self-notified");
 
-        // --- Non-member leg: a mentioned resolvable NON-member gets NOTHING (the membership wall).
+        // --- Non-member leg (follow-up spec §4): a mentioned resolvable NON-member of this PUBLIC channel
+        // NOW gets notified — the membership wall is widened away for Public rooms specifically, since a
+        // directory-resolvable target's tag proves resolvability without needing a membership row.
         _time.Advance(TimeSpan.FromSeconds(2));
         var mixed = await aHub.SendMessage(channel.Id, $"ping <@{members[0]}> and <@{NonMemberTag}>");
         Assert.That(mixed.Code, Is.EqualTo(ChatResultCode.Ok), "mentioning a resolvable non-member is legal content");
 
-        Assert.That(MentionNotifiedFor("conn-stranger"), Is.Empty,
-            "a mentioned NON-member — resolvable AND online — receives NO notification (the excerpt privacy wall)");
-        Assert.That(await _mentionInboxRepository.LoadForUser(NonMemberTag), Is.Empty,
-            "...and gets NO inbox entry, even though the send that named them succeeded");
+        Assert.That(MentionNotifiedFor("conn-stranger"), Has.Count.EqualTo(1),
+            "a mentioned NON-member of a PUBLIC channel — resolvable AND online — DOES receive a notification (§4)");
+        Assert.That(await _mentionInboxRepository.LoadForUser(NonMemberTag), Has.Count.EqualTo(1),
+            "...and gets an inbox entry too");
         Assert.That(MentionNotifiedFor(memberConns[members[0]]), Has.Count.EqualTo(2),
-            "the co-mentioned actual member DID get a second event from that same send — proving the wall, not a total no-op");
+            "the co-mentioned actual member DID get a second event from that same send");
     }
 
     // ============================================================================================
@@ -980,7 +983,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         var hubContextMock = new Mock<IHubContext<ChatHub>>();
         hubContextMock.Setup(h => h.Clients).Returns(clientsMock.Object);
 
-        var fanOut = new MentionFanOut(hubContextMock.Object, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        var fanOut = new MentionFanOut(hubContextMock.Object, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
         var message = new ChannelMessage
         {
             ChannelId = channel.Id,

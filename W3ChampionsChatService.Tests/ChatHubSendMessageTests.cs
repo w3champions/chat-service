@@ -104,7 +104,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _mentionPushHarness.HubContext,
             _sessionRegistry,
             _membershipRepository,
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            _userDirectory);
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -729,8 +730,11 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     // C6 "strip & deliver as plain" (Marco decision 3): a message is NEVER rejected because of its
     // mentions' access/resolvability. An unresolvable/garbage tag, or a tag naming a NON-member, delivers
     // VERBATIM (the client renders the invalid <@…> as plain) and simply produces no inbox entry + no
-    // notification — the membership wall in MentionFanOut is the sole authority on who is notified. These
-    // exercise the full SendMessage pipeline end-to-end (real MentionFanOut + inbox repo + push harness).
+    // notification — the membership wall in MentionFanOut is the sole authority on who is notified. Since
+    // follow-up spec §4, that wall is widened for PUBLIC channels: a directory-RESOLVABLE non-member of a
+    // Public channel now DOES get an entry + notification (only an unresolvable tag still gets nothing
+    // there); Dm/GroupDm/SemiPublic/System keep the unconditional membership wall. These exercise the full
+    // SendMessage pipeline end-to-end (real MentionFanOut + inbox repo + push harness).
     // ---------------------------------------------------------------------------------------------
 
     [Test]
@@ -753,7 +757,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Mention_ResolvableNonMemberOfPublicChannel_Ok_NoInboxEntry()
+    public async Task Mention_ResolvableNonMemberOfPublicChannel_Ok_GetsInboxEntryAndPush()
     {
         var channel = await CreateChannel("general");
         SeedMember("conn-1", BattleTag, channel.Id);
@@ -765,11 +769,10 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         var result = await hub.SendMessage(channel.Id, $"hey {Mention("stranger#1")}");
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "mentioning a resolvable non-member of a public channel is legal — no reject");
-        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("stranger#1"),
-            "a non-member of a Public channel gets NO inbox entry — the uniform membership wall applies to every channel type");
-        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
-            "and no MentionNotified push");
-        Assert.IsEmpty(_mentionPushHarness.AllSignals, "the only mention target was a non-member — nobody is notified");
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("stranger#1")).Count,
+            "follow-up spec §4: a directory-resolvable non-member of a PUBLIC channel now gets an inbox entry — the membership wall is widened away for Public rooms only");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
+            "and the targeted MentionNotified push");
     }
 
     [Test]
