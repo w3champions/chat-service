@@ -349,6 +349,12 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             await hub.SendMessage(channel.Id, $"spam-{i}");
         }
 
+        // A REAL relaunch: conn-1 actually disconnects — running the hub's full disconnect teardown
+        // (FocusRegistry/OnlineMemberRegistry/etc. all torn down) — BEFORE conn-2 is ever seeded. This
+        // is what proves MessageRateLimiter state survives actual disconnect (locking in the removed
+        // ChatHub.cs RemoveConnection call), not merely that a second connection can coexist.
+        await hub.OnDisconnectedAsync(null);
+
         // "Relaunch": a brand-new connection, SAME battleTag. Pre-§1 this was a clean slate.
         SeedMember("conn-2", BattleTag, channel.Id);
         var reconnected = BuildHub("conn-2");

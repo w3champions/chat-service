@@ -214,6 +214,10 @@ public class MessageRateLimiterTests
     [Test]
     public void AutoThrottle_EmitsOneModerationLogLine()
     {
+        // Deliberately MIXED-CASE: User ("peter#123") is already all-lowercase, so it can never
+        // discriminate "logged the caller's original casing" from "logged the internal lowercased
+        // dictionary key" — both would render identically. MixedCaseUser pins the real defect.
+        const string MixedCaseUser = "Peter#123";
         var capturedWarnings = new List<string>();
         var sink = new DelegatingLogSink(evt =>
         {
@@ -231,20 +235,22 @@ public class MessageRateLimiterTests
         {
             for (var i = 0; i < ChatLimits.PerChannelBurst; i++)
             {
-                _limiter.TryAcquire(User, Channel, _t0);
+                _limiter.TryAcquire(MixedCaseUser, Channel, _t0);
             }
             for (var v = 0; v < ChatLimits.AutoThrottleViolationThreshold; v++)
             {
-                _limiter.TryAcquire(User, Channel, _t0);
+                _limiter.TryAcquire(MixedCaseUser, Channel, _t0);
             }
             // Further denied sends inside the hard-throttle window must NOT emit more log lines.
-            _limiter.TryAcquire(User, Channel, _t0.AddSeconds(1));
-            _limiter.TryAcquire(User, Channel, _t0.AddSeconds(2));
+            _limiter.TryAcquire(MixedCaseUser, Channel, _t0.AddSeconds(1));
+            _limiter.TryAcquire(MixedCaseUser, Channel, _t0.AddSeconds(2));
 
             Assert.AreEqual(1, capturedWarnings.Count, "auto-throttle must log exactly one moderation line");
-            // The line logs the LOWERCASED battleTag key, not the raw arg — User is already all-lowercase,
-            // but assert against the normalized form so this stays correct if User ever gains mixed casing.
-            StringAssert.Contains(User.ToLowerInvariant(), capturedWarnings[0], "the moderation line must identify the battleTag");
+            // The line must carry the caller's ORIGINAL casing — matching the hub's companion log line
+            // (ChatHub.Messaging.cs) so a case-sensitive log search finds both — NOT the internal
+            // lowercased dictionary key used for state lookups.
+            StringAssert.Contains(MixedCaseUser, capturedWarnings[0],
+                "the moderation line must identify the battleTag in the caller's original casing, not the lowercased key");
         }
         finally
         {
@@ -305,8 +311,12 @@ public class MessageRateLimiterTests
         var later = _t0 + ChatLimits.AutoThrottleTierDecay + TimeSpan.FromSeconds(1);
         Assert.IsTrue(_limiter.TryAcquire(User, Channel, later).Allowed);
 
-        Assert.LessOrEqual(_limiter.TrackedUserCount, 2,
-            "entries idle past AutoThrottleTierDecay must be pruned (only the sweeping caller may remain)");
+        // The sweep (PruneQuiescentNoLock) runs BEFORE the sweeping call's own entry is created, so all
+        // 200 prior entries — idle since _t0, past the decay horizon — are evicted and exactly ONE entry
+        // (User, just created) remains. Exact, not an upper bound: verified against the implementation's
+        // prune-before-create ordering in TryAcquire.
+        Assert.AreEqual(1, _limiter.TrackedUserCount,
+            "entries idle past AutoThrottleTierDecay must be pruned (only the sweeping caller remains)");
     }
 
     [Test]

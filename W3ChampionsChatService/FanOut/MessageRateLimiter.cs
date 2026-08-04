@@ -137,12 +137,15 @@ public class MessageRateLimiter
         }
 
         // Emit the moderation line outside the lock. The transition it reports happened exactly once
-        // (inside the lock), so this fires exactly once per hard-throttle episode.
+        // (inside the lock), so this fires exactly once per hard-throttle episode. Logs the caller's
+        // ORIGINAL-CASING battleTag (not the internal lowercased `key`) so this line matches the hub's
+        // own companion Log.Warning (ChatHub.Messaging.cs) — a case-sensitive log search for a
+        // particular battleTag must find both lines.
         if (applied is TimeSpan d)
         {
             Log.Warning(
                 "Auto-throttling chat user {BattleTag} for {DurationSeconds}s after {ViolationThreshold} rate-limit violations within {WindowSeconds}s",
-                key,
+                battleTag,
                 d.TotalSeconds,
                 ChatLimits.AutoThrottleViolationThreshold,
                 ChatLimits.AutoThrottleWindow.TotalSeconds);

@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using NUnit.Framework;
 using W3ChampionsChatService.Domain;
 
@@ -50,6 +51,20 @@ public class ChatLimitsTests
             new[] { TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60) },
             ChatLimits.AutoThrottleTierDurations);
         Assert.AreEqual(TimeSpan.FromMinutes(10), ChatLimits.AutoThrottleTierDecay);
+    }
+
+    [Test]
+    public void AutoThrottleTierDurations_AreAllBelowTierDecay()
+    {
+        // Pins the invariant documented at AutoThrottleTierDurations' declaration: MessageRateLimiter's
+        // quiescent prune treats AutoThrottleTierDecay as "definitely idle, safe to evict" for a user's
+        // ENTIRE state (buckets, violations, ladder, and any active hard throttle). That is only true if
+        // no tier duration can outlive the decay horizon — otherwise a still-hard-throttled user could be
+        // pruned mid-penalty and get a silent clean slate on their very next send.
+        Assert.IsTrue(
+            ChatLimits.AutoThrottleTierDurations.All(tier => tier < ChatLimits.AutoThrottleTierDecay),
+            "every AutoThrottleTierDurations entry must be strictly less than AutoThrottleTierDecay, or " +
+            "MessageRateLimiter's quiescent prune could evict a still-hard-throttled user's state early");
     }
 
     [Test]

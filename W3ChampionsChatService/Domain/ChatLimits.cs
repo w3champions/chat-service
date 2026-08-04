@@ -96,7 +96,11 @@ public static class ChatLimits
     /// <summary>Escalating auto-throttle tiers (2026-08-04 follow-up spec §1, hard-coded — no env
     /// plumbing per the parent-spec rule): first trigger 10s, second 30s, third and beyond 60s (cap
     /// — the last element applies to every later trigger). The ladder resets to the first tier after
-    /// <see cref="AutoThrottleTierDecay"/> without a new trigger.</summary>
+    /// <see cref="AutoThrottleTierDecay"/> without a new trigger.
+    /// <para>INVARIANT (pinned by <c>ChatLimitsTests</c>): every element here must stay strictly less
+    /// than <see cref="AutoThrottleTierDecay"/> — <see cref="FanOut.MessageRateLimiter"/>'s quiescent
+    /// prune treats the decay horizon as "definitely idle, safe to evict", which only holds if no tier's
+    /// hard-throttle penalty can still be running that long after a user's last touch.</para></summary>
     public static readonly IReadOnlyList<TimeSpan> AutoThrottleTierDurations =
     [
         TimeSpan.FromSeconds(10),

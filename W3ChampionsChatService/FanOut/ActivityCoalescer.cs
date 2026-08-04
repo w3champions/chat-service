@@ -49,9 +49,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     // The online-member index — read at EMIT time for the member's CURRENT LastReadSeq (suppression).
     private readonly OnlineMemberRegistry _onlineMemberRegistry = onlineMemberRegistry;
 
-    // connectionId -> (channelId -> coalescing window state). Nested by connection (mirroring
-    // MessageRateLimiter's per-connection map) so RemoveConnection on disconnect is O(1) — dropping a
-    // connection never scans every channel. Mutated only under _lock.
+    // connectionId -> (channelId -> coalescing window state). Nested by connection — this coalescer's
+    // own state is (and stays) connection-scoped for the connection's full lifetime, so RemoveConnection
+    // on disconnect is O(1) and dropping a connection never scans every channel. Mutated only under _lock.
     private readonly Dictionary<string, Dictionary<string, Entry>> _entriesByConnection =
         new Dictionary<string, Dictionary<string, Entry>>();
 
@@ -187,8 +187,10 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// single O(1) map removal. Called from the hub's disconnect teardown (via
     /// <see cref="FanOutEngine.OnConnectionClosed"/>) so this singleton's per-connection state can never
     /// leak past the socket's lifetime — SignalR never reuses a connectionId, so an un-evicted entry
-    /// would live for the whole process. Mirrors the <c>RemoveConnection</c> the sibling registries /
-    /// <see cref="MessageRateLimiter"/> expose for the same reason. No-op for an unknown connection.
+    /// would live for the whole process. Mirrors the <c>RemoveConnection</c> the sibling registries
+    /// (<see cref="FocusRegistry"/>, <see cref="OnlineMemberRegistry"/>) expose for the same reason —
+    /// unlike those (and unlike this coalescer), <see cref="MessageRateLimiter"/> is battleTag-keyed and
+    /// deliberately SURVIVES disconnect, so it exposes no such method. No-op for an unknown connection.
     /// </summary>
     public void RemoveConnection(string connectionId)
     {
@@ -247,7 +249,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
 
     /// <summary>
     /// The coalescing window state for one (connection, channel). Plain mutable fields, mutated only
-    /// under the coalescer's lock (mirrors <see cref="MessageRateLimiter"/>'s per-connection state).
+    /// under the coalescer's lock; the entry lives for exactly as long as its owning connection and is
+    /// dropped in one shot by <see cref="RemoveConnection"/> on disconnect.
     /// <see cref="LastSentAt"/> defaults to <see cref="DateTime.MinValue"/> so the first offer is always
     /// "window elapsed" and fires immediately. <see cref="LastEmittedSeq"/> is the running high-water
     /// mark of every seq this (connection, channel) has emitted or pended — both <see cref="Offer"/> and
