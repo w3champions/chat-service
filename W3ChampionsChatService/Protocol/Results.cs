@@ -83,3 +83,11 @@ public record GetPresenceResult(
 public record GetPresenceDetailsResult(
     ChatResultCode Code,
     IReadOnlyList<PresenceDetailsDto> Details = null);
+
+/// <summary>GetConversations (2026-08-04 follow-up spec §6) — one page of the caller's OLDER 1:1 Dm
+/// shells, newest-first by (LastMessageAt, ChannelId). Reuses ChannelDto so a paged conversation is
+/// byte-shaped like a SessionState.Channels entry. The client derives the next cursor from the last
+/// element (channel.LastMessageAt, channel.Id) and detects the end by Count &lt; limit.</summary>
+public record GetConversationsResult(
+    ChatResultCode Code,
+    IReadOnlyList<ChannelDto> Conversations = null);

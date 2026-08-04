@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
@@ -598,5 +600,89 @@ public partial class ChatHub
                 Log.Warning(ex, "RequestReceived push failed for {ConnectionId} on channel {ChannelId} — best-effort, tray resurfaces it via SessionState", recipientSession.ConnectionId, channel.Id);
             }
         }
+    }
+
+    /// <summary>
+    /// 2026-08-04 follow-up spec §6: pages the caller's OLDER 1:1 Dm shells (the ones the bounded
+    /// connect snapshot excluded), newest-first by (LastMessageAt, ChannelId), cursor =
+    /// (cursorLastMessageAt, cursorChannelId) — both null for the first page; strictly-older-than
+    /// filtering keyed on the PAIR makes the pagination stable under concurrent recency changes (a
+    /// conversation that moves forward jumps to the FRONT and can never be double-served in a later
+    /// page). Reuses ChannelDto (the SessionState.Channels shape) and computes the SAME D7
+    /// user-visible unread per returned shell. Every returned shell is ALSO seeded into the caller's
+    /// OnlineMemberRegistry — the follow-up §6 companion rule to the bounded connect seed — so a paged
+    /// conversation is immediately usable (SendMessage/FocusChannel/GetMessages/MarkRead) without an
+    /// extra OpenDm round-trip. Resolution order:
+    /// <list type="number">
+    /// <item>Fail-closed identity → <see cref="ChatResultCode.PermissionDenied"/>.</item>
+    /// <item>Malformed cursor (exactly one half supplied) → <see cref="HubException"/> (the
+    /// <c>GetMessages</c> client-bug mapping).</item>
+    /// <item>Clamp <paramref name="limit"/> to [1, <see cref="ChatLimits.ConversationsPageSize"/>].</item>
+    /// <item>Load ALL memberships + their channels (the same two indexed queries the connect snapshot
+    /// runs), keep <see cref="ChannelType.Dm"/> only, order, cursor-filter, take the page.</item>
+    /// <item>Per shell: D7 unread count → <see cref="ChannelDto"/>; seed the registry; return Ok.</item>
+    /// </list>
+    /// </summary>
+    public async Task<GetConversationsResult> GetConversations(DateTime? cursorLastMessageAt, string cursorChannelId, int limit)
+    {
+        // 1. Fail-closed identity.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new GetConversationsResult(ChatResultCode.PermissionDenied);
+        }
+
+        // 2. The cursor is a PAIR — both halves or neither (first page).
+        var hasCursorTime = cursorLastMessageAt.HasValue;
+        var hasCursorId = !string.IsNullOrEmpty(cursorChannelId);
+        if (hasCursorTime != hasCursorId)
+        {
+            throw new HubException("GetConversations: cursorLastMessageAt and cursorChannelId form one cursor — supply both or neither.");
+        }
+
+        // 3. Clamp — never Limit(0)/unbounded, never rejected.
+        var effectiveLimit = Math.Clamp(limit, 1, ChatLimits.ConversationsPageSize);
+
+        var battleTag = session.Identity.BattleTag;
+
+        // 4. Membership-first (user→channels — the only supported direction), then the channel docs in
+        // ONE LoadByIds. In-memory ordering over the caller's own bounded conversation count mirrors
+        // the CountNameJoinableMembershipsForUser precedent — no new aggregation pipeline.
+        var memberships = await _membershipRepository.LoadForUser(battleTag);
+        var channelsById = (await _channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
+            .ToDictionary(c => c.Id);
+
+        var ordered = memberships
+            .Where(m => channelsById.TryGetValue(m.ChannelId, out var c) && c.Type == ChannelType.Dm)
+            .Select(m =>
+            {
+                var channel = channelsById[m.ChannelId];
+                return (Membership: m, Channel: channel, SortTime: channel.LastMessageAt ?? m.JoinedAt);
+            })
+            .OrderByDescending(x => x.SortTime)
+            .ThenByDescending(x => x.Channel.Id, StringComparer.Ordinal);
+
+        var page = (hasCursorTime
+                ? ordered.Where(x => x.SortTime < cursorLastMessageAt.Value
+                    || (x.SortTime == cursorLastMessageAt.Value && string.CompareOrdinal(x.Channel.Id, cursorChannelId) < 0))
+                : ordered)
+            .Take(effectiveLimit)
+            .ToList();
+
+        // 5. Project (same D7 unread as the connect snapshot) + seed the registry per returned shell.
+        var conversations = new List<ChannelDto>(page.Count);
+        foreach (var item in page)
+        {
+            var unreadCount = await _messageRepository.CountUserVisibleAfter(
+                item.Channel.Id, battleTag, item.Membership.LastReadSeq);
+            conversations.Add(new ChannelDto(
+                item.Channel, MembershipDto.From(item.Membership), unreadCount, unreadCount > 0));
+
+            _onlineMemberRegistry.Join(
+                item.Channel.Id,
+                Context.ConnectionId,
+                new MemberState(battleTag, item.Membership.NotificationLevel, item.Membership.LastReadSeq, ChannelType.Dm));
+        }
+
+        return new GetConversationsResult(ChatResultCode.Ok, conversations);
     }
 }

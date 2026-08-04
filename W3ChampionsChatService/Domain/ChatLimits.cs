@@ -168,6 +168,10 @@ public static class ChatLimits
     /// channel are never bounded by this.</summary>
     public const int DmSnapshotRecentConversations = 30;
 
+    /// <summary>GetConversations page-size cap (2026-08-04 follow-up spec §6 — not spec §13; requested
+    /// limits above this are clamped down, never rejected — the <see cref="MessagePageSize"/> precedent).</summary>
+    public const int ConversationsPageSize = 50;
+
     /// <summary>C7 HMAC freshness window (brief Design decision 2): a request is rejected when
     /// |now − timestamp| exceeds this window. Pinned default — M1/W2 build against this exact 300s
     /// value as a cross-repo contract, so a test asserts it verbatim.</summary>
