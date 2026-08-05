@@ -317,14 +317,11 @@ public partial class ChatHub
     /// <item>Fail-closed identity: an unregistered connection (never authenticated, or its session was
     /// displaced/torn down) → <see cref="ChatResultCode.PermissionDenied"/> — there is no identity to
     /// page history under.</item>
-    /// <item>Malformed-arg guard, BEFORE any DB work: <paramref name="beforeSeq"/> and
-    /// <paramref name="aroundSeq"/> are mutually exclusive paging modes. A caller supplying BOTH is a
-    /// client programming error, not a user-facing rejection, so it throws <see cref="HubException"/>
-    /// (decision 5's client-error mapping — the same graceful-throw style as
-    /// <see cref="Authentication.ChatHubPermissionFilter"/>) rather than a typed result code.</item>
-    /// <item>Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3), BEFORE any DB work — mirrors
-    /// <see cref="SendMessage(string, string)"/>'s "rate limit before the first DB read" ordering. ONE
-    /// per-battleTag token bucket (<see cref="FanOut.ReadRateLimiter"/>) shared with
+    /// <item>Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3) — FIRST THING after identity
+    /// resolution, strictly before the malformed-arg guard below AND any DB work (fix round 1, finding
+    /// F5: this now structurally mirrors <see cref="GetConversations"/>'s "limiter absolutely first"
+    /// ordering exactly, rather than the narrower "before the first DB read" ordering this method used
+    /// before). ONE per-battleTag token bucket (<see cref="FanOut.ReadRateLimiter"/>) shared with
     /// <see cref="GetConversations"/> — the task report records the launcher-e investigation establishing
     /// that a <see cref="ChatResultCode.Throttled"/> GetMessages reject already degrades gracefully on
     /// both old and current shipped clients (silent no-op, no retry storm, no error modal), which is why
@@ -332,6 +329,11 @@ public partial class ChatHub
     /// retry-after. Limits are generous (burst 60, sustained 5/s — sized for connect fan-out, see
     /// <see cref="ChatLimits.ReadBurst"/>'s doc) — server protection only, not UX pacing (Marco) — so no
     /// legitimate client should ever observe this in normal operation.</item>
+    /// <item>Malformed-arg guard, BEFORE any DB work: <paramref name="beforeSeq"/> and
+    /// <paramref name="aroundSeq"/> are mutually exclusive paging modes. A caller supplying BOTH is a
+    /// client programming error, not a user-facing rejection, so it throws <see cref="HubException"/>
+    /// (decision 5's client-error mapping — the same graceful-throw style as
+    /// <see cref="Authentication.ChatHubPermissionFilter"/>) rather than a typed result code.</item>
     /// <item>Membership: the hot path reads <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (zero
     /// DB) and, if the caller is a member, pages directly — no channel load. A non-member falls to the
     /// cold path: a single <see cref="Channels.ChannelRepository.Load"/> distinguishes "no such
@@ -363,8 +365,21 @@ public partial class ChatHub
         {
             return new GetMessagesResult(ChatResultCode.PermissionDenied);
         }
+        var battleTag = session.Identity.BattleTag;
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        // 2. Malformed-arg guard, before any DB work: beforeSeq/aroundSeq are mutually exclusive
+        // 2. Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3) — FIRST THING, before the
+        // malformed-arg guard below and before any DB work (fix round 1, finding F5: structurally
+        // mirrors GetConversations' "limiter absolutely first" ordering exactly). Shares ONE
+        // per-battleTag bucket with GetConversations — see FanOut/ReadRateLimiter.cs and the task
+        // report's scope determination.
+        var readDecision = _readRateLimiter.TryAcquire(battleTag, now);
+        if (!readDecision.Allowed)
+        {
+            return new GetMessagesResult(ChatResultCode.Throttled, readDecision.RetryAfterSeconds);
+        }
+
+        // 3. Malformed-arg guard, before any DB work: beforeSeq/aroundSeq are mutually exclusive
         // paging modes. Supplying both is a client bug — a graceful HubException, not a typed result.
         if (beforeSeq.HasValue && aroundSeq.HasValue)
         {
@@ -372,17 +387,6 @@ public partial class ChatHub
         }
 
         var connectionId = Context.ConnectionId;
-        var battleTag = session.Identity.BattleTag;
-        var now = _timeProvider.GetUtcNow().UtcDateTime;
-
-        // 3. Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3), BEFORE any DB work — mirrors
-        // SendMessage's "rate limit before the first DB read" ordering. Shares ONE per-battleTag bucket
-        // with GetConversations — see FanOut/ReadRateLimiter.cs and the task report's scope determination.
-        var readDecision = _readRateLimiter.TryAcquire(battleTag, now);
-        if (!readDecision.Allowed)
-        {
-            return new GetMessagesResult(ChatResultCode.Throttled, readDecision.RetryAfterSeconds);
-        }
 
         // 4. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
         // distinguishes NotFound from NotMember — EXCEPT for PUBLIC channels (follow-up spec §4's

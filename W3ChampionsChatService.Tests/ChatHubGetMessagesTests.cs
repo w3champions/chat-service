@@ -441,6 +441,34 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         Assert.IsNull(result.Messages);
     }
 
+    // Fix round 1, finding F5: the limiter now runs absolutely FIRST in GetMessages too (moved above the
+    // malformed-arg guard), mirroring GetConversations' ordering exactly instead of the narrower
+    // "before the first DB read" ordering it used before. Pin it the same way GetConversations' own
+    // tripwire (F2) does: supplying BOTH beforeSeq and aroundSeq is normally a client-bug HubException
+    // (step 3) — if the limiter ever slipped below that guard, this call would throw instead of
+    // returning Throttled.
+    [Test]
+    public async Task GetMessages_OverReadLimit_WithMalformedArgs_ReturnsThrottled_NotHubException()
+    {
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        // beforeSeq AND aroundSeq both set — malformed, and normally a client-bug HubException (step 3).
+        // If the limiter ever slipped below that guard, this line throws and the test fails.
+        var result = await hub.GetMessages("any-channel-id", beforeSeq: 1, aroundSeq: 2, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code,
+            "the read rate limit must run FIRST THING — strictly before the malformed-arg guard — so a " +
+            "malformed (beforeSeq + aroundSeq both set) call from an over-budget caller returns Throttled " +
+            "rather than throwing HubException");
+        Assert.IsNull(result.Messages);
+    }
+
     [Test]
     public async Task GetMessages_ReadLimit_IsIndependentPerBattleTag()
     {
