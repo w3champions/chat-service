@@ -137,6 +137,9 @@ public class MatchChannelService(
         // skip iff already detached, OR this epoch's stamped seq is STRICTLY ahead of this call's seq.
         // Read from `channel` as returned by FindOrCreateSystem above — for an EXISTING channel that is
         // exactly a fresh load of current state; the TryAdvanceAssertion call above never mutates it.
+        // NOTE (fix round 1, review r1 Minor-3): deliberately NOT the literal "if (channel.Detached) return
+        // channel;" early-return shape from Task 3 step 4 — D10 requires the TryAdvanceAssertion stamp
+        // attempt above to run regardless of Detached, which an early return before it would prevent.
         var skipAdds = channel.Detached
             || (epoch != null && seq.HasValue && channel.AssertEpoch == epoch && channel.AssertSeq > seq.Value);
 
@@ -394,7 +397,11 @@ public class MatchChannelService(
         // Missing/extra are computed case-insensitively (stored battleTags are lowercased, mm sends JWT
         // casing) — a case-only difference between the stored row and the asserted tag must never read as
         // a remove+add churn. `missing` preserves mm's incoming list ORDER (not the set) for deterministic
-        // add sequencing.
+        // add sequencing. NOTE (fix round 1, review r1 Major-1 residual): if OrdinalIgnoreCase were ever
+        // dropped here, no test would fail — AddMemberWithInvariant's normalizing membershipRepository.Load
+        // gate (:188) swallows every over-reported "missing" member as a no-op add. That masked failure mode
+        // is a silent PERFORMANCE regression (an extra Load round-trip per member per assertion), not a
+        // correctness one — do not "simplify" this comparison away on the observation that the suite stays green.
         var missing = members
             .Where(m => !current.Any(row => string.Equals(row.BattleTag, m, StringComparison.OrdinalIgnoreCase)))
             .ToList();

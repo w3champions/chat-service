@@ -297,6 +297,9 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(reloaded.Name, Is.EqualTo("Real Match Name"), "the backfilled name is durably persisted");
     }
 
+    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): this whole region covers the
+    // DELTA path. mm keeps sending deltas until its own deploy; DELETE THIS ENTIRE REGION in the
+    // mm-deploy-confirmed cleanup PR alongside ApplyMembersDelta itself — see docs plan Task 6.
     // ============================================================================================
     // C7 Task 7 — ApplyMembersDelta: add creates membership + pushes ChannelAdded
     // ============================================================================================
@@ -670,18 +673,20 @@ public class MatchChannelServiceTests : IntegrationTestBase
     [Test]
     public async Task Assert_CaseOnlyDifference_DoesNotChurnMembership()
     {
-        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", "Alice#1");
         await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
-        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+        // Seeded so the stored row is the lowercased key "alice#1"...
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members("alice#1"), name: null, detached: false);
         var pushCountAfterFirst = _harness.AllSignals.Count;
 
-        // Re-assert with a DIFFERENT casing of the same tag.
-        await _service.ApplyRosterAssertion("match-1", "e1", 2, Members("alice#1"), name: null, detached: false);
+        // ...and re-asserted with mm's JWT casing. THIS is the direction that occurs in production.
+        await _service.ApplyRosterAssertion("match-1", "e1", 2, Members("Alice#1"), name: null, detached: false);
 
         Assert.That(_harness.AllSignals.Count, Is.EqualTo(pushCountAfterFirst),
             "a case-only difference between stored (lowercased) and asserted (JWT-cased) battleTags must not churn membership");
         var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
-        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Has.Count.EqualTo(1), "exactly one membership row — no delete+re-add");
+        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Has.Count.EqualTo(1),
+            "exactly one membership row — no delete+re-add");
     }
 
     [Test]
@@ -860,6 +865,38 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(reloaded.Detached, Is.True, "then the channel is frozen");
     }
 
+    // Records the membership row count at the instant the freeze latch lands — the only way to pin the
+    // plan's DETACH-LAST ordering (D4/D10), whose in-process post-conditions are identical either way
+    // (nothing between the latch and the member writes reads Detached — see ChannelRepository.SetDetached's
+    // doc). Used by both the ApplyRosterAssertion and CreateOrGet detach-ordering tests below.
+    private sealed class DetachOrderChannelRepository(MongoClient mongoClient) : ChannelRepository(mongoClient)
+    {
+        public MembershipRepository Memberships;
+        public int RowsAtDetach = -1;
+
+        public override async Task SetDetached(string channelId)
+        {
+            RowsAtDetach = (await Memberships.LoadForChannel(channelId)).Count;
+            await base.SetDetached(channelId);
+        }
+    }
+
+    [Test]
+    public async Task Assert_WithDetachedTrue_DetachLatchLandsAfterTheDiffConverged()
+    {
+        var repo = new DetachOrderChannelRepository(MongoClient);
+        var memberships = new MembershipRepository(MongoClient, repo);
+        repo.Memberships = memberships;
+        var service = new MatchChannelService(repo, memberships, _messageRepository, _fanOutEngine, _time);
+        await service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+
+        await service.ApplyRosterAssertion("match-1", "e1", 1, Members("Alice#1"), name: null, detached: true);
+
+        Assert.That(repo.RowsAtDetach, Is.EqualTo(1),
+            "DETACH LAST (D4): the final member set must already be persisted when the freeze latch lands — "
+            + "detach-first plus a crash mid-diff freezes a wrong roster until the 24h TTL");
+    }
+
     [Test]
     public async Task Assert_AfterDetach_IsDiscarded_EvenWithHigherSeq_AndNewEpoch()
     {
@@ -874,6 +911,32 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "a post-detach assertion never applies, even with a higher seq and a different epoch");
     }
 
+    // Admits everything, so the CAS's own Ne(Detached, true) backstop cannot mask the DOMAIN-level
+    // detach guard this test targets (plan D4 requires BOTH layers — see TryAdvanceAssertion's own
+    // "REDUNDANT BY DESIGN" doc for the analogous Task 1 precedent).
+    private sealed class AlwaysAdmitChannelRepository(MongoClient mongoClient) : ChannelRepository(mongoClient)
+    {
+        public override Task<bool> TryAdvanceAssertion(string channelId, string epoch, long seq) => Task.FromResult(true);
+    }
+
+    [Test]
+    public async Task Assert_AfterDetach_DomainGuardDiscards_WithoutTheCasBackstop()
+    {
+        var repo = new AlwaysAdmitChannelRepository(MongoClient);
+        var memberships = new MembershipRepository(MongoClient, repo);
+        var service = new MatchChannelService(repo, memberships, _messageRepository, _fanOutEngine, _time);
+        var channel = await service.CreateOrGet("match-1", "Ladder", Members("Alice#1"), focus: false, detached: true);
+
+        await service.ApplyRosterAssertion("match-1", "e2", 99, Members("Bob#2"), name: null, detached: false);
+
+        Assert.That(await memberships.Load(channel.Id, "Bob#2"), Is.Null,
+            "the domain-level detach freeze discards on its own — it does not lean on the CAS filter");
+        Assert.That(await memberships.Load(channel.Id, "Alice#1"), Is.Not.Null);
+    }
+
+    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): delta-path-only — pins
+    // ApplyMembersDelta's detach guard specifically. DELETE alongside ApplyMembersDelta itself in the
+    // mm-deploy-confirmed cleanup PR — see docs plan Task 6.
     [Test]
     public async Task Delta_AfterDetach_IsDiscarded()
     {
@@ -998,6 +1061,20 @@ public class MatchChannelServiceTests : IntegrationTestBase
         // A follow-up assertion must be discarded — the channel is frozen from birth.
         await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(bob), name: null, detached: false);
         Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null);
+    }
+
+    [Test]
+    public async Task CreateOrGet_WithDetached_LatchLandsAfterTheBirthAdds()
+    {
+        var repo = new DetachOrderChannelRepository(MongoClient);
+        var memberships = new MembershipRepository(MongoClient, repo);
+        repo.Memberships = memberships;
+        var service = new MatchChannelService(repo, memberships, _messageRepository, _fanOutEngine, _time);
+
+        await service.CreateOrGet("match-1", "Ladder Match", Members("Alice#1"), focus: false, detached: true);
+
+        Assert.That(repo.RowsAtDetach, Is.EqualTo(1),
+            "D10 adds-before-detach: a crashed-then-retried create only converges because the adds always precede the latch");
     }
 
     [Test]

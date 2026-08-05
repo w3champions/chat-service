@@ -292,8 +292,11 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         return result.ModifiedCount == 1;
     }
 
-    /// <summary>Freezes the room (plan D4) — see ChatChannel.Detached. Idempotent.</summary>
-    public Task SetDetached(string channelId) =>
+    /// <summary>Freezes the room (plan D4) — see ChatChannel.Detached. Idempotent.
+    /// Virtual: a test seam (the TryAdvanceAssertion idiom) so a subclass can observe WHEN the latch
+    /// lands and pin the plan's DETACH-LAST / adds-before-detach ordering, which is otherwise
+    /// invisible in-process (nothing between the latch and the member writes reads Detached).</summary>
+    public virtual Task SetDetached(string channelId) =>
         Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Detached, true));
 
     /// <summary>
