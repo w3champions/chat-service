@@ -12,7 +12,8 @@ namespace W3ChampionsChatService.Tests;
 /// reconciliation spec, Task 2). Plain in-memory logic, deliberately **not** an
 /// <c>IntegrationTestBase</c> suite (no Mongo, no channel/membership state) — mirrors
 /// <see cref="ReadRateLimiterTests"/>'s shape: no <c>Thread.Sleep</c>, every interleaving proven
-/// deterministically via <see cref="TaskCompletionSource"/> and awaited tasks with generous timeouts.
+/// deterministically by racing the pending acquire against a bounded <see cref="Task.Delay(TimeSpan)"/>
+/// (a correctly-blocked acquire can only LOSE that race) and awaiting every task with a generous timeout.
 /// </summary>
 public class MatchChannelRefGateTests
 {
@@ -59,6 +60,17 @@ public class MatchChannelRefGateTests
 
         Assert.IsTrue(secondTask.IsCompletedSuccessfully, "a distinct ref must never be blocked by another ref's holder");
         second.Dispose();
+    }
+
+    [Test]
+    public async Task RefsAreCaseSensitive_OrdinalKeys_DoNotShareAGate()
+    {
+        // systemRefs are EXACT Mongo keys ([A-Za-z0-9_-]) — unlike battleTags they are never case-folded,
+        // so "Ab3" and "aB3" are two different channels and must never serialize against each other.
+        using var upper = await _gate.AcquireAsync("Ab3");
+        var lower = await _gate.AcquireAsync("aB3").WaitAsync(Timeout);
+        Assert.AreEqual(2, _gate.TrackedRefCount, "case-differing refs must be tracked as distinct gates");
+        lower.Dispose();
     }
 
     [Test]
