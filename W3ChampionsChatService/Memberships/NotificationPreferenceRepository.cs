@@ -1,5 +1,6 @@
 using System;
 using System.Threading.Tasks;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using W3ChampionsChatService.Domain;
 
@@ -47,7 +48,12 @@ public class NotificationPreferenceRepository(MongoClient mongoClient) : MongoDb
             .Set(p => p.NotificationLevel, level)
             .Set(p => p.UpdatedAt, now)
             .SetOnInsert(p => p.BattleTag, tag)
-            .SetOnInsert(p => p.ChannelId, channelId);
+            .SetOnInsert(p => p.ChannelId, channelId)
+            // Explicit string _id on insert (mirrors MembershipRepository.InsertIfAbsent) — an upsert
+            // that never names _id would otherwise let Mongo assign its own native ObjectId, which the
+            // string-typed Id property here cannot deserialize back (a BsonSerializationException on the
+            // very next Load).
+            .SetOnInsert(p => p.Id, ObjectId.GenerateNewId().ToString());
 
         return Prefs.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
     }

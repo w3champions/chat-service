@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Moq;
+using MongoDB.Driver;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
@@ -44,6 +45,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
 
     private ChannelRepository _channelRepository;
     private MembershipRepository _membershipRepository;
+    private NotificationPreferenceRepository _notificationPreferenceRepository;
     private SessionRegistry _sessionRegistry;
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
@@ -67,6 +69,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
 
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
+        _notificationPreferenceRepository = new NotificationPreferenceRepository(MongoClient);
         _sessionRegistry = new SessionRegistry();
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
@@ -109,7 +112,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            _notificationPreferenceRepository);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
@@ -532,5 +535,214 @@ public class ChatHubMembershipTests : IntegrationTestBase
         var result = await hub.SetNotificationLevel("some-channel-id", NotificationLevel.None);
 
         Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PR36 follow-up (D2) — notification-preference persistence across leave/rejoin. SetNotificationLevel
+    // writes the pref (Public/SemiPublic only), LeaveChannel stays a hard membership delete (unchanged),
+    // and JoinChannel seeds a (re)joined membership from the persisted pref when one exists. The
+    // "mention stays suppressed after leaving" leg builds a REAL MentionFanOut (mirrors the
+    // MentionFanOutTests.cs harness) over the SAME _membershipRepository/_notificationPreferenceRepository
+    // this hub uses, so the consult path is exercised end-to-end rather than asserted only at the
+    // repository layer.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task SetNotificationLevel_Public_UpsertsPreference()
+    {
+        var channel = await CreateChannel("general");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await hub.JoinChannel("general");
+
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+
+        var pref = await _notificationPreferenceRepository.Load(BattleTag, channel.Id);
+        Assert.IsNotNull(pref, "an explicit set on a Public channel must persist a NotificationPreference row");
+        Assert.AreEqual(NotificationLevel.None, pref.NotificationLevel);
+    }
+
+    [Test]
+    public async Task SetNotificationLevel_SemiPublic_UpsertsPreference()
+    {
+        var channel = await CreateChannel("semi-room", ChannelType.SemiPublic);
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await hub.JoinChannel("semi-room");
+
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.All);
+
+        var pref = await _notificationPreferenceRepository.Load(BattleTag, channel.Id);
+        Assert.IsNotNull(pref, "SemiPublic is name-joinable too — the pref must persist");
+        Assert.AreEqual(NotificationLevel.All, pref.NotificationLevel);
+    }
+
+    [Test]
+    public async Task SetNotificationLevel_GroupDm_NoPreferenceWritten()
+    {
+        // ACL-governed types are not user-leavable in the room-catalog sense — the pref collection must
+        // stay bounded to the room catalog (Public/SemiPublic only).
+        var channel = await CreateChannel("group-1", ChannelType.GroupDm);
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await DirectlyJoin(channel.Id, BattleTag);
+
+        var result = await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "None is a valid level on a GroupDm (no Public All-gate)");
+        var pref = await _notificationPreferenceRepository.Load(BattleTag, channel.Id);
+        Assert.IsNull(pref, "a GroupDm level change must NOT write a NotificationPreference row");
+    }
+
+    [Test]
+    public async Task SetNotificationLevel_Public_RepeatedSets_LastWriteWins()
+    {
+        var channel = await CreateChannel("general");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await hub.JoinChannel("general");
+
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.Mentions);
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+
+        var pref = await _notificationPreferenceRepository.Load(BattleTag, channel.Id);
+        Assert.IsNotNull(pref);
+        Assert.AreEqual(NotificationLevel.None, pref.NotificationLevel, "the LAST set must win, not accumulate duplicate rows");
+
+        var db = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
+        var rowCount = await db.GetCollection<NotificationPreference>(ChatCollections.NotificationPreferences)
+            .CountDocumentsAsync(p => p.BattleTag == BattleTag.ToLowerInvariant() && p.ChannelId == channel.Id);
+        Assert.AreEqual(1, rowCount, "repeated sets must upsert the SAME row, never accumulate duplicates");
+    }
+
+    [Test]
+    public async Task JoinChannel_Rejoin_SeedsMembership_FromPersistedPreference_None()
+    {
+        var channel = await CreateChannel("general");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await hub.JoinChannel("general");
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+        await hub.LeaveChannel(channel.Id);
+
+        // Between leave and rejoin: no membership row, but the pref survives independently.
+        Assert.IsNull(await _membershipRepository.Load(channel.Id, BattleTag), "leave must still hard-delete the membership row");
+        Assert.AreEqual(NotificationLevel.None, (await _notificationPreferenceRepository.Load(BattleTag, channel.Id)).NotificationLevel);
+
+        var rejoin = await hub.JoinChannel("general");
+
+        Assert.AreEqual(ChatResultCode.Ok, rejoin.Code);
+        Assert.AreEqual(NotificationLevel.None, rejoin.Membership.NotificationLevel,
+            "a rejoin must seed from the persisted preference, not the fresh-join Mentions default");
+        var persisted = await _membershipRepository.Load(channel.Id, BattleTag);
+        Assert.AreEqual(NotificationLevel.None, persisted.NotificationLevel);
+        var registryMember = _onlineMemberRegistry.GetMembers(channel.Id).Single();
+        Assert.AreEqual(NotificationLevel.None, registryMember.NotificationLevel,
+            "OnlineMemberRegistry must be seeded with the persisted level too, not just the returned DTO");
+    }
+
+    [Test]
+    public async Task JoinChannel_FirstJoin_NoPersistedPreference_DefaultsToMentions()
+    {
+        // Control for the rejoin test above: a genuinely first-time join (no prior SetNotificationLevel
+        // for this user+channel) must still fall back to the Mentions default, not e.g. an implicit None.
+        var channel = await CreateChannel("brand-new-room-2");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.JoinChannel("brand-new-room-2");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(NotificationLevel.Mentions, result.Membership.NotificationLevel);
+        Assert.IsNull(await _notificationPreferenceRepository.Load(BattleTag, channel.Id),
+            "no pref was ever set — nothing should have been written by the seed-path read");
+    }
+
+    [Test]
+    public async Task Lifecycle_SetNone_Leave_MentionInThatRoom_StaysSuppressed_ViaPersistedPreference()
+    {
+        // D2 end-to-end: join -> set None -> leave -> a THIRD party's mention in that room must still be
+        // suppressed for the departed user, via the persisted pref (not membership, which is now gone).
+        var channel = await CreateChannel("general");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await hub.JoinChannel("general");
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+        await hub.LeaveChannel(channel.Id);
+
+        Assert.IsNull(await _membershipRepository.Load(channel.Id, BattleTag));
+
+        // The Public non-member branch also requires directory-resolvability (follow-up spec §4) —
+        // independent of the pref, mirroring MentionFanOutTests' SeedDirectory convention.
+        await _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = BattleTag.ToLowerInvariant(),
+            DisplayBattleTag = BattleTag,
+            NormalizedName = BattleTag.ToLowerInvariant(),
+            LastSeenAt = DateTime.UtcNow,
+        });
+
+        var harness = new HubPushCaptureHarness();
+        var fanOut = new MentionFanOut(
+            harness.HubContext, _sessionRegistry, _membershipRepository, new MentionInboxRepository(MongoClient),
+            _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), _notificationPreferenceRepository);
+
+        var now = DateTime.UtcNow;
+        var message = new W3ChampionsChatService.Messages.ChannelMessage
+        {
+            ChannelId = channel.Id,
+            Seq = 1,
+            Sender = new W3ChampionsChatService.Messages.MessageSender { BattleTag = "someone#1", Name = "Someone" },
+            Content = "hey there",
+            SentAt = now,
+            ExpiresAt = ExpiryCalculator.ForChannelMessage(ChannelType.Public, now),
+        };
+        await fanOut.NotifyAsync(channel, message, new[] { BattleTag }, now);
+
+        var inbox = new MentionInboxRepository(MongoClient);
+        Assert.That(await inbox.LoadForUser(BattleTag.ToLowerInvariant()), Is.Empty,
+            "the persisted None preference keeps a mention suppressed for a room the user already left");
+    }
+
+    [Test]
+    public async Task Lifecycle_SetMentions_Leave_MentionInThatRoom_StillDelivered()
+    {
+        // Only an explicit None suppresses — leaving with any OTHER last-set level must deliver normally.
+        var channel = await CreateChannel("general");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+        await hub.JoinChannel("general"); // fresh-join default is already Mentions
+        await hub.SetNotificationLevel(channel.Id, NotificationLevel.Mentions);
+        await hub.LeaveChannel(channel.Id);
+
+        await _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = BattleTag.ToLowerInvariant(),
+            DisplayBattleTag = BattleTag,
+            NormalizedName = BattleTag.ToLowerInvariant(),
+            LastSeenAt = DateTime.UtcNow,
+        });
+
+        var harness = new HubPushCaptureHarness();
+        var fanOut = new MentionFanOut(
+            harness.HubContext, _sessionRegistry, _membershipRepository, new MentionInboxRepository(MongoClient),
+            _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), _notificationPreferenceRepository);
+
+        var now = DateTime.UtcNow;
+        var message = new W3ChampionsChatService.Messages.ChannelMessage
+        {
+            ChannelId = channel.Id,
+            Seq = 1,
+            Sender = new W3ChampionsChatService.Messages.MessageSender { BattleTag = "someone#1", Name = "Someone" },
+            Content = "hey there",
+            SentAt = now,
+            ExpiresAt = ExpiryCalculator.ForChannelMessage(ChannelType.Public, now),
+        };
+        await fanOut.NotifyAsync(channel, message, new[] { BattleTag }, now);
+
+        var inbox = new MentionInboxRepository(MongoClient);
+        Assert.That(await inbox.LoadForUser(BattleTag.ToLowerInvariant()), Has.Count.EqualTo(1),
+            "a persisted level other than None must not keep suppressing a mention after leaving");
     }
 }
