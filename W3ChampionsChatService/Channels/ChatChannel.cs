@@ -79,8 +79,18 @@ public class ChatChannel
 
     /// <summary>
     /// System+Match only — true once mm's GAME_STARTED final assertion froze this room: membership is
-    /// frozen (later assertions AND legacy deltas are discarded), and the channel is excluded from
-    /// EVERY sweep including epoch syncs. The 24h creation-anchored TTL is its sole cleanup path.
+    /// frozen against BOTH mutating protocols (later assertions AND legacy deltas are discarded), and the
+    /// channel is excluded from EVERY sweep including epoch syncs. The 24h creation-anchored TTL is its
+    /// sole cleanup path.
+    /// <para>
+    /// DELIBERATE BYPASS (2026-08-05 fix wave, final review N2): the freeze does NOT cover
+    /// <c>W3ChampionsChatService.Internal.MatchChannelService.AddMemberWithInvariant</c>'s cross-channel
+    /// eviction — when a user's NEXT match starts, the one-match-channel-per-user invariant still deletes
+    /// their membership row on THIS (detached, frozen) channel to make room for the new one. This is
+    /// intentional, not a hole in the freeze: it is exactly how a post-game room leaves a user's channel
+    /// tray once their next game begins, rather than lingering there until the 24h TTL reaps the whole
+    /// channel.
+    /// </para>
     /// [BsonIgnoreIfDefault] keeps the field ABSENT on non-detached docs, so Ne(Detached, true) matches
     /// every pre-existing document.
     /// </summary>

@@ -40,18 +40,33 @@ namespace W3ChampionsChatService.Internal;
 /// via mm's serialized per-user flows. The strict ordering guarantee this class DOES provide is per-add:
 /// within a single <see cref="AddMemberWithInvariant"/> call, <c>ChannelRemoved(old)</c> is emitted STRICTLY
 /// BEFORE <c>ChannelAdded(new)</c>, so a user moving A→B never transiently sees both channels.
+/// NOT CLOSED BY THE GATE BELOW (2026-08-05 fix wave, final review M1): <see cref="_refGate"/> serializes
+/// per-`systemRef`, but the stale-eviction delete inside <see cref="AddMemberWithInvariant"/> targets a
+/// DIFFERENT ref (the user's OLD channel) than the one the caller's gate token covers — by construction,
+/// since eviction exists specifically to clear a ref the caller is NOT currently operating on. The gate
+/// cannot close this residual without holding two tokens at once, which <see cref="MatchChannelRefGate"/>'s
+/// own no-nesting invariant forbids. This is the SAME residual race already documented above, restated
+/// post-gate: the gate is not a fix for it, and was never meant to be.
 /// </para>
 /// <para>
 /// 2026-08-05 RECONCILIATION (plan D5, D10): adds <see cref="ApplyRosterAssertion"/> — the authoritative
 /// full-set protocol that supersedes <see cref="ApplyMembersDelta"/> — plus a <see cref="MatchChannelRefGate"/>
-/// (<see cref="_refGate"/>) that every mutating match-channel path now acquires FIRST, and detach guards
-/// (plan D4) on the assertion and legacy delta paths. <see cref="CreateOrGet"/> gains OPTIONAL
-/// <c>epoch</c>/<c>seq</c>/<c>detached</c> parameters (plan D10) so a create can also participate in the
-/// (epoch, seq) staleness protocol and birth ladder-match channels already detached. The teardown body
-/// of <see cref="DeleteChannel"/> is extracted into the private <c>TearDownChannel</c>, shared by
-/// <see cref="ApplyEpochSync"/> — the startup mm-crash-recovery sweep (plan D8) that tears down every
-/// non-detached match channel absent from mm's freshly-booted <c>liveLobbyRefs</c> and re-anchors the
-/// channels it spares to the new epoch.
+/// (<see cref="_refGate"/>) that every mutating match-channel path IN THIS CLASS now acquires FIRST, and
+/// detach guards (plan D4) on the assertion and legacy delta paths. TWO DOCUMENTED EXCEPTIONS (2026-08-05
+/// fix wave, final review H4 + M1): <c>ChatHub.LeaveChannel</c> (<c>Chats/ChatHub.Channels.cs</c>) deletes
+/// a membership row directly with no channel-type guard and no gate at all — it lives OUTSIDE this class
+/// and races <see cref="ApplyRosterAssertion"/>'s diff, a divergence bounded by the next assertion
+/// re-adding the member (or permanent only where the user wanted exactly that, on a channel no further
+/// assertion ever reaches); and this class's OWN cross-ref eviction inside <see cref="AddMemberWithInvariant"/>
+/// documented just above, which by definition writes to a ref the caller's gate token does not cover.
+/// <see cref="CreateOrGet"/> gains OPTIONAL <c>epoch</c>/<c>seq</c>/<c>detached</c> parameters (plan D10) so
+/// a create can also participate in the (epoch, seq) staleness protocol and birth ladder-match channels
+/// already detached. The teardown body of <see cref="DeleteChannel"/> is extracted into the private
+/// <c>TearDownChannel</c>, shared by <see cref="ApplyEpochSync"/> — the startup mm-crash-recovery sweep
+/// (plan D8) that tears down every non-detached, assertion-stamped match channel absent from mm's
+/// freshly-booted <c>liveLobbyRefs</c> and re-anchors the channels it spares to the new epoch (an
+/// UNSTAMPED legacy/transition channel is excluded from the sweep entirely and falls to its own 24h TTL
+/// instead — 2026-08-05 fix wave, final review H1).
 /// </para>
 /// </summary>
 public class MatchChannelService(

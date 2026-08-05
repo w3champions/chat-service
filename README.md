@@ -279,6 +279,10 @@ Idempotent create-or-get of a match channel: `{ kind: "match", ref, name, member
 A duplicate call for the same `ref` is `200`, not a conflict — same channel, no duplicate memberships, no
 re-push for members already present, and the 24h creation-anchored expiry is never reset by a re-get.
 
+`name` is **normalized, never rejected**: trimmed, and clamped to 100 chars. An empty-after-trim name
+falls back to `ref` as a placeholder display name — a cosmetic field must never be able to block an
+otherwise-valid create.
+
 Optional additive fields (absent ⇒ today's behavior, byte-for-byte):
 
 - `epoch` (string) / `seq` (integer, >= 1) — must arrive **together**; a lone one is a `400`. When
@@ -319,6 +323,10 @@ lobby's complete member set; chat-service diffs it against stored membership and
   existing member.
 - `name` — optional; used **only** when the assertion must create the channel on demand (mm's boot-race
   healing, so a recreated room never displays its raw ref as its name). Ignored on an existing channel.
+  **Normalized, never rejected**: trimmed and clamped to 100 chars; an empty-after-trim name falls back
+  to the ref placeholder, exactly like create-on-demand above. `name` is cosmetic — mm applies no
+  length/trim/charset validation of its own to a custom-game lobby name before sending it, and a field
+  chat cannot store must never be able to reject the entire authoritative roster.
 - `detached` — see below.
 
 **Staleness — `(epoch, seq)` admission table**, persisted per channel:
@@ -370,6 +378,16 @@ Every non-frozen match channel is then resolved one of two ways:
 re-anchored — regardless of whether their ref appears in `liveLobbyRefs`. A live in-progress or
 just-finished game's chat must never be swept away by an mm restart; its 24h TTL is its only cleanup path.
 
+**Only assertion-stamped channels are ever sweep candidates.** A channel becomes eligible for an epoch
+sync only once it has participated in the assertion protocol at least once — created with `epoch`/`seq`,
+or asserted via the roster endpoint above. A channel that predates this protocol (created only through
+the deprecated delta endpoint, never asserted) carries no stamp at all and is **invisible to the sweep**:
+it survives regardless of `liveLobbyRefs` and falls to its own 24h creation-anchored TTL instead. This is
+what makes it safe to deploy mm's epoch-sync call against the match channels chat already holds from
+before mm's own deploy — the first sync after mm's release simply never sees them, so it cannot tear them
+down. No backfill, feature flag, or deploy-order choreography is required for this beyond "chat-service
+ships first" (see Deploy order below).
+
 ### `DELETE /internal/channels/{ref}`
 
 Explicit, unconditional teardown: messages purged, memberships deleted, the channel doc removed, and
@@ -384,3 +402,10 @@ not an explicit authoritative teardown mm chooses to send.
 shape simultaneously, so today's not-yet-deployed mm keeps working unchanged through its own release.
 Once mm's deploy to the assertion protocol is confirmed, the delta endpoint and its supporting code are
 removed in a follow-up chat-service PR.
+
+**Rollback is a one-way door once mm has deployed the assertion protocol.** After mm starts calling
+`PUT .../roster` and `POST .../epoch-sync`, rolling chat-service back below this version `404`s both
+routes. mm's assertion scheduler has no attempt cap, so every dirty lobby retries at a steady ~30s cadence
+forever and the boot-time epoch sync never converges — a silent, total desync whose only tell is a pegged
+`matchmaking_chat_dirty_channels` gauge on the mm side. **Never roll chat-service back below this version
+while assertion-era mm is live; if a rollback is ever needed, roll mm back first.**
