@@ -550,6 +550,26 @@ public class MentionFanOutTests : IntegrationTestBase
         Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1));
     }
 
+    // Fix round 1 (F3): battleTag normalization was unpinned here — every OTHER test in this section
+    // writes and reads under the SAME (already-lowercase) casing, so a mutation removing
+    // NotificationPreferenceRepository.NormalizeTag's ToLowerInvariant() would pass all of them. Seeding
+    // the pref under one casing and mentioning under a DIFFERENT casing forces the mismatch to matter.
+    [Test]
+    public async Task PublicChannel_NonMember_WithPersistedPreferenceNone_MixedCase_PinsNormalizeTag()
+    {
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("control#1");
+        await _notificationPreferenceRepository.Upsert("Wolf#456", ChannelId, NotificationLevel.None, Now);
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "WOLF#456", "control#1" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "the persisted None preference must suppress regardless of write/read casing mismatch");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0));
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible control still gets the mention");
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Shadow (defense-in-depth in-method guard; the call-site skip is covered end-to-end in
     // ChatHubSendMessageTests.ShadowSender_MentionsOthers_...)
