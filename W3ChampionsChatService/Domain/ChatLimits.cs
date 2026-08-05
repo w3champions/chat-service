@@ -212,10 +212,19 @@ public static class ChatLimits
     /// <summary>2026-08-05 PR36 feedback, Part 3: <see cref="FanOut.ReadRateLimiter"/>'s single per-
     /// battleTag token bucket, shared across every READ-shaped hub method it guards
     /// (<c>GetConversations</c>, <c>GetMessages</c>). This is a server-protection abuse guard, not UX
-    /// pacing (Marco) — burst 30, sustained 5/s is far above any legitimate client's per-user-action
-    /// handful of loads, so no well-behaved client should ever observe a denial in normal operation.
+    /// pacing (Marco).
+    /// <para>
+    /// Fix round 1, finding F1: sized for the CONNECT FAN-OUT shape, not a per-user-action handful of
+    /// loads — the original 30 undercounted this. The connect snapshot carries no messages, so a client
+    /// re-seeds every focused surface on EVERY (re)connect: up to launcher <c>MAX_FOCUSED_CHANNELS</c>
+    /// (10) expanded DM windows in parallel, plus the active channel, plus the match embed (~12
+    /// surfaces). SignalR's default first reconnect retry is 0ms, so a single socket flap pays that
+    /// reseed TWICE within ~2s (~24 calls) before tray scroll or channel clicks push it any higher. 60 ≈
+    /// 2× that worst-case flap with slack — still far above anything a single legitimate user action
+    /// needs, so no well-behaved client should ever observe a denial in normal operation.
+    /// </para>
     /// Not spec §13 text; hard-coded, adjust here only.</summary>
-    public const int ReadBurst = 30;
+    public const int ReadBurst = 60;
 
     /// <summary>Sustained refill rate (tokens/second) for the <see cref="ReadBurst"/> bucket above.</summary>
     public const int ReadRefillPerSecond = 5;

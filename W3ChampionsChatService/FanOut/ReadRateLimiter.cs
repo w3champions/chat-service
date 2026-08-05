@@ -21,8 +21,9 @@ public readonly record struct ReadRateLimitDecision(bool Allowed, double? RetryA
 /// Marco: server protection, NOT UX pacing). <c>GetConversations</c> and <c>GetMessages</c> (the
 /// GetMessages scope decision + its supporting evidence are recorded in the task report) share ONE
 /// per-battleTag token bucket — capacity <see cref="ChatLimits.ReadBurst"/>, refilling
-/// <see cref="ChatLimits.ReadRefillPerSecond"/> tokens/second (burst 30, sustained 5/s — far above any
-/// legitimate client's per-user-action handful of loads).
+/// <see cref="ChatLimits.ReadRefillPerSecond"/> tokens/second (burst 60, sustained 5/s — sized for the
+/// CONNECT FAN-OUT shape, not a per-user-action handful of loads; see <see cref="ChatLimits.ReadBurst"/>'s
+/// doc comment for the full rationale, fix round 1 finding F1).
 /// <para>
 /// Deliberately simpler than <see cref="MessageRateLimiter"/>: a single bucket, no per-channel
 /// dimension, NO violation ladder / hard auto-throttle escalation, and NO

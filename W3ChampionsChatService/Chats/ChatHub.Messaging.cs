@@ -329,8 +329,9 @@ public partial class ChatHub
     /// that a <see cref="ChatResultCode.Throttled"/> GetMessages reject already degrades gracefully on
     /// both old and current shipped clients (silent no-op, no retry storm, no error modal), which is why
     /// this method is guarded at all. Not allowed → <see cref="ChatResultCode.Throttled"/> with the
-    /// retry-after. Limits are generous (burst 30, sustained 5/s) — server protection only, not UX pacing
-    /// (Marco) — so no legitimate client should ever observe this in normal operation.</item>
+    /// retry-after. Limits are generous (burst 60, sustained 5/s — sized for connect fan-out, see
+    /// <see cref="ChatLimits.ReadBurst"/>'s doc) — server protection only, not UX pacing (Marco) — so no
+    /// legitimate client should ever observe this in normal operation.</item>
     /// <item>Membership: the hot path reads <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (zero
     /// DB) and, if the caller is a member, pages directly — no channel load. A non-member falls to the
     /// cold path: a single <see cref="Channels.ChannelRepository.Load"/> distinguishes "no such

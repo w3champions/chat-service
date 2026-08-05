@@ -107,7 +107,9 @@ public class ChatLimitsTests
     public void ReadRateLimiterConstants_MatchPr36FeedbackPart3()
     {
         // 2026-08-05 PR36 feedback, Part 3 — NOT spec §13; hard-coded, adjust here only.
-        Assert.AreEqual(30, ChatLimits.ReadBurst);
+        // Fix round 1, finding F1: ReadBurst raised 30 -> 60 (sized for connect fan-out, not a
+        // per-user-action handful of loads — see ChatLimits.ReadBurst's doc comment).
+        Assert.AreEqual(60, ChatLimits.ReadBurst);
         Assert.AreEqual(5, ChatLimits.ReadRefillPerSecond);
         Assert.AreEqual(TimeSpan.FromMinutes(2), ChatLimits.ReadRateLimiterPruneHorizon);
     }

@@ -622,7 +622,8 @@ public partial class ChatHub
     /// (<see cref="FanOut.ReadRateLimiter"/>) shared with <see cref="GetMessages"/> (per the task
     /// report's scope determination). Not allowed → <see cref="ChatResultCode.Throttled"/> with the
     /// retry-after — the SAME reject shape the relationship-outage path below already uses. Limits are
-    /// generous (burst 30, sustained 5/s) — server protection only, not UX pacing (Marco) — so no
+    /// generous (burst 60, sustained 5/s — sized for connect fan-out, see
+    /// <see cref="ChatLimits.ReadBurst"/>'s doc) — server protection only, not UX pacing (Marco) — so no
     /// legitimate client should ever observe this in normal operation.</item>
     /// <item>Malformed cursor (exactly one half supplied) → <see cref="HubException"/> (the
     /// <c>GetMessages</c> client-bug mapping).</item>
