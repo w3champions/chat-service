@@ -177,9 +177,39 @@ public partial class ChatHub
     /// roster is, by construction, ALWAYS a subset of its actual durable members, for every channel type —
     /// tier 1 candidates are never sent through the batched check. Tiers 2/3 carry no such guarantee (an
     /// "online anywhere" or "recently active in the directory" user need not be a member of THIS
-    /// particular room) and are always checked. Results are a strict SUBSET of the pre-D1 unscoped
-    /// output — a genuinely eligible member beyond the pre-filter cap is never backfilled to top the
-    /// result back up to <see cref="ChatLimits.MentionSearchMaxResults"/>.</item>
+    /// particular room) and are always checked.
+    /// <para>
+    /// TIER 2 KEEP-OR-DROP (fix round 1, finding F1 — explicitly left as a judgment call): tier 2 (online
+    /// anywhere) is KEPT for scoped rooms rather than dropped in favor of the recall backfill below. The
+    /// overlap is harmless — dedup is first-tier-wins, so a genuine online member the backfill would also
+    /// find stays tagged Tier 2 — and keeping it preserves the "currently online" autocomplete grouping
+    /// the <see cref="Protocol.MentionCandidateDto.Tier"/> contract promises callers; dropping it would
+    /// only ever LOSE that distinction (every online member the backfill can find, it finds regardless of
+    /// their tier-2 status), never gain anything.
+    /// </para>
+    /// <para>
+    /// RECALL BACKFILL (fix round 1, finding F1): filtering tiers 2/3 down to real members can leave a
+    /// short (1-2 char) prefix search with near-nothing on a big room — the global tiers above rank+cap
+    /// against the WORLD before the member filter ever runs, so non-member noise can crowd out genuine
+    /// members before they are even considered, degrading recall to "currently-focused viewers only"
+    /// until the prefix is long enough to narrow the global candidate pool back down. If candidates are
+    /// still under <see cref="ChatLimits.MentionSearchMaxResults"/> after the filter above, a
+    /// member-scoped BACKFILL (<see cref="Memberships.MembershipRepository.SearchMemberBattleTagsByPrefix"/>)
+    /// queries <c>channel_memberships</c> DIRECTLY for the prefix — an anchored range scan on the SAME
+    /// <c>ux_channelId_battleTag</c> index, bounded to the remaining slots, never <c>LoadForChannel</c>.
+    /// This covers BOTH online-but-unfocused members (ranked out of tier 2's own capped window by global
+    /// noise) AND offline members outside tier 3's 90d activity gate — restoring full short-prefix recall
+    /// for every legal mention target of the room without ever loading the whole room. Backfill hits are
+    /// tagged Tier 3 (they are, functionally, the member-scoped completion of tier 3's "not a live
+    /// viewer" bucket) and hydrated the same way every other tier ends up display-cased
+    /// (<see cref="Users.UserDirectoryRepository.LoadMany"/> — <c>channel_memberships</c> itself carries
+    /// no display casing, unlike the directory rows tiers 1-3 draw from), degrading to the bare
+    /// (lowercase) membership battleTag on a directory miss — the same graceful-degrade convention
+    /// <see cref="BuildCandidateDto"/>'s own directory-miss branch already uses. Results remain a strict
+    /// SUBSET of the pre-D1 unscoped output (every surfaced candidate is still a real member) — the
+    /// backfill restores RECALL, it does not relax the membership wall itself.
+    /// </para>
+    /// </item>
     /// </list>
     /// <see cref="ChannelType.Public"/> is the ONLY type that still searches the full, unrestricted
     /// universe (§4 "mention anywhere") — no membership read of any kind is made for it.
@@ -205,7 +235,9 @@ public partial class ChatHub
     /// scoping decision above without a second membership read.</item>
     /// <item>Assemble tiers 1-3 in order (each tier skipped once the cap is already met — tier 3's
     /// directory read never runs if tiers 1-2 alone already filled the cap), capped at
-    /// <see cref="ChatLimits.MentionSearchMaxResults"/> total.</item>
+    /// <see cref="ChatLimits.MentionSearchMaxResults"/> total; for SemiPublic/System, the candidate-side
+    /// member-verification filter and the fix-round-1 recall backfill (see the class doc's MEMBER-SCOPING
+    /// section) then run in sequence.</item>
     /// <item>ONE batch enrichment read, project to <see cref="MentionCandidateDto"/>, return
     /// <see cref="ChatResultCode.Ok"/>.</item>
     /// </list>
@@ -341,6 +373,36 @@ public partial class ChatHub
             {
                 var verifiedMembers = await _membershipRepository.LoadMemberBattleTags(channelId, toVerify);
                 candidates.RemoveAll(c => c.Tier != 1 && !verifiedMembers.Contains(c.BattleTag));
+            }
+        }
+
+        // Fix round 1 (finding F1): member-scoped RECALL BACKFILL for SemiPublic/System — see the class
+        // doc's MEMBER-SCOPING/RECALL BACKFILL section. The global tiers above rank+cap against the WORLD
+        // before the filter just above ever runs, so a short prefix on a big room can be filtered down to
+        // near-nothing even though real members match it. If there's still room under the cap, query
+        // channel_memberships DIRECTLY for the prefix (never LoadForChannel) to restore full recall —
+        // online-but-unfocused AND offline members alike, regardless of tier 3's 90d activity gate (a
+        // legal mention target of THIS room is never activity-gated).
+        if (callerState.ChannelType is ChannelType.SemiPublic or ChannelType.System
+            && candidates.Count < ChatLimits.MentionSearchMaxResults)
+        {
+            var remaining = ChatLimits.MentionSearchMaxResults - candidates.Count;
+            var seenLower = seen.Select(tag => tag.ToLowerInvariant()).ToList();
+            var memberMatches = await _membershipRepository.SearchMemberBattleTagsByPrefix(
+                channelId, prefixLower, remaining, seenLower);
+            if (memberMatches.Count > 0)
+            {
+                // Hydrate display casing/profile the same way the other tiers already carry it —
+                // channel_memberships stores no display casing of its own (unlike the directory rows
+                // tiers 1-3 draw from), so this is a small, separate batched read (bounded to
+                // memberMatches.Count, never a per-candidate lookup); a miss falls back to the bare
+                // (lowercase) membership battleTag — the same graceful-degrade convention
+                // BuildCandidateDto's own directory-miss branch already uses.
+                var backfillDirectory = await _userDirectory.LoadMany(memberMatches);
+                var backfillDirectoryByTag = backfillDirectory.ToDictionary(e => e.BattleTag, StringComparer.OrdinalIgnoreCase);
+                var displayTags = memberMatches.Select(tag =>
+                    backfillDirectoryByTag.TryGetValue(tag, out var entry) ? (entry.DisplayBattleTag ?? tag) : tag);
+                AddTier(displayTags, 3);
             }
         }
 

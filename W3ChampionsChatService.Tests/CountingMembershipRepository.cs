@@ -15,15 +15,27 @@ namespace W3ChampionsChatService.Tests;
 /// candidate-side <see cref="MembershipRepository.LoadMemberBattleTags"/> check being bounded to the
 /// (small, already-capped) candidate list rather than the room's total membership. <see cref="LoadForChannel"/>
 /// is already <c>virtual</c> for exactly this kind of test seam (see its own doc comment).
+/// <para>
+/// Fix round 1 (finding F6a): also counts <see cref="LoadMemberBattleTags"/> calls, so a test can assert
+/// the Public lane — the ONLY channel type that must never perform ANY membership-scoping read at all —
+/// genuinely performs zero, not merely zero of the full-room variant.
+/// </para>
 /// </summary>
 internal sealed class CountingMembershipRepository(MongoClient client, ChannelRepository channelRepository)
     : MembershipRepository(client, channelRepository)
 {
     public int LoadForChannelCallCount { get; private set; }
+    public int LoadMemberBattleTagsCallCount { get; private set; }
 
     public override Task<List<ChannelMembership>> LoadForChannel(string channelId)
     {
         LoadForChannelCallCount++;
         return base.LoadForChannel(channelId);
+    }
+
+    public override Task<HashSet<string>> LoadMemberBattleTags(string channelId, IEnumerable<string> battleTags)
+    {
+        LoadMemberBattleTagsCallCount++;
+        return base.LoadMemberBattleTags(channelId, battleTags);
     }
 }

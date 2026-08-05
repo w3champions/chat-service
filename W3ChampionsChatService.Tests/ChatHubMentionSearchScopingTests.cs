@@ -294,11 +294,14 @@ public class ChatHubMentionSearchScopingTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Tier 1 (live viewers) is exempt from the candidate-side re-check by construction (see the class
+    // Tier 1 (live viewers) is EXEMPT from the candidate-side re-check by construction (see the class
     // doc on ChatHub.Mentions.cs's SearchMentionCandidates): reaching tier 1 requires a successful
     // FocusChannel call, which itself requires OnlineMemberRegistry membership — always seeded from a
-    // durable row. This proves an ACTUAL member who is currently focused (tier 1) is still returned by
-    // the SemiPublic lane (i.e. the candidate-side filter never accidentally excludes a genuine tier-1 hit).
+    // durable row. Fix round 1 (finding F6b): this test only pins the POSITIVE half of that invariant —
+    // a genuine tier-1 (focused) member is still returned by the SemiPublic lane. The NEGATIVE half (a
+    // non-member somehow reaching tier 1 and wrongly surviving the exemption) is not something this test
+    // CAN exercise: the registry invariant makes that state impossible to construct in the first place,
+    // not merely untested here.
     // ---------------------------------------------------------------------------------------------
 
     [Test]
@@ -322,5 +325,141 @@ public class ChatHubMentionSearchScopingTests : IntegrationTestBase
         var candidate = result.Candidates.SingleOrDefault(c => c.BattleTag == viewer);
         Assert.That(candidate, Is.Not.Null, "a genuine tier-1 (focused) member must still be offered by the SemiPublic lane");
         Assert.That(candidate.Tier, Is.EqualTo(1));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Fix round 1, finding F1 — the member-scoped RECALL BACKFILL. Filtering tiers 2/3 down to real
+    // members (the tests above) can, on a big room, leave a short prefix with near-nothing: the global
+    // tiers rank+cap against the WORLD before the member filter ever runs, so non-member noise can
+    // crowd a genuine member entirely out of the pre-filter candidate window. These prove the backfill
+    // (MembershipRepository.SearchMemberBattleTagsByPrefix) restores recall for that member without
+    // ever loading the whole room.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Search_SemiPublicChannel_ShortPrefix_BigRoomNoise_MemberStillOffered_ViaBackfill()
+    {
+        const string channelId = "semi-1";
+        const string caller = "caller#1";
+        const string member = "m-buddy#2"; // actual member: OFFLINE, no directory row — findable ONLY via the backfill
+
+        RegisterSession("conn-caller", caller);
+        JoinChannel(channelId, "conn-caller", caller, ChannelType.SemiPublic);
+
+        // Global noise matching the SAME 1-char prefix, sized well past the result cap — enough to fill
+        // tier 2 (online anywhere) BEFORE the member-scope filter ever runs, so the member (who is never
+        // registered as online) has zero chance of reaching `candidates` through the global tiers at all.
+        for (var i = 0; i < ChatLimits.MentionSearchMaxResults + 10; i++)
+        {
+            RegisterSession($"conn-noise-{i}", $"m-noise{i}#1");
+        }
+
+        await SeedMembership(channelId, member);
+
+        var hub = BuildHub("conn-caller");
+        var result = await hub.SearchMentionCandidates(channelId, "m");
+
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Contain(member),
+            "F1: a member matching a short prefix must be recalled via the backfill even when global-tier " +
+            "noise fully dominates the pre-filter candidate window");
+    }
+
+    [Test]
+    public async Task Search_SystemChannel_ShortPrefix_BigRoomNoise_MemberStillOffered_ViaBackfill()
+    {
+        const string channelId = "system-1";
+        const string caller = "caller#1";
+        const string member = "m-buddy#2";
+
+        RegisterSession("conn-caller", caller);
+        JoinChannel(channelId, "conn-caller", caller, ChannelType.System);
+
+        for (var i = 0; i < ChatLimits.MentionSearchMaxResults + 10; i++)
+        {
+            RegisterSession($"conn-noise-{i}", $"m-noise{i}#1");
+        }
+
+        await SeedMembership(channelId, member);
+
+        var hub = BuildHub("conn-caller");
+        var result = await hub.SearchMentionCandidates(channelId, "m");
+
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Contain(member),
+            "F1: the same recall backfill applies to System channels (any SystemChannelKind)");
+    }
+
+    [Test]
+    public async Task Search_SemiPublicChannel_ShortPrefix_NonMemberStillAbsent_ViaBackfill()
+    {
+        const string channelId = "semi-1";
+        const string caller = "caller#1";
+        const string intruder = "m-intruder#9"; // matches the prefix, has a directory row, but NO membership
+
+        RegisterSession("conn-caller", caller);
+        JoinChannel(channelId, "conn-caller", caller, ChannelType.SemiPublic);
+        await SeedDirectory(intruder, Now.AddDays(-1));
+
+        var hub = BuildHub("conn-caller");
+        var result = await hub.SearchMentionCandidates(channelId, "m");
+
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Not.Contain(intruder),
+            "F1: the backfill queries channel_memberships DIRECTLY, so it can never surface a non-member " +
+            "regardless of prefix or directory freshness");
+    }
+
+    [Test]
+    public async Task Search_SemiPublicChannel_Backfill_BoundedAndNeverCallsLoadForChannel()
+    {
+        const string channelId = "semi-1";
+        const string caller = "caller#1";
+
+        RegisterSession("conn-caller", caller);
+        JoinChannel(channelId, "conn-caller", caller, ChannelType.SemiPublic);
+
+        // More matching members than the result cap — the backfill's own `limit` (remaining slots) must
+        // bound the read, never the room's total membership.
+        for (var i = 0; i < ChatLimits.MentionSearchMaxResults + 10; i++)
+        {
+            await SeedMembership(channelId, $"m-member{i}#1");
+        }
+
+        var countingMembership = new CountingMembershipRepository(MongoClient, _channelRepository);
+        var hub = BuildHub("conn-caller", countingMembership);
+
+        var result = await hub.SearchMentionCandidates(channelId, "m");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Candidates.Count, Is.LessThanOrEqualTo(ChatLimits.MentionSearchMaxResults),
+            "F1: the backfill's own limit (remaining cap slots) must bound the result, never the room's total membership");
+        Assert.That(countingMembership.LoadForChannelCallCount, Is.EqualTo(0),
+            "F1: the backfill must stay bounded via SearchMemberBattleTagsByPrefix — it must NEVER fall back to LoadForChannel's full-room scan");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Fix round 1, finding F6a — Public is the ONLY lane that must never perform ANY membership-scoping
+    // read at all (not just never the full-room LoadForChannel — the batched LoadMemberBattleTags check
+    // itself must never run either).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Search_PublicChannel_PerformsNoMembershipScopingRead()
+    {
+        const string channelId = "pub-1";
+        const string caller = "caller#1";
+        const string stranger = "stranger#2";
+
+        RegisterSession("conn-caller", caller);
+        JoinChannel(channelId, "conn-caller", caller, ChannelType.Public);
+        RegisterSession("conn-stranger", stranger);
+
+        var countingMembership = new CountingMembershipRepository(MongoClient, _channelRepository);
+        var hub = BuildHub("conn-caller", countingMembership);
+
+        var result = await hub.SearchMentionCandidates(channelId, "");
+
+        Assert.That(result.Candidates.Select(c => c.BattleTag), Does.Contain(stranger));
+        Assert.That(countingMembership.LoadMemberBattleTagsCallCount, Is.EqualTo(0),
+            "F6a: Public is the universe-wide lane — it must never perform ANY membership-scoping read, batched or otherwise");
+        Assert.That(countingMembership.LoadForChannelCallCount, Is.EqualTo(0));
     }
 }
