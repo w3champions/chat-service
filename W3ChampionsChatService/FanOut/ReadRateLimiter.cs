@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Serilog;
 using W3ChampionsChatService.Domain;
 
 namespace W3ChampionsChatService.FanOut;
@@ -40,7 +41,12 @@ public readonly record struct ReadRateLimitDecision(bool Allowed, double? RetryA
 /// <para>
 /// NO timers and NO wall-clock reads: every decision takes an explicit <c>now</c> and refills are
 /// derived from elapsed time, so it is fully testable without sleeping. Singleton, hit concurrently by
-/// many connections — mirrors <see cref="MessageRateLimiter"/>'s single-lock-guards-all-state idiom.
+/// many connections — mirrors <see cref="MessageRateLimiter"/>'s single-lock-guards-all-state idiom. The
+/// one exception is the denial <see cref="Log.Warning"/> (fix round 1, finding F3 — denials were
+/// otherwise invisible to operators): the once-per-<see cref="ChatLimits.ReadRateLimiterDenyLogInterval"/>
+/// decision and its <c>LastDenyLoggedAt</c> stamp are computed/mutated INSIDE the lock, but the actual
+/// log I/O is deliberately emitted AFTER releasing it — no I/O under lock, mirroring
+/// <see cref="MessageRateLimiter"/>'s own moderation-log idiom exactly.
 /// </para>
 /// </summary>
 public class ReadRateLimiter
@@ -65,6 +71,8 @@ public class ReadRateLimiter
     public ReadRateLimitDecision TryAcquire(string battleTag, DateTime now)
     {
         var key = battleTag.ToLowerInvariant();
+        ReadRateLimitDecision decision;
+        bool shouldLog;
 
         lock (_lock)
         {
@@ -79,8 +87,33 @@ public class ReadRateLimiter
                 return new ReadRateLimitDecision(true, null);
             }
 
-            return new ReadRateLimitDecision(false, bucket.Tokens.SecondsUntilToken());
+            decision = new ReadRateLimitDecision(false, bucket.Tokens.SecondsUntilToken());
+
+            // Fix round 1, finding F3: shouldLog + the LastDenyLoggedAt stamp are both decided/mutated
+            // HERE, inside the lock — the state transition (has enough time passed since the last logged
+            // denial for THIS user) must be atomic, or two concurrent denials could both observe a stale
+            // stamp and both decide to log. The actual Log.Warning call happens after the lock is
+            // released (below) — see this class's doc comment for why.
+            shouldLog = bucket.LastDenyLoggedAt is null
+                || now - bucket.LastDenyLoggedAt >= ChatLimits.ReadRateLimiterDenyLogInterval;
+            if (shouldLog)
+            {
+                bucket.LastDenyLoggedAt = now;
+            }
         }
+
+        if (shouldLog)
+        {
+            // ORIGINAL-casing battleTag (not the internal lowercased `key`) — mirrors
+            // MessageRateLimiter's log-searchability convention, so a case-sensitive log search for a
+            // particular battleTag finds this line too.
+            Log.Warning(
+                "Read rate limit denied {BattleTag} (retryAfter {RetryAfterSeconds}s)",
+                battleTag,
+                decision.RetryAfterSeconds);
+        }
+
+        return decision;
     }
 
     // Test seam (assembly has InternalsVisibleTo): number of tracked user entries — asserts the
@@ -88,6 +121,19 @@ public class ReadRateLimiter
     internal int TrackedUserCount
     {
         get { lock (_lock) { return _byUser.Count; } }
+    }
+
+    // Test seam (assembly has InternalsVisibleTo): the last time a denial was logged for battleTag, or
+    // null if never logged (including "no tracked bucket at all"). UserBucket is a private nested type,
+    // so this is the only way outside the lock for a test to observe the once-per-
+    // ReadRateLimiterDenyLogInterval logging decision (fix round 1, finding F3) without a log-capture
+    // harness — none exists in this test suite, so the tests assert this stamp/refresh behavior directly.
+    internal DateTime? LastDenyLoggedAtFor(string battleTag)
+    {
+        lock (_lock)
+        {
+            return _byUser.TryGetValue(battleTag.ToLowerInvariant(), out var bucket) ? bucket.LastDenyLoggedAt : null;
+        }
     }
 
     // Caller must already hold _lock.
@@ -139,6 +185,12 @@ public class ReadRateLimiter
     {
         internal readonly TokenBucket Tokens;
         internal DateTime LastTouchedAt;
+
+        // Fix round 1, finding F3: when this user's denial was last logged — null until the first
+        // denial. Test seam (assembly has InternalsVisibleTo, mirrors TrackedUserCount below): tests
+        // assert the stamp/refresh behavior directly rather than via a log-capture harness (none exists
+        // in this test suite).
+        internal DateTime? LastDenyLoggedAt;
 
         internal UserBucket(DateTime now)
         {

@@ -237,4 +237,11 @@ public static class ChatLimits
     /// pruned at this horizon and silently recreated fresh (full capacity) would NOT be behaviour-
     /// preserving relative to a live bucket that had only refilled for that same idle duration.</summary>
     public static readonly TimeSpan ReadRateLimiterPruneHorizon = TimeSpan.FromMinutes(2);
+
+    /// <summary>Fix round 1 (finding F3): minimum interval between two <see cref="FanOut.ReadRateLimiter"/>
+    /// "read rate limit denied" log lines for the SAME user. Denials were previously invisible to
+    /// operators — combined with the silent client failure mode on a denial, "no legitimate client ever
+    /// hits it" was unfalsifiable in production. A sustained-denial user must not spam the log on every
+    /// call, so this bounds it to once per window. Not spec §13 text; hard-coded, adjust here only.</summary>
+    public static readonly TimeSpan ReadRateLimiterDenyLogInterval = TimeSpan.FromMinutes(1);
 }

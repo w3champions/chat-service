@@ -26,6 +26,18 @@ public class ReadRateLimiterTests
         _t0 = new DateTime(2026, 7, 3, 12, 0, 0, DateTimeKind.Utc);
     }
 
+    // Drains User's bucket back to zero tokens AS OF `at` (refilling first, same as a real TryAcquire
+    // would) — used by the F3 logging tests below to force a genuine denial at an arbitrary later time,
+    // since the bucket's full-refill time (12s) is far shorter than ReadRateLimiterDenyLogInterval (60s)
+    // and would otherwise have long since refilled by the time a suppression probe runs.
+    private void ExhaustBurstAt(DateTime at)
+    {
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            _limiter.TryAcquire(User, at);
+        }
+    }
+
     [Test]
     public void Burst_AllowsReadBurstImmediateCalls_NextIsDenied_WithRetryAfter()
     {
@@ -133,6 +145,49 @@ public class ReadRateLimiterTests
             Assert.IsTrue(_limiter.TryAcquire(User, _t0).Allowed, $"call {i + 1} within the shared budget must be allowed");
         }
         Assert.IsFalse(_limiter.TryAcquire(User, _t0).Allowed, "the shared per-battleTag budget is exhausted regardless of which guarded method spent it");
+    }
+
+    [Test]
+    public void Deny_LogsAtMostOncePerDenyLogInterval_PerUser()
+    {
+        // Fix round 1, finding F3: denials were previously invisible to operators. There is no
+        // log-capture harness in this test suite (see FanOut/ReadRateLimiter.cs's class doc for why —
+        // the log call is deliberately outside the lock), so this pins the once-per-
+        // ChatLimits.ReadRateLimiterDenyLogInterval logging decision directly via the internal test seam
+        // (LastDenyLoggedAtFor) rather than captured log output.
+        ExhaustBurstAt(_t0);
+        Assert.IsNull(_limiter.LastDenyLoggedAtFor(User), "no denial has happened yet — nothing logged");
+
+        // First denial at t0: stamps LastDenyLoggedAt.
+        var firstDenial = _limiter.TryAcquire(User, _t0);
+        Assert.IsFalse(firstDenial.Allowed, "the bucket is already fully drained by ExhaustBurstAt");
+        Assert.AreEqual(_t0, _limiter.LastDenyLoggedAtFor(User), "the first denial stamps the log time");
+
+        // A denial well within ReadRateLimiterDenyLogInterval must NOT refresh the stamp (suppressed).
+        // Re-exhaust first: by 30s later the bucket has long since fully refilled (full-refill time is
+        // only 12s), so the probe call needs a fresh drain to be a genuine denial rather than a hit.
+        var withinWindow = _t0 + TimeSpan.FromSeconds(30);
+        ExhaustBurstAt(withinWindow);
+        var secondDenial = _limiter.TryAcquire(User, withinWindow);
+        Assert.IsFalse(secondDenial.Allowed);
+        Assert.AreEqual(_t0, _limiter.LastDenyLoggedAtFor(User),
+            "a denial within the log interval must not refresh the stamp — logging stays suppressed");
+
+        // A denial once the interval has fully elapsed refreshes the stamp.
+        var afterWindow = _t0 + ChatLimits.ReadRateLimiterDenyLogInterval + TimeSpan.FromSeconds(1);
+        ExhaustBurstAt(afterWindow);
+        var thirdDenial = _limiter.TryAcquire(User, afterWindow);
+        Assert.IsFalse(thirdDenial.Allowed);
+        Assert.AreEqual(afterWindow, _limiter.LastDenyLoggedAtFor(User),
+            "a denial once the log interval has elapsed must refresh the stamp — logging resumes");
+    }
+
+    [Test]
+    public void Allow_NeverStampsLastDenyLoggedAt()
+    {
+        // The stamp must only ever move on a DENIAL, never on an allowed read.
+        Assert.IsTrue(_limiter.TryAcquire(User, _t0).Allowed);
+        Assert.IsNull(_limiter.LastDenyLoggedAtFor(User), "an allowed read must never stamp LastDenyLoggedAt");
     }
 
     [Test]
