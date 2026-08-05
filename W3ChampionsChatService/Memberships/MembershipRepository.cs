@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -151,6 +153,73 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
     /// <see cref="LoadForChannel"/> but returns a bare count.</summary>
     public async Task<int> CountForChannel(string channelId) =>
         (int)await Memberships.CountDocumentsAsync(m => m.ChannelId == channelId);
+
+    /// <summary>
+    /// D1 follow-up (2026-08-05, mention-canonicalization brief): batched member-scope check for
+    /// <c>ChatHub.SearchMentionCandidates</c>' SemiPublic/System lane. Given an already-assembled,
+    /// SMALL candidate battleTag set (bounded to <see cref="ChatLimits.MentionSearchMaxResults"/>, ~20),
+    /// returns the SUBSET that actually has a <c>channel_memberships</c> row for
+    /// <paramref name="channelId"/> — ONE indexed <c>$in</c> query (backed by the same
+    /// <c>ux_channelId_battleTag</c> index <see cref="LoadForChannel"/> uses), never the full-room
+    /// membership scan <see cref="LoadForChannel"/> performs. This is what keeps the search bounded on a
+    /// big SemiPublic/System room: the read is sized to the CANDIDATE list, never the room's total
+    /// membership. A projected read (only <see cref="ChannelMembership.BattleTag"/> crosses the wire).
+    /// Tags are lowercase-normalized both in the query and the returned set (see the class doc's BATTLETAG
+    /// KEY CONVENTION), so callers should compare case-insensitively. Virtual solely so tests can
+    /// spy/count calls (mirrors <see cref="LoadForChannel"/>) — fix round 1, finding F6a: proves a lane
+    /// that must never perform this scoping read (e.g. Public) actually doesn't.
+    /// </summary>
+    public virtual async Task<HashSet<string>> LoadMemberBattleTags(string channelId, IEnumerable<string> battleTags)
+    {
+        var tags = battleTags.Select(NormalizeTag).ToList();
+        if (tags.Count == 0)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var rows = await Memberships
+            .Find(m => m.ChannelId == channelId && tags.Contains(m.BattleTag))
+            .Project(m => m.BattleTag)
+            .ToListAsync();
+        return new HashSet<string>(rows, StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// D1 fix round 1 (finding F1): member-scoped RECALL BACKFILL for
+    /// <c>ChatHub.SearchMentionCandidates</c>' SemiPublic/System lane. The global tiers (viewer/online/
+    /// directory) run UNSCOPED and are ranked+capped against the WORLD before the candidate-side
+    /// <see cref="LoadMemberBattleTags"/> check ever runs — on a big room, a short (1-2 char) prefix can
+    /// be dominated by non-member noise and filtered down to near-nothing, degrading autocomplete recall
+    /// to "currently-focused viewers only". This method restores full recall (online-but-unfocused AND
+    /// offline members) by querying <c>channel_memberships</c> DIRECTLY for members whose (lowercased)
+    /// BattleTag matches the prefix — an anchored range scan on the SAME compound
+    /// <c>ux_channelId_battleTag</c> index <see cref="LoadForChannel"/> uses (ChannelId equality + a
+    /// BattleTag prefix bound), bounded to <paramref name="limit"/> rows, NEVER the room's total
+    /// membership (never <see cref="LoadForChannel"/>'s full scan). Mirrors
+    /// <see cref="Users.UserDirectoryRepository.SearchByNormalizedPrefix"/>'s contract exactly:
+    /// <paramref name="prefixLower"/> must already be lowercased by the caller (not re-normalized here —
+    /// it is already the durable storage casing), and <paramref name="excludeBattleTagsLower"/> ANDs in a
+    /// <c>$nin</c> against battleTags the caller's tiers 1-3 already claimed, so this query's own
+    /// <paramref name="limit"/> is never wasted re-fetching a dupe ahead of a genuinely new match — the
+    /// same starve-out bug class that method's own doc explains. A projected read: only
+    /// <see cref="ChannelMembership.BattleTag"/> crosses the wire. Virtual solely so tests can spy/count
+    /// calls (mirrors <see cref="LoadForChannel"/>/<see cref="LoadMemberBattleTags"/>).
+    /// </summary>
+    public virtual Task<List<string>> SearchMemberBattleTagsByPrefix(
+        string channelId, string prefixLower, int limit, IReadOnlyCollection<string> excludeBattleTagsLower = null)
+    {
+        var filterBuilder = Builders<ChannelMembership>.Filter;
+        var filter = filterBuilder.And(
+            filterBuilder.Eq(m => m.ChannelId, channelId),
+            filterBuilder.Regex(m => m.BattleTag, new BsonRegularExpression("^" + Regex.Escape(prefixLower))));
+
+        if (excludeBattleTagsLower is { Count: > 0 })
+        {
+            filter = filterBuilder.And(filter, filterBuilder.Nin(m => m.BattleTag, excludeBattleTagsLower));
+        }
+
+        return Memberships.Find(filter).Limit(limit).Project(m => m.BattleTag).ToListAsync();
+    }
 
     public Task SetRole(string channelId, string battleTag, MembershipRole role)
     {

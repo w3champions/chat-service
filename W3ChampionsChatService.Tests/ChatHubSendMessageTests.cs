@@ -732,31 +732,37 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // C6 "strip & deliver as plain" (Marco decision 3): a message is NEVER rejected because of its
-    // mentions' access/resolvability. An unresolvable/garbage tag, or a tag naming a NON-member, delivers
-    // VERBATIM (the client renders the invalid <@…> as plain) and simply produces no inbox entry + no
-    // notification — the membership wall in MentionFanOut is the sole authority on who is notified. Since
-    // follow-up spec §4, that wall is widened for PUBLIC channels: a directory-RESOLVABLE non-member of a
-    // Public channel now DOES get an entry + notification (only an unresolvable tag still gets nothing
-    // there); Dm/GroupDm/SemiPublic/System keep the unconditional membership wall. These exercise the full
-    // SendMessage pipeline end-to-end (real MentionFanOut + inbox repo + push harness).
+    // C6 "strip & deliver as plain" (Marco decision 3), amended by D2 (2026-08-05, server-canonical
+    // rendering): a message is NEVER rejected because of its mentions' access/resolvability. But since D2,
+    // an unresolvable/garbage tag, or a tag naming a NON-legal-render-target, is no longer delivered with
+    // its markup intact — step 5.26 rewrites it to plain text (`@tag`) in the PERSISTED content before the
+    // fan-out ever runs, so every reader sees identical canonical content. The membership wall in
+    // MentionFanOut still independently decides who gets an inbox entry + notification (now a redundant
+    // second line of defense behind the same base condition step 5.26 already evaluated). Since follow-up
+    // spec §4, that wall is widened for PUBLIC channels: a directory-RESOLVABLE non-member of a Public
+    // channel keeps its markup AND gets an entry + notification (only an unresolvable tag still gets
+    // nothing there, and is stripped); Dm/GroupDm/SemiPublic/System keep the unconditional membership wall
+    // for BOTH render and notify. These exercise the full SendMessage pipeline end-to-end (real
+    // MentionFanOut + inbox repo + push harness).
     // ---------------------------------------------------------------------------------------------
 
     [Test]
-    public async Task Mention_GarbageTag_Ok_DeliveredVerbatim_NoInboxEntry()
+    public async Task Mention_GarbageTag_Ok_StrippedToPlainText_NoInboxEntry()
     {
         var channel = await CreateChannel("general");
         SeedMember("conn-1", BattleTag, channel.Id);
         var hub = BuildHub("conn-1");
 
-        // "ghost#999" resolves to nobody (no directory row, no session, no membership) — a garbage mention.
+        // "ghost#999" resolves to nobody (no directory row, no session, no membership) — a garbage mention,
+        // and NOT a legal render target (no membership row; Public but not directory-resolvable).
         var content = $"hey {Mention("ghost#999")} are you real?";
         var result = await hub.SendMessage(channel.Id, content);
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "an unresolvable/garbage <@tag> must NEVER reject the send");
         var persisted = await _messageRepository.Load(result.MessageId);
         Assert.IsNotNull(persisted, "the message is durably persisted");
-        Assert.AreEqual(content, persisted.Content, "the message delivers verbatim — the client renders the invalid <@…> as plain text");
+        Assert.AreEqual("hey @ghost#999 are you real?", persisted.Content,
+            "D2: a non-renderable mention token is stripped to its plain-text form in the persisted content");
         Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("ghost#999"), "a garbage mention writes NO inbox entry");
         Assert.IsEmpty(_mentionPushHarness.AllSignals, "and pushes nothing");
     }
@@ -771,9 +777,13 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         await SeedDirectory("stranger#1");
         var hub = BuildHub("conn-1");
 
-        var result = await hub.SendMessage(channel.Id, $"hey {Mention("stranger#1")}");
+        var content = $"hey {Mention("stranger#1")}";
+        var result = await hub.SendMessage(channel.Id, content);
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "mentioning a resolvable non-member of a public channel is legal — no reject");
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.AreEqual(content, persisted.Content,
+            "D2: a directory-resolvable target in a Public channel IS a legal render target — markup stays intact, never stripped");
         Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("stranger#1")).Count,
             "follow-up spec §4: a directory-resolvable non-member of a PUBLIC channel now gets an inbox entry — the membership wall is widened away for Public rooms only");
         Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
@@ -782,13 +792,16 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Mention_NonMemberInGroupDm_Ok_DeliveredVerbatim_NonMemberGetsNothing_MemberControlNotified()
+    public async Task Mention_NonMemberInGroupDm_Ok_OutsiderStripped_MemberKeepsMarkup_MemberControlNotified()
     {
         // Marco's headline case: a GroupDm (a PRIVATE conversation). The sender mentions BOTH an outsider
-        // who is NOT a member of the group AND a real member (wolf). The send is NOT rejected — it delivers
-        // VERBATIM — but the excerpt PRIVACY WALL means the non-member outsider gets NO inbox entry and NO
-        // MentionNotified (a private conversation's ~120-char excerpt must never reach a non-participant),
-        // while the member control still gets both (so this fails against a do-nothing stub too).
+        // who is NOT a member of the group AND a real member (wolf). The send is NOT rejected, but D2
+        // (2026-08-05) strips the outsider's token to plain text — a GroupDm is never Public, so a
+        // non-member is never a legal render target there, only a real membership row is — while wolf's
+        // markup stays intact. The excerpt PRIVACY WALL still means the non-member outsider gets NO inbox
+        // entry and NO MentionNotified (a private conversation's ~120-char excerpt must never reach a
+        // non-participant), while the member control still gets both (so this fails against a do-nothing
+        // stub too).
         var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastSeq = 0, LastMessageAt = Now, ExpiresAt = Now.AddDays(365) };
         await _channelRepository.Insert(group);
         SeedMember("conn-1", BattleTag, group.Id);                     // sender (a member)
@@ -803,10 +816,11 @@ public class ChatHubSendMessageTests : IntegrationTestBase
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "a mention of a non-member must NEVER reject the send (strip & deliver as plain)");
 
-        // The message delivered VERBATIM — persisted with the exact content, including the <@outsider#1> token.
+        // D2: the outsider's token is stripped to plain text; wolf's (an actual member) stays markup.
         var persisted = await _messageRepository.Load(result.MessageId);
         Assert.IsNotNull(persisted, "the message is durably persisted");
-        Assert.AreEqual(content, persisted.Content, "the message text delivers verbatim — the invalid <@…> token is kept as plain text");
+        Assert.AreEqual($"secret plans @outsider#1 and {Mention("wolf#456")}", persisted.Content,
+            "D2: a GroupDm non-member is never a legal render target — only the outsider's token is stripped, the member's markup is untouched");
 
         // The excerpt PRIVACY WALL: the non-member outsider gets NO inbox entry and NO MentionNotified —
         // a private (GroupDm) conversation's excerpt NEVER reaches a non-participant.

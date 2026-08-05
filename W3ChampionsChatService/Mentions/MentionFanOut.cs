@@ -36,8 +36,9 @@ namespace W3ChampionsChatService.Mentions;
 /// entry carries a ~120-char content excerpt, and a private conversation's excerpt must NEVER reach a
 /// non-participant. This wall is the SOLE authority on who is notified: the send-side gate (step 5.25)
 /// validates only the mention COUNT cap — never resolvability or membership — so mentioning a non-member
-/// (or an unresolvable/garbage tag) is legal content that delivers verbatim and simply notifies nobody
-/// here. Follow-up spec §4 EXCEPTION: for <see cref="ChannelType.Public"/> rooms only, a target with NO
+/// (or an unresolvable/garbage tag) is legal content that is delivered with its markup already rewritten
+/// to plain text by step 5.26 (fix round 1, finding F2 — D2's canonical strip, not a verbatim delivery)
+/// and simply notifies nobody here. Follow-up spec §4 EXCEPTION: for <see cref="ChannelType.Public"/> rooms only, a target with NO
 /// membership row is still eligible provided the tag resolves to a <see cref="UserDirectoryRepository"/>
 /// row — a public room's excerpt is public content, so the membership wall protects nothing there;
 /// Dm/GroupDm/SemiPublic/System are unaffected and keep the membership wall exactly as before.</item>
@@ -63,6 +64,16 @@ namespace W3ChampionsChatService.Mentions;
 /// owns the ack surface). An OFFLINE eligible target gets the durable entry only (no live connection to
 /// push to); <c>GetMentionInbox</c> / <c>SessionState.MentionUnreadCount</c> (Task 6) surface it on
 /// their next connect.
+/// </para>
+/// <para>
+/// D2 (2026-08-05, mention-canonicalization decision): <see cref="ChatHub.SendMessage(string, string)"/>'s
+/// step 5.26 now independently evaluates the SAME base condition as rule (c) below (membership OR
+/// Public-and-directory-resolvable) to decide whether a mention RENDERS, and rewrites an unrenderable
+/// token's markup to plain text in the persisted content before this class ever runs. <c>NotifyAsync</c>'s
+/// <c>mentionTags</c> is still the FULL original extracted list (unaffected by that rewrite — this class never re-parses
+/// <c>message.Content</c>), so nothing here changes: rule (c)'s membership/Public-directory wall is left
+/// UNCHANGED deliberately, per the brief, and now doubles as a redundant second line of defense — any
+/// target it would exclude was, by construction, already excluded from rendering by step 5.26 too.
 /// </para>
 /// <para>
 /// Singleton (registered in <see cref="Startup"/>): it holds no per-call state and is shared by every

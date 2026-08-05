@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
@@ -55,19 +56,31 @@ public partial class ChatHub
     /// <see cref="ChatLimits.MaxMentionsPerMessage"/> distinct tags → <see cref="ChatResultCode.TooLong"/>
     /// (an anti-abuse bound on fan-out work / spam; the pinned 7-member enum has no InvalidContent value —
     /// same C3 precedent as empty-after-trim). A message is NEVER rejected for the access or resolvability
-    /// of its mentions: an unresolvable/garbage tag, or a tag naming someone who is not a current member of
-    /// this channel, is legal content — it delivers VERBATIM (the client renders the invalid
-    /// <c>&lt;@…&gt;</c> as plain text) and simply produces no mention-inbox entry and no notification. So
-    /// there is NO directory read and NO membership check here — resolvability ≠ selectability (that is
-    /// <c>SearchMentionCandidates</c>' job), and who is actually notified is decided SOLELY by the uniform
-    /// membership wall in <see cref="Mentions.MentionFanOut"/> (step 8 below). The count cap is
-    /// content-intrinsic and deterministic, so it runs BEFORE the private-lane gates and the mute gate
-    /// below BY DESIGN: a blocked sender and an unblocked sender must see an IDENTICAL outcome for the same
-    /// over-cap content (running it after the private-lane gate's silent short-circuit would let a fake-Ok
-    /// mask a TooLong reject and leak block state), and a shadow/full-muted sender's over-cap markup must
-    /// still be rejected normally (a rejection does not break either illusion). The extracted, deduped,
-    /// post-cap tag list is kept in a local and threads forward to the (Task 5) mention fan-out call
-    /// site.</item>
+    /// of its mentions: an unresolvable/garbage tag, or a tag naming someone who is not a legal render
+    /// target of this channel, is legal content — it is never a reason to reject the send. The extracted,
+    /// deduped, post-cap tag list is kept in a local and threads forward to both step 5.26 below and the
+    /// (Task 5) mention fan-out call site.</item>
+    /// <item>Server-canonical mention rendering (step 5.26 — D2, 2026-08-05 decision, mention-
+    /// canonicalization brief): for each distinct mentioned target (the same post-cap tag list from step
+    /// 5.25), evaluate the RENDERABILITY predicate — a <see cref="Memberships.MembershipRepository"/> row
+    /// for this channel, OR (the channel is <see cref="ChannelType.Public"/> AND the tag is
+    /// <see cref="Users.UserDirectoryRepository"/>-resolvable) — and rewrite <c>content</c> via
+    /// <see cref="Mentions.MentionMarkup.RewriteUnrenderable"/>: a token whose target fails the predicate is
+    /// downgraded to its plain-text form (<c>@BattleTag#123</c>, no angle brackets — byte-for-byte the
+    /// launcher's pre-existing client-side downgrade text) IN THE PERSISTED CONTENT; every other token's
+    /// markup is left untouched. This is Mongo point reads ONLY (membership +, for Public non-members,
+    /// directory — never both per target, and never the relationship provider), bounded to at most
+    /// <see cref="ChatLimits.MaxMentionsPerMessage"/> (5) targets. Deciding this SERVER-SIDE, once, at
+    /// send time — rather than leaving it to each client to guess a roster — means every reader (live
+    /// delivery, history paging, a non-member's Public read, an old un-upgraded client) sees IDENTICAL
+    /// canonical content; the launcher's own client-side roster-guessing downgrade gate is now redundant
+    /// and has been removed. The predicate deliberately does NOT consult blocks, NotificationLevel,
+    /// notification preferences, or DeclinedUntil — those suppress the PING (<see cref="Mentions.MentionFanOut"/>,
+    /// step 8), never the RENDER: a member who blocked the sender still SEES a normal chip (stripping it
+    /// would leak the block to the sender, an explicit Marco pin), and an opted-out member still sees their
+    /// own name highlighted. Runs BEFORE the private-lane gates (5.5) and the mute gate (6) so a shadow or
+    /// muted send is canonicalized exactly like any other — this is content canonicalization, not
+    /// moderation, and applies unconditionally to whatever eventually gets persisted.</item>
     /// <item>Private-lane gates (C5 Task 4, step 5.5) — <see cref="ChannelType.Dm"/>/
     /// <see cref="ChannelType.GroupDm"/> ONLY: block/consent/cap handling that may silently short-circuit
     /// with a fabricated <see cref="ChatResultCode.Ok"/> (<c>FakeSendAck</c>) or the one fail-closed
@@ -166,21 +179,62 @@ public partial class ChatHub
         // ExtractTags dedupes case-insensitively (D1) — a target mentioned 6 times counts ONCE toward the
         // cap. Zero cost on the hot path: no `<@tag>` tokens means the cap check is skipped entirely, so
         // the common case (most messages have no mentions) pays nothing.
-        // STRIP & DELIVER AS PLAIN: an unresolvable/garbage tag, or a tag naming a non-member of this
-        // channel, is NOT a reject reason — the message text delivers VERBATIM (the client renders the
-        // invalid `<@…>` as plain text) and that target simply gets no inbox entry and no notification. So
-        // the send path performs NO directory read and NO membership check: resolvability ≠ selectability
-        // (that's SearchMentionCandidates' job), and who is actually notified is decided SOLELY by the
-        // uniform membership wall in MentionFanOut (step 8). The cap reject maps to TooLong (the pinned
-        // 7-member enum has no InvalidContent — same C3 precedent as empty-after-trim).
-        // mentionTags (all extracted, deduped, post-cap) threads forward to the (Task 5) mention fan-out
-        // call site that lands after DM materialization (7.5) and AFTER FanOutEngine.OnMessagePersisted
-        // (7.75, fix round 1 F2b — moved earlier so channel delivery never waits on the mention fan-out's
-        // relationship reads).
+        // The cap reject maps to TooLong (the pinned 7-member enum has no InvalidContent — same C3
+        // precedent as empty-after-trim).
+        // mentionTags (all extracted, deduped, post-cap) threads forward to step 5.26 below AND the
+        // (Task 5) mention fan-out call site that lands after DM materialization (7.5) and AFTER
+        // FanOutEngine.OnMessagePersisted (7.75, fix round 1 F2b — moved earlier so channel delivery never
+        // waits on the mention fan-out's relationship reads).
         var mentionTags = MentionMarkup.ExtractTags(content);
         if (mentionTags.Count > ChatLimits.MaxMentionsPerMessage)
         {
             return new SendMessageResult(ChatResultCode.TooLong);
+        }
+
+        // 5.26 Server-canonical mention rendering (D2, 2026-08-05 decision — mention-canonicalization
+        // brief). Zero cost when mentionTags is empty (the common case). For each distinct target, decide
+        // whether it RENDERS (stays a `<@tag>` chip) or is DOWNGRADED to plain text
+        // (`@tag`, no angle brackets — byte-identical to the launcher's pre-existing client-side downgrade
+        // text), then rewrite `content` accordingly BEFORE persist — so every future reader of this
+        // message (live delivery, history paging, a non-member's Public read, an old un-upgraded client)
+        // sees the SAME canonical text; the launcher's own client-side roster-guessing gate is now
+        // redundant and has been removed.
+        // RENDERABILITY PREDICATE (exact — deliberately mirrors, but is independent of, MentionFanOut's
+        // notification eligibility below): the target has a channel_memberships row for THIS channel, OR
+        // the channel is Public AND the target is user-directory-resolvable. Mongo point reads only — the
+        // channel doc is already loaded (step 5), so this is ONE batched, indexed $in membership read
+        // covering every distinct target (fix round 1, finding F3 — MembershipRepository.LoadMemberBattleTags,
+        // replacing what was up to MaxMentionsPerMessage (5) sequential membership Loads) plus (Public,
+        // non-member only) up to one sequential directory read per still-unresolved target, bounded to
+        // MaxMentionsPerMessage (5); the relationship provider is NEVER consulted here. The predicate deliberately IGNORES blocks,
+        // NotificationLevel, notification preferences, and DeclinedUntil — those suppress the PING
+        // (MentionFanOut, step 8), never the RENDER: a member who has blocked the sender must still SEE a
+        // normal chip (stripping it would leak the block state to the sender — an explicit Marco pin), and
+        // an opted-out member still sees themself mentioned normally.
+        // This runs BEFORE the private-lane gates (5.5) and the mute gate (6) so a shadow/full-muted
+        // sender's content is canonicalized exactly like anyone else's — content canonicalization is
+        // unconditional, not a moderation decision, and the rewritten `content` is what ultimately gets
+        // persisted and fanned out regardless of which path the send takes afterward.
+        if (mentionTags.Count > 0)
+        {
+            // Fix round 1 (finding F3): ONE batched, indexed $in membership read
+            // (MembershipRepository.LoadMemberBattleTags) covering every distinct target, replacing what
+            // was up to MaxMentionsPerMessage (5) sequential point-reads. The Public/directory fallback
+            // stays sequential and bounded, exactly as before — only ever reached for a target this
+            // batched check already found has no membership row.
+            var memberTags = await _membershipRepository.LoadMemberBattleTags(channel.Id, mentionTags);
+            var renderableByTag = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            foreach (var tag in mentionTags)
+            {
+                var isRenderable = memberTags.Contains(tag);
+                if (!isRenderable && channel.Type == ChannelType.Public)
+                {
+                    isRenderable = await _userDirectory.Load(tag) != null;
+                }
+                renderableByTag[tag] = isRenderable;
+            }
+            content = MentionMarkup.RewriteUnrenderable(
+                content, tag => renderableByTag.TryGetValue(tag, out var renderable) && renderable);
         }
 
         // 5.5 Private-lane gates (C5 Task 4) — Dm/GroupDm ONLY. Runs BEFORE persist so a silent-drop or

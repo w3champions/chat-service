@@ -38,4 +38,42 @@ public static class MentionMarkup
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
+
+    /// <summary>
+    /// D2 (2026-08-05, server-canonical mention rendering): a single pass over the SAME token grammar
+    /// <see cref="ExtractTags"/> uses (reusing <see cref="TokenPattern"/> — this is deliberately NOT a
+    /// second parser) that downgrades every mention token whose target is not a legal render target for
+    /// the channel to its plain-text display form, and leaves every other token's markup untouched.
+    /// <para>
+    /// The plain-text form is <c>@{tag}</c> — no angle brackets, tag byte-for-byte as captured (display
+    /// casing preserved). This matches the launcher's PRE-EXISTING client-side downgrade path byte-for-
+    /// byte (<c>mention-markup.helper.ts</c>'s <c>parseMessageSegments</c>: <c>segment.text = `@${battleTag}`</c>,
+    /// returned verbatim by <c>ChatMessage.tsx</c>'s <c>MessageContent</c> for a non-rendering mention),
+    /// so a pre-change client and a post-change client show byte-identical text for the same content.
+    /// </para>
+    /// <paramref name="isRenderable"/> is invoked once per REGEX MATCH, not once per distinct tag — the
+    /// same target mentioned twice with different casing in one message is evaluated once per occurrence.
+    /// Callers should back it with a case-insensitive lookup (the same dedup convention
+    /// <see cref="ExtractTags"/> uses) so every occurrence of the same target gets the same decision.
+    /// </summary>
+    public static string RewriteUnrenderable(string content, Func<string, bool> isRenderable)
+    {
+        if (string.IsNullOrEmpty(content))
+        {
+            return content;
+        }
+
+        return TokenPattern.Replace(content, m =>
+        {
+            var tag = m.Groups[1].Value;
+            // Fix round 1 (finding F5): a caller's TryGetValue-miss on this tag (no decision was ever
+            // computed for it) is unreachable in practice — every real caller builds its decisions from
+            // ExtractTags over this SAME content, so every regex match here already has an entry. Callers
+            // resolve a miss to false (strip), never true (render): rendering an unvalidated mention is
+            // the worse failure — a stripped-but-actually-legal mention is only a cosmetic downgrade,
+            // while a rendered-but-never-checked one could leak a chip nobody actually validated. Hence
+            // fail-closed.
+            return isRenderable(tag) ? m.Value : $"@{tag}";
+        });
+    }
 }

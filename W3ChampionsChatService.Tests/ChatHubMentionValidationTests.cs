@@ -29,7 +29,7 @@ namespace W3ChampionsChatService.Tests;
 /// gates (step 5.5) and the mute gate (step 6). After the amendment the gate validates EXACTLY ONE thing:
 /// the mention COUNT cap (an anti-abuse bound). A message is NEVER rejected for the resolvability or
 /// access of its mentions — an unresolvable/garbage tag, or a tag naming a non-member, is legal content
-/// that delivers VERBATIM and simply never fans out (the membership wall in <see cref="MentionFanOut"/>
+/// that delivers with its markup rewritten to plain text by step 5.26 and never fans out (the membership wall in <see cref="MentionFanOut"/>
 /// is the sole authority on who is notified — proven directly in <see cref="MentionFanOutTests"/> and
 /// end-to-end in <see cref="ChatHubSendMessageTests"/>). Two properties are load-bearing here: (1) the
 /// COUNT cap is content-intrinsic, so a blocked sender and an unblocked sender must get an IDENTICAL
@@ -247,15 +247,17 @@ public class ChatHubMentionValidationTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Send_UnresolvableMention_StillOk_DeliversVerbatim()
+    public async Task Send_UnresolvableMention_StillOk_StrippedToPlainText()
     {
         var channel = await CreateChannel("general");
         SeedMember("conn-1", Sender, channel.Id);
         var hub = BuildHub("conn-1");
 
-        // "ghost#999" resolves to nobody (never seeded anywhere). Strip-and-deliver-as-plain: the send is
-        // NOT rejected — the message delivers VERBATIM (the client renders the invalid <@…> as plain text),
-        // and the fan-out's membership wall alone drops the (non-member) target. NOT TooLong.
+        // "ghost#999" resolves to nobody (never seeded anywhere) — no membership row, and the channel is
+        // Public but the tag is not directory-resolvable, so it fails the D2 renderability predicate. The
+        // send is NOT rejected, but step 5.26 rewrites the token to its plain-text form before persist —
+        // the fan-out's membership wall (now a redundant second line of defense) still drops the target
+        // for notification purposes independently. NOT TooLong.
         var content = $"hey {Mention("ghost#999")}";
         var result = await hub.SendMessage(channel.Id, content);
 
@@ -264,7 +266,8 @@ public class ChatHubMentionValidationTests : IntegrationTestBase
         var reloaded = await _channelRepository.Load(channel.Id);
         Assert.That(reloaded.LastSeq, Is.EqualTo(1L), "the message persists — an unresolvable mention is legal content");
         var persisted = await _messageRepository.Load(result.MessageId);
-        Assert.That(persisted.Content, Is.EqualTo(content), "the message text delivers verbatim — the invalid <@…> token is kept");
+        Assert.That(persisted.Content, Is.EqualTo("hey @ghost#999"),
+            "D2 (2026-08-05): a non-renderable mention token is stripped to its plain-text form in the persisted content");
     }
 
     [Test]
@@ -282,25 +285,42 @@ public class ChatHubMentionValidationTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // Zero-cost / zero-DB: the send path performs NO directory read — even for a message WITH mentions
-    // (the resolvability Load loop was removed by the strip-and-deliver-as-plain amendment).
+    // Bounded-cost: D2 (2026-08-05) reintroduces directory reads on the mention send path — one per
+    // distinct target that has no membership row in a Public channel — but they stay BOUNDED at
+    // MaxMentionsPerMessage (5), never unbounded, and a message with NO mention tokens still pays zero.
     // ---------------------------------------------------------------------------------------------
 
     [Test]
-    public async Task Send_WithMentions_PerformsZeroDirectoryReads()
+    public async Task Send_WithMentions_PerformsBoundedDirectoryReads_ForCanonicalization()
     {
         var channel = await CreateChannel("general");
         SeedMember("conn-1", Sender, channel.Id);
         var countingDirectory = new CountingUserDirectoryRepository(MongoClient);
         var hub = BuildHub("conn-1", countingDirectory);
 
-        // A message carrying real mention markup — under the old gate this would have driven one directory
-        // Load per tag. The resolvability check is gone, so the send path must now do ZERO directory reads.
+        // Two distinct non-member targets in a Public channel — step 5.26's renderability predicate reads
+        // the directory once per target (neither has a membership row) to decide render-vs-strip. Bounded
+        // to the distinct-tag count, never per-occurrence or unbounded.
         var result = await hub.SendMessage(channel.Id, $"hey {Mention("wolf#456")} and {Mention("frank#789")}");
 
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(countingDirectory.LoadCallCount, Is.EqualTo(2),
+            "D2's renderability predicate reads the directory exactly once per distinct non-member Public-channel target");
+    }
+
+    [Test]
+    public async Task Send_WithoutMentions_PerformsZeroDirectoryReads()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", Sender, channel.Id);
+        var countingDirectory = new CountingUserDirectoryRepository(MongoClient);
+        var hub = BuildHub("conn-1", countingDirectory);
+
+        var result = await hub.SendMessage(channel.Id, "just a plain message, no mentions here");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
         Assert.That(countingDirectory.LoadCallCount, Is.EqualTo(0),
-            "the send path performs ZERO directory reads — resolvability is no longer validated (strip & deliver as plain)");
+            "a message with no <@tag> tokens must pay zero directory reads — mentionTags.Count == 0 short-circuits step 5.26 entirely");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -388,5 +408,115 @@ public class ChatHubMentionValidationTests : IntegrationTestBase
             "consequence (D2): a full-muted sender with over-cap markup gets TooLong, not Muted");
         var reloaded = await _channelRepository.Load(channel.Id);
         Assert.That(reloaded.LastSeq, Is.EqualTo(0L));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // D2 (2026-08-05, server-canonical rendering — mention-canonicalization brief, step 5.26):
+    // walled-channel (SemiPublic/System) render canonicalization, verified via the GetMessages
+    // round-trip (not just MessageRepository.Load) — proving a READER, not just the raw persisted row,
+    // sees the canonical content.
+    // ---------------------------------------------------------------------------------------------
+
+    private Task SeedDurableMembership(string channelId, string battleTag, NotificationLevel level = NotificationLevel.All) =>
+        _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channelId,
+            BattleTag = battleTag,
+            NotificationLevel = level,
+            JoinedAt = Now,
+        });
+
+    [Test]
+    public async Task Send_SemiPublicChannel_NonMemberStripped_MemberKeepsMarkup_ViaGetMessagesRoundTrip()
+    {
+        var channel = await CreateChannel("semi-room", ChannelType.SemiPublic);
+        SeedMember("conn-1", Sender, channel.Id, ChannelType.SemiPublic);
+        await SeedDurableMembership(channel.Id, Recipient); // a real member — a legal render target
+
+        var hub = BuildHub("conn-1");
+        var content = $"hey {Mention(Recipient)} and {Mention("ghost#999")}";
+        var result = await hub.SendMessage(channel.Id, content);
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        var expected = $"hey {Mention(Recipient)} and @ghost#999";
+        var page = await hub.GetMessages(channel.Id, null, null, 10);
+        Assert.That(page.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(page.Messages.Single(m => m.Id == result.MessageId).Content, Is.EqualTo(expected),
+            "a SemiPublic non-member's mention token is stripped to plain text and a real member's markup " +
+            "is kept — a READER (GetMessages), not just the raw persisted row, sees the canonical content");
+    }
+
+    [Test]
+    public async Task Send_SystemMatchChannel_NonMemberStripped_MemberKeepsMarkup_ViaGetMessagesRoundTrip()
+    {
+        var channel = new ChatChannel
+        {
+            Type = ChannelType.System,
+            SystemKind = SystemChannelKind.Match,
+            SystemRef = "match-1",
+            Name = "Match Chat",
+        };
+        await _channelRepository.Insert(channel);
+        SeedMember("conn-1", Sender, channel.Id, ChannelType.System);
+        await SeedDurableMembership(channel.Id, Recipient); // a real member — a legal render target
+
+        var hub = BuildHub("conn-1");
+        var content = $"hey {Mention(Recipient)} and {Mention("ghost#999")}";
+        var result = await hub.SendMessage(channel.Id, content);
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        var expected = $"hey {Mention(Recipient)} and @ghost#999";
+        var page = await hub.GetMessages(channel.Id, null, null, 10);
+        Assert.That(page.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(page.Messages.Single(m => m.Id == result.MessageId).Content, Is.EqualTo(expected),
+            "a System (match) channel non-member's mention token is stripped to plain text and a real " +
+            "member's markup is kept — a READER (GetMessages), not just the raw persisted row, sees the canonical content");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The renderability predicate deliberately IGNORES blocks and notification preferences — those
+    // suppress the PING (MentionFanOut), never the RENDER. A stripped chip for a blocking member would
+    // leak the block state to the sender (explicit Marco pin); ping suppression itself is proven directly
+    // against NotifyAsync in MentionFanOutTests (e.g. Notify_BlockedTarget_MemberBranch_...).
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Send_MentionOfMemberWhoBlockedSender_MarkupKept_RenderNeverLeaksBlocks()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", Sender, channel.Id);
+        await SeedDurableMembership(channel.Id, Recipient);
+        // Configure a real block relationship (Recipient has blocked Sender) on the SAME relationship
+        // provider the hub's private-lane gates use — documents that the render predicate has no path to
+        // it at all (step 5.26 never consults IRelationshipProvider), unlike MentionFanOut's own D1 ping gate.
+        SetBlocked(Recipient, Sender);
+        var hub = BuildHub("conn-1");
+
+        var content = $"hey {Mention(Recipient)}";
+        var result = await hub.SendMessage(channel.Id, content);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.That(persisted.Content, Is.EqualTo(content),
+            "a mentioned member's markup stays intact even though they blocked the sender — " +
+            "the renderability predicate never consults blocks; only MentionFanOut's separate ping gate does");
+    }
+
+    [Test]
+    public async Task Send_MentionOfMemberWithNotificationLevelNone_MarkupKept()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", Sender, channel.Id);
+        await SeedDurableMembership(channel.Id, Recipient, NotificationLevel.None);
+        var hub = BuildHub("conn-1");
+
+        var content = $"hey {Mention(Recipient)}";
+        var result = await hub.SendMessage(channel.Id, content);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.That(persisted.Content, Is.EqualTo(content),
+            "a mentioned member's markup stays intact even with NotificationLevel.None — " +
+            "the renderability predicate only checks membership EXISTENCE, never the notification level");
     }
 }
