@@ -126,6 +126,10 @@ public class OldProtocolRemovedTests
             // precedent as every C5/C6 growth above.
             "GetPresence",
             "GetPresenceDetails",
+            // 2026-08-04 follow-up spec §6 (CS Task 8): the cursor-paginated read of the caller's
+            // older 1:1 Dm shells — GetConversations (ChatHub.Dm.cs). Widens the pinned set, never
+            // weakens it — same precedent as every C5/C6 growth above.
+            "GetConversations",
             // Legacy moderation trio (kept, ChatHub.cs)
             "DeleteMessage",
             "PurgeMessagesFromUser",

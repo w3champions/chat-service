@@ -55,6 +55,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
@@ -85,6 +86,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
         _assembler = new SessionStateAssembler(
@@ -109,6 +111,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -123,7 +126,8 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
@@ -274,7 +278,9 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     [Test]
     public async Task GetMessages_NonMember_ReturnsNotMember()
     {
-        var channel = await CreateChannel();
+        // SemiPublic — public rooms are non-member-readable since the §4 mention-jump allowance; every
+        // other type keeps the wall.
+        var channel = await CreateChannel(type: ChannelType.SemiPublic);
         RegisterSession("conn-1", BattleTag);
         // Deliberately no membership seed — the caller has a live session but is not a member.
         var hub = BuildHub("conn-1");
@@ -282,6 +288,81 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
 
         Assert.AreEqual(ChatResultCode.NotMember, result.Code);
+        Assert.IsNull(result.Messages);
+    }
+
+    [Test]
+    public async Task GetMessages_NonMember_PublicChannel_ReturnsHistory()
+    {
+        var channel = await CreateChannel(); // Public by default
+        var seeded = await SeedMessage(channel.Id, OtherBattleTag, "hello public");
+        RegisterSession("conn-1", BattleTag);
+        // Deliberately NO membership seed — the mention-inbox jump into an unjoined public room (§4).
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: seeded.Seq, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code, "public-room history is readable without membership");
+        Assert.AreEqual(1, result.Messages.Count);
+        Assert.AreEqual(seeded.Seq, result.Messages[0].Seq);
+    }
+
+    [Test]
+    public async Task GetMessages_NonMember_PublicChannel_StillAppliesUserVisibleFilter()
+    {
+        var channel = await CreateChannel();
+        await SeedMessage(channel.Id, OtherBattleTag, "visible");
+        await SeedMessage(channel.Id, OtherBattleTag, "shadow-hidden", shadow: true);
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, result.Messages.Count, "the non-member read uses the SAME UserVisible-filtered path");
+        Assert.AreEqual("visible", result.Messages[0].Content);
+    }
+
+    [Test]
+    public async Task GetMessages_FullBannedNonMember_PublicChannel_Denied()
+    {
+        // A full-banned caller must not be able to read Public history through the §4 non-member
+        // fallthrough — mirrors JoinChannel's full-ban gate (ChatHub.Channels.cs) and the catalog-hiding
+        // rule in SessionStateAssembler. Must resolve to the SAME NotMember a non-member got before this
+        // task's fallthrough existed — indistinguishable, no new information disclosure.
+        var channel = await CreateChannel(); // Public by default
+        await SeedMessage(channel.Id, OtherBattleTag, "hello public");
+        RegisterSession("conn-1", BattleTag);
+        // Deliberately NO membership seed — a full-banned non-member reaching the Public fallthrough.
+        // Seed the mute cache the SAME way the connect flow does (SessionStateAssembler.SeedLegacyMuteCache
+        // -> ConnectionMapping.SetMute), mirroring JoinChannel_FullBanned_PublicChannel_ReturnsPermissionDenied.
+        _connectionMapping.SetMute("conn-1", MuteStatus.Full, Now.AddDays(1));
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.NotMember, result.Code,
+            "a full-banned non-member must not read Public history via the §4 fallthrough");
+        Assert.IsNull(result.Messages);
+    }
+
+    [Test]
+    public async Task GetMessages_FullBannedNonMemberModerator_PublicChannel_Denied()
+    {
+        // The Moderation role claim must not bypass the full-ban gate: a non-member moderator who is
+        // ALSO full-banned is denied exactly like any other full-banned non-member — the ban check runs
+        // in step 4, strictly before step 5's moderator/user branch split.
+        var channel = await CreateChannel(); // Public by default
+        await SeedMessage(channel.Id, OtherBattleTag, "hello public");
+        RegisterModeratorSession("mod-conn", ModeratorBattleTag);
+        // Deliberately NO membership seed for the moderator.
+        _connectionMapping.SetMute("mod-conn", MuteStatus.Full, Now.AddDays(1));
+        var hub = BuildHub("mod-conn");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.NotMember, result.Code,
+            "a full-banned non-member moderator is still denied — the Moderation claim does not bypass the ban gate");
         Assert.IsNull(result.Messages);
     }
 
@@ -308,6 +389,105 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
 
         Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
         Assert.IsNull(result.Messages);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // 2026-08-05 PR36 feedback, Part 3: GetMessages shares the SAME ReadRateLimiter instance/budget as
+    // GetConversations (per the task report's scope determination — old/current shipped clients already
+    // treat any non-Ok GetMessages result as a silent no-op). Guarded BEFORE any DB work.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task GetMessages_OverReadLimit_ReturnsThrottled_WithRetryAfter()
+    {
+        var channel = await CreateChannel();
+        SeedMember("conn-1", BattleTag, channel.Id);
+        await SeedMessage(channel.Id, BattleTag, "hello");
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code, "over the shared read budget must be rejected");
+        Assert.IsNull(result.Messages, "a Throttled reject must never carry a payload");
+        Assert.IsNotNull(result.RetryAfterSeconds);
+        Assert.Greater(result.RetryAfterSeconds.Value, 0);
+    }
+
+    [Test]
+    public async Task GetMessages_OverReadLimit_UnknownChannel_ReturnsThrottled_NotNotFound()
+    {
+        // Ordering proof (no Mongo-call mocking available in this hub harness — see
+        // GetMessages_UnknownChannel_ReturnsNotFound above for the SAME unknown-channel call succeeding
+        // through to a Mongo-backed NotFound when the limiter is NOT exhausted): if the rate limiter ran
+        // AFTER the channel load, an unknown channelId would still reach Mongo and come back NotFound. It
+        // instead comes back Throttled, proving the limiter denies BEFORE the channel load ever runs.
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        var result = await hub.GetMessages("no-such-channel-id", beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code,
+            "the read-abuse guard must deny BEFORE the channel load — an unknown channel must never reach Mongo once denied");
+        Assert.IsNull(result.Messages);
+    }
+
+    // Fix round 1, finding F5: the limiter now runs absolutely FIRST in GetMessages too (moved above the
+    // malformed-arg guard), mirroring GetConversations' ordering exactly instead of the narrower
+    // "before the first DB read" ordering it used before. Pin it the same way GetConversations' own
+    // tripwire (F2) does: supplying BOTH beforeSeq and aroundSeq is normally a client-bug HubException
+    // (step 3) — if the limiter ever slipped below that guard, this call would throw instead of
+    // returning Throttled.
+    [Test]
+    public async Task GetMessages_OverReadLimit_WithMalformedArgs_ReturnsThrottled_NotHubException()
+    {
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        // beforeSeq AND aroundSeq both set — malformed, and normally a client-bug HubException (step 3).
+        // If the limiter ever slipped below that guard, this line throws and the test fails.
+        var result = await hub.GetMessages("any-channel-id", beforeSeq: 1, aroundSeq: 2, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code,
+            "the read rate limit must run FIRST THING — strictly before the malformed-arg guard — so a " +
+            "malformed (beforeSeq + aroundSeq both set) call from an over-budget caller returns Throttled " +
+            "rather than throwing HubException");
+        Assert.IsNull(result.Messages);
+    }
+
+    [Test]
+    public async Task GetMessages_ReadLimit_IsIndependentPerBattleTag()
+    {
+        var channel = await CreateChannel();
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+        var throttled = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Throttled, throttled.Code, "BattleTag's own budget is spent");
+
+        const string OtherBattleTag2 = "shadow#999";
+        SeedMember("conn-2", OtherBattleTag2, channel.Id);
+        var otherHub = BuildHub("conn-2");
+        var unaffected = await otherHub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Ok, unaffected.Code, "a distinct battleTag has its own independent read budget");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -457,7 +637,10 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     [Test]
     public async Task GetMessages_Moderator_NonMember_StillNotMember()
     {
-        var channel = await CreateChannel();
+        // SemiPublic — public rooms are non-member-readable since the §4 mention-jump allowance; every
+        // other type keeps the wall. On a PUBLIC channel a non-member (moderator or not) now falls
+        // through to the read path instead of NotMember.
+        var channel = await CreateChannel(type: ChannelType.SemiPublic);
         // A moderator with a live session but NO membership in the channel.
         RegisterModeratorSession("mod-conn", ModeratorBattleTag);
         var hub = BuildHub("mod-conn");
@@ -468,6 +651,40 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         // membership even for a moderator (the privileged any-channel read is the REST endpoint, Task 7).
         Assert.AreEqual(ChatResultCode.NotMember, result.Code);
         Assert.IsNull(result.Messages);
+    }
+
+    // 2026-08-04 follow-up (Minor finding): step 5's comment previously read as if the privileged
+    // ForModerator view were NEVER reachable outside the REST endpoint. That is imprecise for Public
+    // channels specifically — step 4's non-member Public fallthrough (§4) lets a NON-MEMBER moderator
+    // reach step 5's moderator branch too, so they get the SAME ForModerator projection (deleted rows +
+    // every author's real shadow flag) a member-moderator would, through THIS hub method. Pinning that
+    // explicitly so the behavior is a chosen, tested outcome rather than an accidental side effect of
+    // the §4 fallthrough. The full-banned variant of this exact scenario is already covered by
+    // GetMessages_FullBannedNonMemberModerator_PublicChannel_Denied — extended here, not duplicated.
+    [Test]
+    public async Task GetMessages_NonMemberModerator_PublicChannel_ReturnsForModeratorProjection()
+    {
+        var channel = await CreateChannel(); // Public by default
+        var normal = await SeedMessage(channel.Id, BattleTag, "visible to everyone");
+        var deleted = await SeedMessage(channel.Id, BattleTag, "will be deleted");
+        var foreignShadow = await SeedMessage(channel.Id, OtherBattleTag, "shadow from someone else", shadow: true);
+        await _messageRepository.MarkDeleted(deleted.Id, "Mod#1", Now);
+
+        RegisterModeratorSession("mod-conn", ModeratorBattleTag);
+        // Deliberately NO membership seed and NO full-ban — a non-member moderator reaching the Public
+        // fallthrough (step 4) with a clean mute status.
+        var hub = BuildHub("mod-conn");
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code,
+            "a non-member moderator reads a Public channel via step 4's fallthrough, then step 5's moderator branch");
+        CollectionAssert.AreEqual(
+            new[] { normal.Seq, deleted.Seq, foreignShadow.Seq },
+            result.Messages.Select(m => m.Seq).ToArray(),
+            "a non-member moderator gets the SAME ForModerator projection a member-moderator would — deleted and every author's shadow rows included");
+        Assert.IsTrue(result.Messages.Single(m => m.Seq == deleted.Seq).Deleted, "the deleted row carries the REAL deleted flag");
+        Assert.IsTrue(result.Messages.Single(m => m.Seq == foreignShadow.Seq).Shadow, "a foreign author's shadow row carries the REAL shadow flag");
     }
 
     [Test]

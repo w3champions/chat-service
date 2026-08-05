@@ -37,6 +37,12 @@ public sealed class HubPushCaptureHarness
     // capture list since both are read/written from the same Client(connectionId) callback.
     private readonly Dictionary<string, Exception> _throwingConnections = new();
 
+    // ConnectionIds configured (via GateSend) to await a caller-supplied Task before recording —
+    // lets a test hold a specific connection's send genuinely in flight (never landing until released)
+    // to prove some caller does NOT await it (fire-and-forget), as opposed to just being fast. Guarded by
+    // lock (_sends) alongside the other lookup dictionaries for the same reason.
+    private readonly Dictionary<string, Task> _gatedConnections = new();
+
     public HubPushCaptureHarness()
     {
         var hubClients = new Mock<IHubClients>();
@@ -50,9 +56,11 @@ public sealed class HubPushCaptureHarness
                     .Returns<string, object[], CancellationToken>((method, args, _) =>
                     {
                         Exception exceptionToThrow;
+                        Task gate;
                         lock (_sends)
                         {
                             _throwingConnections.TryGetValue(connectionId, out exceptionToThrow);
+                            _gatedConnections.TryGetValue(connectionId, out gate);
                         }
 
                         if (exceptionToThrow != null)
@@ -60,17 +68,28 @@ public sealed class HubPushCaptureHarness
                             return Task.FromException(exceptionToThrow);
                         }
 
-                        lock (_sends)
-                        {
-                            _sends.Add((connectionId, method, args.Length > 0 ? args[0] : null));
-                        }
-                        return Task.CompletedTask;
+                        return RecordAsync(connectionId, method, args, gate);
                     });
                 return proxy.Object;
             });
 
         _hubContextMock = new Mock<IHubContext<ChatHub>>();
         _hubContextMock.Setup(h => h.Clients).Returns(hubClients.Object);
+    }
+
+    // Awaits the gate (if any) BEFORE recording — so a test asserting on SignalsFor/PayloadFor/etc while
+    // the gate is held observes NOTHING for this send yet, and only sees it after release.
+    private async Task RecordAsync(string connectionId, string method, object[] args, Task gate)
+    {
+        if (gate != null)
+        {
+            await gate;
+        }
+
+        lock (_sends)
+        {
+            _sends.Add((connectionId, method, args.Length > 0 ? args[0] : null));
+        }
     }
 
     /// <summary>
@@ -84,6 +103,23 @@ public sealed class HubPushCaptureHarness
         lock (_sends)
         {
             _throwingConnections[connectionId] = exception ?? new InvalidOperationException($"Simulated send failure for connection '{connectionId}'");
+        }
+    }
+
+    /// <summary>
+    /// Configures every subsequent <c>SendAsync</c>/<c>SendCoreAsync</c> call to <paramref
+    /// name="connectionId"/> to await <paramref name="gate"/> before it records the signal (or completes
+    /// at all) — holds that connection's send genuinely in flight so a test can prove some caller does
+    /// NOT await it (fire-and-forget) rather than merely being fast enough to race past. While the gate is
+    /// held, <see cref="SignalsFor"/>/<see cref="PayloadFor"/>/<see cref="SignalCount"/> report NOTHING for
+    /// this send; once <paramref name="gate"/> completes the signal is recorded as normal. Other
+    /// connections are unaffected.
+    /// </summary>
+    public void GateSend(string connectionId, Task gate)
+    {
+        lock (_sends)
+        {
+            _gatedConnections[connectionId] = gate;
         }
     }
 

@@ -72,6 +72,7 @@ public class DmGroupIntegrationTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
@@ -115,6 +116,7 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
@@ -186,6 +188,7 @@ public class DmGroupIntegrationTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -200,7 +203,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

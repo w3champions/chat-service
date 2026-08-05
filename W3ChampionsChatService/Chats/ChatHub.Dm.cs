@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using MongoDB.Bson;
@@ -7,6 +9,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Users;
@@ -373,12 +376,8 @@ public partial class ChatHub
     /// snapshot/registry lookups; the materialized membership + settings reads). Never called for GroupDm
     /// (no pair-key).
     /// </summary>
-    private static string ResolveDmCounterpart(ChatChannel channel, string senderBattleTag)
-    {
-        var parts = channel.PairKey.Split('|');
-        var senderNormalized = senderBattleTag.Trim().ToLowerInvariant();
-        return string.Equals(parts[0], senderNormalized, StringComparison.OrdinalIgnoreCase) ? parts[1] : parts[0];
-    }
+    private static string ResolveDmCounterpart(ChatChannel channel, string senderBattleTag) =>
+        DmPairKey.CounterpartOf(channel.PairKey, senderBattleTag);
 
     /// <summary>
     /// The shared consent-accept transition used by BOTH reply-accept (a recipient's first reply) and
@@ -544,7 +543,20 @@ public partial class ChatHub
         var recipientMembership = await _membershipRepository.InsertIfAbsent(candidate);
         var newlyMaterialized = recipientMembership.Id == candidate.Id;
 
-        if (newlyMaterialized)
+        // Follow-up spec §6 (bounded-snapshot repair): the recipient's connect snapshot may have
+        // EXCLUDED this older 1:1 shell — and with it their OnlineMemberRegistry seed (registry set ==
+        // DTO set). If they are online but this connection's registry lacks the channel, RE-ANNOUNCE
+        // exactly like a first materialization: PushChannelAdded(focus:false) re-seeds the registry AND
+        // hands the client the shell — and because this hook runs BEFORE the step-8 fan-out, the
+        // activity for THIS very message reaches them. An already-seeded recipient is untouched (no
+        // ChannelAdded on ordinary messages); ChannelAdded is an upsert client-side, so a client that
+        // somehow still knows the shell just refreshes it.
+        var recipientSession = _sessionRegistry.GetByBattleTag(counterpart);
+        var needsReAnnounce = !newlyMaterialized
+            && recipientSession != null
+            && !_onlineMemberRegistry.IsMember(recipientSession.ConnectionId, channel.Id);
+
+        if (newlyMaterialized || needsReAnnounce)
         {
             // Seeds the recipient's OnlineMemberRegistry + pushes ChannelAdded(focus:false) if they are
             // online; a no-op for an offline recipient (their SessionState picks the channel up on connect).
@@ -572,7 +584,6 @@ public partial class ChatHub
             await _membershipRepository.ClearDeclinedUntil(channel.Id, counterpart);
         }
 
-        var recipientSession = _sessionRegistry.GetByBattleTag(counterpart);
         if (recipientSession != null)
         {
             var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now);
@@ -590,5 +601,168 @@ public partial class ChatHub
                 Log.Warning(ex, "RequestReceived push failed for {ConnectionId} on channel {ChannelId} — best-effort, tray resurfaces it via SessionState", recipientSession.ConnectionId, channel.Id);
             }
         }
+    }
+
+    /// <summary>
+    /// 2026-08-04 follow-up spec §6: pages the caller's OLDER 1:1 Dm shells (the ones the bounded
+    /// connect snapshot excluded), newest-first by (LastMessageAt, ChannelId), cursor =
+    /// (cursorLastMessageAt, cursorChannelId) — both null for the first page; strictly-older-than
+    /// filtering keyed on the PAIR makes the pagination stable under concurrent recency changes (a
+    /// conversation that moves forward jumps to the FRONT and can never be double-served in a later
+    /// page). Reuses ChannelDto (the SessionState.Channels shape) and computes the SAME D7
+    /// user-visible unread per returned shell. Every returned shell is ALSO seeded into the caller's
+    /// OnlineMemberRegistry — the follow-up §6 companion rule to the bounded connect seed — so a paged
+    /// conversation is immediately usable (SendMessage/FocusChannel/GetMessages/MarkRead) without an
+    /// extra OpenDm round-trip. Resolution order:
+    /// <list type="number">
+    /// <item>Fail-closed identity → <see cref="ChatResultCode.PermissionDenied"/>.</item>
+    /// <item>Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3): invoked FIRST THING after identity
+    /// resolution — before the cursor validation, the clamp, and the relationship-snapshot fetch below —
+    /// so a denied caller never reaches ANY further work. ONE per-battleTag token bucket
+    /// (<see cref="FanOut.ReadRateLimiter"/>) shared with <see cref="GetMessages"/> (per the task
+    /// report's scope determination). Not allowed → <see cref="ChatResultCode.Throttled"/> with the
+    /// retry-after — the SAME reject shape the relationship-outage path below already uses. Limits are
+    /// generous (burst 60, sustained 5/s — sized for connect fan-out, see
+    /// <see cref="ChatLimits.ReadBurst"/>'s doc) — server protection only, not UX pacing (Marco) — so no
+    /// legitimate client should ever observe this in normal operation.</item>
+    /// <item>Malformed cursor (exactly one half supplied) → <see cref="HubException"/> (the
+    /// <c>GetMessages</c> client-bug mapping).</item>
+    /// <item>Clamp <paramref name="limit"/> to [1, <see cref="ChatLimits.ConversationsPageSize"/>].</item>
+    /// <item>Resolve the CALLER's <see cref="RelationshipSnapshot"/> ONCE (mirrors <see cref="OpenDm"/>
+    /// step 3): no usable snapshot at all (<see cref="RelationshipUnavailableException"/>) fails closed to
+    /// <see cref="ChatResultCode.Throttled"/> rather than risk serving an unfiltered page — a blocked
+    /// counterpart's shell must NEVER page in here as an ordinary conversation (it stays in the connect
+    /// snapshot unconditionally, Task 6, for the client's Blocked section ONLY).</item>
+    /// <item>Load ALL memberships + their channels (the same two indexed queries the connect snapshot
+    /// runs), keep <see cref="ChannelType.Dm"/> shells that are NOT <see cref="DmRequestState.Pending"/>
+    /// (pending requests ride the connect snapshot + request tray ONLY — see
+    /// <see cref="Protocol.SessionStateAssembler.SelectSnapshotMemberships"/>), NOT blocked, and carry a
+    /// non-null <see cref="ChatChannel.LastMessageAt"/> (a null-stamped doc is data-impossible in
+    /// production but would otherwise dead-end the client's wire cursor); order, cursor-filter, take the
+    /// page.</item>
+    /// <item>ONE batched <see cref="Messages.MessageRepository.CountUserVisibleAfterMany"/> aggregation
+    /// covers D7 unread for the WHOLE page (2026-08-05 PR36 feedback, Part 1 — previously one
+    /// <c>CountUserVisibleAfter</c> round-trip PER shell, up to <see cref="ChatLimits.ConversationsPageSize"/>
+    /// round-trips per call); per shell: build the <see cref="ChannelDto"/> from the batched result, seed
+    /// the registry via <see cref="OnlineMemberRegistry.JoinPreservingReadCursor"/> (never regresses a
+    /// newer in-flight <c>MarkRead</c>); return Ok.</item>
+    /// </list>
+    /// Per-page cost scales with the caller's TOTAL membership count (one <c>LoadForUser</c> + one
+    /// <c>LoadByIds</c> per call, independent of the requested page size) — an explicit brief decision,
+    /// acceptable because a client is expected to need only 1-3 pages before reaching the end. The unread
+    /// hydration step above, by contrast, is now O(1) round-trips regardless of page size (was O(page
+    /// size) before the 2026-08-05 batching fix). Paging deliberately relaxes Task 6's "registry set ==
+    /// connect-snapshot DTO set" invariant: the registry can now hold MORE than what any single
+    /// SessionState carried. The broader property still holds — registry membership implies the client
+    /// actually knows about the channel — because every shell seeded here is returned in this SAME
+    /// response.
+    /// </summary>
+    public async Task<GetConversationsResult> GetConversations(DateTime? cursorLastMessageAt, string cursorChannelId, int limit)
+    {
+        // 1. Fail-closed identity.
+        if (!_sessionRegistry.TryGetByConnectionId(Context.ConnectionId, out var session))
+        {
+            return new GetConversationsResult(ChatResultCode.PermissionDenied);
+        }
+        var battleTag = session.Identity.BattleTag;
+
+        // 2. Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3) — FIRST THING, before any further
+        // work (cursor validation, clamp, relationship-snapshot fetch, Mongo). Shares ONE per-battleTag
+        // bucket with GetMessages — see FanOut/ReadRateLimiter.cs and the task report's scope determination.
+        var readDecision = _readRateLimiter.TryAcquire(battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        if (!readDecision.Allowed)
+        {
+            return new GetConversationsResult(ChatResultCode.Throttled, readDecision.RetryAfterSeconds);
+        }
+
+        // 3. The cursor is a PAIR — both halves or neither (first page).
+        var hasCursorTime = cursorLastMessageAt.HasValue;
+        var hasCursorId = !string.IsNullOrEmpty(cursorChannelId);
+        if (hasCursorTime != hasCursorId)
+        {
+            throw new HubException("GetConversations: cursorLastMessageAt and cursorChannelId form one cursor — supply both or neither.");
+        }
+
+        // 4. Clamp — never Limit(0)/unbounded, never rejected.
+        var effectiveLimit = Math.Clamp(limit, 1, ChatLimits.ConversationsPageSize);
+
+        // 5. Resolve the CALLER's relationship snapshot ONCE (mirrors OpenDm step 3): blocked shells stay
+        // in the connect snapshot unconditionally (Task 6's Blocked tray) but must NEVER page in here as
+        // an ordinary, live conversation — e.g. a 2-year-old blocked shell must not re-surface and get
+        // registry-Joined as a live fan-out target. No usable snapshot at all is an outage: fail closed
+        // retriable rather than risk serving an unfiltered page.
+        RelationshipSnapshot snapshot;
+        try
+        {
+            snapshot = await _relationshipProvider.GetSnapshotAsync(battleTag);
+        }
+        catch (RelationshipUnavailableException)
+        {
+            return new GetConversationsResult(ChatResultCode.Throttled, ChatLimits.RelationshipRetryAfterSeconds);
+        }
+
+        // 6. Membership-first (user→channels — the only supported direction), then the channel docs in
+        // ONE LoadByIds. In-memory ordering over the caller's own bounded conversation count — no new
+        // aggregation pipeline needed here (unlike the batched unread counts in step 7 below, this step
+        // needs the full membership/channel docs, not just a count).
+        var memberships = await _membershipRepository.LoadForUser(battleTag);
+        var channelsById = (await _channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
+            .ToDictionary(c => c.Id);
+
+        var ordered = memberships
+            .Where(m => channelsById.TryGetValue(m.ChannelId, out var c)
+                && c.Type == ChannelType.Dm
+                // Pending requests ride the connect snapshot + request tray ONLY — never a paged
+                // "conversation", from either direction (incoming or caller-initiated outgoing).
+                && c.RequestState != DmRequestState.Pending
+                // A null-stamped LastMessageAt is data-impossible in production (FindOrCreateDm always
+                // stamps it at insert) but would otherwise produce an inexpressible client cursor for
+                // that shell — exclude it from the page rather than dead-end pagination. The `?? JoinedAt`
+                // SortTime fallback below is retained regardless, for ordering determinism.
+                && c.LastMessageAt != null
+                // Blocked-counterpart shells stay Blocked-tray-only (Task 6) — never page in here.
+                && !(c.PairKey != null && snapshot.HasBlocked(DmPairKey.CounterpartOf(c.PairKey, battleTag))))
+            .Select(m =>
+            {
+                var channel = channelsById[m.ChannelId];
+                return (Membership: m, Channel: channel, SortTime: channel.LastMessageAt ?? m.JoinedAt);
+            })
+            .OrderByDescending(x => x.SortTime)
+            .ThenByDescending(x => x.Channel.Id, StringComparer.Ordinal);
+
+        var page = (hasCursorTime
+                ? ordered.Where(x => x.SortTime < cursorLastMessageAt.Value
+                    || (x.SortTime == cursorLastMessageAt.Value && string.CompareOrdinal(x.Channel.Id, cursorChannelId) < 0))
+                : ordered)
+            .Take(effectiveLimit)
+            .ToList();
+
+        // 7. Project (same D7 unread as the connect snapshot) — ONE batched CountUserVisibleAfterMany
+        // aggregation for the whole page (2026-08-05 PR36 feedback, Part 1: this used to be one
+        // CountUserVisibleAfter round-trip PER shell, up to ConversationsPageSize == 50 round-trips per
+        // call) — then seed the registry per returned shell.
+        var unreadCounts = await _messageRepository.CountUserVisibleAfterMany(
+            page.Select(item => new ChannelUnreadCursor(item.Channel.Id, item.Membership.LastReadSeq)).ToList(),
+            battleTag);
+
+        var conversations = new List<ChannelDto>(page.Count);
+        foreach (var item in page)
+        {
+            var unreadCount = unreadCounts.GetValueOrDefault(item.Channel.Id, 0L);
+            conversations.Add(new ChannelDto(
+                item.Channel, MembershipDto.From(item.Membership), unreadCount, unreadCount > 0));
+
+            // JoinPreservingReadCursor (not the plain Join): membership.LastReadSeq was captured back at
+            // step 6 (LoadForUser), and this method awaits the channel LoadByIds AND the batched
+            // unread-count aggregation before reaching this seed loop — a concurrent MarkRead landing on an
+            // already-seeded (channel, connection) entry during that window must never be regressed back
+            // down by the DB-loaded LastReadSeq captured earlier.
+            _onlineMemberRegistry.JoinPreservingReadCursor(
+                item.Channel.Id,
+                Context.ConnectionId,
+                new MemberState(battleTag, item.Membership.NotificationLevel, item.Membership.LastReadSeq, ChannelType.Dm));
+        }
+
+        return new GetConversationsResult(ChatResultCode.Ok, Conversations: conversations);
     }
 }

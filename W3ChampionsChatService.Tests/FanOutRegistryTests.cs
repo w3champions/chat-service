@@ -321,6 +321,54 @@ public class FanOutRegistryTests
         Assert.DoesNotThrow(() => _memberRegistry.AdvanceLastReadSeq("channel-a", "conn-unknown", 42));
     }
 
+    // ---------------------------------------------------------------------
+    // OnlineMemberRegistry.JoinPreservingReadCursor (Task 8 fix round, finding 5) — the
+    // GetConversations-safe sibling of Join: preserves an existing, possibly-newer LastReadSeq
+    // (Math.Max) instead of a plain overwrite, so a concurrent MarkRead landing between the caller's
+    // stale DB read and this seed can never be regressed back down.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public void JoinPreservingReadCursor_NoExistingEntry_BehavesLikeJoin()
+    {
+        _memberRegistry.JoinPreservingReadCursor("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 5, ChannelType.Dm));
+
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(5));
+    }
+
+    [Test]
+    public void JoinPreservingReadCursor_ExistingHigherLastReadSeq_IsPreserved()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm));
+
+        _memberRegistry.JoinPreservingReadCursor("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm));
+
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10),
+            "a stale DB-loaded LastReadSeq must never regress a newer registry value (e.g. a concurrent MarkRead)");
+    }
+
+    [Test]
+    public void JoinPreservingReadCursor_ExistingLowerLastReadSeq_Advances()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm));
+
+        _memberRegistry.JoinPreservingReadCursor("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm));
+
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10));
+    }
+
+    [Test]
+    public void JoinPreservingReadCursor_UpdatesOtherFieldsEvenWhenSeqIsPreserved()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm));
+
+        _memberRegistry.JoinPreservingReadCursor("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.Mentions, 3, ChannelType.Dm));
+
+        var member = _memberRegistry.GetMembers("channel-a").Single();
+        Assert.That(member.LastReadSeq, Is.EqualTo(10));
+        Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
+    }
+
     [Test]
     public void GetMembers_UnknownChannel_ReturnsEmpty()
     {

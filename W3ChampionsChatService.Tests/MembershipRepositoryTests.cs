@@ -44,6 +44,30 @@ public class MembershipRepositoryTests : IntegrationTestBase
         CollectionAssert.AreEquivalent(new[] { "chan1", "chan2" }, mine.Select(m => m.ChannelId).ToList());
     }
 
+    // 2026-08-04 follow-up (carried launcher-review item): LoadForUser had no explicit sort, so
+    // SessionStateDto.Channels order was Mongo-arbitrary — the launcher relies on server order to
+    // preserve "join order" for name-joinable (SemiPublic) channels across a reconnect. Pinned here at
+    // scrambled INSERTION order against distinct, out-of-insertion-order JoinedAt stamps: the returned
+    // list must come back JoinedAt-ascending regardless of when each row was written.
+    [Test]
+    public async Task LoadForUser_ReturnsChannelsInJoinedAtAscendingOrder_RegardlessOfInsertionOrder()
+    {
+        var repo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        // Inserted in scrambled order: chan3 (oldest JoinedAt) written FIRST, chan1 (newest) written LAST.
+        await repo.Insert(new ChannelMembership { ChannelId = "chan3", BattleTag = "Peter#123", JoinedAt = t0 });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = t0.AddMinutes(10) });
+        await repo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = t0.AddMinutes(5) });
+
+        var mine = await repo.LoadForUser("Peter#123");
+
+        CollectionAssert.AreEqual(
+            new[] { "chan3", "chan2", "chan1" },
+            mine.Select(m => m.ChannelId).ToList(),
+            "LoadForUser must return rows JoinedAt-ascending, not insertion/natural order");
+    }
+
     [Test]
     public async Task DuplicateMembership_IsRejectedByUniqueIndex()
     {
@@ -67,8 +91,34 @@ public class MembershipRepositoryTests : IntegrationTestBase
         Assert.AreEqual(1, unique["key"]["ChannelId"].ToInt32());
         Assert.AreEqual(1, unique["key"]["BattleTag"].ToInt32());
 
-        var byUser = indexes.Single(i => i["name"] == "ix_battleTag");
+        // 2026-08-04 follow-up: ix_battleTag was extended to a compound (BattleTag, JoinedAt) index so
+        // LoadForUser's JoinedAt-ascending sort (see that method's doc) is index-served rather than an
+        // in-memory sort behind an index-only BattleTag scan.
+        var byUser = indexes.Single(i => i["name"] == "ix_battleTag_joinedAt");
         Assert.AreEqual(1, byUser["key"]["BattleTag"].ToInt32());
+        Assert.AreEqual(1, byUser["key"]["JoinedAt"].ToInt32());
+
+        Assert.IsFalse(indexes.Any(i => i["name"] == "ix_battleTag"),
+            "the superseded single-field index must be gone after ensure");
+    }
+
+    [Test]
+    public async Task MembershipIndexes_EnsureIsIdempotent_AgainstPreMigrationDatabase()
+    {
+        // Simulate a database that still carries the OLD-named single-field index from before this
+        // migration — Ensure must best-effort drop it (swallowing IndexNotFound is the OTHER branch,
+        // covered by MembershipIndexes_AreCreated running against a fresh DB) and still converge on the
+        // new compound index, never throw. Mirrors MessageRepositoryTests' equivalent D6 migration test.
+        var memberships = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName).GetCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+        await memberships.Indexes.CreateOneAsync(new CreateIndexModel<ChannelMembership>(
+            Builders<ChannelMembership>.IndexKeys.Ascending(m => m.BattleTag),
+            new CreateIndexOptions { Name = "ix_battleTag" }));
+
+        Assert.DoesNotThrowAsync(() => ChatDomainIndexes.EnsureAllAsync(MongoClient));
+
+        var indexes = await (await memberships.Indexes.ListAsync()).ToListAsync();
+        Assert.IsFalse(indexes.Any(i => i["name"] == "ix_battleTag"), "the pre-existing old-named index must be dropped");
+        Assert.IsTrue(indexes.Any(i => i["name"] == "ix_battleTag_joinedAt"), "the new compound index must exist");
     }
 
     [Test]
@@ -121,6 +171,34 @@ public class MembershipRepositoryTests : IntegrationTestBase
         var count = await membershipRepo.CountNameJoinableMembershipsForUser("Peter#123");
 
         Assert.AreEqual(2, count);
+    }
+
+    // 2026-08-05 PR36 feedback (Part 3): a user with zero memberships must short-circuit to 0 without
+    // the second (channel-count) round-trip ever needing to run against a real id set.
+    [Test]
+    public async Task CountNameJoinableMembershipsForUser_ZeroMemberships_ReturnsZero()
+    {
+        var membershipRepo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+
+        var count = await membershipRepo.CountNameJoinableMembershipsForUser("Nobody#999");
+
+        Assert.AreEqual(0, count);
+    }
+
+    // 2026-08-05 PR36 feedback (Part 3): CountNameJoinableMembershipsForUser was rewritten from a
+    // full-document double-load to a projected ChannelId read + a server-side CountDocumentsAsync — pins
+    // the projection itself returns exactly the caller's own channel ids, nobody else's.
+    [Test]
+    public async Task LoadChannelIdsForUser_ReturnsOnlyThatUsersChannelIds()
+    {
+        var membershipRepo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Wolf#456", JoinedAt = DateTime.UtcNow });
+
+        var ids = await membershipRepo.LoadChannelIdsForUser("Peter#123");
+
+        CollectionAssert.AreEquivalent(new[] { "chan1", "chan2" }, ids);
     }
 
     // ── C5 Task 2 — DM/group repository foundation additions ─────────────────────────────

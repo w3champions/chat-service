@@ -48,6 +48,7 @@ public class ChatHubMentionInboxTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
@@ -78,6 +79,7 @@ public class ChatHubMentionInboxTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
@@ -104,6 +106,7 @@ public class ChatHubMentionInboxTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -118,7 +121,8 @@ public class ChatHubMentionInboxTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            new NotificationPreferenceRepository(MongoClient));
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

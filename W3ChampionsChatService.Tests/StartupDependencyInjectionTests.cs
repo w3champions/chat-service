@@ -208,6 +208,18 @@ public class StartupDependencyInjectionTests
     }
 
     [Test]
+    public void ReadRateLimiter_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<ReadRateLimiter>();
+        var second = provider.GetRequiredService<ReadRateLimiter>();
+
+        Assert.AreSame(first, second,
+            "ReadRateLimiter MUST be a singleton — a transient registration would silently fragment the in-memory fan-out state each connection seeds and tears down");
+    }
+
+    [Test]
     public void ActivityCoalescer_IsSingleton_SharedAcrossResolutions()
     {
         using var provider = BuildProvider();
@@ -306,6 +318,7 @@ public class StartupDependencyInjectionTests
         Assert.IsNotNull(provider.GetRequiredService<UserDirectoryRepository>());
         Assert.IsNotNull(provider.GetRequiredService<UserSettingsRepository>());
         Assert.IsNotNull(provider.GetRequiredService<MentionInboxRepository>());
+        Assert.IsNotNull(provider.GetRequiredService<NotificationPreferenceRepository>());
         Assert.IsNotNull(provider.GetRequiredService<PublicChannelSeeder>());
         Assert.IsNotNull(provider.GetRequiredService<CleanupJobs>());
 

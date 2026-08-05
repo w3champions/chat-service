@@ -1,5 +1,8 @@
 using System;
+using System.Linq;
 using NUnit.Framework;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 
 namespace W3ChampionsChatService.Tests;
@@ -46,7 +49,24 @@ public class ChatLimitsTests
         Assert.AreEqual(100, ChatLimits.MessagePageSize);
         Assert.AreEqual(5, ChatLimits.AutoThrottleViolationThreshold);
         Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleWindow);
-        Assert.AreEqual(TimeSpan.FromSeconds(60), ChatLimits.AutoThrottleDuration);
+        CollectionAssert.AreEqual(
+            new[] { TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(60) },
+            ChatLimits.AutoThrottleTierDurations);
+        Assert.AreEqual(TimeSpan.FromMinutes(10), ChatLimits.AutoThrottleTierDecay);
+    }
+
+    [Test]
+    public void AutoThrottleTierDurations_AreAllBelowTierDecay()
+    {
+        // Pins the invariant documented at AutoThrottleTierDurations' declaration: MessageRateLimiter's
+        // quiescent prune treats AutoThrottleTierDecay as "definitely idle, safe to evict" for a user's
+        // ENTIRE state (buckets, violations, ladder, and any active hard throttle). That is only true if
+        // no tier duration can outlive the decay horizon — otherwise a still-hard-throttled user could be
+        // pruned mid-penalty and get a silent clean slate on their very next send.
+        Assert.IsTrue(
+            ChatLimits.AutoThrottleTierDurations.All(tier => tier < ChatLimits.AutoThrottleTierDecay),
+            "every AutoThrottleTierDurations entry must be strictly less than AutoThrottleTierDecay, or " +
+            "MessageRateLimiter's quiescent prune could evict a still-hard-throttled user's state early");
     }
 
     [Test]
@@ -67,5 +87,60 @@ public class ChatLimitsTests
         Assert.AreEqual(100, ChatLimits.MentionAckBatchMax);
         Assert.AreEqual(200, ChatLimits.MentionInboxMaxEntries);
         Assert.AreEqual(200, ChatLimits.PresenceQueryMaxBattleTags);
+    }
+
+    [Test]
+    public void ConversationsPageSize_IsAtLeastLauncherPageSize()
+    {
+        // Cross-repo contract (Task 8 fix round, finding 3): the launcher's client-side page size
+        // (CONVERSATIONS_PAGE_SIZE = 30, launcher-e chat plumbing) drives GetConversations' Count &lt;
+        // limit end-detection (see GetConversationsResult's doc comment). That end-detection is only
+        // sound when a caller's requested limit never exceeds this cap — a launcher paging at 30 while
+        // this cap ever dropped below 30 would get a silently-clamped, potentially-short page and could
+        // stop pagination early. Pinned here so a future change to either constant is caught at CI time.
+        Assert.GreaterOrEqual(ChatLimits.ConversationsPageSize, 30,
+            "the launcher's CONVERSATIONS_PAGE_SIZE = 30 depends on ChatLimits.ConversationsPageSize " +
+            "staying >= 30 for GetConversations' Count < limit end-detection to remain sound");
+    }
+
+    [Test]
+    public void ReadRateLimiterConstants_MatchPr36FeedbackPart3()
+    {
+        // 2026-08-05 PR36 feedback, Part 3 — NOT spec §13; hard-coded, adjust here only.
+        // Fix round 1, finding F1: ReadBurst raised 30 -> 60 (sized for connect fan-out, not a
+        // per-user-action handful of loads — see ChatLimits.ReadBurst's doc comment).
+        Assert.AreEqual(60, ChatLimits.ReadBurst);
+        Assert.AreEqual(5, ChatLimits.ReadRefillPerSecond);
+        Assert.AreEqual(TimeSpan.FromMinutes(2), ChatLimits.ReadRateLimiterPruneHorizon);
+    }
+
+    [Test]
+    public void ReadRateLimiterPruneHorizon_ExceedsBucketFullRefillTime()
+    {
+        // Pins the invariant documented at ReadRateLimiterPruneHorizon's declaration — mirrors
+        // AutoThrottleTierDurations_AreAllBelowTierDecay above, but for ReadRateLimiter: pruning an idle
+        // entry and letting a later call recreate it fresh (a full ReadBurst-token bucket) is only
+        // behaviour-preserving if a LIVE bucket, left untouched for that same idle duration, would ALSO
+        // have refilled all the way back to capacity — i.e. the prune horizon must exceed the bucket's
+        // own full-refill time (ReadBurst / ReadRefillPerSecond seconds = 12s).
+        var fullRefillTime = TimeSpan.FromSeconds((double)ChatLimits.ReadBurst / ChatLimits.ReadRefillPerSecond);
+        Assert.Greater(ChatLimits.ReadRateLimiterPruneHorizon, fullRefillTime,
+            "ReadRateLimiterPruneHorizon must strictly exceed the bucket's full-refill time, or a pruned " +
+            "entry recreated fresh could diverge from what a live, un-pruned bucket would actually hold");
+    }
+
+    [Test]
+    public void DefaultChatRooms_NormalizeToDistinctKeys()
+    {
+        // C3 Task 3: Guards the static SessionStateAssembler.CatalogOrder initialization invariant.
+        // If any two DefaultChatRooms.Rooms entries normalize to the same key (via ChannelNames.Normalize:
+        // trim + ToLowerInvariant), the ToDictionary call at static init throws KeyAlreadyExistsException
+        // → TypeInitializationException on every connect (full outage). This test pins the invariant at CI time.
+        Assert.IsNotEmpty(DefaultChatRooms.Rooms, "DefaultChatRooms.Rooms must be non-empty");
+        var normalizedNames = DefaultChatRooms.Rooms.Select(ChannelNames.Normalize).ToList();
+        var distinctCount = normalizedNames.Distinct().Count();
+        Assert.AreEqual(normalizedNames.Count, distinctCount,
+            "all DefaultChatRooms.Rooms entries must normalize to distinct keys, or " +
+            "SessionStateAssembler.CatalogOrder's static ToDictionary initialization will crash with TypeInitializationException");
     }
 }

@@ -66,6 +66,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
@@ -105,6 +106,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
@@ -117,7 +119,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
         // The REAL C6 T5 writer (D3/D4), shared with the hubs' own membership/session state, so tests
         // can seed genuine mention-inbox entries the same way the send pipeline would (C6 Task 7).
-        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
         // Wraps the REAL C6 Task 7 cleaner (MentionInboxCleaner) so DeleteMessage/PurgeMessagesFromUser
         // physically remove mention-inbox rows in this suite too, while still recording each call's exact
         // id batch for the pre-existing spy assertions below.
@@ -178,6 +180,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -192,7 +195,8 @@ public class ModerationIntegrationTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

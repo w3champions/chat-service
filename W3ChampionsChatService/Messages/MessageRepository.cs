@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using MongoDB.Bson;
@@ -10,6 +11,13 @@ namespace W3ChampionsChatService.Messages;
 
 /// <summary>(Id, ChannelId) projection for a moderator bulk-purge target list (D6, consumed by a later C4 task).</summary>
 public record PurgeTarget(string Id, string ChannelId);
+
+/// <summary>
+/// One (channel, read-cursor) input pair for <see cref="MessageRepository.CountUserVisibleAfterMany"/>
+/// (2026-08-05 PR36 feedback, Part 1) — mirrors <see cref="MessageRepository.CountUserVisibleAfter"/>'s
+/// <c>(channelId, afterSeq)</c> argument pair as a single batchable unit.
+/// </summary>
+public record ChannelUnreadCursor(string ChannelId, long AfterSeq);
 
 public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
 {
@@ -130,11 +138,13 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
-    /// D7 (consumed by a later C4 task's unread math): count of rows in <paramref name="channelId"/>
-    /// visible to <paramref name="viewerBattleTag"/> (same rule as <see cref="UserVisible"/>) with
+    /// D7: count of rows in <paramref name="channelId"/> visible to
+    /// <paramref name="viewerBattleTag"/> (same rule as <see cref="UserVisible"/>) with
     /// <c>Seq &gt; afterSeq</c>. The filter leads with ChannelId equality + a Seq range so the
     /// count is an INDEXED RANGE COUNT bounded by <c>ux_channelId_seq</c> — never a full-collection
-    /// scan.
+    /// scan. Retained as the documented single-channel primitive and as the equivalence baseline for
+    /// <see cref="CountUserVisibleAfterMany"/>'s tests; no production call site since 2026-08-05
+    /// (both former callers migrated to the batched sibling — do NOT remove as dead code).
     /// </summary>
     public Task<long> CountUserVisibleAfter(string channelId, string viewerBattleTag, long afterSeq)
     {
@@ -146,6 +156,53 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             ShadowVisibleToSelf(viewerBattleTag));
 
         return Messages.CountDocumentsAsync(filter);
+    }
+
+    /// <summary>
+    /// Batched sibling of <see cref="CountUserVisibleAfter"/> (2026-08-05 PR36 feedback, Part 1) — one
+    /// aggregation round-trip in place of one <c>CountDocumentsAsync</c> per channel (the connect
+    /// snapshot and <c>GetConversations</c> page hydration both used to award one Mongo round-trip PER
+    /// KEPT SHELL; an extreme DM account turned that into tens of sequential queries per connect/page).
+    /// <para>
+    /// The <c>$match</c> stage is a <c>$or</c> of per-pair <c>{ChannelId, Seq &gt; afterSeq}</c> branches
+    /// (each branch alone is served by <c>ux_channelId_seq</c>, ChannelId-then-Seq, exactly like the
+    /// single-channel version) ANDed with the SAME <c>Deleted == null</c> + <see cref="ShadowVisibleToSelf"/>
+    /// visibility predicates <see cref="CountUserVisibleAfter"/> applies — this is a pure batching of that
+    /// query, never a relaxation of its semantics. The subsequent <c>$group</c> by ChannelId with a
+    /// <c>$sum: 1</c> accumulator (via LINQ <c>g.Count()</c>) then yields one count per channel that had
+    /// at least one matching row.
+    /// </para>
+    /// A <paramref name="cursors"/> entry whose ChannelId never matches (fully caught up, or genuinely no
+    /// rows) is simply ABSENT from the returned dictionary — callers must treat a missing key as count 0
+    /// (<c>GetValueOrDefault(channelId, 0)</c>), never index it directly. Empty input short-circuits to an
+    /// empty result WITHOUT issuing any query — <c>$or: []</c> would otherwise match everything.
+    /// </summary>
+    public async Task<IReadOnlyDictionary<string, long>> CountUserVisibleAfterMany(
+        IReadOnlyCollection<ChannelUnreadCursor> cursors, string viewerBattleTag)
+    {
+        if (cursors.Count == 0)
+        {
+            return new Dictionary<string, long>();
+        }
+
+        var filterBuilder = Builders<ChannelMessage>.Filter;
+        var perChannelBranches = cursors
+            .Select(cursor => filterBuilder.And(
+                filterBuilder.Eq(m => m.ChannelId, cursor.ChannelId),
+                filterBuilder.Gt(m => m.Seq, cursor.AfterSeq)))
+            .ToList();
+
+        var filter = filterBuilder.And(
+            filterBuilder.Or(perChannelBranches),
+            filterBuilder.Eq(m => m.Deleted, null),
+            ShadowVisibleToSelf(viewerBattleTag));
+
+        var counted = await Messages.Aggregate()
+            .Match(filter)
+            .Group(m => m.ChannelId, g => new { ChannelId = g.Key, Count = g.Count() })
+            .ToListAsync();
+
+        return counted.ToDictionary(x => x.ChannelId, x => (long)x.Count);
     }
 
     /// <summary>

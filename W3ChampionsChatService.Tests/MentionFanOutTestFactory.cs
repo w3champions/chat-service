@@ -3,6 +3,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -30,6 +31,9 @@ internal static class MentionFanOutTestFactory
             harness.HubContext,
             new SessionRegistry(),
             new MembershipRepository(mongoClient, channelRepository),
-            new MentionInboxRepository(mongoClient));
+            new MentionInboxRepository(mongoClient),
+            new UserDirectoryRepository(mongoClient),
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new NotificationPreferenceRepository(mongoClient));
     }
 }

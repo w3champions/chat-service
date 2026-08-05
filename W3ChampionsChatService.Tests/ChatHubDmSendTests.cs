@@ -55,6 +55,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
@@ -96,6 +97,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _userSettings = new UserSettingsRepository(MongoClient);
         _dmInitiationTracker = new DmInitiationTracker();
@@ -139,6 +141,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -153,7 +156,8 @@ public class ChatHubDmSendTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingProxy(connectionId));
@@ -490,6 +494,53 @@ public class ChatHubDmSendTests : IntegrationTestBase
         // The tray is already live after the first request — subsequent pending messages do NOT re-notify.
         Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(1), "RequestReceived fires ONCE, not per message");
         Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1), "ChannelAdded fires ONCE (first materialization only)");
+    }
+
+    [Test]
+    public async Task DmSend_OnlineRecipient_WhoseRegistryLacksTheShell_GetsReAnnouncedChannelAdded()
+    {
+        // An ESTABLISHED conversation: both durable membership rows exist, but the recipient's bounded
+        // connect snapshot excluded this older shell — so their OnlineMemberRegistry does NOT hold it.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);   // sender: session + registry seed
+        RegisterSession(RecipientConn, Recipient);          // recipient: ONLINE but NOT registry-seeded
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "are you still there?");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null, "a snapshot-excluded shell is re-announced when a message arrives");
+        Assert.That(added.Focus, Is.False, "re-announce never auto-opens the DM");
+        Assert.That(_onlineMemberRegistry.IsMember(RecipientConn, channel.Id), Is.True,
+            "the re-announce re-seeds the recipient's registry so fan-out reaches them from this message on");
+    }
+
+    [Test]
+    public async Task DmSend_OnlineRecipient_AlreadySeeded_GetsNoReAnnounce()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        SeedMember(RecipientConn, Recipient, channel.Id);   // recipient registry ALREADY holds the shell
+
+        await BuildHub(InitiatorConn).SendMessage(channel.Id, "ordinary message");
+
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(0),
+            "no ChannelAdded spam on ordinary messages to an already-seeded recipient");
     }
 
     // ------------------------------------------------------------------------------------------------

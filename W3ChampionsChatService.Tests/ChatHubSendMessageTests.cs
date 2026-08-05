@@ -56,6 +56,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
@@ -96,6 +97,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
         _mentionPushHarness = new HubPushCaptureHarness();
@@ -104,7 +106,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _mentionPushHarness.HubContext,
             _sessionRegistry,
             _membershipRepository,
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -127,6 +130,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -141,7 +145,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _authService.Object,
             _mentionFanOut,
             new PresenceInterestRegistry(),
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();
@@ -334,6 +339,34 @@ public class ChatHubSendMessageTests : IntegrationTestBase
 
         var notices = _callerSends.Count(s => s.Method == ChatEvents.ThrottleNotice);
         Assert.AreEqual(1, notices, "Exactly one ThrottleNotice must be pushed on the single auto-throttle escalation");
+    }
+
+    [Test]
+    public async Task Send_AutoThrottle_SurvivesReconnect_SameBattleTag()
+    {
+        var channel = await CreateChannel("general");
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        // Drive conn-1 into hard auto-throttle: burst, then threshold violations (frozen clock — no refill).
+        for (var i = 0; i < ChatLimits.PerChannelBurst + ChatLimits.AutoThrottleViolationThreshold; i++)
+        {
+            await hub.SendMessage(channel.Id, $"spam-{i}");
+        }
+
+        // A REAL relaunch: conn-1 actually disconnects — running the hub's full disconnect teardown
+        // (FocusRegistry/OnlineMemberRegistry/etc. all torn down) — BEFORE conn-2 is ever seeded. This
+        // is what proves MessageRateLimiter state survives actual disconnect (locking in the removed
+        // ChatHub.cs RemoveConnection call), not merely that a second connection can coexist.
+        await hub.OnDisconnectedAsync(null);
+
+        // "Relaunch": a brand-new connection, SAME battleTag. Pre-§1 this was a clean slate.
+        SeedMember("conn-2", BattleTag, channel.Id);
+        var reconnected = BuildHub("conn-2");
+        var result = await reconnected.SendMessage(channel.Id, "back for more");
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code, "the auto-throttle must survive the reconnect");
+        Assert.IsTrue(result.RetryAfterSeconds > 0);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -556,7 +589,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
 
     // ---------------------------------------------------------------------------------------------
     // C6 Task 5 — mention fan-out (D3/D4), end-to-end through the SendMessage pipeline. These exercise
-    // the step-7.75 call site (validated mention list → MentionFanOut → durable entry + targeted event),
+    // the step-8 call site (fix round 1 F2b renumbered it — validated mention list → MentionFanOut →
+    // durable entry + targeted event),
     // the shadow call-site skip, focus-irrelevance, and the sender-ack fault isolation. The per-rule
     // eligibility boundary is covered directly in MentionFanOutTests.
     // ---------------------------------------------------------------------------------------------
@@ -701,8 +735,11 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     // C6 "strip & deliver as plain" (Marco decision 3): a message is NEVER rejected because of its
     // mentions' access/resolvability. An unresolvable/garbage tag, or a tag naming a NON-member, delivers
     // VERBATIM (the client renders the invalid <@…> as plain) and simply produces no inbox entry + no
-    // notification — the membership wall in MentionFanOut is the sole authority on who is notified. These
-    // exercise the full SendMessage pipeline end-to-end (real MentionFanOut + inbox repo + push harness).
+    // notification — the membership wall in MentionFanOut is the sole authority on who is notified. Since
+    // follow-up spec §4, that wall is widened for PUBLIC channels: a directory-RESOLVABLE non-member of a
+    // Public channel now DOES get an entry + notification (only an unresolvable tag still gets nothing
+    // there); Dm/GroupDm/SemiPublic/System keep the unconditional membership wall. These exercise the full
+    // SendMessage pipeline end-to-end (real MentionFanOut + inbox repo + push harness).
     // ---------------------------------------------------------------------------------------------
 
     [Test]
@@ -725,7 +762,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Mention_ResolvableNonMemberOfPublicChannel_Ok_NoInboxEntry()
+    public async Task Mention_ResolvableNonMemberOfPublicChannel_Ok_GetsInboxEntryAndPush()
     {
         var channel = await CreateChannel("general");
         SeedMember("conn-1", BattleTag, channel.Id);
@@ -737,11 +774,11 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         var result = await hub.SendMessage(channel.Id, $"hey {Mention("stranger#1")}");
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code, "mentioning a resolvable non-member of a public channel is legal — no reject");
-        Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("stranger#1"),
-            "a non-member of a Public channel gets NO inbox entry — the uniform membership wall applies to every channel type");
-        Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
-            "and no MentionNotified push");
-        Assert.IsEmpty(_mentionPushHarness.AllSignals, "the only mention target was a non-member — nobody is notified");
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser("stranger#1")).Count,
+            "follow-up spec §4: a directory-resolvable non-member of a PUBLIC channel now gets an inbox entry — the membership wall is widened away for Public rooms only");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-stranger", ChatEvents.MentionNotified),
+            "and the targeted MentionNotified push");
+        Assert.AreEqual(1, _mentionPushHarness.AllSignals.Count, "exactly one push — targeted at the stranger, nobody else");
     }
 
     [Test]

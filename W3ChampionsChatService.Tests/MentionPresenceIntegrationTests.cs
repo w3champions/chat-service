@@ -72,6 +72,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
@@ -84,6 +85,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     private MembershipRepository _membershipRepository;
     private MessageRepository _messageRepository;
     private MentionInboxRepository _mentionInboxRepository;
+    private NotificationPreferenceRepository _notificationPreferenceRepository;
     private MentionFanOut _mentionFanOut;       // the REAL C6 T5 writer, pushing through the shared harness
     private MentionInboxCleaner _mentionCleaner; // the REAL C6 T7 cleaner (physical mention_inbox delete)
     private SessionStateAssembler _assembler;
@@ -95,6 +97,11 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     // Per-tag friends, read by the fake source's snapshot factory (OrdinalIgnoreCase) — only the friend-
     // presence test populates this; every other test's connects resolve an empty friends set (no push).
     private readonly Dictionary<string, HashSet<string>> _friends = new(StringComparer.OrdinalIgnoreCase);
+
+    // Per-tag blocks, read by the SAME fake source's snapshot factory (fix round 1, F9) — only the D1
+    // block-suppression test below populates this; every other test's mentions resolve an empty block
+    // list (no suppression), identical to the pre-F9 always-empty CreateIgnored() stub.
+    private readonly Dictionary<string, HashSet<string>> _blocked = new(StringComparer.OrdinalIgnoreCase);
 
     // Every Clients.Caller/Client push + every Context.Abort(), in order, across ALL connections. The
     // cross-connection fan-out pushes (MentionNotified/PresenceChanged/FriendPresenceChanged) go to
@@ -108,6 +115,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     {
         _hubSends.Clear();
         _friends.Clear();
+        _blocked.Clear();
         _time = new FakeTimeProvider(new DateTimeOffset(T0, TimeSpan.Zero));
         _harness = new HubPushCaptureHarness();
 
@@ -117,6 +125,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _presenceInterestRegistry = new PresenceInterestRegistry();
         _userDirectory = new UserDirectoryRepository(MongoClient);
@@ -126,11 +135,28 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
         _messageRepository = new MessageRepository(MongoClient);
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
+        _notificationPreferenceRepository = new NotificationPreferenceRepository(MongoClient);
+
+        // Built BEFORE _mentionFanOut below (fix round 1, F9) — the REAL C5 D1 provider, so the fan-out's
+        // own D1 block check can be exercised end-to-end by this suite rather than a never-blocking stub.
+        _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
+            tag,
+            _friends.TryGetValue(tag, out var f) ? f : new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            _blocked.TryGetValue(tag, out var b) ? b : new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            now));
+        // Makes every fetch resolve SYNCHRONOUSLY (no genuine suspension), so the fire-and-forget friend push
+        // is deterministically observable right after Connect/disconnect return (mirrors ChatHubFriendPresenceTests).
+        _relationshipSource.ReleaseGate = Task.CompletedTask;
+        _relationshipProvider = new RelationshipProvider(_relationshipSource, _time);
+
         // The REAL C6 T5 writer, wired to the SHARED harness + session registry + membership/inbox repos —
         // so a hub's own SendMessage(<@tag>) fans out a genuine mention-inbox entry AND a capturable,
         // targeted MentionNotified through the one shared capture (unlike the CreateIgnored factory the
         // moderation/DM suites use, whose push goes to a throwaway sink and whose session registry is empty).
-        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        // Fix round 1 (F9): wired with the REAL _relationshipProvider above (was
+        // RelationshipProviderTestFactory.CreateIgnored()) — behavior was identical while the fake source's
+        // block list was always empty, but this lets the suite exercise D1 end-to-end too.
+        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, _relationshipProvider, _notificationPreferenceRepository);
         // The REAL C6 T7 cleaner, so a moderator DeleteMessage/PurgeMessagesFromUser physically removes the
         // referenced mention-inbox rows in this suite too (acceptance 3).
         _mentionCleaner = new MentionInboxCleaner(MongoClient);
@@ -157,16 +183,6 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
-
-        _relationshipSource = new FakeRelationshipSource((tag, now) => new RelationshipSnapshot(
-            tag,
-            _friends.TryGetValue(tag, out var f) ? f : new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
-            now));
-        // Makes every fetch resolve SYNCHRONOUSLY (no genuine suspension), so the fire-and-forget friend push
-        // is deterministically observable right after Connect/disconnect return (mirrors ChatHubFriendPresenceTests).
-        _relationshipSource.ReleaseGate = Task.CompletedTask;
-        _relationshipProvider = new RelationshipProvider(_relationshipSource, _time);
     }
 
     // ============================================================================================
@@ -200,6 +216,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -214,7 +231,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             _authService.Object,
             _mentionFanOut,                     // REAL fan-out through the shared harness
             _presenceInterestRegistry,          // SHARED — same instance the engine reads
-            _mentionInboxRepository);           // SHARED — the read/ack store
+            _mentionInboxRepository,            // SHARED — the read/ack store
+            _notificationPreferenceRepository); // SHARED — same instance _mentionFanOut reads (fix round 1, F9)
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -288,7 +306,13 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
 
     // ---- Mongo seed helpers ------------------------------------------------------------------------
 
-    private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public)
+    // Follow-up spec §6: SessionStateAssembler.SelectSnapshotMemberships now reads channel.PairKey for
+    // every non-pending 1:1 Dm (the blocked-shell keep) — a REAL Dm channel always carries one
+    // (ChannelRepository.FindOrCreateDm always sets it via DmPairKey.For; the collection's unique
+    // partial index enforces Type==Dm ⇒ PairKey present). dmBattleTagA/B are therefore REQUIRED for
+    // ChannelType.Dm so this fixture can never manufacture the data-impossible shape (a Dm channel with
+    // no PairKey) that used to slip past every test that never exercised the connect snapshot's DM slice.
+    private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public, string dmBattleTagA = null, string dmBattleTagB = null)
     {
         var channel = new ChatChannel
         {
@@ -299,6 +323,11 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         };
         if (type == ChannelType.Dm)
         {
+            if (dmBattleTagA == null || dmBattleTagB == null)
+            {
+                throw new ArgumentException("CreateChannel(ChannelType.Dm, ...) requires both dmBattleTagA and dmBattleTagB to build a real PairKey");
+            }
+            channel.PairKey = DmPairKey.For(dmBattleTagA, dmBattleTagB);
             channel.RequestState = DmRequestState.Accepted;
         }
         await _channelRepository.Insert(channel);
@@ -453,6 +482,74 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             "the durable rows all survive until the 30d TTL — read is a field flip, never a delete");
     }
 
+    // Fix round 1 (F9): now that _mentionFanOut is wired with the fixture's REAL _relationshipProvider
+    // (over the fake source, block-controlled by _blocked), D1 block suppression can be exercised
+    // end-to-end through a real SendMessage → real MentionFanOut → real RelationshipProvider chain,
+    // rather than only unit-tested against MentionFanOut directly (MentionFanOutTests).
+    [Test]
+    public async Task MentionOfBlockingTarget_EndToEnd_NoInboxEntry_NoMentionNotified()
+    {
+        const string ATag = "author#1";
+        const string BTag = "bob#2";
+
+        var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
+        await SeedMembership(channel.Id, ATag);
+        await SeedMembership(channel.Id, BTag);
+
+        // B has blocked A — D1 direction: it's the TARGET's own block list that suppresses.
+        _blocked[BTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ATag };
+
+        var aHub = await Connect("conn-a", ATag);
+        var bHub = await Connect("conn-b", BTag);
+
+        var send = await aHub.SendMessage(channel.Id, $"hey <@{BTag}> you there?");
+
+        Assert.That(send.Code, Is.EqualTo(ChatResultCode.Ok), "the message itself still sends and renders normally");
+        Assert.That(MentionNotifiedFor("conn-b"), Is.Empty,
+            "a target who has blocked the sender gets NO MentionNotified push, end-to-end through the real RelationshipProvider");
+        Assert.That((await bHub.GetMentionInbox()).Entries, Is.Empty, "and no durable inbox entry either");
+    }
+
+    // Fix round 1 (F2b) ordering pin: ChatHub.Messaging.cs's SendMessage now awaits the channel fan-out
+    // (FanOutEngine.OnMessagePersisted, which pushes MessageReceived to FOCUSED viewers) BEFORE the
+    // mention fan-out (MentionFanOut.NotifyAsync, which pushes the targeted MentionNotified) — see that
+    // method's step 7.75/8 comments for why. For a member who is BOTH focused on the channel AND the
+    // mention's target, both events land on the SAME connection, so the dispatch order is directly
+    // observable. Both services are constructed (SetupBeforeEach) against the ONE shared
+    // HubPushCaptureHarness — its `_sends` list is a single lock-guarded, insertion-ordered list across
+    // ALL connections, and SignalsFor(connectionId) filters that ONE list without reordering — so the
+    // index comparison below reflects the real cross-service dispatch order, not two independent capture
+    // lists that happen to agree.
+    [Test]
+    public async Task MentionOfFocusedMember_EndToEnd_MessageReceivedPrecedesMentionNotified()
+    {
+        const string ATag = "author#1";
+        const string BTag = "bob#2";
+
+        var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
+        await SeedMembership(channel.Id, ATag);
+        await SeedMembership(channel.Id, BTag);
+
+        var aHub = await Connect("conn-a", ATag);
+        var bHub = await Connect("conn-b", BTag);
+        Assert.That((await bHub.FocusChannel(channel.Id)).Code, Is.EqualTo(ChatResultCode.Ok),
+            "B must be FOCUSED on the channel to receive MessageReceived (FanOutEngine's focused-viewers-only guardrail)");
+
+        var send = await aHub.SendMessage(channel.Id, $"hey <@{BTag}> look at this");
+        Assert.That(send.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        var signals = _harness.SignalsFor("conn-b").ToList();
+        var messageReceivedIndex = signals.FindIndex(s => s.Method == ChatEvents.MessageReceived);
+        var mentionNotifiedIndex = signals.FindIndex(s => s.Method == ChatEvents.MentionNotified);
+
+        Assert.That(messageReceivedIndex, Is.GreaterThanOrEqualTo(0), "sanity: B (focused) received MessageReceived");
+        Assert.That(mentionNotifiedIndex, Is.GreaterThanOrEqualTo(0), "sanity: B (mentioned) received MentionNotified");
+        Assert.That(messageReceivedIndex, Is.LessThan(mentionNotifiedIndex),
+            "F2b: the channel fan-out's MessageReceived must be DISPATCHED before the mention fan-out's " +
+            "MentionNotified for a target who is both focused and mentioned — pinning the accepted ordering " +
+            "(and its sender-ack latency trade, see ChatHub.Messaging.cs's F2b comment) as a tested outcome");
+    }
+
     // ============================================================================================
     // Slate 2 — ModerationDelete_ScrubsInbox_EndToEnd (acceptance 3).
     // A real mention → moderator DeleteMessage physically removes the referenced inbox entry; and a
@@ -525,7 +622,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     // >5 distinct rejected (the COUNT cap); an unresolvable mention is NOT rejected — it delivers verbatim
     // and simply notifies nobody (strip & deliver as plain); exactly 5 valid mentions fan out to EXACTLY
     // those 5 members (a co-present non-mentioned member and the sender get nothing); a mentioned resolvable
-    // NON-member gets no notification (the membership wall).
+    // NON-member of this PUBLIC channel DOES get notified (follow-up spec §4 — Public rooms are
+    // membership-independent for a directory-resolvable target).
     // ============================================================================================
 
     [Test]
@@ -565,7 +663,9 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             "the over-cap send allocated no seq and persisted nothing");
 
         // --- Strip & deliver as plain: an UNRESOLVABLE mention is NOT rejected — it delivers VERBATIM and
-        // simply notifies nobody (the fan-out membership wall drops the non-member target). NOT TooLong.
+        // simply notifies nobody. This channel is Public, so membership is not the gate here (§4) — the
+        // fan-out drops "nobody#404" because it has NO user_directory row, the directory-resolvability
+        // check §4 substitutes for the membership wall on Public rooms. NOT TooLong.
         var unresolvableContent = "who is <@nobody#404>";
         var unresolvable = await aHub.SendMessage(channel.Id, unresolvableContent);
         Assert.That(unresolvable.Code, Is.EqualTo(ChatResultCode.Ok),
@@ -573,7 +673,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That((await _messageRepository.Load(unresolvable.MessageId)).Content, Is.EqualTo(unresolvableContent),
             "the message delivers verbatim — the invalid <@…> token is kept as plain text");
         Assert.That(await _mentionInboxRepository.LoadForUser("nobody#404"), Is.Empty,
-            "the unresolvable target gets no inbox entry (nobody is a member)");
+            "the unresolvable target gets no inbox entry (nobody#404 has no user_directory row — unresolvable, not merely a non-member)");
         Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(1L),
             "the unresolvable send DID persist (seq 1) — it is a normal, deliverable message");
 
@@ -595,17 +695,19 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That(await _mentionInboxRepository.LoadForUser(BystanderTag), Is.Empty, "...and gets no inbox entry");
         Assert.That(MentionNotifiedFor("conn-valauthor"), Is.Empty, "the sender is never self-notified");
 
-        // --- Non-member leg: a mentioned resolvable NON-member gets NOTHING (the membership wall).
+        // --- Non-member leg (follow-up spec §4): a mentioned resolvable NON-member of this PUBLIC channel
+        // NOW gets notified — the membership wall is widened away for Public rooms specifically, since a
+        // directory-resolvable target's tag proves resolvability without needing a membership row.
         _time.Advance(TimeSpan.FromSeconds(2));
         var mixed = await aHub.SendMessage(channel.Id, $"ping <@{members[0]}> and <@{NonMemberTag}>");
         Assert.That(mixed.Code, Is.EqualTo(ChatResultCode.Ok), "mentioning a resolvable non-member is legal content");
 
-        Assert.That(MentionNotifiedFor("conn-stranger"), Is.Empty,
-            "a mentioned NON-member — resolvable AND online — receives NO notification (the excerpt privacy wall)");
-        Assert.That(await _mentionInboxRepository.LoadForUser(NonMemberTag), Is.Empty,
-            "...and gets NO inbox entry, even though the send that named them succeeded");
+        Assert.That(MentionNotifiedFor("conn-stranger"), Has.Count.EqualTo(1),
+            "a mentioned NON-member of a PUBLIC channel — resolvable AND online — DOES receive a notification (§4)");
+        Assert.That(await _mentionInboxRepository.LoadForUser(NonMemberTag), Has.Count.EqualTo(1),
+            "...and gets an inbox entry too");
         Assert.That(MentionNotifiedFor(memberConns[members[0]]), Has.Count.EqualTo(2),
-            "the co-mentioned actual member DID get a second event from that same send — proving the wall, not a total no-op");
+            "the co-mentioned actual member DID get a second event from that same send");
     }
 
     // ============================================================================================
@@ -704,7 +806,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         const string BystanderTag = "Cara#3";  // genuinely wired, focused on an UNRELATED DM
         const string YoungTag = "Young#5";
 
-        var dmAx = await CreateChannel("dm-ax", ChannelType.Dm);
+        var dmAx = await CreateChannel("dm-ax", ChannelType.Dm, AliceTag, XavierTag);
         await SeedMembership(dmAx.Id, AliceTag);
         await SeedMembership(dmAx.Id, XavierTag);
 
@@ -712,7 +814,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         await SeedMembership(grpAx.Id, AliceTag, role: MembershipRole.Owner);
         await SeedMembership(grpAx.Id, XavierTag);
 
-        var dmCy = await CreateChannel("dm-cy", ChannelType.Dm);
+        var dmCy = await CreateChannel("dm-cy", ChannelType.Dm, BystanderTag, YoungTag);
         await SeedMembership(dmCy.Id, BystanderTag);
         await SeedMembership(dmCy.Id, YoungTag);
 
@@ -980,7 +1082,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         var hubContextMock = new Mock<IHubContext<ChatHub>>();
         hubContextMock.Setup(h => h.Clients).Returns(clientsMock.Object);
 
-        var fanOut = new MentionFanOut(hubContextMock.Object, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        var fanOut = new MentionFanOut(hubContextMock.Object, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
         var message = new ChannelMessage
         {
             ChannelId = channel.Id,

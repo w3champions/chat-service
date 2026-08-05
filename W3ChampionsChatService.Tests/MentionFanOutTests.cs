@@ -12,7 +12,9 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -27,11 +29,23 @@ namespace W3ChampionsChatService.Tests;
 /// <para>
 /// The five eligibility rules (D3): (a) message NOT shadow; (b) target ≠ sender (case-insensitive);
 /// (c) target has a <c>channel_memberships</c> row for THIS channel — the Dm/GroupDm excerpt PRIVACY
-/// WALL; (d) membership <c>NotificationLevel != None</c>; (e) membership is NOT currently
+/// WALL — EXCEPT for <see cref="ChannelType.Public"/> rooms (follow-up spec §4), where a target with NO
+/// membership row is still eligible provided the tag resolves to a <see cref="UserDirectoryRepository"/>
+/// row, since a public room's excerpt is public content and the membership wall protects nothing there;
+/// Dm/GroupDm/SemiPublic/System are unaffected and keep the membership wall exactly as before;
+/// (d) membership <c>NotificationLevel != None</c>; (e) membership is NOT currently
 /// decline-suppressed (<c>DeclinedUntil</c> unset or already elapsed vs. <c>now</c>). Every
 /// negative-eligibility test below ALSO mentions an eligible CONTROL member in the SAME call and
 /// asserts the control DID get an entry + event — so the test fails against a do-nothing stub AND
 /// against an over-permissive filter, not just one of the two.
+/// </para>
+/// <para>
+/// PR36 follow-up (D1/D2): a sixth eligibility rule — the TARGET has not blocked the sender — and a
+/// notification-preference consult path (Public non-member branch) round out the class doc's six-rule
+/// list. The default <see cref="_fanOut"/> below wires a NEVER-blocking <see cref="IRelationshipProvider"/>
+/// (<see cref="RelationshipProviderTestFactory.CreateIgnored"/>) so every PRE-EXISTING test above is
+/// unaffected; D1/D2-specific tests build their OWN <see cref="MentionFanOut"/> with a purpose-built
+/// provider/pref, mirroring the existing <c>faultyFanOut</c> per-test-customization idiom.
 /// </para>
 /// </summary>
 public class MentionFanOutTests : IntegrationTestBase
@@ -49,6 +63,8 @@ public class MentionFanOutTests : IntegrationTestBase
     private HubPushCaptureHarness _harness;
     private MentionFanOut _fanOut;
     private FakeTimeProvider _time;
+    private UserDirectoryRepository _userDirectory;
+    private NotificationPreferenceRepository _notificationPreferenceRepository;
 
     private DateTime Now => _time.GetUtcNow().UtcDateTime;
 
@@ -61,7 +77,9 @@ public class MentionFanOutTests : IntegrationTestBase
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
         _sessionRegistry = new SessionRegistry();
         _harness = new HubPushCaptureHarness();
-        _fanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository);
+        _userDirectory = new UserDirectoryRepository(MongoClient);
+        _notificationPreferenceRepository = new NotificationPreferenceRepository(MongoClient);
+        _fanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), _notificationPreferenceRepository);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -86,6 +104,15 @@ public class MentionFanOutTests : IntegrationTestBase
             NotificationLevel = level,
             JoinedAt = Now,
             DeclinedUntil = declinedUntil,
+        });
+
+    private Task SeedDirectory(string battleTag) =>
+        _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = battleTag.ToLowerInvariant(),
+            DisplayBattleTag = battleTag,
+            NormalizedName = battleTag.ToLowerInvariant(),
+            LastSeenAt = Now,
         });
 
     private static ChatChannel Channel(ChannelType type = ChannelType.Public) =>
@@ -208,7 +235,9 @@ public class MentionFanOutTests : IntegrationTestBase
     [Test]
     public async Task Notify_NonMember_NoEntryNoEvent_ControlMemberStillNotified()
     {
-        // stranger#1 is resolvable content but NOT a member of this channel → no entry/event.
+        // stranger#1 has NO membership row AND no user_directory row, so it stays ineligible even
+        // now that Public rooms are membership-independent (§4): the wall this documents for Public
+        // is directory-resolvability, not membership — stranger#1 has neither.
         RegisterSession("conn-stranger", "stranger#1");
         await SeedMembership("wolf#456", NotificationLevel.All);
         RegisterSession("conn-wolf", "wolf#456");
@@ -323,6 +352,251 @@ public class MentionFanOutTests : IntegrationTestBase
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Follow-up spec §4 — PUBLIC rooms are mentionable without joining (membership-independent fan-out)
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PublicChannel_NonMember_WithDirectoryRow_GetsEntryAndPush()
+    {
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        // Deliberately NO membership row: follow-up spec §4 — public rooms are mentionable without joining.
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1),
+            "a directory-resolvable NON-member of a PUBLIC room gets a mention-inbox entry");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1), "and the targeted MentionNotified push");
+    }
+
+    [Test]
+    public async Task PublicChannel_NonMember_WithoutDirectoryRow_GetsNothing()
+    {
+        await SeedMembership("control#1");
+        // "ghost#999" has neither a membership nor a user_directory row — an unresolvable tag.
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "ghost#999", "control#1" }, Now);
+
+        Assert.That(await InboxOf("ghost#999"), Is.Empty,
+            "an unresolvable tag still notifies nobody (garbage `<@…>` markup stays inert)");
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible control member still fires");
+    }
+
+    [Test]
+    public async Task SemiPublicChannel_NonMember_EvenWithDirectoryRow_GetsNothing()
+    {
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("control#1", channelId: ChannelId);
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.SemiPublic), Message(), new[] { "wolf#456", "control#1" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "§4 widens PUBLIC rooms only — SemiPublic keeps the membership wall");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0),
+            "the wall blocks the live push too, not just the inbox entry, even though wolf is online");
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public async Task PublicChannel_JoinedMember_WithNotificationLevelNone_StaysSilenced()
+    {
+        await SeedDirectory("silent#1");
+        await SeedMembership("silent#1", NotificationLevel.None);
+        await SeedMembership("control#1");
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "silent#1", "control#1" }, Now);
+
+        Assert.That(await InboxOf("silent#1"), Is.Empty,
+            "lock-in: join + NotificationLevel.None remains the opt-out even now that non-members are mentionable");
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1),
+            "the eligible control member still gets the mention — proves this isn't vacuously true against a do-nothing fan-out");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PR36 follow-up (D1) — block suppression: the TARGET's own block list, consulted LAST and only for
+    // an otherwise-eligible target. Each test builds its OWN MentionFanOut over a purpose-built
+    // IRelationshipProvider (mirrors the ThrowingInsertRepository/faultyFanOut per-test-customization
+    // idiom below), so the default _fanOut (a never-blocking provider) stays untouched for every other
+    // test in this class.
+    // ---------------------------------------------------------------------------------------------
+
+    // Builds a real RelationshipProvider (the production cache/fail-closed policy) over a
+    // FakeRelationshipSource whose snapshot for `blockingTargetTag` lists `blockedBattleTag` as blocked;
+    // every other tag resolves to an empty (no friends, no blocks) snapshot.
+    private MentionFanOut BuildFanOutWithBlock(string blockingTargetTag, string blockedBattleTag)
+    {
+        var source = new FakeRelationshipSource((tag, snapshotNow) =>
+            string.Equals(tag, blockingTargetTag, StringComparison.OrdinalIgnoreCase)
+                ? new RelationshipSnapshot(tag, new HashSet<string>(), new HashSet<string> { blockedBattleTag }, snapshotNow)
+                : new RelationshipSnapshot(tag, new HashSet<string>(), new HashSet<string>(), snapshotNow));
+        var provider = new RelationshipProvider(source, _time);
+        return new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, provider, _notificationPreferenceRepository);
+    }
+
+    [Test]
+    public async Task Notify_BlockedTarget_MemberBranch_NoEntryNoEvent_ControlMemberStillNotified()
+    {
+        // "wolf#456" is a fully joined, level-All member who has blocked the sender — D1 must suppress
+        // the entry + event for them even though every OTHER eligibility rule (a)-(e) is satisfied.
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("frank#789", NotificationLevel.All);
+        RegisterSession("conn-frank", "frank#789");
+
+        var fanOut = BuildFanOutWithBlock(blockingTargetTag: "wolf#456", blockedBattleTag: Sender);
+
+        await fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456", "frank#789" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "a joined member who has blocked the sender gets NO inbox entry");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0), "and NO live push");
+        Assert.That(await InboxOf("frank#789"), Has.Count.EqualTo(1),
+            "a non-blocking member control (test 3: non-blocked targets in the same message) still gets the mention");
+        Assert.That(MentionEventCount("conn-frank"), Is.EqualTo(1));
+    }
+
+    // Fix round 1 (F8): D1 suppression is type-agnostic (the class doc says "ALL channel types"), but was
+    // only pinned against a Public channel above — a GroupDm variant of the SAME member-branch scenario
+    // proves the walled-channel path (which never reaches the Public non-member branch) still applies it.
+    [Test]
+    public async Task Notify_BlockedTarget_MemberBranch_GroupDm_NoEntryNoEvent_ControlMemberStillNotified()
+    {
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("frank#789", NotificationLevel.All);
+        RegisterSession("conn-frank", "frank#789");
+
+        var fanOut = BuildFanOutWithBlock(blockingTargetTag: "wolf#456", blockedBattleTag: Sender);
+
+        await fanOut.NotifyAsync(Channel(ChannelType.GroupDm), Message(content: "secret plans"), new[] { "wolf#456", "frank#789" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "a GroupDm member who has blocked the sender gets NO inbox entry — D1 applies to walled channels too");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0), "and NO live push");
+        Assert.That(await InboxOf("frank#789"), Has.Count.EqualTo(1), "a non-blocking member control still gets the mention");
+        Assert.That(MentionEventCount("conn-frank"), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Notify_BlockedTarget_PublicNonMemberBranch_NoEntryNoEvent_ControlMemberStillNotified()
+    {
+        // "wolf#456" is a directory-resolvable NON-member of a Public room (follow-up spec §4 eligible)
+        // who has blocked the sender — D1 applies uniformly across BOTH the member and non-member
+        // branches, not just the member one.
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("control#1");
+
+        var fanOut = BuildFanOutWithBlock(blockingTargetTag: "wolf#456", blockedBattleTag: Sender);
+
+        await fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456", "control#1" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "a directory-resolvable non-member who has blocked the sender gets NO entry");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0));
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible member control still fires");
+    }
+
+    [Test]
+    public async Task Notify_BlockCheckThrows_DeliversFailOpen_NoSuppressionOfOtherwiseEligibleTarget()
+    {
+        // A relationship-provider outage (e.g. RelationshipUnavailableException after the stale-cache
+        // fallback is also exhausted — simulated directly via a throwing provider double, mirroring the
+        // ThrowingInsertRepository idiom) must DELIVER the mention rather than suppress it: an outage
+        // must never blanket-mute every mention or break the send pipeline.
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+
+        var fanOut = new MentionFanOut(
+            _harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory,
+            new ThrowingRelationshipProvider(), _notificationPreferenceRepository);
+
+        await fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1),
+            "a relationship-provider failure fails OPEN — the mention is still delivered, not suppressed");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1), "and the live push still fires");
+    }
+
+    // Always throws, simulating a relationship-provider outage with nothing cached to fall back to
+    // (RelationshipUnavailableException) — proves NotifyAsync's LOCAL catch inside IsBlockedFailOpenAsync
+    // is what keeps the block check fail-open. After the three-stage restructure there is no OUTER
+    // per-target catch around stage 2's Task.WhenAll that could instead skip just this target: were
+    // IsBlockedFailOpenAsync's internal catch removed, the exception would escape the WhenAll, escape
+    // NotifyAsync entirely (uncaught at the ChatHub.Messaging.cs step 8 call site), and turn this
+    // already-persisted send's Ok ack into an ERROR ack — worse than merely skipping the target, and
+    // worse than the fail-open delivery this test asserts.
+    private sealed class ThrowingRelationshipProvider : IRelationshipProvider
+    {
+        public Task<RelationshipSnapshot> GetSnapshotAsync(string battleTag) =>
+            throw new RelationshipUnavailableException(battleTag, new InvalidOperationException("relationship provider unavailable (test)"));
+
+        public void Invalidate(string battleTag)
+        {
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PR36 follow-up (D2) — the non-member Public consult path: a persisted NotificationPreference row
+    // (written by ChatHub.SetNotificationLevel, independent of ChannelMembership's lifecycle) silences a
+    // mention for a target with NO membership row. The hub-level lifecycle (join → set None → leave →
+    // rejoin) is covered end-to-end in ChatHubMembershipTests; these tests isolate MentionFanOut's OWN
+    // consult-path behavior directly.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PublicChannel_NonMember_WithPersistedPreferenceNone_StaysSuppressed()
+    {
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("control#1");
+        // No membership row for wolf — simulates a prior leave. The persisted pref is what must silence it.
+        await _notificationPreferenceRepository.Upsert("wolf#456", ChannelId, NotificationLevel.None, Now);
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456", "control#1" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "a non-member with a persisted NotificationLevel.None preference for this channel stays silenced");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0));
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible control still gets the mention");
+    }
+
+    [Test]
+    public async Task PublicChannel_NonMember_WithPersistedPreferenceMentions_Delivers()
+    {
+        // Only an explicit None suppresses — any OTHER persisted level must deliver normally.
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        await _notificationPreferenceRepository.Upsert("wolf#456", ChannelId, NotificationLevel.Mentions, Now);
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1),
+            "a persisted level other than None must not suppress the mention");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1));
+    }
+
+    // Fix round 1 (F3): battleTag normalization was unpinned here — every OTHER test in this section
+    // writes and reads under the SAME (already-lowercase) casing, so a mutation removing
+    // NotificationPreferenceRepository.NormalizeTag's ToLowerInvariant() would pass all of them. Seeding
+    // the pref under one casing and mentioning under a DIFFERENT casing forces the mismatch to matter.
+    [Test]
+    public async Task PublicChannel_NonMember_WithPersistedPreferenceNone_MixedCase_PinsNormalizeTag()
+    {
+        await SeedDirectory("wolf#456");
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("control#1");
+        await _notificationPreferenceRepository.Upsert("Wolf#456", ChannelId, NotificationLevel.None, Now);
+
+        await _fanOut.NotifyAsync(Channel(), Message(), new[] { "WOLF#456", "control#1" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "the persisted None preference must suppress regardless of write/read casing mismatch");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0));
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible control still gets the mention");
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Shadow (defense-in-depth in-method guard; the call-site skip is covered end-to-end in
     // ChatHubSendMessageTests.ShadowSender_MentionsOthers_...)
     // ---------------------------------------------------------------------------------------------
@@ -410,7 +684,7 @@ public class MentionFanOutTests : IntegrationTestBase
 
         // A repository whose Insert throws for wolf ONLY — simulating a single-target Mongo write failure.
         var throwingInbox = new ThrowingInsertRepository(MongoClient, "wolf#456");
-        var faultyFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, throwingInbox);
+        var faultyFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, throwingInbox, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
 
         Assert.DoesNotThrowAsync(() => faultyFanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456", "frank#789" }, Now),
             "a single target's failed insert must be fault-isolated — NotifyAsync must not throw");

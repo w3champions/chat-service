@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Bson;
@@ -530,6 +531,75 @@ public class MessageRepositoryTests : IntegrationTestBase
         var count = await repo.CountUserVisibleAfter("chan1", "Peter#123", 5);
 
         Assert.AreEqual(0, count);
+    }
+
+    // ── 2026-08-05 PR36 feedback (Part 1) — CountUserVisibleAfterMany, one aggregation round-trip ────
+
+    [Test]
+    public async Task CountUserVisibleAfterMany_MatchesSingleVersion_AcrossMultipleChannels()
+    {
+        var repo = new MessageRepository(MongoClient);
+
+        // chan1: same mix as CountUserVisibleAfter_ExcludesForeignShadowAndDeleted_IncludesOwnShadow —
+        // exercises the SAME visibility predicates (deleted + foreign-shadow exclusion, own-shadow
+        // inclusion) inside the batched $match.
+        var normal = NewMessage("chan1", 1, "Peter#123");
+        var deleted = NewMessage("chan1", 2, "Peter#123");
+        var foreignShadow = NewMessage("chan1", 3, "Wolf#456");
+        foreignShadow.Shadow = true;
+        var ownShadow = NewMessage("chan1", 4, "Peter#123");
+        ownShadow.Shadow = true;
+        var trailing = NewMessage("chan1", 5, "Peter#123");
+        await repo.Insert(normal);
+        await repo.Insert(deleted);
+        await repo.Insert(foreignShadow);
+        await repo.Insert(ownShadow);
+        await repo.Insert(trailing);
+        await repo.MarkDeleted(deleted.Id, "Mod#1", DateTime.UtcNow);
+
+        // chan2: caught up (a real zero-count channel with the cursor at the tip) — must be ABSENT from
+        // the batched result, never a spurious zero entry.
+        for (var seq = 1; seq <= 3; seq++)
+        {
+            await repo.Insert(NewMessage("chan2", seq));
+        }
+
+        // chan3: no messages at all — the "genuinely no rows ever" zero-count case.
+        var cursors = new[]
+        {
+            new ChannelUnreadCursor("chan1", 0),
+            new ChannelUnreadCursor("chan2", 3),
+            new ChannelUnreadCursor("chan3", 0),
+        };
+
+        var batched = await repo.CountUserVisibleAfterMany(cursors, "Peter#123");
+
+        var singleChan1 = await repo.CountUserVisibleAfter("chan1", "Peter#123", 0);
+        var singleChan2 = await repo.CountUserVisibleAfter("chan2", "Peter#123", 3);
+        var singleChan3 = await repo.CountUserVisibleAfter("chan3", "Peter#123", 0);
+
+        Assert.AreEqual(singleChan1, batched.GetValueOrDefault("chan1", 0), "chan1 (mixed visible/deleted/shadow) must match the single-version count");
+        Assert.AreEqual(0, singleChan2, "sanity: chan2 is caught up under the single version too");
+        Assert.AreEqual(singleChan2, batched.GetValueOrDefault("chan2", 0), "chan2 (caught up) must match the single-version count");
+        Assert.AreEqual(0, singleChan3, "sanity: chan3 has no rows under the single version too");
+        Assert.AreEqual(singleChan3, batched.GetValueOrDefault("chan3", 0), "chan3 (no rows) must match the single-version count");
+
+        CollectionAssert.AreEqual(new[] { "chan1" }, batched.Keys.ToList(),
+            "a zero-count channel (caught up OR no rows) must be ABSENT from the dictionary, not present with value 0");
+    }
+
+    [Test]
+    public async Task CountUserVisibleAfterMany_EmptyInput_ReturnsEmptyWithoutQuerying()
+    {
+        var repo = new MessageRepository(MongoClient);
+        // Present so an unguarded `$or: []` (which Mongo treats as match-everything) would wrongly
+        // surface this channel — proving the empty-input guard short-circuits before any query.
+        await repo.Insert(NewMessage("chan1", 1, "Peter#123"));
+
+        var result = await repo.CountUserVisibleAfterMany(Array.Empty<ChannelUnreadCursor>(), "Peter#123");
+
+        Assert.AreEqual(0, result.Count,
+            "empty input must short-circuit to an empty result, never match-all via an unguarded $or: []");
     }
 
     // ── C4 Task 1 (D6) — purge query building blocks (consumed by a later C4 task) ───────────

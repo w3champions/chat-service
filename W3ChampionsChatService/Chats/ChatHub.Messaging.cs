@@ -60,7 +60,7 @@ public partial class ChatHub
     /// <c>&lt;@…&gt;</c> as plain text) and simply produces no mention-inbox entry and no notification. So
     /// there is NO directory read and NO membership check here — resolvability ≠ selectability (that is
     /// <c>SearchMentionCandidates</c>' job), and who is actually notified is decided SOLELY by the uniform
-    /// membership wall in <see cref="Mentions.MentionFanOut"/> (step 7.75 below). The count cap is
+    /// membership wall in <see cref="Mentions.MentionFanOut"/> (step 8 below). The count cap is
     /// content-intrinsic and deterministic, so it runs BEFORE the private-lane gates and the mute gate
     /// below BY DESIGN: a blocked sender and an unblocked sender must see an IDENTICAL outcome for the same
     /// over-cap content (running it after the private-lane gate's silent short-circuit would let a fake-Ok
@@ -122,19 +122,21 @@ public partial class ChatHub
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
         // 4. Rate limit BEFORE the channel load (security-review fix): reject a throttled member before
-        // paying for a DB read. JustAutoThrottled (only ever true on a denial) → push exactly one
-        // ThrottleNotice. TryAcquire only needs connectionId + channelId, both already in hand.
-        var decision = _messageRateLimiter.TryAcquire(connectionId, channelId, now);
+        // paying for a DB read. JustAutoThrottled fires once per escalation episode (the single decision
+        // that transitions the user into hard auto-throttle) → push exactly one ThrottleNotice.
+        // TryAcquire is keyed by battleTag (follow-up spec §1: violations/tier/hard-throttle survive
+        // reconnect), so it needs the durable identity, not the ephemeral connectionId.
+        var decision = _messageRateLimiter.TryAcquire(session.Identity.BattleTag, channelId, now);
         if (decision.JustAutoThrottled)
         {
-            // Moderation-attribution log: MessageRateLimiter only has the ephemeral connectionId in
-            // scope, so a reconnect-flapping spammer can't be correlated across auto-throttle episodes
-            // from its line alone. The hub has the durable battleTag (session.Identity.BattleTag) right
-            // here, so it logs its own attributed line — mirrors the battleTag-attribution style of
-            // ChatHubPermissionFilter/BanUser's moderation logs. The limiter's own connectionId-only
-            // line (MessageRateLimiter.TryAcquire) stays as-is (MessageRateLimiterTests asserts on it),
-            // so this auto-throttle episode is intentionally logged twice — once per durable identity
-            // (this line) and once from the pure limiter (connectionId only).
+            // Moderation-attribution log: the limiter's own line (MessageRateLimiter.TryAcquire) already
+            // identifies the battleTag key now that state is re-keyed by it — but it has no visibility
+            // into WHICH connection triggered this particular episode. The hub adds that connectionId
+            // here so a moderator can correlate the episode to a specific live socket — mirrors the
+            // battleTag-attribution style of ChatHubPermissionFilter/BanUser's moderation logs. The
+            // limiter's own line stays as-is (MessageRateLimiterTests asserts on it), so this auto-throttle
+            // episode is intentionally logged twice — once from the pure limiter (battleTag only) and once
+            // from the hub (battleTag + the triggering connectionId).
             Log.Warning(
                 "Auto-throttled chat connection {ConnectionId} (battleTag {BattleTag}) after repeated rate-limit violations",
                 connectionId,
@@ -169,10 +171,12 @@ public partial class ChatHub
         // invalid `<@…>` as plain text) and that target simply gets no inbox entry and no notification. So
         // the send path performs NO directory read and NO membership check: resolvability ≠ selectability
         // (that's SearchMentionCandidates' job), and who is actually notified is decided SOLELY by the
-        // uniform membership wall in MentionFanOut (step 7.75). The cap reject maps to TooLong (the pinned
+        // uniform membership wall in MentionFanOut (step 8). The cap reject maps to TooLong (the pinned
         // 7-member enum has no InvalidContent — same C3 precedent as empty-after-trim).
         // mentionTags (all extracted, deduped, post-cap) threads forward to the (Task 5) mention fan-out
-        // call site that lands after DM materialization (7.5) and before FanOutEngine.OnMessagePersisted (8).
+        // call site that lands after DM materialization (7.5) and AFTER FanOutEngine.OnMessagePersisted
+        // (7.75, fix round 1 F2b — moved earlier so channel delivery never waits on the mention fan-out's
+        // relationship reads).
         var mentionTags = MentionMarkup.ExtractTags(content);
         if (mentionTags.Count > ChatLimits.MaxMentionsPerMessage)
         {
@@ -208,10 +212,10 @@ public partial class ChatHub
 
         // 7. Persist (C1 amendment): allocate the per-channel seq (atomic $inc LastSeq + $set
         // LastMessageAt on the channel doc), then insert the durable message.
-        // TOCTOU guard: the channel existed at step 4, but a TTL-backed shell (System/Dm/GroupDm) could
+        // TOCTOU guard: the channel existed at step 5, but a TTL-backed shell (System/Dm/GroupDm) could
         // be reaped in the gap before AllocateSeq. AllocateSeq then throws (its $inc matched no doc, so
         // NO seq/LastMessageAt was burned) — map that vanished-channel race to the SAME typed NotFound
-        // as step 4 rather than letting an untyped exception escape as a generic SignalR error (the
+        // as step 5 rather than letting an untyped exception escape as a generic SignalR error (the
         // pipeline's "every rejection is a typed result" guardrail). A genuine Insert failure below is a
         // real infrastructure error and is deliberately left to propagate.
         // C5 D10 (shell-expiry maintenance, the C1-amendment gap): for Dm/GroupDm the SAME atomic
@@ -261,32 +265,54 @@ public partial class ChatHub
             await MaterializeDmRecipientAndNotify(channel, session.Identity.BattleTag, now);
         }
 
-        // 7.75 Mention fan-out (C6 Task 5, D3/D4). Runs AFTER the Dm recipient is materialized (7.5) — so
-        // a first-message Dm mention of the counterpart finds their just-created membership row — and
-        // BEFORE the C3 fan-out seam (8). SKIPPED ENTIRELY (zero cost) when the message is shadow — a
-        // shadow sender's mentions must notify NOBODY, the shadow illusion (the C3 fan-out below already
-        // routes a shadow message to its author only) — or when there are no mention tags (the common case:
-        // `mentionTags` came from the step-5.25 gate, empty for a message with no `<@…>` markup, so the hot
-        // path pays nothing). MentionFanOut is the SOLE authority on who gets an inbox entry + notification:
-        // for each ELIGIBLE target (D3: not the sender; an actual member of THIS channel — the uniform
-        // membership wall, a.k.a. the Dm/GroupDm excerpt PRIVACY WALL; NotificationLevel != None)
-        // NotifyAsync writes a mention-inbox entry (expiry via ExpiryCalculator.ForMentionInboxEntry — the
-        // C1-amendment-1 wiring, 30d and always <= the message TTL) and pushes a targeted MentionNotified.
-        // Per-target fault isolation lives inside NotifyAsync (mirrors FanOutEngine's idiom), so a dead
-        // target socket or a single failed insert never turns this already-persisted send's Ok ack into an
-        // error, nor blocks the other targets.
-        if (!isShadow && mentionTags.Count > 0)
-        {
-            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
-        }
-
-        // 8. Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
+        // 7.75 Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
         // delivery + shadow-author-only routing, then unfocused level-All members are routed to the
         // ActivityCoalescer. `now` is threaded in (not re-read) so the whole send — rate limit, persist,
         // expiry, and fan-out coalescing — decides against the SAME server instant. Per-recipient sends
         // are fault-isolated inside FanOutEngine, so a fan-out hiccup never turns this already-persisted
         // message's ack into an error below.
+        // Fix round 1 (F2b): this now runs BEFORE the mention fan-out (step 8, below) — previously it ran
+        // after, so a degraded relationship service (mention fan-out's D1 block check, up to
+        // MaxMentionsPerMessage wb round-trips) could delay MessageReceived for every OTHER viewer of the
+        // channel. OnMessagePersisted consumes nothing the mention fan-out produces (no shared write, no
+        // read-after-write dependency), so swapping the order is behavior-preserving for channel delivery;
+        // it only changes which of the two a mention target's client observes first.
+        // ACCEPTED CEILING (Marco round 2026-08-05, decision I2): the reordering above fixes OTHER
+        // viewers only. The SENDER's own ack still awaits step 8's mention fan-out below, whose stage 2
+        // resolves every otherwise-eligible target's D1 block snapshot CONCURRENTLY — so a mention-bearing
+        // send pays AT MOST ONE wb HTTP timeout (~2s, WebsiteBackendRelationshipSource's client timeout)
+        // when wb is degraded, never one per mention. This is a chosen trade, not an unaddressed artifact
+        // of the reordering — consistent with the DM-send path's existing wb coupling in
+        // ApplyPrivateLaneGates.
         await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow, now);
+
+        // 8. Mention fan-out (C6 Task 5, D3/D4). Runs AFTER the Dm recipient is materialized (7.5) — so a
+        // first-message Dm mention of the counterpart finds their just-created membership row — and AFTER
+        // the C3 fan-out seam (7.75, fix round 1 F2b — see that step's comment for why). SKIPPED ENTIRELY
+        // (zero cost) when the message is shadow — a shadow sender's mentions must notify NOBODY, the
+        // shadow illusion (the C3 fan-out above already routes a shadow message to its author only) — or
+        // when there are no mention tags (the common case: `mentionTags` came from the step-5.25 gate,
+        // empty for a message with no `<@…>` markup, so the hot path pays nothing). MentionFanOut is the
+        // SOLE authority on who gets an inbox entry + notification: for each ELIGIBLE target (D3: not the
+        // sender). Dm/GroupDm/SemiPublic/System keep the membership PRIVACY WALL — a real
+        // channel_memberships row is required (a.k.a. the Dm/GroupDm excerpt wall). Public rooms are the
+        // one exception (2026-08-04 follow-up §4): a target with no membership row is still eligible there
+        // provided the tag resolves to a UserDirectoryRepository row, since a public room's excerpt is
+        // public content and the membership wall protects nothing there. For a JOINED target of any
+        // channel type, NotificationLevel != None remains the opt-out.
+        // NotifyAsync writes a mention-inbox entry (expiry via ExpiryCalculator.ForMentionInboxEntry — the
+        // C1-amendment-1 wiring, 30d and always <= the message TTL) and pushes a targeted MentionNotified.
+        // Per-target fault isolation lives inside NotifyAsync (mirrors FanOutEngine's idiom), so a dead
+        // target socket or a single failed insert never turns this already-persisted send's Ok ack into an
+        // error, nor blocks the other targets. It does NOT shield the SENDER's own ack from latency,
+        // though: this call is awaited before step 9 returns, so the ack pays NotifyAsync's stage 2 wb
+        // round-trip (block-check snapshots resolved CONCURRENTLY, so at most ONE ~2s wb HTTP timeout when
+        // wb is degraded — see the F2b comment above). That is an accepted trade (Marco round 2026-08-05),
+        // not an artifact; other viewers' delivery is unaffected because the fan-out engine above already ran.
+        if (!isShadow && mentionTags.Count > 0)
+        {
+            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
+        }
 
         // 9. Typed ack.
         return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq);
@@ -302,6 +328,18 @@ public partial class ChatHub
     /// <item>Fail-closed identity: an unregistered connection (never authenticated, or its session was
     /// displaced/torn down) → <see cref="ChatResultCode.PermissionDenied"/> — there is no identity to
     /// page history under.</item>
+    /// <item>Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3) — FIRST THING after identity
+    /// resolution, strictly before the malformed-arg guard below AND any DB work (fix round 1, finding
+    /// F5: this now structurally mirrors <see cref="GetConversations"/>'s "limiter absolutely first"
+    /// ordering exactly, rather than the narrower "before the first DB read" ordering this method used
+    /// before). ONE per-battleTag token bucket (<see cref="FanOut.ReadRateLimiter"/>) shared with
+    /// <see cref="GetConversations"/> — the task report records the launcher-e investigation establishing
+    /// that a <see cref="ChatResultCode.Throttled"/> GetMessages reject already degrades gracefully on
+    /// both old and current shipped clients (silent no-op, no retry storm, no error modal), which is why
+    /// this method is guarded at all. Not allowed → <see cref="ChatResultCode.Throttled"/> with the
+    /// retry-after. Limits are generous (burst 60, sustained 5/s — sized for connect fan-out, see
+    /// <see cref="ChatLimits.ReadBurst"/>'s doc) — server protection only, not UX pacing (Marco) — so no
+    /// legitimate client should ever observe this in normal operation.</item>
     /// <item>Malformed-arg guard, BEFORE any DB work: <paramref name="beforeSeq"/> and
     /// <paramref name="aroundSeq"/> are mutually exclusive paging modes. A caller supplying BOTH is a
     /// client programming error, not a user-facing rejection, so it throws <see cref="HubException"/>
@@ -311,7 +349,13 @@ public partial class ChatHub
     /// DB) and, if the caller is a member, pages directly — no channel load. A non-member falls to the
     /// cold path: a single <see cref="Channels.ChannelRepository.Load"/> distinguishes "no such
     /// channel" (<see cref="ChatResultCode.NotFound"/>) from "channel exists, caller just isn't in it"
-    /// (<see cref="ChatResultCode.NotMember"/>).</item>
+    /// (<see cref="ChatResultCode.NotMember"/>) — EXCEPT for a <see cref="ChannelType.Public"/> channel
+    /// (follow-up spec §4, the mention-inbox jump into an unjoined public room), where a non-member falls
+    /// through to the same paging step 5 uses for a member instead of being rejected. That exception
+    /// itself excludes a full-banned non-member (<see cref="ConnectionMapping.GetEffectiveMuteStatus"/>
+    /// == <see cref="MuteStatus.Full"/>, mirroring <see cref="JoinChannel"/>'s gate), which still gets
+    /// <see cref="ChatResultCode.NotMember"/> — the same result a non-member got before this fallthrough
+    /// existed, so the ban is not disclosed.</item>
     /// <item>Page: <paramref name="aroundSeq"/> set → <see cref="Messages.MessageRepository.LoadPageAround"/>;
     /// otherwise → <see cref="Messages.MessageRepository.LoadPageBefore"/> (a null
     /// <paramref name="beforeSeq"/> means the latest page). Both repo methods already apply
@@ -332,8 +376,21 @@ public partial class ChatHub
         {
             return new GetMessagesResult(ChatResultCode.PermissionDenied);
         }
+        var battleTag = session.Identity.BattleTag;
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        // 2. Malformed-arg guard, before any DB work: beforeSeq/aroundSeq are mutually exclusive
+        // 2. Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3) — FIRST THING, before the
+        // malformed-arg guard below and before any DB work (fix round 1, finding F5: structurally
+        // mirrors GetConversations' "limiter absolutely first" ordering exactly). Shares ONE
+        // per-battleTag bucket with GetConversations — see FanOut/ReadRateLimiter.cs and the task
+        // report's scope determination.
+        var readDecision = _readRateLimiter.TryAcquire(battleTag, now);
+        if (!readDecision.Allowed)
+        {
+            return new GetMessagesResult(ChatResultCode.Throttled, readDecision.RetryAfterSeconds);
+        }
+
+        // 3. Malformed-arg guard, before any DB work: beforeSeq/aroundSeq are mutually exclusive
         // paging modes. Supplying both is a client bug — a graceful HubException, not a typed result.
         if (beforeSeq.HasValue && aroundSeq.HasValue)
         {
@@ -341,24 +398,54 @@ public partial class ChatHub
         }
 
         var connectionId = Context.ConnectionId;
-        var battleTag = session.Identity.BattleTag;
 
-        // 3. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
-        // distinguishes NotFound from NotMember — mirrors FocusChannel's cold path exactly.
+        // 4. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
+        // distinguishes NotFound from NotMember — EXCEPT for PUBLIC channels (follow-up spec §4's
+        // mention-inbox jump): a public room is name-joinable by anyone, so its history is not
+        // privileged and a non-member may READ it. Pull-only and UserVisible-filtered exactly like a
+        // member's read; joining stays explicit, and FocusChannel/MarkRead keep their membership
+        // gates — this is a read-only context allowance, never implicit membership.
+        // A full-banned caller is excluded from that allowance: the codebase's full-ban room-scope rule
+        // already blocks a full-banned user from JOINING a Public room (ChatHub.Channels.cs's JoinChannel
+        // full-ban gate) and hides the catalog entirely (SessionStateAssembler's full-ban catalog-hiding
+        // rule) — letting the SAME user read Public history for free via this fallthrough would bypass
+        // that rule. Mirrors JoinChannel's gate style exactly (GetEffectiveMuteStatus == Full), but
+        // returns the SAME NotMember a non-member got before this task's fallthrough existed, so the ban
+        // is indistinguishable from ordinary non-membership — no new information disclosure. Shadow does
+        // NOT block reads (only Full does) — a shadow-muted caller keeps the illusion. This check is
+        // scoped strictly to the non-member Public fallthrough: a MEMBER's read (including a full-banned
+        // member's) is completely unaffected — this is a read-only gate, not a general mute check.
         if (!_onlineMemberRegistry.IsMember(connectionId, channelId))
         {
             var channel = await _channelRepository.Load(channelId);
-            return channel == null
-                ? new GetMessagesResult(ChatResultCode.NotFound)
-                : new GetMessagesResult(ChatResultCode.NotMember);
+            if (channel == null)
+            {
+                return new GetMessagesResult(ChatResultCode.NotFound);
+            }
+            if (channel.Type != ChannelType.Public)
+            {
+                return new GetMessagesResult(ChatResultCode.NotMember);
+            }
+            if (_connections.GetEffectiveMuteStatus(connectionId, now) == MuteStatus.Full)
+            {
+                return new GetMessagesResult(ChatResultCode.NotMember);
+            }
+            // Public, not full-banned: fall through to step 5's normal paging below.
         }
 
-        // 4. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no
+        // 5. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no
         // UserVisible filter, so deleted rows and EVERY author's shadow rows come back — and projects
         // with the REAL flags (ForModerator). This is the moderator's own in-channel focused view, so
         // their OWN shadow/deleted rows are flagged too, not illusion-forced (they are a moderator). The
-        // membership gate above is UNCHANGED — a non-member is already rejected regardless of permission;
-        // the privileged any-channel read is the REST endpoint (Task 7), not this focused-view read.
+        // membership gate above is UNCHANGED for non-Public channels — a non-member is still rejected
+        // regardless of permission there. On a Public channel, though, a NON-MEMBER moderator DOES reach
+        // this branch (step 4's fallthrough, full-ban excluded) and gets the SAME privileged ForModerator
+        // projection a member-moderator would — a deliberate, narrow consequence of §4's non-member read
+        // allowance for Public channels, chosen rather than accidental (pinned by
+        // GetMessages_NonMemberModerator_PublicChannel_ReturnsForModeratorProjection). It stays bounded to
+        // ONE Public channel per call, keyed by the caller-supplied channelId; the privileged read across
+        // EVERY channel regardless of type/membership is still the REST endpoint (Task 7) — this method
+        // does not replace or widen that.
         //
         // This branch does NOT re-apply the {Public, SemiPublic, System+Match} scope wall that
         // single-delete/purge/the REST endpoint enforce — it is safe only emergently, by construction
@@ -374,7 +461,7 @@ public partial class ChatHub
                 ? await _messageRepository.LoadPageAroundForModerator(channelId, aroundSeq.Value, limit)
                 : await _messageRepository.LoadPageBeforeForModerator(channelId, beforeSeq, limit);
             var moderatorMessages = moderatorPage.Select(m => MessageDto.ForModerator(channelId, m)).ToList();
-            return new GetMessagesResult(ChatResultCode.Ok, moderatorMessages);
+            return new GetMessagesResult(ChatResultCode.Ok, Messages: moderatorMessages);
         }
 
         // Non-moderator: the repo applies UserVisible filtering and clamps the limit — passed straight
@@ -384,7 +471,7 @@ public partial class ChatHub
             ? await _messageRepository.LoadPageAround(channelId, battleTag, aroundSeq.Value, limit)
             : await _messageRepository.LoadPageBefore(channelId, battleTag, beforeSeq, limit);
         var messages = page.Select(m => MessageDto.ForUserDelivery(channelId, m)).ToList();
-        return new GetMessagesResult(ChatResultCode.Ok, messages);
+        return new GetMessagesResult(ChatResultCode.Ok, Messages: messages);
     }
 
     /// <summary>

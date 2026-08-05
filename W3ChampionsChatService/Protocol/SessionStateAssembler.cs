@@ -11,6 +11,7 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Relationships;
 
 namespace W3ChampionsChatService.Protocol;
 
@@ -48,18 +49,36 @@ public class SessionStateAssembler(
     private static readonly IReadOnlySet<EPermission> ChatRelevantPermissions =
         new HashSet<EPermission> { EPermission.Moderation };
 
+    // Follow-up spec §3: position of each seeded room in the hardcoded catalog (DefaultChatRooms.Rooms,
+    // "W3C Lounge" first), keyed by normalized name. Computed once — ordering and seeding read the SAME
+    // constant, so the contract "catalog order == seed list order" cannot drift.
+    private static readonly IReadOnlyDictionary<string, int> CatalogOrder = DefaultChatRooms.Rooms
+        .Select((name, index) => (Name: ChannelNames.Normalize(name), Index: index))
+        .ToDictionary(x => x.Name, x => x.Index);
+
+    /// <summary>
+    /// Orders the public catalog deterministically: seed-list position first (follow-up spec §3 —
+    /// "catalog order == seed order"); any public channel whose name is NOT in the seed list (legacy
+    /// leftover) sorts after all seeded rooms, alphabetically by normalized name.
+    /// </summary>
+    internal static List<ChatChannel> OrderByCatalog(List<ChatChannel> channels) => channels
+        .OrderBy(c => CatalogOrder.TryGetValue(c.NormalizedName ?? string.Empty, out var index) ? index : int.MaxValue)
+        .ThenBy(c => c.NormalizedName, StringComparer.Ordinal)
+        .ToList();
+
     // D9: chatUser is now RESOLVED BY THE CALLER (ChatHub, hoisted) and handed straight through — this
     // method no longer calls IChatAuthenticationService.GetUserFromIdentity itself. Before this change
     // the connect path resolved the flair TWICE per connect (once here, once again for the connect-time
     // directory upsert); hoisting the ONE resolution into the hub and threading it through here (and
     // into the directory upsert) means a single wb round-trip serves both.
     public async Task<(SessionStateDto Dto, MuteStatus MuteStatus)> AssembleAndSeed(
-        W3CUserAuthentication identity, string connectionId, DateTime now, ChatUser chatUser)
+        W3CUserAuthentication identity, string connectionId, DateTime now, ChatUser chatUser,
+        RelationshipSnapshot relationshipSnapshot = null)
     {
         var memberships = await membershipRepository.LoadForUser(identity.BattleTag);
         var channelsById = (await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
             .ToDictionary(c => c.Id);
-        var publicCatalog = await channelRepository.LoadAllOfType(ChannelType.Public);
+        var publicCatalog = OrderByCatalog(await channelRepository.LoadAllOfType(ChannelType.Public));
         var mutedPlayer = await muteRepository.GetMutedPlayer(identity.BattleTag);
 
         var muteStatus = ResolveMuteStatus(mutedPlayer, now);
@@ -79,16 +98,26 @@ public class SessionStateAssembler(
             .Where(m => channelsById.ContainsKey(m.ChannelId))
             .ToList();
 
+        // Follow-up spec §6: bound the 1:1-DM slice of the snapshot. The SELECTED set feeds the DTO's
+        // Channels list, the pending tray, AND the OnlineMemberRegistry seed below — the registry set
+        // must equal the DTO set (the long-standing invariant), so both are bounded TOGETHER. Excluded
+        // shells are repaired by the two §6 companion paths: an incoming message re-announces via
+        // ChannelAdded (ChatHub.MaterializeDmRecipientAndNotify), and GetConversations pages + seeds.
+        var snapshotMemberships = SelectSnapshotMemberships(
+            channelBackedMemberships, channelsById, relationshipSnapshot, identity.BattleTag);
+
         // D7 (Amendment 3): unread is computed per channel as the COUNT of user-visible rows after the
-        // member's read cursor (see ToChannelDto) — an async, index-bounded Mongo count per membership.
-        // Sequential await (not Task.WhenAll): memberships are bounded (the public+semiPublic cap plus
-        // DMs/groups/match), and each count is a fast indexed range count, so the simpler sequential loop
-        // is preferred over parallelizing across the Mongo connection pool.
-        var channelDtos = new List<ChannelDto>(channelBackedMemberships.Count);
-        foreach (var membership in channelBackedMemberships)
-        {
-            channelDtos.Add(await ToChannelDto(channelsById[membership.ChannelId], membership, identity.BattleTag));
-        }
+        // member's read cursor (see ToChannelDto). 2026-08-05 PR36 feedback (Part 1): this used to be a
+        // deliberately sequential per-shell Mongo count — bounded but still ONE round-trip per kept
+        // membership (a 500-DM account with 40 older-unread shells meant 70 sequential queries per
+        // connect). Now a SINGLE CountUserVisibleAfterMany aggregation covers the whole kept set in one
+        // round-trip; ToChannelDto is a pure in-memory lookup against the returned per-channel dictionary.
+        var unreadCounts = await messageRepository.CountUserVisibleAfterMany(
+            snapshotMemberships.Select(m => new ChannelUnreadCursor(m.ChannelId, m.LastReadSeq)).ToList(),
+            identity.BattleTag);
+        var channelDtos = snapshotMemberships
+            .Select(m => ToChannelDto(channelsById[m.ChannelId], m, unreadCounts))
+            .ToList();
 
         // C6 (Task 6, D6): the live unread-mention count — CountUnread(ReadAt == null). identity.BattleTag
         // is passed straight through (JWT-cased); the repository normalizes it to the lowercased
@@ -98,15 +127,104 @@ public class SessionStateAssembler(
         var dto = new SessionStateDto(
             Channels: channelDtos,
             PublicCatalog: effectivePublicCatalog,
-            PendingDmRequests: BuildPendingDmTray(channelBackedMemberships, channelsById, identity.BattleTag, now),
+            PendingDmRequests: BuildPendingDmTray(snapshotMemberships, channelsById, identity.BattleTag, now),
             MentionUnreadCount: (int)mentionUnreadCount,
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
 
-        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, channelBackedMemberships, channelsById);
+        SeedOnlineMemberRegistry(connectionId, identity.BattleTag, snapshotMemberships, channelsById);
         SeedLegacyMuteCache(connectionId, chatUser, muteStatus, mutedPlayer);
 
         return (dto, muteStatus);
+    }
+
+    /// <summary>
+    /// Follow-up spec §6 connect-snapshot bounds. Keeps: (a) every non-1:1 channel
+    /// (Public/SemiPublic/System/GroupDm — untouched by bounding); (b) every PENDING 1:1 Dm (either
+    /// direction — the tray needs the recipient's, dual-listing and the initiator's outgoing view need
+    /// the rest); (c) every 1:1 Dm whose counterpart is in the caller's block list, regardless of
+    /// recency (the Blocked tray section) — degrades to no blocked-keeps when no snapshot was
+    /// resolvable at connect (self-heals next connect); (d) the DmSnapshotRecentConversations
+    /// most-recent remaining shells by LastMessageAt; (e) any OLDER remaining shell with a POSSIBLE
+    /// unread (raw channel.LastSeq &gt; membership.LastReadSeq — the cheap candidate test; the real D7
+    /// user-visible count is computed on the selected set afterwards, so a phantom candidate rides
+    /// with UnreadCount 0: bounded over-inclusion, never an understated badge) — CAPPED at
+    /// <see cref="ChatLimits.DmSnapshotMaxOlderUnread"/> (2026-08-05 PR36 feedback, Part 2): the ordered
+    /// (recency-desc) scan stops applying rule (e) once that many older-unread shells have been kept, so
+    /// the kept tail is always the MOST RECENT older-unread shells, never an unbounded scan of a
+    /// pathological account's entire history. Rules (a)-(d) and pending/blocked handling are unaffected
+    /// by the cap.
+    /// </summary>
+    internal static List<ChannelMembership> SelectSnapshotMemberships(
+        List<ChannelMembership> channelBackedMemberships,
+        IReadOnlyDictionary<string, ChatChannel> channelsById,
+        RelationshipSnapshot relationshipSnapshot,
+        string viewerBattleTag)
+    {
+        var kept = new List<ChannelMembership>();
+        var remainingDms = new List<(ChannelMembership Membership, ChatChannel Channel, DateTime SortTime)>();
+
+        foreach (var membership in channelBackedMemberships)
+        {
+            var channel = channelsById[membership.ChannelId];
+
+            if (channel.Type != ChannelType.Dm)
+            {
+                kept.Add(membership); // (a)
+                continue;
+            }
+            if (channel.RequestState == DmRequestState.Pending)
+            {
+                kept.Add(membership); // (b)
+                continue;
+            }
+            // Defensive — a malformed doc (null PairKey) can never come from FindOrCreateDm's
+            // DmPairKey.For + unique-index path, but if one ever exists it must degrade to "not
+            // blocked-kept", never NRE and brick connect for both members.
+            if (channel.PairKey != null
+                && relationshipSnapshot != null
+                && relationshipSnapshot.HasBlocked(DmPairKey.CounterpartOf(channel.PairKey, viewerBattleTag)))
+            {
+                kept.Add(membership); // (c)
+                continue;
+            }
+
+            remainingDms.Add((membership, channel, channel.LastMessageAt ?? membership.JoinedAt));
+        }
+
+        var ordered = remainingDms
+            .OrderByDescending(x => x.SortTime)
+            .ThenByDescending(x => x.Channel.Id, StringComparer.Ordinal)
+            .ToList();
+
+        // Part 2 (2026-08-05 PR36 feedback): olderUnreadKept counts rule-(e) keeps ONLY — once it hits
+        // the DmSnapshotMaxOlderUnread cap, rule (e) stops applying entirely. The list is already
+        // recency-ordered, so the cap naturally keeps the MOST RECENT older-unread shells and drops the
+        // rest of the (older still) tail.
+        var olderUnreadKept = 0;
+        for (var i = 0; i < ordered.Count; i++)
+        {
+            if (i < ChatLimits.DmSnapshotRecentConversations) // (d)
+            {
+                kept.Add(ordered[i].Membership);
+                continue;
+            }
+
+            if (olderUnreadKept >= ChatLimits.DmSnapshotMaxOlderUnread)
+            {
+                // Cap reached: every remaining index is past rule (d)'s threshold already, and rule (e)
+                // is now closed too, so nothing further in this recency-ordered list can ever be kept.
+                break;
+            }
+
+            if (ordered[i].Channel.LastSeq > ordered[i].Membership.LastReadSeq) // (e)
+            {
+                kept.Add(ordered[i].Membership);
+                olderUnreadKept++;
+            }
+        }
+
+        return kept;
     }
 
     private static MuteStatus ResolveMuteStatus(LoungeMute mute, DateTime now)
@@ -117,16 +235,19 @@ public class SessionStateAssembler(
         return mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
     }
 
-    private async Task<ChannelDto> ToChannelDto(ChatChannel channel, ChannelMembership membership, string viewerBattleTag)
+    private static ChannelDto ToChannelDto(
+        ChatChannel channel, ChannelMembership membership, IReadOnlyDictionary<string, long> unreadCounts)
     {
         // D7 (Amendment 3): unread is the COUNT of USER-VISIBLE rows after the member's read cursor —
         // NOT channel.LastSeq − membership.LastReadSeq. That raw-seq delta counts INVISIBLE rows
         // (foreign-author shadow rows + soft-deleted rows), so on reconnect it produced PHANTOM unread
         // for a shadow-banned author's message or a purged message — the exact defect pinned acceptance 2
-        // ("shadow messages generate NO unread for others") forbids. CountUserVisibleAfter applies the
-        // UserVisible predicate (Deleted == null AND (Shadow == false OR sender == viewer)) with
-        // Seq > LastReadSeq, index-bounded on ux_channelId_seq. The viewer's OWN shadow rows still count
-        // toward THEIR own unread (via the sender == viewer disjunct) — the symmetric illusion.
+        // ("shadow messages generate NO unread for others") forbids. CountUserVisibleAfterMany (2026-08-05
+        // PR36 feedback, Part 1 — one batched aggregation for the whole kept set, see AssembleAndSeed)
+        // applies the UserVisible predicate (Deleted == null AND (Shadow == false OR sender == viewer))
+        // with Seq > LastReadSeq per channel, index-bounded on ux_channelId_seq. The viewer's OWN shadow
+        // rows still count toward THEIR own unread (via the sender == viewer disjunct) — the symmetric
+        // illusion. A channel absent from unreadCounts (fully caught up, or zero matching rows) is 0.
         //
         // KNOWN LIVE-PATH RESIDUAL (documented here, deliberately NOT fixed — a launcher/L4 concern, out
         // of C4 scope, and self-healing): this fixes the CONNECT-time snapshot only. A shadow/soft-deleted
@@ -136,7 +257,7 @@ public class SessionStateAssembler(
         // the unread gap — until the next MarkRead (sets lastReadSeq to the max VISIBLE seq the member
         // rendered → the count returns to correct) or the next reconnect (re-baselines via this D7
         // snapshot). Bounded, rare (shadow bans are rare), and self-healing.
-        var unreadCount = await messageRepository.CountUserVisibleAfter(channel.Id, viewerBattleTag, membership.LastReadSeq);
+        var unreadCount = unreadCounts.GetValueOrDefault(channel.Id, 0L);
         return new ChannelDto(
             channel,
             MembershipDto.From(membership),
@@ -146,7 +267,7 @@ public class SessionStateAssembler(
 
     /// <summary>
     /// C5 T6 — the pending-Dm-request tray (spec §11 SessionState slot). Built ENTIRELY from the
-    /// already-loaded <paramref name="channelBackedMemberships"/> + <paramref name="channelsById"/> (zero
+    /// already-loaded <paramref name="snapshotMemberships"/> + <paramref name="channelsById"/> (zero
     /// extra Mongo reads): the connecting viewer sees one <see cref="PendingDmRequestDto"/> per channel that
     /// is a <see cref="ChannelType.Dm"/> whose <see cref="ChatChannel.RequestState"/> is
     /// <see cref="DmRequestState.Pending"/>, was initiated by SOMEONE ELSE (<see cref="ChatChannel.RequestInitiatedBy"/>
@@ -156,16 +277,18 @@ public class SessionStateAssembler(
     /// the tray for the 24h window). <see cref="PendingDmRequestDto.RequestedAt"/> is the channel's last
     /// message time, falling back to the membership's join time for a shell with no message yet. The same
     /// pending-recipient channels ALSO remain in the DTO's <see cref="SessionStateDto.Channels"/> (D4
-    /// dual-listing) — this tray is additive, never a filter on that list.
+    /// dual-listing) — this tray is additive, never a filter on that list. Follow-up spec §6: pending 1:1
+    /// Dms are always kept by <see cref="SelectSnapshotMemberships"/> regardless of recency, so bounding
+    /// never hides a pending request from this tray.
     /// </summary>
     private static IReadOnlyList<PendingDmRequestDto> BuildPendingDmTray(
-        List<ChannelMembership> channelBackedMemberships,
+        List<ChannelMembership> snapshotMemberships,
         IReadOnlyDictionary<string, ChatChannel> channelsById,
         string viewerBattleTag,
         DateTime now)
     {
         var tray = new List<PendingDmRequestDto>();
-        foreach (var membership in channelBackedMemberships)
+        foreach (var membership in snapshotMemberships)
         {
             var channel = channelsById[membership.ChannelId];
             if (channel.Type != ChannelType.Dm || channel.RequestState != DmRequestState.Pending)
@@ -222,17 +345,17 @@ public class SessionStateAssembler(
     private void SeedOnlineMemberRegistry(
         string connectionId,
         string battleTag,
-        List<ChannelMembership> channelBackedMemberships,
+        List<ChannelMembership> snapshotMemberships,
         IReadOnlyDictionary<string, ChatChannel> channelsById)
     {
-        // channelBackedMemberships is already filtered to rows whose channel exists (same filter the
-        // DTO's Channels list uses) — the registry's channel set must match the DTO's exactly, so
-        // nothing ever fans out to a channel with no row. Materialized (ToList) before crossing into
-        // the registry's locked Seed — Seed enumerates its argument while holding the lock
-        // (FanOut/OnlineMemberRegistry.cs carry-forward note). C5 (Task 5, D11): each entry's
+        // snapshotMemberships is the SAME §6-bounded selection (SelectSnapshotMemberships) that feeds the
+        // DTO's Channels list above — the registry's channel set must match the DTO's exactly, so nothing
+        // ever fans out to a channel excluded from this connection's snapshot. Materialized (ToList)
+        // before crossing into the registry's locked Seed — Seed enumerates its argument while holding
+        // the lock (FanOut/OnlineMemberRegistry.cs carry-forward note). C5 (Task 5, D11): each entry's
         // ChannelType comes from the already-loaded channelsById map (zero extra Mongo reads) so
         // ChatHub can later zero-DB-lookup whether a (channel, connection) is a Dm/GroupDm private lane.
-        var seed = channelBackedMemberships
+        var seed = snapshotMemberships
             .Select(m => (m.ChannelId, new MemberState(battleTag, m.NotificationLevel, m.LastReadSeq, channelsById[m.ChannelId].Type)))
             .ToList();
         onlineMemberRegistry.Seed(connectionId, seed);

@@ -13,6 +13,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -306,6 +307,45 @@ public class SessionStateAssemblerTests : IntegrationTestBase
 
         Assert.IsNotEmpty(dto.PublicCatalog);
         Assert.IsTrue(dto.PublicCatalog.Any(c => c.Id == pub.Id));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Follow-up spec §3 — the public catalog must come back in DefaultChatRooms seed order (deploy's
+    // hardcoded room list, "W3C Lounge" first), NOT Mongo's natural/insertion order. A legacy public
+    // channel not present in the seed list sorts after all seeded rooms, alphabetically.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task PublicCatalog_ComesBackInDefaultChatRoomsSeedOrder_RegardlessOfInsertionOrder()
+    {
+        // A subset of the hardcoded catalog, inserted in DELIBERATELY scrambled order.
+        await InsertChannel(ChannelType.Public, "FFA", 0);
+        await InsertChannel(ChannelType.Public, "1 vs 1", 0);
+        await InsertChannel(ChannelType.Public, "W3C Lounge", 0);
+        await InsertChannel(ChannelType.Public, "Legion TD", 0);
+
+        var identity = Identity("peter#123");
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        CollectionAssert.AreEqual(
+            new[] { "W3C Lounge", "1 vs 1", "FFA", "Legion TD" },
+            dto.PublicCatalog.Select(c => c.Name).ToList(),
+            "catalog order must equal DefaultChatRooms seed order (W3C Lounge first), not Mongo output order");
+    }
+
+    [Test]
+    public async Task PublicCatalog_UnknownPublicChannel_SortsAfterAllSeededRooms()
+    {
+        await InsertChannel(ChannelType.Public, "Zombie Legacy Room", 0);
+        await InsertChannel(ChannelType.Public, "W3C Lounge", 0);
+
+        var identity = Identity("peter#123");
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        CollectionAssert.AreEqual(
+            new[] { "W3C Lounge", "Zombie Legacy Room" },
+            dto.PublicCatalog.Select(c => c.Name).ToList(),
+            "a legacy public channel not in the seed list sorts last, alphabetically — still deterministic");
     }
 
     [Test]
@@ -641,5 +681,241 @@ public class SessionStateAssemblerTests : IntegrationTestBase
 
         Assert.AreEqual(1, dto.MentionUnreadCount,
             "CountUnread must normalize the identity's casing to match the lowercased stored key");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Follow-up spec §6 — bounded SessionState 1:1-DM snapshot. Keeps ALL non-DM channels, ALL pending
+    // 1:1 requests, ALL blocked 1:1 shells (any age), the DmSnapshotRecentConversations most-recent
+    // ACCEPTED-non-blocked 1:1 shells, and any OLDER such shell with a possible unread. The
+    // OnlineMemberRegistry seed is bounded TOGETHER with the DTO (registry == DTO invariant).
+    // ---------------------------------------------------------------------------------------------
+
+    // Inserts an ACCEPTED 1:1 shell between viewer and counterpart at the given recency, with the
+    // viewer's own membership row (LastReadSeq = lastReadSeq), returning the shell. LastSeq controls the
+    // raw-seq unread candidate test (LastSeq > LastReadSeq).
+    private async Task<ChatChannel> InsertAcceptedDmWithMembership(
+        string viewer, string counterpart, DateTime lastMessageAt, long lastSeq = 0, long lastReadSeq = 0)
+    {
+        var channel = new ChatChannel
+        {
+            Type = ChannelType.Dm,
+            PairKey = DmPairKey.For(viewer, counterpart),
+            RequestState = DmRequestState.Accepted,
+            RequestInitiatedBy = viewer,
+            LastSeq = lastSeq,
+            LastMessageAt = lastMessageAt,
+        };
+        await _channelRepository.Insert(channel);
+        await InsertMembership(channel.Id, viewer, lastReadSeq);
+        return channel;
+    }
+
+    [Test]
+    public async Task Snapshot_Keeps30MostRecentAcceptedDms_AndDropsOlderReadOnes()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+        var shells = new List<ChatChannel>();
+        for (var i = 0; i < 35; i++) // 35 accepted, fully-read shells, newest = i=34
+        {
+            shells.Add(await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i)));
+        }
+
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        var dmIds = dto.Channels.Where(c => c.Channel.Type == ChannelType.Dm).Select(c => c.Channel.Id).ToHashSet();
+        Assert.AreEqual(ChatLimits.DmSnapshotRecentConversations, dmIds.Count, "exactly the 30 most-recent ride");
+        for (var i = 5; i < 35; i++) Assert.IsTrue(dmIds.Contains(shells[i].Id), $"recent shell {i} must be kept");
+        for (var i = 0; i < 5; i++) Assert.IsFalse(dmIds.Contains(shells[i].Id), $"old read shell {i} must be dropped");
+
+        // The registry seed matches the DTO exactly — the excluded shells are NOT fan-out members.
+        Assert.IsTrue(_onlineMemberRegistry.IsMember("conn-1", shells[34].Id));
+        Assert.IsFalse(_onlineMemberRegistry.IsMember("conn-1", shells[0].Id),
+            "registry channel set must equal the DTO channel set (bounded together)");
+    }
+
+    [Test]
+    public async Task Snapshot_KeepsOlderDm_WhenItHasUnread()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+        // The unread old one, OLDEST of all — LastSeq 3 > LastReadSeq 1.
+        var unreadOld = await InsertAcceptedDmWithMembership(viewer, "olduna#1", t0.AddMinutes(-60), lastSeq: 3, lastReadSeq: 1);
+        for (var i = 0; i < ChatLimits.DmSnapshotRecentConversations; i++)
+        {
+            await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i));
+        }
+
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        Assert.IsTrue(dto.Channels.Any(c => c.Channel.Id == unreadOld.Id),
+            "an older 1:1 shell with unread > 0 must ride the snapshot (truthful Messages badge)");
+    }
+
+    // 2026-08-05 PR36 feedback (Part 1) — unread hydration across the kept set now runs through ONE
+    // batched CountUserVisibleAfterMany aggregation instead of one query per shell; this pins that the
+    // per-channel $or branches never cross-contaminate each other's counts.
+    [Test]
+    public async Task Snapshot_UnreadCounts_AreCorrectPerChannel_AcrossMultipleDmShells_ViaBatchedQuery()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        var shellA = await InsertAcceptedDmWithMembership(viewer, "alpha#1", t0.AddMinutes(1), lastSeq: 3, lastReadSeq: 0);
+        for (var seq = 1L; seq <= 3; seq++) await InsertMessage(shellA.Id, "alpha#1", seq);
+
+        var shellB = await InsertAcceptedDmWithMembership(viewer, "bravo#1", t0.AddMinutes(2), lastSeq: 5, lastReadSeq: 2);
+        for (var seq = 1L; seq <= 5; seq++) await InsertMessage(shellB.Id, "bravo#1", seq);
+
+        // No messages at all for shellC — a genuine zero that must not pick up A's or B's $or-branch match.
+        var shellC = await InsertAcceptedDmWithMembership(viewer, "charlie#1", t0.AddMinutes(3), lastSeq: 0, lastReadSeq: 0);
+
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        Assert.AreEqual(3L, dto.Channels.Single(c => c.Channel.Id == shellA.Id).UnreadCount, "shellA: 3 visible rows after cursor 0");
+        Assert.AreEqual(3L, dto.Channels.Single(c => c.Channel.Id == shellB.Id).UnreadCount, "shellB: rows 3,4,5 after cursor 2");
+        Assert.AreEqual(0L, dto.Channels.Single(c => c.Channel.Id == shellC.Id).UnreadCount, "shellC: no messages — must not leak another channel's count");
+    }
+
+    // 2026-08-05 PR36 feedback (Part 2) — the rule-(e) older-unread tail is capped at
+    // ChatLimits.DmSnapshotMaxOlderUnread so a pathological account can never force an unbounded scan.
+    [Test]
+    public async Task Snapshot_CapsOlderUnreadTail_AtDmSnapshotMaxOlderUnread_KeepingTheMostRecentOfTheTail()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        // 30 recent, fully-read shells — rule (d), entirely unaffected by the rule-(e) cap below.
+        for (var i = 0; i < ChatLimits.DmSnapshotRecentConversations; i++)
+        {
+            await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i));
+        }
+
+        // 101 OLDER shells, each with a possible unread (LastSeq 3 > LastReadSeq 1). older[0] is the
+        // MOST RECENT of this tail (closest to t0); older[100] is the OLDEST. Every one of them is older
+        // than every "recent" shell above (t0.AddDays(-1)-ish vs t0.AddMinutes(0..29)).
+        const int olderCount = ChatLimits.DmSnapshotMaxOlderUnread + 1;
+        var older = new List<ChatChannel>();
+        for (var k = 0; k < olderCount; k++)
+        {
+            older.Add(await InsertAcceptedDmWithMembership(
+                viewer, $"olduna{k}#1", t0.AddDays(-1).AddMinutes(-k), lastSeq: 3, lastReadSeq: 1));
+        }
+
+        // Realism extras: a pending request and a non-Dm channel — neither ever enters the ordered/capped
+        // rule-(d)/(e) scan, so both must ride the snapshot regardless of the cap above.
+        var pending = await InsertDmChannel("stranger#7", viewer, DmRequestState.Pending, t0.AddDays(-500));
+        await InsertMembership(pending.Id, viewer, 0);
+        var nonDm = await InsertChannel(ChannelType.SemiPublic, "MyClan", lastSeq: 0);
+        await InsertMembership(nonDm.Id, viewer, 0);
+
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        var keptIds = dto.Channels.Select(c => c.Channel.Id).ToHashSet();
+        var olderIdsKept = older.Select(c => c.Id).Where(keptIds.Contains).ToHashSet();
+
+        Assert.AreEqual(ChatLimits.DmSnapshotMaxOlderUnread, olderIdsKept.Count,
+            "exactly the cap's worth of older-unread shells ride the snapshot, not all 101");
+        for (var k = 0; k < ChatLimits.DmSnapshotMaxOlderUnread; k++)
+        {
+            Assert.IsTrue(olderIdsKept.Contains(older[k].Id),
+                $"older[{k}] is within the {ChatLimits.DmSnapshotMaxOlderUnread}-most-recent slice of the tail and must be kept");
+        }
+        Assert.IsFalse(olderIdsKept.Contains(older[olderCount - 1].Id),
+            "the 101st (oldest) older-unread shell must be excluded once the cap is reached");
+
+        Assert.IsTrue(keptIds.Contains(pending.Id), "pending requests are unaffected by the rule-(e) cap");
+        Assert.IsTrue(keptIds.Contains(nonDm.Id), "non-Dm channels are unaffected by the rule-(e) cap");
+    }
+
+    [Test]
+    public async Task Snapshot_KeepsPendingAndBlockedDms_RegardlessOfRecency_AndAllGroupDms()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+        // Ancient pending request TO the viewer; ancient fully-read shell with a BLOCKED counterpart.
+        var pending = await InsertDmChannel("stranger#7", viewer, DmRequestState.Pending, t0.AddDays(-20));
+        await InsertMembership(pending.Id, viewer, 0);
+        var blocked = await InsertAcceptedDmWithMembership(viewer, "creep#666", t0.AddDays(-300));
+        var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "the gang", LastMessageAt = t0.AddDays(-200) };
+        await _channelRepository.Insert(group);
+        await InsertMembership(group.Id, viewer, 0);
+        for (var i = 0; i < ChatLimits.DmSnapshotRecentConversations; i++)
+        {
+            await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i));
+        }
+
+        // Mixed casing vs. the lowercased pair-key half CounterpartOf returns ("creep#666") — exercises
+        // the OrdinalIgnoreCase contract RelationshipSnapshot.HasBlocked documents, instead of a
+        // same-casing comparison that would pass even with an ordinal-exact (bugged) comparer.
+        var snapshot = new RelationshipSnapshot(
+            viewer,
+            friends: new HashSet<string>(),
+            blocked: new HashSet<string> { "Creep#666" },
+            fetchedAt: t0.AddHours(1));
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity), snapshot);
+
+        var ids = dto.Channels.Select(c => c.Channel.Id).ToHashSet();
+        Assert.IsTrue(ids.Contains(pending.Id), "every pending request rides, regardless of recency");
+        Assert.IsTrue(ids.Contains(blocked.Id), "every blocked 1:1 shell rides, regardless of recency");
+        Assert.IsTrue(ids.Contains(group.Id), "every GroupDm shell rides — bounding is 1:1-only");
+        Assert.IsTrue(dto.PendingDmRequests.Any(r => r.ChannelId == pending.Id), "the tray still sees it");
+    }
+
+    [Test]
+    public async Task Snapshot_WithoutRelationshipSnapshot_DegradesBlockedKeeps_ButBoundsStillApply()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+        var blockedOld = await InsertAcceptedDmWithMembership(viewer, "creep#666", t0.AddDays(-300));
+        for (var i = 0; i < ChatLimits.DmSnapshotRecentConversations; i++)
+        {
+            await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i));
+        }
+
+        var identity = Identity(viewer);
+        // relationshipSnapshot omitted (null) — the wb-unavailable degradation.
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        Assert.IsFalse(dto.Channels.Any(c => c.Channel.Id == blockedOld.Id),
+            "no snapshot ⇒ no blocked-keeps (degradation; self-heals next connect) — the recency bound still applies");
+        Assert.AreEqual(ChatLimits.DmSnapshotRecentConversations,
+            dto.Channels.Count(c => c.Channel.Type == ChannelType.Dm));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Carried launcher-review item (2026-08-04 follow-up): MembershipRepository.LoadForUser had NO
+    // explicit sort, so SessionStateDto.Channels order was Mongo-arbitrary — the launcher relies on
+    // server order to preserve "join order" for name-joinable (SemiPublic) channels across a reconnect.
+    // Fixed at the repository (MembershipRepository.LoadForUser sorts JoinedAt ascending); pinned here
+    // end-to-end through the assembler so a regression in either layer fails this test.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Assemble_Channels_PreserveMembershipJoinedAtOrder_ForNonDmChannels_RegardlessOfInsertionOrder()
+    {
+        var identity = Identity("peter#123");
+        var chanA = await InsertChannel(ChannelType.SemiPublic, "ClanAlpha", lastSeq: 0);
+        var chanB = await InsertChannel(ChannelType.SemiPublic, "ClanBravo", lastSeq: 0);
+        var chanC = await InsertChannel(ChannelType.SemiPublic, "ClanCharlie", lastSeq: 0);
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        // Inserted (and JoinedAt-stamped) in SCRAMBLED order: C joined first, then A, then B — but the
+        // channel rows themselves were created A, B, C above (insertion order != join order).
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = chanC.Id, BattleTag = identity.BattleTag, JoinedAt = t0 });
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = chanA.Id, BattleTag = identity.BattleTag, JoinedAt = t0.AddMinutes(5) });
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = chanB.Id, BattleTag = identity.BattleTag, JoinedAt = t0.AddMinutes(10) });
+
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        CollectionAssert.AreEqual(
+            new[] { chanC.Id, chanA.Id, chanB.Id },
+            dto.Channels.Select(c => c.Channel.Id).ToList(),
+            "Channels must come back in membership JoinedAt-ascending order, not Mongo insertion/natural order");
     }
 }

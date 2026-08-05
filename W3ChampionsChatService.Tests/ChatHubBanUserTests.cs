@@ -79,6 +79,7 @@ public class ChatHubBanUserTests : IntegrationTestBase
             new FocusRegistry(),
             _onlineMemberRegistry,
             new MessageRateLimiter(),
+            new ReadRateLimiter(),
             TimeProvider.System,
             _channelRepository,
             _membershipRepository,
@@ -93,7 +94,8 @@ public class ChatHubBanUserTests : IntegrationTestBase
             chatAuthService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         _clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

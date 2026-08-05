@@ -70,6 +70,30 @@ public class OnlineMemberRegistry
         }
     }
 
+    /// <summary>
+    /// Adds/replaces a single (channelId, connectionId) membership entry like <see cref="Join"/>, but
+    /// never REGRESSES an already-tracked <see cref="MemberState.LastReadSeq"/>: if an entry already
+    /// exists, the stored value becomes <c>Math.Max(existing.LastReadSeq, state.LastReadSeq)</c> instead
+    /// of a plain overwrite; every other field of <paramref name="state"/> (NotificationLevel, etc.) is
+    /// applied as given. <see cref="Chats.ChatHub.GetConversations"/> (2026-08-04 follow-up spec §6)
+    /// calls this instead of <see cref="Join"/>: its per-shell loop awaits a Mongo unread count between
+    /// reading a membership's DB LastReadSeq and seeding it here, so a concurrent <c>MarkRead</c> that
+    /// lands in that window (which advances the registry via <see cref="AdvanceLastReadSeq"/>) must never
+    /// be regressed back down by the now-stale DB value. Absent entry ⇒ identical to <see cref="Join"/>
+    /// (first seed, nothing to preserve). Single locked pass — read-then-write is atomic, no separate
+    /// caller-side TryGetMember/Join TOCTOU window.
+    /// </summary>
+    public void JoinPreservingReadCursor(string channelId, string connectionId, MemberState state)
+    {
+        lock (_lock)
+        {
+            var merged = TryGetNoLock(channelId, connectionId, out var existing)
+                ? state with { LastReadSeq = Math.Max(existing.LastReadSeq, state.LastReadSeq) }
+                : state;
+            JoinNoLock(channelId, connectionId, merged);
+        }
+    }
+
     /// <summary>Removes a single (channelId, connectionId) membership entry. No-op if absent.</summary>
     public void Leave(string channelId, string connectionId)
     {

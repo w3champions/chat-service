@@ -19,6 +19,32 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     public Task<List<ChatChannel>> LoadByIds(IEnumerable<string> ids) =>
         Channels.Find(Builders<ChatChannel>.Filter.In(c => c.Id, ids.ToList())).ToListAsync();
 
+    /// <summary>
+    /// Server-side count of the subset of <paramref name="ids"/> that are name-joinable
+    /// (<see cref="ChannelType.Public"/> or <see cref="ChannelType.SemiPublic"/>) — 2026-08-05 PR36
+    /// feedback, Part 3: backs <see cref="Memberships.MembershipRepository.CountNameJoinableMembershipsForUser"/>'s
+    /// minimal-payload rewrite, so the join-cap gate counts via <c>CountDocumentsAsync</c> instead of
+    /// pulling every channel document behind a user's memberships just to count a type-filtered subset.
+    /// A channel id with no matching document (deleted channel behind an orphan membership) simply
+    /// doesn't count — same as <see cref="LoadByIds"/> silently omitting it.
+    /// </summary>
+    public Task<long> CountNameJoinableAmongIds(IReadOnlyCollection<string> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return Task.FromResult(0L);
+        }
+
+        var filterBuilder = Builders<ChatChannel>.Filter;
+        var filter = filterBuilder.And(
+            filterBuilder.In(c => c.Id, ids),
+            filterBuilder.Or(
+                filterBuilder.Eq(c => c.Type, ChannelType.Public),
+                filterBuilder.Eq(c => c.Type, ChannelType.SemiPublic)));
+
+        return Channels.CountDocumentsAsync(filter);
+    }
+
     public Task<ChatChannel> LoadByNormalizedName(ChannelType type, string normalizedName) =>
         Channels.Find(c => c.Type == type && c.NormalizedName == normalizedName).FirstOrDefaultAsync();
 

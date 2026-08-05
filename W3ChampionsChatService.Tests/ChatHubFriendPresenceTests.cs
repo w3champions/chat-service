@@ -40,15 +40,21 @@ namespace W3ChampionsChatService.Tests;
 /// friend-list control.
 /// </para>
 /// <para>
-/// DETERMINISM: the connect/disconnect friend push rides a FIRE-AND-FORGET background task (never
-/// awaited by <c>OnConnectedAsync</c>/<c>OnDisconnectedAsync</c>), so most tests set
-/// <see cref="FakeRelationshipSource.ReleaseGate"/> to <see cref="Task.CompletedTask"/> (already
-/// completed) — this removes the fetch's internal <c>await Task.Yield()</c> suspension entirely, so the
-/// WHOLE background chain (fetch → cache publish → friend push) runs SYNCHRONOUSLY to completion as part
-/// of the discarded call, observable immediately after <c>Connect</c>/<c>OnDisconnectedAsync</c> returns —
-/// no sleeps, no polling. The two "rides the existing task, no new await" tests deliberately do the
-/// OPPOSITE: they hold an UNRELEASED gate to force genuine asynchrony, proving the connect/disconnect path
-/// itself completes without waiting on it.
+/// DETERMINISM: the disconnect-side friend push rides a FIRE-AND-FORGET background task (never awaited
+/// by <c>OnDisconnectedAsync</c>), so most tests set <see cref="FakeRelationshipSource.ReleaseGate"/> to
+/// <see cref="Task.CompletedTask"/> (already completed) — this removes the fetch's internal
+/// <c>await Task.Yield()</c> suspension entirely, so the WHOLE background chain (fetch → cache publish →
+/// friend push) runs SYNCHRONOUSLY to completion as part of the discarded call, observable immediately
+/// after <c>Connect</c>/<c>OnDisconnectedAsync</c> returns — no sleeps, no polling. The disconnect-side
+/// "rides the existing task, no new await" test deliberately does the OPPOSITE: it holds an UNRELEASED
+/// gate to force genuine asynchrony, proving the disconnect path itself completes without waiting on it.
+/// Follow-up spec §6 changed the CONNECT side of this story: the connect path now AWAITS one
+/// relationship fetch before assembly (the bounded 1:1-DM snapshot needs the block list) and hands that
+/// resolved snapshot straight to the fire-and-forget dispatch, which never touches the relationship SOURCE
+/// itself anymore — so a gate on the source can no longer distinguish "connect awaits it" from "the push
+/// rides behind it". <c>Connect_AwaitsRelationshipFetch_ThenFriendPushRidesTheWarmCache</c> instead gates
+/// the push's own SignalR send (<see cref="HubPushCaptureHarness.GateSend"/>) to pin the still-true
+/// contract: connect never awaits the friend push.
 /// </para>
 /// </summary>
 public class ChatHubFriendPresenceTests : IntegrationTestBase
@@ -64,6 +70,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
@@ -98,6 +105,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _presenceInterestRegistry = new PresenceInterestRegistry();
         _userDirectory = new UserDirectoryRepository(MongoClient);
@@ -158,6 +166,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -172,7 +181,8 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             _presenceInterestRegistry,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);
@@ -388,30 +398,42 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
     // ================================================================================================
 
     [Test]
-    public async Task Connect_PushRidesPrefetchTask_NoAwaitOnConnectPath()
+    public async Task Connect_AwaitsRelationshipFetch_ThenFriendPushRidesTheWarmCache()
     {
+        // Follow-up spec §6: the connect path now AWAITS one relationship fetch BEFORE assembly (the
+        // bounded 1:1-DM snapshot needs the block list) and hands that ALREADY-RESOLVED snapshot straight
+        // to the fire-and-forget PushFriendPresenceFromSnapshot dispatch, which no longer calls
+        // GetSnapshotAsync itself at all (see ChatHub.PushFriendPresenceFromSnapshot — a duplicate wb
+        // round-trip there would double load on wb during exactly the outage where it's least welcome).
+        // That means the relationship SOURCE can no longer be gated to distinguish "connect awaits it" from
+        // "the push rides behind it" — there is nothing left downstream of connect's own await that
+        // touches the source. So this test gates the PUSH'S OWN SignalR send instead (HubPushCaptureHarness
+        // .GateSend) and proves connect completes and returns while that send is STILL in flight — i.e.
+        // genuinely fire-and-forget, not merely fast enough to look that way.
         const string SubjectTag = "Subject#1";
         const string FriendTag = "Friend#2";
         _friends[SubjectTag] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { FriendTag };
 
         await Connect("conn-friend", FriendTag);
 
-        var gate = new TaskCompletionSource();
-        _relationshipSource.ReleaseGate = gate.Task; // hold the connecting user's fetch open indefinitely
+        var pushGate = new TaskCompletionSource();
+        _harness.GateSend("conn-friend", pushGate.Task); // hold the friend-presence send open indefinitely
 
         var subjectHub = BuildHub("conn-subject", _ticketStore.Mint(Identity(SubjectTag), DateTime.UtcNow));
-        await subjectHub.OnConnectedAsync(); // must return WITHOUT waiting on the held gate
+        var connectTask = subjectHub.OnConnectedAsync();
 
-        Assert.That(_sessionRegistry.TryGetByConnectionId("conn-subject", out _), Is.True,
-            "connect completed even though the relationship fetch (and the friend push riding it) is still stuck on the gate");
+        var completed = await Task.WhenAny(connectTask, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.That(completed, Is.SameAs(connectTask),
+            "connect must complete WITHOUT waiting on the friend-presence send — it is fire-and-forget");
+        Assert.That(_sessionRegistry.TryGetByConnectionId("conn-subject", out _), Is.True);
         Assert.That(FriendPresenceFor("conn-friend"), Is.Empty,
-            "the friend push has NOT happened yet — it is still blocked behind the fetch gate");
+            "the friend-presence send is still gated open at the moment connect returns — proof it was " +
+            "never awaited by the connect path, not just delivered quickly");
 
-        gate.SetResult(); // release the background fetch — the friend push rides it to completion
-
+        pushGate.SetResult(); // release — the in-flight send completes
+        await Task.Delay(TimeSpan.FromMilliseconds(50)); // let the fire-and-forget chain finish recording
         Assert.That(FriendPresenceFor("conn-friend").Count(p => p.BattleTag == SubjectTag && p.Online), Is.EqualTo(1),
-            "once the fire-and-forget prefetch completes, the SAME background task delivers the friend push — " +
-            "proving it rides the existing task rather than adding a new await on the connect path");
+            "the friend push lands once its gated send is released");
     }
 
     // ================================================================================================

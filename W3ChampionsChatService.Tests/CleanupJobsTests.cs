@@ -68,4 +68,25 @@ public class CleanupJobsTests : IntegrationTestBase
         Assert.AreEqual(1, (await membershipRepo.LoadForUser("NoDirectoryEntry#3")).Count,
             "users unknown to the directory are conservatively kept");
     }
+
+    // Fix round 1 (F6): PruneIdleMemberships also sweeps the SAME idle users' NotificationPreference rows
+    // — that carrier has no TTL of its own (PR36 D2 — deliberately durable across an ordinary leave/
+    // rejoin), so this job is its ONLY GC path and must not let it outlive every other trace of the user.
+    [Test]
+    public async Task IdleMembershipPruning_AlsoRemovesNotificationPreferencesOfIdleUsers()
+    {
+        var directoryRepo = new UserDirectoryRepository(MongoClient);
+        var prefsRepo = new NotificationPreferenceRepository(MongoClient);
+        var now = DateTime.UtcNow;
+
+        await directoryRepo.Upsert(new UserDirectoryEntry { BattleTag = "Idle#1", NormalizedName = "idle#1", LastSeenAt = now.AddDays(-400) });
+        await directoryRepo.Upsert(new UserDirectoryEntry { BattleTag = "Active#2", NormalizedName = "active#2", LastSeenAt = now.AddDays(-5) });
+        await prefsRepo.Upsert("Idle#1", "chan1", NotificationLevel.None, now.AddDays(-500));
+        await prefsRepo.Upsert("Active#2", "chan1", NotificationLevel.None, now.AddDays(-500));
+
+        await new CleanupJobs(MongoClient).PruneIdleMemberships(now);
+
+        Assert.IsNull(await prefsRepo.Load("Idle#1", "chan1"), "the idle user's persisted preference must be pruned too");
+        Assert.IsNotNull(await prefsRepo.Load("Active#2", "chan1"), "the active user's preference must survive");
+    }
 }

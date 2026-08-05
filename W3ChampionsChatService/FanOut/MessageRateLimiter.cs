@@ -21,9 +21,9 @@ namespace W3ChampionsChatService.FanOut;
 /// blocking window. Null when <paramref name="Allowed"/> is true.
 /// </param>
 /// <param name="JustAutoThrottled">
-/// True on the SINGLE decision that transitions the connection into hard auto-throttle — the hub's
+/// True on the SINGLE decision that transitions the user into hard auto-throttle — the hub's
 /// cue to push exactly one <see cref="Protocol.ChatEvents.ThrottleNotice"/>. False on every other
-/// decision, including the denials that follow while the connection stays hard-throttled.
+/// decision, including the denials that follow while the user stays hard-throttled.
 /// </param>
 public readonly record struct RateLimitDecision(
     bool Allowed,
@@ -31,20 +31,20 @@ public readonly record struct RateLimitDecision(
     bool JustAutoThrottled);
 
 /// <summary>
-/// Pure, deterministic send-path abuse control (spec §13, C3 Task 6). Two classic token buckets per
-/// connection:
+/// Pure, deterministic send-path abuse control (spec §13, C3 Task 6; re-keyed to battleTag by the
+/// 2026-08-04 follow-up spec §1). Two classic token buckets per user (battleTag-keyed):
 /// <list type="bullet">
-/// <item>a per-(connection, channel) bucket — capacity <see cref="ChatLimits.PerChannelBurst"/>,
+/// <item>a per-(user, channel) bucket — capacity <see cref="ChatLimits.PerChannelBurst"/>,
 /// refilling one token every <see cref="ChatLimits.PerChannelSustainedInterval"/> (5 immediate, then
 /// 1/sec); and</item>
-/// <item>a per-connection GLOBAL bucket — capacity <see cref="ChatLimits.GlobalMessageBurst"/> over
+/// <item>a per-user GLOBAL bucket — capacity <see cref="ChatLimits.GlobalMessageBurst"/> over
 /// <see cref="ChatLimits.GlobalMessageWindow"/>, enforced across every channel (10 per 5s, i.e. one
 /// token every 0.5s).</item>
 /// </list>
 /// A send consumes one token from BOTH buckets; if either is short, the send is throttled and no
-/// token is consumed. Repeated throttles escalate to a hard per-connection auto-throttle
-/// (<see cref="ChatLimits.AutoThrottleViolationThreshold"/> violations within
-/// <see cref="ChatLimits.AutoThrottleWindow"/> → denied for <see cref="ChatLimits.AutoThrottleDuration"/>).
+/// token is consumed. Repeated throttles escalate to an escalating hard auto-throttle
+/// (<see cref="ChatLimits.AutoThrottleTierDurations"/> 10s→30s→60s cap, ladder decaying after
+/// <see cref="ChatLimits.AutoThrottleTierDecay"/>).
 /// <para>
 /// NO timers and NO wall-clock reads: every decision takes an explicit <c>now</c> and refills are
 /// derived from elapsed time, so it is fully testable without sleeping. The limiter is PURE domain
@@ -61,31 +61,44 @@ public readonly record struct RateLimitDecision(
 /// </summary>
 public class MessageRateLimiter
 {
-    private readonly Dictionary<string, ConnectionState> _byConnection =
-        new Dictionary<string, ConnectionState>();
+    private readonly Dictionary<string, UserState> _byUser =
+        new Dictionary<string, UserState>();
 
     private readonly object _lock = new object();
 
+    // Last time PruneQuiescentNoLock actually swept the map (see that method for why this is
+    // time-gated rather than run on every call).
+    private DateTime _lastPruneAt;
+
     /// <summary>
-    /// Attempts to consume one send for <paramref name="connectionId"/> on <paramref name="channelId"/>
-    /// as of <paramref name="now"/>. Allowed only when the per-channel AND global buckets each hold a
-    /// token; otherwise throttled with a positive retry-after. A throttle counts as a violation, and
-    /// crossing the escalation threshold hard-throttles the whole connection for the auto-throttle
-    /// duration (all channels), logging one moderation line and signalling the notice once.
+    /// Attempts to consume one send for <paramref name="battleTag"/> on <paramref name="channelId"/> as
+    /// of <paramref name="now"/>. State is keyed by LOWERCASED battleTag (follow-up spec §1) so
+    /// violations, the tier ladder, and an active hard throttle survive reconnect/relaunch; entries
+    /// quiescent past <see cref="ChatLimits.AutoThrottleTierDecay"/> are pruned opportunistically
+    /// (mirrors <see cref="Sessions.MintRateLimiter"/>'s stale-window purge), bounding the map to
+    /// roughly the users active within one decay window rather than letting it grow across the
+    /// service's entire historical user population. Allowed only when the per-channel AND global buckets
+    /// each hold a token; otherwise throttled with a positive retry-after. A throttle counts as a
+    /// violation, and crossing the escalation threshold hard-throttles the whole user (every channel,
+    /// across every connection) for the auto-throttle duration, logging one moderation line and
+    /// signalling the notice once.
     /// <para><paramref name="now"/> MUST be a trusted server-side clock read (never derived from
     /// client-supplied data); the buckets fail safe on a backwards clock but assume a monotone one.</para>
     /// </summary>
-    public RateLimitDecision TryAcquire(string connectionId, string channelId, DateTime now)
+    public RateLimitDecision TryAcquire(string battleTag, string channelId, DateTime now)
     {
+        var key = battleTag.ToLowerInvariant();
         RateLimitDecision decision;
-        var logAutoThrottle = false;
+        TimeSpan? applied = null;
 
         lock (_lock)
         {
-            var state = GetOrCreateState(connectionId, now);
+            PruneQuiescentNoLock(now);
+            var state = GetOrCreateState(key, now);
+            state.LastTouchedAt = now;
 
             // 1) Hard auto-throttle gate: while serving the penalty, deny EVERYTHING for this
-            //    connection (no bucket work, no new violation) with the remaining time as retry-after.
+            //    user (no bucket work, no new violation) with the remaining time as retry-after.
             if (state.HardThrottleUntil is DateTime until)
             {
                 if (now < until)
@@ -117,25 +130,23 @@ public class MessageRateLimiter
             var retryAfter = Math.Max(channelBucket.SecondsUntilToken(), state.GlobalBucket.SecondsUntilToken());
 
             // 4) Record the violation in the rolling window; escalate if it crosses the threshold.
-            if (RecordViolationAndCheckEscalation(state, now))
-            {
-                logAutoThrottle = true;
-                decision = new RateLimitDecision(false, ChatLimits.AutoThrottleDuration.TotalSeconds, true);
-            }
-            else
-            {
-                decision = new RateLimitDecision(false, retryAfter, false);
-            }
+            applied = RecordViolationAndCheckEscalation(state, now);
+            decision = applied is TimeSpan escalated
+                ? new RateLimitDecision(false, escalated.TotalSeconds, true)
+                : new RateLimitDecision(false, retryAfter, false);
         }
 
         // Emit the moderation line outside the lock. The transition it reports happened exactly once
-        // (inside the lock), so this fires exactly once per hard-throttle episode.
-        if (logAutoThrottle)
+        // (inside the lock), so this fires exactly once per hard-throttle episode. Logs the caller's
+        // ORIGINAL-CASING battleTag (not the internal lowercased `key`) so this line matches the hub's
+        // own companion Log.Warning (ChatHub.Messaging.cs) — a case-sensitive log search for a
+        // particular battleTag must find both lines.
+        if (applied is TimeSpan d)
         {
             Log.Warning(
-                "Auto-throttling chat connection {ConnectionId} for {DurationSeconds}s after {ViolationThreshold} rate-limit violations within {WindowSeconds}s",
-                connectionId,
-                ChatLimits.AutoThrottleDuration.TotalSeconds,
+                "Auto-throttling chat user {BattleTag} for {DurationSeconds}s after {ViolationThreshold} rate-limit violations within {WindowSeconds}s",
+                battleTag,
+                d.TotalSeconds,
                 ChatLimits.AutoThrottleViolationThreshold,
                 ChatLimits.AutoThrottleWindow.TotalSeconds);
         }
@@ -143,40 +154,72 @@ public class MessageRateLimiter
         return decision;
     }
 
-    /// <summary>Drops all bucket, violation, and hard-throttle state for a connection (on disconnect).</summary>
-    public void RemoveConnection(string connectionId)
+    // Test seam (assembly has InternalsVisibleTo): number of live per-channel buckets a user is
+    // tracking. Used to assert the idle-bucket purge keeps that map bounded. Mirrors MintRateLimiter.Count.
+    internal int TrackedChannelCount(string battleTag)
     {
         lock (_lock)
         {
-            _byConnection.Remove(connectionId);
+            var key = battleTag.ToLowerInvariant();
+            return _byUser.TryGetValue(key, out var state) ? state.ChannelBucketCount : 0;
         }
     }
 
-    // Test seam (assembly has InternalsVisibleTo): number of live per-channel buckets a connection is
-    // tracking. Used to assert the idle-bucket purge keeps that map bounded. Mirrors MintRateLimiter.Count.
-    internal int TrackedChannelCount(string connectionId)
+    // Test seam (InternalsVisibleTo): number of tracked user entries — asserts the quiescent prune
+    // keeps the map bounded. Mirrors MintRateLimiter.Count.
+    internal int TrackedUserCount
     {
-        lock (_lock)
-        {
-            return _byConnection.TryGetValue(connectionId, out var state) ? state.ChannelBucketCount : 0;
-        }
+        get { lock (_lock) { return _byUser.Count; } }
     }
 
     // Caller must already hold _lock.
-    private ConnectionState GetOrCreateState(string connectionId, DateTime now)
+    private UserState GetOrCreateState(string key, DateTime now)
     {
-        if (!_byConnection.TryGetValue(connectionId, out var state))
+        if (!_byUser.TryGetValue(key, out var state))
         {
-            state = new ConnectionState(now);
-            _byConnection[connectionId] = state;
+            state = new UserState(now);
+            _byUser[key] = state;
         }
         return state;
     }
 
+    // Caller must already hold _lock. Sweeps at most once per AutoThrottleTierDecay: an entry idle
+    // that long is fully reset in every dimension (buckets guaranteed full — refill horizons are
+    // seconds; violations aged out — the window is 60s; penalty served — tiers cap at 60s; ladder
+    // decayed — the horizon IS the decay), so removal is behavior-preserving by construction. Gated by
+    // time (not run on every call) because TryAcquire is the hot path — a full-map sweep on every send
+    // would be O(n) per message.
+    private void PruneQuiescentNoLock(DateTime now)
+    {
+        if (now - _lastPruneAt < ChatLimits.AutoThrottleTierDecay)
+        {
+            return;
+        }
+        _lastPruneAt = now;
+
+        List<string> quiescent = null;
+        foreach (var kvp in _byUser)
+        {
+            if (now - kvp.Value.LastTouchedAt >= ChatLimits.AutoThrottleTierDecay)
+            {
+                (quiescent ??= new List<string>()).Add(kvp.Key);
+            }
+        }
+        if (quiescent == null)
+        {
+            return;
+        }
+        foreach (var key in quiescent)
+        {
+            _byUser.Remove(key);
+        }
+    }
+
     // Caller must already hold _lock. Records a throttle violation at now, ages out ones older than
-    // the rolling window, and returns true if the connection just crossed into hard auto-throttle
-    // (setting the deadline and clearing the counter) — false for a plain non-escalating throttle.
-    private static bool RecordViolationAndCheckEscalation(ConnectionState state, DateTime now)
+    // the rolling window, and — when the count crosses the threshold — escalates into the NEXT tier
+    // (10s → 30s → 60s cap; the ladder resets first if AutoThrottleTierDecay has passed since the
+    // last trigger), returning the applied duration. Null for a plain non-escalating throttle.
+    private static TimeSpan? RecordViolationAndCheckEscalation(UserState state, DateTime now)
     {
         state.Violations.Add(now);
         var cutoff = now - ChatLimits.AutoThrottleWindow;
@@ -184,29 +227,50 @@ public class MessageRateLimiter
 
         if (state.Violations.Count < ChatLimits.AutoThrottleViolationThreshold)
         {
-            return false;
+            return null;
         }
 
-        state.HardThrottleUntil = now + ChatLimits.AutoThrottleDuration;
+        // Tier decay: 10 clean minutes since the last trigger reset the ladder to the first tier.
+        if (state.LastAutoThrottleAt is DateTime last && now - last >= ChatLimits.AutoThrottleTierDecay)
+        {
+            state.TierLevel = 0;
+        }
+
+        var tierIndex = Math.Min(state.TierLevel, ChatLimits.AutoThrottleTierDurations.Count - 1);
+        var duration = ChatLimits.AutoThrottleTierDurations[tierIndex];
+        state.HardThrottleUntil = now + duration;
+        state.LastAutoThrottleAt = now;
+        // Saturate rather than grow unbounded: TierLevel only ever needs to reach the tier count
+        // (any further increments would be equivalent to the cap anyway, via the Math.Min above).
+        state.TierLevel = Math.Min(state.TierLevel + 1, ChatLimits.AutoThrottleTierDurations.Count);
         state.Violations.Clear();
-        return true;
+        return duration;
     }
 
     /// <summary>
-    /// All rate-limiting state for a single connection: its per-channel buckets, the shared global
-    /// bucket, the rolling violation timestamps, and an optional hard-throttle deadline. Mutated only
-    /// under the limiter's lock, so plain mutable fields (mirrors the in-place-under-lock idiom of the
-    /// sibling registries).
+    /// All rate-limiting state for a single user (battleTag-keyed — follow-up spec §1): its per-channel
+    /// buckets, the shared global bucket, the rolling violation timestamps, an optional hard-throttle
+    /// deadline, and when it was last touched (<see cref="LastTouchedAt"/>, the quiescent-prune anchor
+    /// consulted by <see cref="MessageRateLimiter.PruneQuiescentNoLock"/>). Mutated only under the
+    /// limiter's lock, so plain mutable fields (mirrors the in-place-under-lock idiom of the sibling
+    /// registries).
     /// </summary>
-    private sealed class ConnectionState
+    private sealed class UserState
     {
         internal readonly TokenBucket GlobalBucket;
         internal readonly Dictionary<string, TokenBucket> ChannelBuckets =
             new Dictionary<string, TokenBucket>();
         internal readonly List<DateTime> Violations = new List<DateTime>();
         internal DateTime? HardThrottleUntil;
+        // Follow-up spec §1: completed auto-throttle triggers (the ladder position) + when the last one
+        // fired (anchors the 10-minute decay). Mutated only under the limiter's lock, like every sibling.
+        internal int TierLevel;
+        internal DateTime? LastAutoThrottleAt;
+        // Follow-up spec §1: refreshed on every TryAcquire — the anchor PruneQuiescentNoLock uses to
+        // decide whether this user's whole state (buckets, violations, tier, throttle) is quiescent.
+        internal DateTime LastTouchedAt;
 
-        internal ConnectionState(DateTime now)
+        internal UserState(DateTime now)
         {
             // Global bucket: 10 tokens over 5s ⇒ one token every 0.5s. Derived from the constants so
             // the "per 5s" window and the burst stay in one place.
@@ -214,6 +278,7 @@ public class MessageRateLimiter
                 ChatLimits.GlobalMessageBurst,
                 ChatLimits.GlobalMessageWindow / ChatLimits.GlobalMessageBurst,
                 now);
+            LastTouchedAt = now;
         }
 
         internal int ChannelBucketCount => ChannelBuckets.Count;
@@ -231,10 +296,11 @@ public class MessageRateLimiter
         /// <summary>
         /// Drops every per-channel bucket (except <paramref name="keepChannelId"/>) that has sat idle
         /// long enough to be guaranteed full: such a bucket is indistinguishable from a fresh one, so
-        /// removing it is behaviour-preserving and bounds the map to the channels a connection is
-        /// actively sending in. Mirrors <see cref="Sessions.MintRateLimiter"/>'s opportunistic
-        /// stale-window purge — without it a connection blasting a new channel per message (which
-        /// never trips the per-channel bucket) could grow this map without limit until disconnect.
+        /// removing it is behaviour-preserving and bounds the map to the channels a user is actively
+        /// sending in. Mirrors <see cref="Sessions.MintRateLimiter"/>'s opportunistic stale-window
+        /// purge — without it a user blasting a new channel per message (which never trips the
+        /// per-channel bucket) could grow this map without limit for as long as this user's state
+        /// lives, which — now that state survives reconnect — can span far longer than one connection.
         /// </summary>
         internal void PruneIdleChannelBuckets(string keepChannelId, DateTime now)
         {

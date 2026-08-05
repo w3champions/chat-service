@@ -98,6 +98,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             new MessageRateLimiter(),
+            new ReadRateLimiter(),
             TimeProvider.System,
             _channelRepository,
             new MembershipRepository(MongoClient, _channelRepository),
@@ -112,7 +113,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             chatAuthenticationService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

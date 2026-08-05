@@ -30,6 +30,10 @@ public partial class ChatHub(
     FocusRegistry focusRegistry,
     OnlineMemberRegistry onlineMemberRegistry,
     MessageRateLimiter messageRateLimiter,
+    // 2026-08-05 PR36 feedback, Part 3: the read-shaped hub methods' abuse guard (GetConversations,
+    // GetMessages), added right beside MessageRateLimiter — same singleton-sharing rationale, deliberately
+    // NOT the same instance/type (see FanOut/ReadRateLimiter.cs class doc for why they stay separate).
+    ReadRateLimiter readRateLimiter,
     TimeProvider timeProvider,
     // C3 (Task 9): resolves a channel for the FocusChannel NotFound-vs-NotMember split (cold path,
     // only reached when the caller is NOT already a member per OnlineMemberRegistry).
@@ -79,7 +83,8 @@ public partial class ChatHub(
     // FreshFromWb to decide whether it may replace the cached Profile) — one wb round-trip serves both,
     // where the pre-D9 path resolved it twice.
     IChatAuthenticationService chatAuthenticationService,
-    // C6 (Task 5, D3/D4): the mention fan-out. SendMessage's step 7.75 (ChatHub.Messaging.cs) hands it
+    // C6 (Task 5, D3/D4): the mention fan-out. SendMessage's step 8 (ChatHub.Messaging.cs; fix round 1
+    // F2b moved it after the step-7.75 channel fan-out seam) hands it
     // the validated mention-tag list for each persisted, NON-shadow message; per eligible member it
     // writes a mention-inbox entry + a targeted MentionNotified push. Singleton (Startup).
     MentionFanOut mentionFanOut,
@@ -92,7 +97,11 @@ public partial class ChatHub(
     // MarkMentionsRead / MentionUnreadCount), injected now in the SAME single ctor growth. There is NO
     // T5 consumer — the write path uses MentionFanOut's OWN MentionInboxRepository, not this one; Task 6
     // is the first reader.
-    MentionInboxRepository mentionInboxRepository) : Hub
+    MentionInboxRepository mentionInboxRepository,
+    // PR36 follow-up (D2): the notification-preference carrier — JoinChannel's rejoin-seed path reads it,
+    // SetNotificationLevel's write path (Public/SemiPublic only) writes it. Both live in
+    // ChatHub.Channels.cs; this is the ONLY ctor change this task makes to ChatHub itself.
+    NotificationPreferenceRepository notificationPreferenceRepository) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
@@ -106,6 +115,9 @@ public partial class ChatHub(
     private readonly FocusRegistry _focusRegistry = focusRegistry;
     private readonly OnlineMemberRegistry _onlineMemberRegistry = onlineMemberRegistry;
     private readonly MessageRateLimiter _messageRateLimiter = messageRateLimiter;
+    // 2026-08-05 PR36 feedback, Part 3: the read-shaped hub methods' abuse guard — see the ctor param
+    // doc comment above.
+    private readonly ReadRateLimiter _readRateLimiter = readRateLimiter;
     private readonly TimeProvider _timeProvider = timeProvider;
     private readonly ChannelRepository _channelRepository = channelRepository;
     // C3 (Task 10): membership self-service deps — see the constructor param doc comment above.
@@ -126,7 +138,7 @@ public partial class ChatHub(
     private readonly DmInitiationTracker _dmInitiationTracker = dmInitiationTracker;
     // D9 (C6 Task 3): the hoisted chat-flair resolution — see the constructor param doc comment above.
     private readonly IChatAuthenticationService _chatAuthenticationService = chatAuthenticationService;
-    // C6 (Task 5): the mention fan-out seam consumed by SendMessage's step 7.75 (ChatHub.Messaging.cs).
+    // C6 (Task 5): the mention fan-out seam consumed by SendMessage's step 8 (ChatHub.Messaging.cs).
     private readonly MentionFanOut _mentionFanOut = mentionFanOut;
     // C6 (Task 5, D15): injected now, first CONSUMED in Task 9 (presence-interest derivation). No T5
     // reader — see the ctor param doc comment for why it lands in this single ctor growth.
@@ -134,6 +146,8 @@ public partial class ChatHub(
     // C6 (Task 6): the mention-inbox read/ack store — first CONSUMED in Task 6. No T5 reader — see the
     // ctor param doc comment (the write path uses MentionFanOut's own repository, not this field).
     private readonly MentionInboxRepository _mentionInboxRepository = mentionInboxRepository;
+    // PR36 follow-up (D2): the notification-preference carrier — see the ctor param doc comment above.
+    private readonly NotificationPreferenceRepository _notificationPreferenceRepository = notificationPreferenceRepository;
 
     public override async Task OnConnectedAsync()
     {
@@ -184,17 +198,30 @@ public partial class ChatHub(
         var resolution = await _chatAuthenticationService.GetUserFromIdentity(identity);
         await UpsertDirectory(identity, resolution, now);
 
-        // C5 (Task 1, spec §6): warm the relationship cache with the CONNECTING user's OWN snapshot so the
-        // block/friend gates (later C5 tasks) start hot. Fire-and-forget and NON-FATAL: it is deliberately
-        // NOT awaited (a slow/unreachable wb read must never add latency to, or fail, a connect), and any
-        // failure is swallowed + logged exactly like UpsertDirectory. The task touches only the singleton
-        // provider + the captured battleTag/connectionId, so it is safe even after this hub instance is
-        // disposed; a cache miss simply self-heals on the first gated action.
-        // C6 (Task 11, D13): this SAME task now ALSO carries the friend-presence push — see
-        // PrefetchRelationshipSnapshot's doc comment below. Riding the existing fire-and-forget work
-        // (rather than adding a second background task) is what keeps this connect-latency-free: wentOnline
-        // and Context.ConnectionId are captured NOW, synchronously, before the task is dispatched.
-        _ = PrefetchRelationshipSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId);
+        // Follow-up spec §6: resolve the caller's OWN relationship snapshot BEFORE assembly — the
+        // bounded DM snapshot needs the block list to keep every blocked 1:1 shell regardless of
+        // recency. Bounded wait: the wb source self-caps at its 2s HttpClient timeout and the provider
+        // serves fresh-cache/stale tiers first (the connect path already awaits one wb round-trip —
+        // GetUserFromIdentity above). Fail-soft: with nothing cached at all, assemble WITHOUT a
+        // snapshot — blocked shells outside the recency window may be omitted from THIS SessionState
+        // only (self-heals on the next connect); a wb outage must never fail the connect. Catches
+        // Exception (not just RelationshipUnavailableException), matching every sibling wb call on this
+        // hub's connect/disconnect paths (UpsertDirectory, PushFriendPresenceFromSnapshot,
+        // PushFriendPresenceOnDisconnect) — no provider exception type can ever hard-fail connect.
+        RelationshipSnapshot relationshipSnapshot = null;
+        try
+        {
+            relationshipSnapshot = await _relationshipProvider.GetSnapshotAsync(identity.BattleTag);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "No relationship snapshot for {BattleTag} at connect — blocked 1:1 shells may be omitted from this SessionState", identity.BattleTag);
+        }
+
+        // C5 (Task 1) / C6 (Task 11, D13): unchanged role (friend-presence push), now dispatched AFTER
+        // the awaited fetch above and handed that ALREADY-RESOLVED snapshot directly — a wb outage means
+        // one round-trip per connect, not two. Still fire-and-forget and non-fatal.
+        _ = PushFriendPresenceFromSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId, relationshipSnapshot);
 
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
         // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
@@ -203,7 +230,7 @@ public partial class ChatHub(
         // the connect fails — an authenticated connection with no snapshot is useless — so we do NOT
         // swallow it (unlike the non-fatal directory upsert above). The already-resolved chatUser is
         // threaded straight through — AssembleAndSeed no longer re-resolves it itself (D9).
-        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now, resolution.User);
+        var (dto, muteStatus) = await _assembler.AssembleAndSeed(identity, Context.ConnectionId, now, resolution.User, relationshipSnapshot);
         await Clients.Caller.SendAsync(ChatEvents.SessionState, dto);
 
         if (muteStatus == MuteStatus.Full)
@@ -258,38 +285,33 @@ public partial class ChatHub(
         }
     }
 
-    // C5 (Task 1): best-effort connect-time relationship prefetch. Deliberately fire-and-forget — the
+    // C5 (Task 1): best-effort connect-time friend-presence push. Deliberately fire-and-forget — the
     // caller does NOT await it, so a slow/unreachable wb read never adds latency to (or fails) a connect.
-    // Any failure is swallowed and logged exactly like UpsertDirectoryStub; on success the provider caches
-    // the snapshot. References only the singleton provider + the captured battleTag/connectionId, so it is
-    // safe to run to completion after this hub instance is disposed.
-    // C6 (Task 11, D13): EXTENDED (not a second background task) so that, after a successful fetch, on a
+    // C6 (Task 11, D13): EXTENDED (not a second background task) so that, after a resolved snapshot, on a
     // GENUINE offline→online transition (<paramref name="wentOnline"/> — the SAME flag OnConnectedAsync
     // already computed; never re-derived here) it also pushes FriendPresenceChanged{subject, online:true}
     // to every one of the connecting user's OWN friends (from THIS snapshot) that currently has a live
-    // connection. Fault-isolated per-recipient via FanOutEngine.PushFriendPresenceChanged. On ANY failure
-    // fetching the snapshot — including RelationshipUnavailableException (no cache at all) — the friend
-    // push is silently skipped (logged, never thrown): honest degradation, matching the same
-    // stale-usable/fail-closed policy Task 10's GetPresenceDetails already established for this provider.
-    // A displaced reconnect (wentOnline == false) pushes nothing, mirroring Task 9's PresenceChanged
-    // transition guard exactly.
-    private async Task PrefetchRelationshipSnapshot(string battleTag, bool wentOnline, string connectionId)
+    // connection. Fault-isolated per-recipient via FanOutEngine.PushFriendPresenceChanged. A displaced
+    // reconnect (wentOnline == false) pushes nothing, mirroring Task 9's PresenceChanged transition guard
+    // exactly.
+    // Follow-up spec §6: this method no longer fetches its own snapshot at all (hence no longer named
+    // "Prefetch...") — <paramref name="resolvedSnapshot"/> is the connect path's ALREADY-RESOLVED
+    // pre-assembly snapshot (null when that fetch itself failed — the exception was already logged
+    // there). Calling GetSnapshotAsync again here would be a duplicate wb round-trip stacked on the one
+    // the connect path already awaited — precisely doubling load on wb during exactly the outage where
+    // it's least welcome. When null, the friend push is silently skipped: honest degradation (a later
+    // connect self-heals once wb recovers), never a retry. This makes the source call count for a whole
+    // connect exactly one, by construction — never conditional on timing or on whether the pre-assembly
+    // fetch succeeded.
+    private async Task PushFriendPresenceFromSnapshot(
+        string battleTag, bool wentOnline, string connectionId, RelationshipSnapshot resolvedSnapshot)
     {
-        RelationshipSnapshot snapshot;
-        try
+        if (resolvedSnapshot == null || !wentOnline)
         {
-            snapshot = await _relationshipProvider.GetSnapshotAsync(battleTag);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "Failed to prefetch relationship snapshot for {BattleTag}", battleTag);
             return;
         }
 
-        if (wentOnline)
-        {
-            await _fanOutEngine.PushFriendPresenceChanged(battleTag, online: true, snapshot.Friends, connectionId);
-        }
+        await _fanOutEngine.PushFriendPresenceChanged(battleTag, online: true, resolvedSnapshot.Friends, connectionId);
     }
 
     public override async Task OnDisconnectedAsync(Exception exception)
@@ -363,7 +385,12 @@ public partial class ChatHub(
 
             _focusRegistry.RemoveConnection(Context.ConnectionId);
             _onlineMemberRegistry.RemoveConnection(Context.ConnectionId);
-            _messageRateLimiter.RemoveConnection(Context.ConnectionId);
+            // MessageRateLimiter is deliberately NOT torn down here (2026-08-04 follow-up spec §1): its
+            // state is battleTag-keyed and must SURVIVE disconnect/reconnect (violations, the tier
+            // ladder, and an active hard throttle all persist across a relaunch) — the limiter prunes
+            // its own quiescent entries opportunistically instead. See
+            // MessageRateLimiterTests.HardThrottle_SurvivesReconnect_BecauseStateIsKeyedByBattleTag and
+            // ChatHubSendMessageTests.Send_AutoThrottle_SurvivesReconnect_SameBattleTag.
             // Task 13: also drop the connection's ChannelActivity coalescing state (routed through the
             // fan-out engine, which owns the coalescer) so the singleton can't leak past the socket.
             _fanOutEngine.OnConnectionClosed(Context.ConnectionId);
@@ -421,7 +448,7 @@ public partial class ChatHub(
         }
     }
 
-    // C6 (Task 11, D13): the disconnect-side counterpart to PrefetchRelationshipSnapshot's connect-time
+    // C6 (Task 11, D13): the disconnect-side counterpart to PushFriendPresenceFromSnapshot's connect-time
     // push. A NEW fire-and-forget task (the disconnect path had no pre-existing background task to ride).
     // Fetches the disconnecting user's OWN relationship snapshot and, on success, pushes
     // FriendPresenceChanged{subject, online:false} to every currently-online friend via

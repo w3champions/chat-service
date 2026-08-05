@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace W3ChampionsChatService.Domain;
 
@@ -86,13 +87,27 @@ public static class ChatLimits
     /// not messages, so a larger ceiling is appropriate.</summary>
     public const int ModerationChannelsPageSize = 500;
 
-    /// <summary>Auto-throttle escalation (C3 plan decision, Task 1). Spec §13 pins only "60s
-    /// automatic throttle"; the trigger threshold/window are NOT spec-pinned — cheap to change
-    /// (C3-plan.md Open question 3). Repeated rate-limit violations within the window escalate to
-    /// a hard per-connection throttle for the duration below, plus a moderation log entry.</summary>
+    /// <summary>Auto-throttle escalation trigger (C3 plan decision, Task 1; trigger UNCHANGED by the
+    /// 2026-08-04 follow-up spec §1): repeated rate-limit violations within the window escalate to a
+    /// hard per-user throttle, plus a moderation log entry.</summary>
     public const int AutoThrottleViolationThreshold = 5;
     public static readonly TimeSpan AutoThrottleWindow = TimeSpan.FromSeconds(60);
-    public static readonly TimeSpan AutoThrottleDuration = TimeSpan.FromSeconds(60);
+
+    /// <summary>Escalating auto-throttle tiers (2026-08-04 follow-up spec §1, hard-coded — no env
+    /// plumbing per the parent-spec rule): first trigger 10s, second 30s, third and beyond 60s (cap
+    /// — the last element applies to every later trigger). The ladder resets to the first tier after
+    /// <see cref="AutoThrottleTierDecay"/> without a new trigger.
+    /// <para>INVARIANT (pinned by <c>ChatLimitsTests</c>): every element here must stay strictly less
+    /// than <see cref="AutoThrottleTierDecay"/> — <see cref="FanOut.MessageRateLimiter"/>'s quiescent
+    /// prune treats the decay horizon as "definitely idle, safe to evict", which only holds if no tier's
+    /// hard-throttle penalty can still be running that long after a user's last touch.</para></summary>
+    public static readonly IReadOnlyList<TimeSpan> AutoThrottleTierDurations =
+    [
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromSeconds(60),
+    ];
+    public static readonly TimeSpan AutoThrottleTierDecay = TimeSpan.FromMinutes(10);
 
     /// <summary>Relationship (friends/blocked) snapshot cache TTL (C5 plan decision, T1 — not spec §13).
     /// The provider serves a cached snapshot without refetching for this long; spec §6 notes the
@@ -147,6 +162,25 @@ public static class ChatLimits
     /// not spec §13; requests above this are rejected with <c>HubException</c>).</summary>
     public const int PresenceQueryMaxBattleTags = 200;
 
+    /// <summary>2026-08-04 follow-up spec §6: connect-snapshot bound for ACCEPTED, non-blocked 1:1 Dm
+    /// shells — the N most-recent ride SessionState; older ones ride only with unread > 0 (or via
+    /// GetConversations pagination). Pending requests, blocked shells, GroupDm, and every non-DM
+    /// channel are never bounded by this.</summary>
+    public const int DmSnapshotRecentConversations = 30;
+
+    /// <summary>2026-08-05 PR36 feedback, Part 2 — safety ceiling against pathological accounts on the
+    /// connect-snapshot rule-(e) tail (<see cref="Protocol.SessionStateAssembler.SelectSnapshotMemberships"/>):
+    /// the ordered (recency-desc) scan keeps at most this many OLDER-with-unread 1:1 Dm shells beyond the
+    /// <see cref="DmSnapshotRecentConversations"/> most-recent window; anything beyond is still reachable
+    /// via <c>GetConversations</c> pagination. The Messages badge may undercount ONLY for an account with
+    /// MORE than this many unread older 1:1 conversations at once — an accepted trade-off (Marco,
+    /// 2026-08-05), never a silently-wrong count for anyone under the cap.</summary>
+    public const int DmSnapshotMaxOlderUnread = 100;
+
+    /// <summary>GetConversations page-size cap (2026-08-04 follow-up spec §6 — not spec §13; requested
+    /// limits above this are clamped down, never rejected — the <see cref="MessagePageSize"/> precedent).</summary>
+    public const int ConversationsPageSize = 50;
+
     /// <summary>C7 HMAC freshness window (brief Design decision 2): a request is rejected when
     /// |now − timestamp| exceeds this window. Pinned default — M1/W2 build against this exact 300s
     /// value as a cross-repo contract, so a test asserts it verbatim.</summary>
@@ -174,4 +208,40 @@ public static class ChatLimits
     /// endpoint bodies pin this field; plan decision, not itself brief-pinned text; hard-coded, adjust
     /// here only.</summary>
     public const int InternalChannelNameMaxLength = 100;
+
+    /// <summary>2026-08-05 PR36 feedback, Part 3: <see cref="FanOut.ReadRateLimiter"/>'s single per-
+    /// battleTag token bucket, shared across every READ-shaped hub method it guards
+    /// (<c>GetConversations</c>, <c>GetMessages</c>). This is a server-protection abuse guard, not UX
+    /// pacing (Marco).
+    /// <para>
+    /// Fix round 1, finding F1: sized for the CONNECT FAN-OUT shape, not a per-user-action handful of
+    /// loads — the original 30 undercounted this. The connect snapshot carries no messages, so a client
+    /// re-seeds every focused surface on EVERY (re)connect: up to launcher <c>MAX_FOCUSED_CHANNELS</c>
+    /// (10) expanded DM windows in parallel, plus the active channel, plus the match embed (~12
+    /// surfaces). SignalR's default first reconnect retry is 0ms, so a single socket flap pays that
+    /// reseed TWICE within ~2s (~24 calls) before tray scroll or channel clicks push it any higher. 60 ≈
+    /// 2× that worst-case flap with slack — still far above anything a single legitimate user action
+    /// needs, so no well-behaved client should ever observe a denial in normal operation.
+    /// </para>
+    /// Not spec §13 text; hard-coded, adjust here only.</summary>
+    public const int ReadBurst = 60;
+
+    /// <summary>Sustained refill rate (tokens/second) for the <see cref="ReadBurst"/> bucket above.</summary>
+    public const int ReadRefillPerSecond = 5;
+
+    /// <summary>Quiescent-prune horizon for <see cref="FanOut.ReadRateLimiter"/> — mirrors
+    /// <see cref="FanOut.MessageRateLimiter"/>'s <see cref="AutoThrottleTierDecay"/>-anchored sweep, but this
+    /// limiter has no violation ladder to protect, only the single bucket's fullness. INVARIANT (pinned
+    /// by <c>ChatLimitsTests</c>): this MUST stay strictly greater than the bucket's own full-refill time
+    /// (<see cref="ReadBurst"/> / <see cref="ReadRefillPerSecond"/> seconds = 12s) — otherwise an entry
+    /// pruned at this horizon and silently recreated fresh (full capacity) would NOT be behaviour-
+    /// preserving relative to a live bucket that had only refilled for that same idle duration.</summary>
+    public static readonly TimeSpan ReadRateLimiterPruneHorizon = TimeSpan.FromMinutes(2);
+
+    /// <summary>Fix round 1 (finding F3): minimum interval between two <see cref="FanOut.ReadRateLimiter"/>
+    /// "read rate limit denied" log lines for the SAME user. Denials were previously invisible to
+    /// operators — combined with the silent client failure mode on a denial, "no legitimate client ever
+    /// hits it" was unfalsifiable in production. A sustained-denial user must not spam the log on every
+    /// call, so this bounds it to once per window. Not spec §13 text; hard-coded, adjust here only.</summary>
+    public static readonly TimeSpan ReadRateLimiterDenyLogInterval = TimeSpan.FromMinutes(1);
 }
