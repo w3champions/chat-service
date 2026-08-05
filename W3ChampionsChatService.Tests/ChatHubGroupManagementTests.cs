@@ -152,7 +152,8 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);

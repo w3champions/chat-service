@@ -130,7 +130,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         // so a hub's own SendMessage(<@tag>) fans out a genuine mention-inbox entry AND a capturable,
         // targeted MentionNotified through the one shared capture (unlike the CreateIgnored factory the
         // moderation/DM suites use, whose push goes to a throwaway sink and whose session registry is empty).
-        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
+        _mentionFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
         // The REAL C6 T7 cleaner, so a moderator DeleteMessage/PurgeMessagesFromUser physically removes the
         // referenced mention-inbox rows in this suite too (acceptance 3).
         _mentionCleaner = new MentionInboxCleaner(MongoClient);
@@ -214,7 +214,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             _authService.Object,
             _mentionFanOut,                     // REAL fan-out through the shared harness
             _presenceInterestRegistry,          // SHARED — same instance the engine reads
-            _mentionInboxRepository);           // SHARED — the read/ack store
+            _mentionInboxRepository,
+            new NotificationPreferenceRepository(MongoClient));           // SHARED — the read/ack store
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -996,7 +997,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         var hubContextMock = new Mock<IHubContext<ChatHub>>();
         hubContextMock.Setup(h => h.Clients).Returns(clientsMock.Object);
 
-        var fanOut = new MentionFanOut(hubContextMock.Object, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
+        var fanOut = new MentionFanOut(hubContextMock.Object, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
         var message = new ChannelMessage
         {
             ChannelId = channel.Id,

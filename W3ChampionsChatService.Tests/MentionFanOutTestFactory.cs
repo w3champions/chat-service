@@ -32,6 +32,8 @@ internal static class MentionFanOutTestFactory
             new SessionRegistry(),
             new MembershipRepository(mongoClient, channelRepository),
             new MentionInboxRepository(mongoClient),
-            new UserDirectoryRepository(mongoClient));
+            new UserDirectoryRepository(mongoClient),
+            RelationshipProviderTestFactory.CreateIgnored(),
+            new NotificationPreferenceRepository(mongoClient));
     }
 }

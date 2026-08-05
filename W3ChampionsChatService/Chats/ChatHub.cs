@@ -92,7 +92,11 @@ public partial class ChatHub(
     // MarkMentionsRead / MentionUnreadCount), injected now in the SAME single ctor growth. There is NO
     // T5 consumer — the write path uses MentionFanOut's OWN MentionInboxRepository, not this one; Task 6
     // is the first reader.
-    MentionInboxRepository mentionInboxRepository) : Hub
+    MentionInboxRepository mentionInboxRepository,
+    // PR36 follow-up (D2): the notification-preference carrier — JoinChannel's rejoin-seed path reads it,
+    // SetNotificationLevel's write path (Public/SemiPublic only) writes it. Both live in
+    // ChatHub.Channels.cs; this is the ONLY ctor change this task makes to ChatHub itself.
+    NotificationPreferenceRepository notificationPreferenceRepository) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
@@ -134,6 +138,8 @@ public partial class ChatHub(
     // C6 (Task 6): the mention-inbox read/ack store — first CONSUMED in Task 6. No T5 reader — see the
     // ctor param doc comment (the write path uses MentionFanOut's own repository, not this field).
     private readonly MentionInboxRepository _mentionInboxRepository = mentionInboxRepository;
+    // PR36 follow-up (D2): the notification-preference carrier — see the ctor param doc comment above.
+    private readonly NotificationPreferenceRepository _notificationPreferenceRepository = notificationPreferenceRepository;
 
     public override async Task OnConnectedAsync()
     {

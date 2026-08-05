@@ -68,7 +68,7 @@ public class MentionFanOutTests : IntegrationTestBase
         _sessionRegistry = new SessionRegistry();
         _harness = new HubPushCaptureHarness();
         _userDirectory = new UserDirectoryRepository(MongoClient);
-        _fanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory);
+        _fanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, _mentionInboxRepository, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -489,7 +489,7 @@ public class MentionFanOutTests : IntegrationTestBase
 
         // A repository whose Insert throws for wolf ONLY — simulating a single-target Mongo write failure.
         var throwingInbox = new ThrowingInsertRepository(MongoClient, "wolf#456");
-        var faultyFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, throwingInbox, _userDirectory);
+        var faultyFanOut = new MentionFanOut(_harness.HubContext, _sessionRegistry, _membershipRepository, throwingInbox, _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
 
         Assert.DoesNotThrowAsync(() => faultyFanOut.NotifyAsync(Channel(), Message(), new[] { "wolf#456", "frank#789" }, Now),
             "a single target's failed insert must be fault-isolated — NotifyAsync must not throw");

@@ -105,7 +105,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _sessionRegistry,
             _membershipRepository,
             _mentionInboxRepository,
-            _userDirectory);
+            _userDirectory, RelationshipProviderTestFactory.CreateIgnored(), new NotificationPreferenceRepository(MongoClient));
         _assembler = new SessionStateAssembler(
             _membershipRepository,
             _channelRepository,
@@ -142,7 +142,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _authService.Object,
             _mentionFanOut,
             new PresenceInterestRegistry(),
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();

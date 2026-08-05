@@ -93,7 +93,8 @@ public class MuteReconciliationTests : IntegrationTestBase
             chatAuthService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();

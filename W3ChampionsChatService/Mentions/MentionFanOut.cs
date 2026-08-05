@@ -9,6 +9,7 @@ using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -46,6 +47,13 @@ namespace W3ChampionsChatService.Mentions;
 /// recipient who DECLINED (C5 D3's 24h soft window) must never be pinged by the initiator's mentions, even
 /// though a decline never lowers the membership level. Mirrors
 /// <see cref="SessionStateAssembler.BuildPendingDmTray"/>, which hides the same window from the tray.</item>
+/// <item>PR36 follow-up (D1): the TARGET has NOT blocked the sender — checked LAST, only for a target
+/// that is otherwise eligible per rules (a)-(e) above, via <see cref="IRelationshipProvider.GetSnapshotAsync"/>
+/// on the TARGET's own tag (direction matters: sender-side blocking is deliberately out of scope here —
+/// see the per-target body for the one-line note). FAIL OPEN on a provider failure: a relationship-service
+/// outage DELIVERS the mention rather than suppressing it (never breaks the send pipeline or blanket-mutes
+/// every mention). This is a notification-only gate — the message and its mention chip still render
+/// normally in the channel for everyone; only the inbox entry + push are withheld from a blocking target.</item>
 /// </list>
 /// FOCUS IS IRRELEVANT here (unlike C3 activity routing, which suppresses focused members): a focused
 /// target STILL gets the entry + event. The server never guesses whether a mention was "seen"; a
@@ -74,7 +82,14 @@ public class MentionFanOut(
     ISessionRegistry sessionRegistry,
     MembershipRepository membershipRepository,
     MentionInboxRepository mentionInboxRepository,
-    UserDirectoryRepository userDirectory)
+    UserDirectoryRepository userDirectory,
+    // PR36 follow-up (D1): the block-enforcement source — GetSnapshotAsync is read for the TARGET's own
+    // tag, ONLY for a target that already cleared the cheap eligibility checks below (bounded to at most
+    // ChatLimits.MaxMentionsPerMessage calls per message).
+    IRelationshipProvider relationshipProvider,
+    // PR36 follow-up (D2): the persisted-preference carrier — consulted in the non-member Public branch
+    // so a target who opted out (None) before leaving a room stays silenced even without a membership row.
+    NotificationPreferenceRepository notificationPreferenceRepository)
 {
     // The SignalR delivery channel — pushes the targeted MentionNotified to a specific connection.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
@@ -92,9 +107,15 @@ public class MentionFanOut(
     // existence check OpenDm uses. Read ONLY on the public/no-membership branch below.
     private readonly UserDirectoryRepository _userDirectory = userDirectory;
 
+    // PR36 follow-up (D1): the block-enforcement source — see the ctor param doc comment above.
+    private readonly IRelationshipProvider _relationshipProvider = relationshipProvider;
+
+    // PR36 follow-up (D2): the persisted-preference carrier — see the ctor param doc comment above.
+    private readonly NotificationPreferenceRepository _notificationPreferenceRepository = notificationPreferenceRepository;
+
     /// <summary>
     /// Fans a persisted, non-shadow message's validated mention tags out to the eligible members —
-    /// see the class doc for the five eligibility rules and the fault-isolation contract.
+    /// see the class doc for the six eligibility rules and the fault-isolation contract.
     /// <paramref name="now"/> is the trusted server clock the hub already read once for this send
     /// (threaded in, not re-read, so the entry's CreatedAt/ExpiresAt decide against the same instant).
     /// </summary>
@@ -157,11 +178,23 @@ public class MentionFanOut(
                     // Follow-up spec §4: PUBLIC rooms are mentionable WITHOUT membership — a public
                     // room's excerpt is public content, so rule (c)'s wall protects nothing here. The
                     // target must still be a RESOLVABLE user (a user_directory row; Load lowercases the
-                    // display-cased tag), so garbage tags keep producing nothing. v1 accepted gap: a
-                    // non-member cannot silence mentions from a room they haven't joined — join +
-                    // NotificationLevel.None (the membership branch above) is the opt-out.
+                    // display-cased tag), so garbage tags keep producing nothing. PR36 follow-up (D2)
+                    // narrowed the v1 gap here — see the pref check right below.
                     var directoryEntry = await _userDirectory.Load(tag);
                     if (directoryEntry == null)
+                    {
+                        continue;
+                    }
+
+                    // PR36 follow-up (D2): the narrowed v1 gap — a non-member can silence mentions from
+                    // a room they haven't (re)joined by: join → NotificationLevel.None → leave. Leave
+                    // hard-deletes the membership row (so rule (c) above no longer sees it), but the
+                    // LAST EXPLICITLY-SET level persists independently here (written by
+                    // ChatHub.SetNotificationLevel, and seeded back into a rejoined membership by
+                    // JoinChannel). Only an explicit None suppresses; any other level, or no pref at all
+                    // (never explicitly set), delivers normally.
+                    var pref = await _notificationPreferenceRepository.Load(tag, channel.Id);
+                    if (pref != null && pref.NotificationLevel == NotificationLevel.None)
                     {
                         continue;
                     }
@@ -171,6 +204,36 @@ public class MentionFanOut(
                     // Rule (c) — UNCHANGED for every non-public type: the Dm/GroupDm excerpt PRIVACY
                     // WALL, and SemiPublic/System keep the membership wall too (§4 widens Public only).
                     continue;
+                }
+
+                // PR36 follow-up (D1): block suppression, consulted LAST — the target has cleared every
+                // cheap check above and is otherwise ELIGIBLE, so this is the only point a relationship
+                // snapshot fetch (worst case a wb HTTP round-trip) ever runs, bounded to at most
+                // ChatLimits.MaxMentionsPerMessage calls for this message. Direction is deliberate: only
+                // the TARGET's OWN block list matters here — sender-side blocking (the sender having
+                // blocked the target) is out of scope for mention gating and is never consulted.
+                // OUTAGE POSTURE — FAIL OPEN: this catch is LOCAL (not the per-target catch below), so a
+                // relationship-provider failure — including RelationshipUnavailableException once the
+                // provider's own stale-cache fallback is exhausted — DELIVERS the mention instead of
+                // suppressing it. A relationship outage must never blanket-mute every mention or break
+                // the send pipeline; it only means this one target's block state couldn't be proven, and
+                // we default to delivering rather than guessing a block.
+                try
+                {
+                    var targetSnapshot = await _relationshipProvider.GetSnapshotAsync(tag);
+                    if (targetSnapshot.HasBlocked(message.Sender?.BattleTag))
+                    {
+                        continue;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(
+                        ex,
+                        "Relationship snapshot unavailable for mention target {Tag} on channel {ChannelId} for message {MessageId} — delivering fail-open",
+                        tag,
+                        channel.Id,
+                        message.Id);
                 }
 
                 // Eligible. Write the offline inbox entry FIRST — its id rides in the event payload. Expiry

@@ -34,6 +34,7 @@ public static class ChatDomainIndexes
         await EnsureMessageIndexes(db);
         await EnsureMentionInboxIndexes(db);
         await EnsureUserDirectoryIndexes(db);
+        await EnsureNotificationPreferenceIndexes(db);
     }
 
     private static async Task EnsureChannelIndexes(IMongoDatabase db)
@@ -187,6 +188,22 @@ public static class ChatDomainIndexes
             new CreateIndexModel<UserDirectoryEntry>(
                 Builders<UserDirectoryEntry>.IndexKeys.Ascending(e => e.NormalizedName).Descending(e => e.LastSeenAt),
                 new CreateIndexOptions { Name = "ix_normalizedName_lastSeenAt" }),
+        ]);
+    }
+
+    /// <summary>
+    /// PR36 follow-up (D2): backs <see cref="Memberships.NotificationPreferenceRepository"/>'s Load
+    /// (BattleTag, ChannelId) point-read AND enforces the one-row-per-(user, channel) invariant that
+    /// makes <c>Upsert</c>'s last-write-wins semantics well-defined.
+    /// </summary>
+    private static async Task EnsureNotificationPreferenceIndexes(IMongoDatabase db)
+    {
+        var prefs = db.GetCollection<NotificationPreference>(ChatCollections.NotificationPreferences);
+        await prefs.Indexes.CreateManyAsync(
+        [
+            new CreateIndexModel<NotificationPreference>(
+                Builders<NotificationPreference>.IndexKeys.Ascending(p => p.BattleTag).Ascending(p => p.ChannelId),
+                new CreateIndexOptions { Name = "ux_battleTag_channelId", Unique = true }),
         ]);
     }
 }

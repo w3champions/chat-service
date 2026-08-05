@@ -146,7 +146,8 @@ public class MutePortTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            new MentionInboxRepository(MongoClient))
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient))
         {
             Clients = clients,
             Context = context,

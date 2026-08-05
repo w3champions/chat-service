@@ -178,7 +178,8 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             _presenceInterestRegistry,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);

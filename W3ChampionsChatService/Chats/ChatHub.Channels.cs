@@ -259,7 +259,10 @@ public partial class ChatHub
     /// touches the throttle.</item>
     /// <item>Create the membership with <see cref="NotificationLevel.Mentions"/> — an EXPLICIT override
     /// of <see cref="ChannelMembership.NotificationLevel"/>'s model default (<c>All</c>) — insert it,
-    /// seed <see cref="FanOut.OnlineMemberRegistry"/> for this connection, and return Ok.</item>
+    /// seed <see cref="FanOut.OnlineMemberRegistry"/> for this connection, and return Ok. PR36 follow-up
+    /// (D2): the Mentions default is used ONLY when the caller has no persisted preference for this
+    /// channel (<see cref="Memberships.NotificationPreferenceRepository.Load"/>); otherwise the (re)join
+    /// seeds from that persisted level instead — see the seeding code just above the insert.</item>
     /// </list>
     /// </summary>
     public async Task<JoinChannelResult> JoinChannel(string name)
@@ -324,18 +327,26 @@ public partial class ChatHub
             channel = await _channelRepository.FindOrCreateSemiPublic(name, now);
         }
 
+        // PR36 follow-up (D2): a (re)join seeds from the caller's own PERSISTED preference for this
+        // channel if one exists (the last level they EXPLICITLY set via SetNotificationLevel, surviving
+        // a prior leave's hard membership delete) — otherwise falls back to the fresh-join Mentions
+        // default. This is what lets "join → set None → leave → rejoin" keep the room silenced.
+        var pref = await _notificationPreferenceRepository.Load(battleTag, channel.Id);
+        var seedLevel = pref?.NotificationLevel ?? NotificationLevel.Mentions;
+
         var membership = new ChannelMembership
         {
             ChannelId = channel.Id,
             BattleTag = battleTag,
-            // Override the model default (All) — a freshly joined channel starts at Mentions.
-            NotificationLevel = NotificationLevel.Mentions,
+            // Override the model default (All) — a freshly joined channel starts at Mentions, unless a
+            // persisted preference says otherwise (see above).
+            NotificationLevel = seedLevel,
             JoinedAt = now,
         };
         await _membershipRepository.Insert(membership);
 
         _onlineMemberRegistry.Join(channel.Id, Context.ConnectionId,
-            new MemberState(battleTag, NotificationLevel.Mentions, membership.LastReadSeq, channel.Type));
+            new MemberState(battleTag, seedLevel, membership.LastReadSeq, channel.Type));
 
         return new JoinChannelResult(ChatResultCode.Ok, Channel: channel, Membership: membership);
     }
@@ -475,6 +486,15 @@ public partial class ChatHub
     /// SemiPublic (and every other type) supports all three levels. On success, persists via
     /// <see cref="Memberships.MembershipRepository.SetNotificationLevel"/> and mirrors the change into
     /// <see cref="FanOut.OnlineMemberRegistry"/> so the hot fan-out path sees it immediately.
+    /// <para>
+    /// PR36 follow-up (D2): AFTER that membership update succeeds, ALSO upserts a
+    /// <see cref="Memberships.NotificationPreference"/> row for (battleTag, channelId) — but ONLY when
+    /// the channel is name-joinable (<see cref="ChannelType.Public"/>/<see cref="ChannelType.SemiPublic"/>).
+    /// Dm/GroupDm/System memberships are ACL-governed, not user-leavable in the room-catalog sense, so the
+    /// pref collection stays bounded to the room catalog — this write is what lets the level SURVIVE a
+    /// later hard-delete leave (<see cref="LeaveChannel"/>) and get re-seeded on rejoin (<see cref="JoinChannel"/>)
+    /// or consulted for a non-member Public mention (<see cref="Mentions.MentionFanOut"/>).
+    /// </para>
     /// </summary>
     public async Task<ChannelOperationResult> SetNotificationLevel(string channelId, NotificationLevel level)
     {
@@ -491,17 +511,27 @@ public partial class ChatHub
             return new ChannelOperationResult(ChatResultCode.NotMember);
         }
 
-        if (level == NotificationLevel.All)
+        // PR36 follow-up (D2): the channel is now loaded UNCONDITIONALLY (previously only for the All-
+        // on-Public rejection check below) — the pref write further down needs its Type regardless of
+        // which level was requested.
+        var channel = await _channelRepository.Load(channelId);
+
+        if (level == NotificationLevel.All && channel != null && channel.Type == ChannelType.Public)
         {
-            var channel = await _channelRepository.Load(channelId);
-            if (channel != null && channel.Type == ChannelType.Public)
-            {
-                return new ChannelOperationResult(ChatResultCode.PermissionDenied);
-            }
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }
 
         await _membershipRepository.SetNotificationLevel(channelId, battleTag, level);
         _onlineMemberRegistry.SetNotificationLevel(channelId, Context.ConnectionId, level);
+
+        // PR36 follow-up (D2): persist the just-applied level for name-joinable rooms only, so it
+        // survives a later leave/rejoin cycle. A vanished channel (null) is treated as non-name-joinable
+        // — no pref write, nothing to seed back into on a rejoin that can never happen.
+        if (channel != null && (channel.Type == ChannelType.Public || channel.Type == ChannelType.SemiPublic))
+        {
+            var now = _timeProvider.GetUtcNow().UtcDateTime;
+            await _notificationPreferenceRepository.Upsert(battleTag, channelId, level, now);
+        }
 
         return new ChannelOperationResult(ChatResultCode.Ok);
     }

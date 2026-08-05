@@ -154,7 +154,8 @@ public class ChatHubPresenceTests : IntegrationTestBase
             _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             _presenceInterestRegistry, // SHARED — same instance the engine reads
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

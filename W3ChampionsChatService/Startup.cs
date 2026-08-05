@@ -77,6 +77,9 @@ public class Startup
         services.AddTransient<UserDirectoryRepository>();
         services.AddTransient<UserSettingsRepository>();
         services.AddTransient<MentionInboxRepository>();
+        // PR36 follow-up (D2): the notification-preference carrier — read by JoinChannel (rejoin seed)
+        // and MentionFanOut (non-member Public consult path), written by SetNotificationLevel.
+        services.AddTransient<NotificationPreferenceRepository>();
         services.AddTransient<PublicChannelSeeder>();
         services.AddTransient<CleanupJobs>();
         services.AddHostedService<ChatDomainBootstrap>();   // indexes + catalog seeding at boot

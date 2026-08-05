@@ -118,7 +118,8 @@ public class ChatHubMentionSearchTests : IntegrationTestBase
             authService ?? _authService.Object,
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            new NotificationPreferenceRepository(MongoClient));
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
