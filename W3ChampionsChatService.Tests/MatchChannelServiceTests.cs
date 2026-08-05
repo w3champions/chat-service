@@ -1328,4 +1328,132 @@ public class MatchChannelServiceTests : IntegrationTestBase
             "the shared TearDownChannel routine deletes messages, memberships AND the channel doc together — "
             + "so no orphaned membership row is left behind for CleanupJobs to find");
     }
+
+    [Test]
+    public async Task EpochSync_LiveRefMatching_IsCaseSensitive()
+    {
+        await _service.CreateOrGet("match-A", "Upper", Members("Alice#1"), focus: false);
+
+        // A ref differing only in case is a DIFFERENT lobby — refs are exact Mongo keys drawn from
+        // [A-Za-z0-9_-] (mm's nanoids use a mixed-case alphabet), unlike battleTags.
+        await _service.ApplyEpochSync("e2", Members("match-a"));
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-A"), Is.Null,
+            "liveLobbyRefs is matched ORDINALLY — case folding would SPARE an orphaned channel whose ref "
+            + "differs only in case from a live one");
+    }
+
+    [Test]
+    public async Task EpochSync_DoesNotResetAChannelAlreadyAnchoredToTheSyncsOwnEpoch()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        // Anchor the channel to "e2" DURING what will be treated as "this same boot" — mirrors a lobby
+        // created/asserted while an epoch sync under "e2" was still retrying.
+        await _service.ApplyRosterAssertion("match-1", "e2", 5, Members(alice), name: null, detached: false);
+
+        await _service.ApplyEpochSync("e2", Members("match-1"));
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(5),
+            "a channel already anchored to the sync's OWN epoch must be left entirely untouched — "
+            + "resetting AssertSeq to 0 here would re-open the duplicate-replay window for assertions "
+            + "already applied under this epoch (plan D8 refinement, Task-4 review INFO-1)");
+
+        // If the reset had wrongly landed (AssertSeq -> 0), this duplicate/stale seq-3 assertion would be
+        // wrongly re-admitted (3 > 0) instead of discarded (3 <= the real stored seq, 5).
+        await _service.ApplyRosterAssertion("match-1", "e2", 3, Members(bob), name: null, detached: false);
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null,
+            "a duplicate (e2, 3) assertion is STILL discarded after the sync — proves AssertSeq was not reset");
+
+        // seq 6 — genuinely newer than the untouched stored seq 5 — still applies normally.
+        await _service.ApplyRosterAssertion("match-1", "e2", 6, Members(bob), name: null, detached: false);
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null,
+            "(e2, 6) still applies — the untouched counter continues advancing normally post-sync");
+    }
+
+    // Fires a one-shot hook the first time a teardown reads a channel's member list — TearDownChannel's
+    // very first statement, and the ONLY caller of LoadForChannel on this path. That instant is inside
+    // ApplyEpochSync's loop but strictly AFTER its discovery scan, i.e. exactly the TOCTOU window the
+    // in-gate re-load exists to cover. (LoadForChannel is already a documented test seam.)
+    private sealed class TeardownHookMembershipRepository(
+        MongoClient client, ChannelRepository channelRepository, Func<string, Task> onFirstTeardown)
+        : MembershipRepository(client, channelRepository)
+    {
+        private int _calls;
+
+        public override async Task<List<ChannelMembership>> LoadForChannel(string channelId)
+        {
+            if (Interlocked.Increment(ref _calls) == 1)
+            {
+                await onFirstTeardown(channelId);
+            }
+
+            return await base.LoadForChannel(channelId);
+        }
+    }
+
+    [Test]
+    public async Task EpochSync_ReLoadsInsideTheGate_SoAChannelDetachedAfterTheScanIsSpared()
+    {
+        var channelRepo = new ChannelRepository(MongoClient);
+        string idA = null;
+        string idB = null;
+
+        // Detach the OTHER orphan while the first one is being torn down — order-independent, so this
+        // does not depend on the natural order LoadNonDetachedMatchChannels returns.
+        var memberships = new TeardownHookMembershipRepository(
+            MongoClient, channelRepo, async tornDownId => await channelRepo.SetDetached(tornDownId == idA ? idB : idA));
+        var service = new MatchChannelService(channelRepo, memberships, _messageRepository, _fanOutEngine, _time);
+
+        var a = await service.CreateOrGet("match-a", "A", Members("Alice#1"), focus: false);
+        var b = await service.CreateOrGet("match-b", "B", Members("Bob#2"), focus: false);
+        idA = a.Id;
+        idB = b.Id;
+
+        // Empty live list: BOTH refs are orphans at scan time, so both are teardown candidates.
+        await service.ApplyEpochSync("e2", Members());
+
+        var survivors = new[]
+        {
+            await channelRepo.LoadBySystemRef(SystemChannelKind.Match, "match-a"),
+            await channelRepo.LoadBySystemRef(SystemChannelKind.Match, "match-b"),
+        }.Where(c => c != null).ToList();
+
+        Assert.That(survivors.Count, Is.EqualTo(1),
+            "a channel DETACHED between the discovery scan and its own turn must be re-loaded inside the "
+            + "per-ref gate and SPARED — acting on the stale scan-time candidate tears down a live room");
+        Assert.That(survivors[0].Detached, Is.True, "the survivor is the one that was detached mid-sync");
+        Assert.That(await memberships.Load(survivors[0].Id, survivors[0].SystemRef == "match-a" ? "Alice#1" : "Bob#2"),
+            Is.Not.Null, "the spared channel keeps its membership rows");
+    }
+
+    [Test]
+    public async Task EpochSync_ReLoadsInsideTheGate_SoAChannelDeletedAfterTheScanIsSkipped()
+    {
+        RegisterOnline("conn-alice", "Alice#1");
+        RegisterOnline("conn-bob", "Bob#2");
+        var channelRepo = new ChannelRepository(MongoClient);
+        string idA = null;
+        string idB = null;
+
+        var memberships = new TeardownHookMembershipRepository(
+            MongoClient, channelRepo, async tornDownId => await channelRepo.Delete(tornDownId == idA ? idB : idA));
+        var service = new MatchChannelService(channelRepo, memberships, _messageRepository, _fanOutEngine, _time);
+
+        var a = await service.CreateOrGet("match-a", "A", Members("Alice#1"), focus: false);
+        var b = await service.CreateOrGet("match-b", "B", Members("Bob#2"), focus: false);
+        idA = a.Id;
+        idB = b.Id;
+        var pushesBefore = _harness.AllSignals.Count;
+
+        await service.ApplyEpochSync("e2", Members());
+
+        // The concurrently-deleted channel is skipped outright: no second teardown, no ChannelRemoved
+        // for a channel this sync never owned. Exactly ONE teardown ran, so exactly ONE push landed.
+        Assert.That(_harness.AllSignals.Count - pushesBefore, Is.EqualTo(1),
+            "a channel whose doc vanished between the scan and its turn is skipped, not torn down on stale data");
+    }
 }

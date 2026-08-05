@@ -448,14 +448,27 @@ public class MatchChannelService(
     /// once at boot under a fresh epoch. Every NON-DETACHED System+Match channel whose SystemRef is
     /// absent from <paramref name="liveLobbyRefs"/> is torn down (memberships deleted, ChannelRemoved
     /// pushed so stuck rows vanish from connected clients immediately, channel doc removed); the
-    /// channels that ARE listed are SPARED and re-anchored to the new epoch with the seq counter
-    /// reset to the 0 sentinel (plan D8), so mm's first assertion under the new epoch applies cleanly.
+    /// channels that ARE listed are SPARED and passed to <see cref="ChannelRepository.StampAssertionEpoch"/>,
+    /// which — CONDITIONALLY, only when the stored <c>AssertEpoch</c> differs from <paramref name="epoch"/>
+    /// (absent counts as different) — re-anchors the channel to the new epoch with the seq counter reset to
+    /// the 0 sentinel (plan D8), so mm's first assertion under the new epoch applies cleanly. A spared
+    /// channel already anchored to THIS sync's own epoch (created or asserted during this same boot, while
+    /// the sync itself was still retrying) is left entirely untouched by the re-stamp: resetting its seq
+    /// would re-open the duplicate-replay window for assertions already applied under this epoch (Task-4
+    /// review INFO-1).
     /// <para>DETACHED CHANNELS ARE EXCLUDED ENTIRELY — filtered server-side by
     /// <see cref="ChannelRepository.LoadNonDetachedMatchChannels"/>, so an in-game/post-game room is
     /// never loaded, never torn down, never re-stamped. Its 24h TTL owns it.</para>
-    /// <para>Each channel is processed under its OWN per-ref gate (never one global lock) and
-    /// RE-LOADED inside that gate before teardown, so a channel that was (re)created or detached
-    /// between the discovery scan and its turn is not torn down on stale information.</para>
+    /// <para>Each channel is processed under its OWN per-ref gate (never one global lock) and RE-LOADED
+    /// inside that gate before teardown, so the teardown/spare decision is always made on FRESHLY loaded
+    /// state: a channel deleted or detached between the discovery scan and its own turn is skipped
+    /// outright (never torn down on stale information), and a channel recreated in that window is judged
+    /// on its NEW document rather than the stale scan-time candidate — a recreated channel whose ref is
+    /// still absent from <paramref name="liveLobbyRefs"/> IS torn down; recreation does not spare it, it
+    /// just means the decision is made on fresh data instead of stale data.</para>
+    /// <para>Conversely, a channel created AFTER the discovery scan is not a candidate at all and is never
+    /// swept — by definition any lobby mm creates after boot is live under the new epoch, so it survives
+    /// to the next assertion or the 24h TTL (plan residual 4).</para>
     /// </summary>
     public async Task ApplyEpochSync(string epoch, IReadOnlyList<string> liveLobbyRefs)
     {

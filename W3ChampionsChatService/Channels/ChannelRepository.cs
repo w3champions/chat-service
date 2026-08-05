@@ -315,14 +315,37 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
-    /// Epoch-sync authority reset for the channels a sync SPARES (plan D8): adopt the new epoch and
-    /// reset the per-lobby counter to the 0 sentinel, so mm's first assertion under the new epoch
-    /// (seq >= 1) applies cleanly. Writes 0 rather than $unset — see ChatChannel.AssertSeq.
+    /// Epoch-sync authority reset for the channels a sync SPARES (plan D8) — CONDITIONAL: the update
+    /// only lands when the stored <c>AssertEpoch</c> differs from <paramref name="epoch"/> (absent
+    /// counts as different, mirroring <see cref="TryAdvanceAssertion"/>'s rule (a)/(c) split). When it
+    /// does, adopt the new epoch and reset the per-lobby counter to the 0 sentinel, so mm's first
+    /// assertion under the new epoch (seq >= 1) applies cleanly. Writes 0 rather than $unset — see
+    /// ChatChannel.AssertSeq.
+    /// <para>
+    /// A channel ALREADY anchored to the sync's own epoch is left completely untouched. Such a channel
+    /// was created or asserted by mm DURING this same boot — a new lobby, or a retried assertion, that
+    /// landed while the epoch sync was still retrying — so it is not "stale" in the sense this reset
+    /// exists to fix. Resetting it anyway would zero out an already-advancing seq counter, re-opening
+    /// the duplicate-replay window for every assertion already applied under this epoch (2026-08-05
+    /// Task-4 review r1, INFO-1): a retried lower-seq assertion would be wrongly re-admitted and would
+    /// apply a stale full member set, reverting the roster until mm's next assertion re-converges it.
+    /// The conditional keeps the reset scoped to its actual purpose — re-anchoring channels stamped
+    /// under a now-dead PRE-restart epoch — and keeps <see cref="TryAdvanceAssertion"/>'s D3(c) anomaly
+    /// Warning meaningful (it fires on a genuine mismatch, not on every graceful restart).
+    /// </para>
     /// </summary>
-    public Task StampAssertionEpoch(string channelId, string epoch) =>
-        Channels.UpdateOneAsync(
-            c => c.Id == channelId,
-            Builders<ChatChannel>.Update.Set(c => c.AssertEpoch, epoch).Set(c => c.AssertSeq, 0L));
+    public Task StampAssertionEpoch(string channelId, string epoch)
+    {
+        var fb = Builders<ChatChannel>.Filter;
+        var filter = fb.And(
+            fb.Eq(c => c.Id, channelId),
+            fb.Or(fb.Exists(c => c.AssertEpoch, false), fb.Ne(c => c.AssertEpoch, epoch)));
+        var update = Builders<ChatChannel>.Update
+            .Set(c => c.AssertEpoch, epoch)
+            .Set(c => c.AssertSeq, 0L);
+
+        return Channels.UpdateOneAsync(filter, update);
+    }
 
     /// <summary>Hard-deletes a channel doc (C5 D12 — e.g. the last group member leaving; residual
     /// memberships are cleaned up separately via <see cref="Memberships.MembershipRepository.DeleteAllForChannel"/>).
