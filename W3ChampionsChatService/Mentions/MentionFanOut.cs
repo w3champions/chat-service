@@ -36,8 +36,9 @@ namespace W3ChampionsChatService.Mentions;
 /// entry carries a ~120-char content excerpt, and a private conversation's excerpt must NEVER reach a
 /// non-participant. This wall is the SOLE authority on who is notified: the send-side gate (step 5.25)
 /// validates only the mention COUNT cap — never resolvability or membership — so mentioning a non-member
-/// (or an unresolvable/garbage tag) is legal content that delivers verbatim and simply notifies nobody
-/// here. Follow-up spec §4 EXCEPTION: for <see cref="ChannelType.Public"/> rooms only, a target with NO
+/// (or an unresolvable/garbage tag) is legal content that is delivered with its markup already rewritten
+/// to plain text by step 5.26 (fix round 1, finding F2 — D2's canonical strip, not a verbatim delivery)
+/// and simply notifies nobody here. Follow-up spec §4 EXCEPTION: for <see cref="ChannelType.Public"/> rooms only, a target with NO
 /// membership row is still eligible provided the tag resolves to a <see cref="UserDirectoryRepository"/>
 /// row — a public room's excerpt is public content, so the membership wall protects nothing there;
 /// Dm/GroupDm/SemiPublic/System are unaffected and keep the membership wall exactly as before.</item>

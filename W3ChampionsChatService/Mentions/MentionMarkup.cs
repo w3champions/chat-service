@@ -66,6 +66,13 @@ public static class MentionMarkup
         return TokenPattern.Replace(content, m =>
         {
             var tag = m.Groups[1].Value;
+            // Fix round 1 (finding F5): a caller's TryGetValue-miss on this tag (no decision was ever
+            // computed for it) is unreachable in practice — every real caller builds its decisions from
+            // ExtractTags over this SAME content, so every regex match here already has an entry. Callers
+            // resolve a miss to false (strip), never true (render): rendering an unvalidated mention is
+            // the worse failure — a stripped-but-actually-legal mention is only a cosmetic downgrade,
+            // while a rendered-but-never-checked one could leak a chip nobody actually validated. Hence
+            // fail-closed.
             return isRenderable(tag) ? m.Value : $"@{tag}";
         });
     }
