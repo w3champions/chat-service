@@ -293,6 +293,14 @@ public partial class ChatHub
             {
                 // System / Dm / GroupDm — ACL-governed, not joinable by name. NOT an implicit-create
                 // case: a name collision with an existing ACL channel must be rejected outright.
+                //
+                // Match-channel-hygiene brief (2026-08-05), Part 3: LoadAnyByNormalizedName can only ever
+                // MATCH a System channel here if some future write path populates its NormalizedName —
+                // today ChannelRepository.FindOrCreateSystem (the sole System-channel creation path)
+                // never sets that field, so this branch is currently unreachable for Type == System (Dm/
+                // GroupDm are unreachable too, for the same reason — neither creation path sets it
+                // either). Kept deliberately: it is the guard that keeps the ACL namespace safe the
+                // moment anyone ever DOES populate NormalizedName on one of these types.
                 return new JoinChannelResult(ChatResultCode.PermissionDenied);
             }
 
