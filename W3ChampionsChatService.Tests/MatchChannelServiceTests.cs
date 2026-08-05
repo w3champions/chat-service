@@ -593,8 +593,11 @@ public class MatchChannelServiceTests : IntegrationTestBase
         RegisterOnline("conn-alice", alice);
         var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
 
-        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+        var outcome = await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
 
+        // 2026-08-05 fix wave (final review M2): the outcome the controller now logs instead of an
+        // unconditional "succeeded" line.
+        Assert.That(outcome, Is.EqualTo(RosterAssertionOutcome.Applied));
         Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the missing member is added");
         Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
         var dto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelAdded) as ChannelAddedDto;
@@ -771,8 +774,10 @@ public class MatchChannelServiceTests : IntegrationTestBase
         var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
         await _service.ApplyRosterAssertion("match-1", "e1", 5, Members(alice), name: null, detached: false);
 
-        await _service.ApplyRosterAssertion("match-1", "e1", 4, Members(bob), name: null, detached: false);
+        var outcome = await _service.ApplyRosterAssertion("match-1", "e1", 4, Members(bob), name: null, detached: false);
 
+        // 2026-08-05 fix wave (final review M2).
+        Assert.That(outcome, Is.EqualTo(RosterAssertionOutcome.DiscardedStale));
         Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "membership unchanged");
         Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "the stale assertion never applied");
         var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
@@ -905,8 +910,10 @@ public class MatchChannelServiceTests : IntegrationTestBase
         var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
         await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
 
-        await _service.ApplyRosterAssertion("match-1", "e2", 99, Members(bob), name: null, detached: false);
+        var outcome = await _service.ApplyRosterAssertion("match-1", "e2", 99, Members(bob), name: null, detached: false);
 
+        // 2026-08-05 fix wave (final review M2).
+        Assert.That(outcome, Is.EqualTo(RosterAssertionOutcome.DiscardedFrozen));
         Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the frozen set is untouched");
         Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "a post-detach assertion never applies, even with a higher seq and a different epoch");
     }

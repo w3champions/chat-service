@@ -373,8 +373,16 @@ public class MatchChannelService(
     /// <paramref name="name"/> is nullable (null ⇒ ref placeholder on create-on-demand). There is NO
     /// <c>focus</c> parameter — mm has never sent focus on any internal call, so adds pass
     /// <c>focus: false</c> to <see cref="AddMemberWithInvariant"/>, byte-identical to today's behavior.
+    /// <para>
+    /// RETURN VALUE (2026-08-05 fix wave, final review M2): <see cref="RosterAssertionOutcome"/> lets the
+    /// CALLER log the real outcome exactly once, instead of the controller's old unconditional "succeeded"
+    /// line coexisting with this method's own separate discard line — a contradictory Information pair on
+    /// precisely the storm paths (an mm retry storm, or mm asserting a frozen lobby) the staleness/detach
+    /// gates exist to absorb. The two discard paths below now log at Debug, not Information; the
+    /// controller owns the single Information-level outcome line.
+    /// </para>
     /// </summary>
-    public async Task ApplyRosterAssertion(
+    public async Task<RosterAssertionOutcome> ApplyRosterAssertion(
         string systemRef, string epoch, long seq, IReadOnlyList<string> members, string name, bool detached)
     {
         using var _ = await _refGate.AcquireAsync(systemRef);
@@ -387,8 +395,8 @@ public class MatchChannelService(
 
         if (channel.Detached)
         {
-            Log.Information("ApplyRosterAssertion: discarded — match channel {Ref} is detached (frozen)", systemRef);
-            return;
+            Log.Debug("ApplyRosterAssertion: discarded — match channel {Ref} is detached (frozen)", systemRef);
+            return RosterAssertionOutcome.DiscardedFrozen;
         }
 
         // Captured BEFORE the CAS call — the durable backstop below re-checks Detached and staleness
@@ -399,10 +407,10 @@ public class MatchChannelService(
 
         if (!await channelRepository.TryAdvanceAssertion(channel.Id, epoch, seq))
         {
-            Log.Information(
+            Log.Debug(
                 "ApplyRosterAssertion: discarded stale/duplicate assertion for match channel {Ref} (epoch {Epoch}, seq {Seq})",
                 systemRef, epoch, seq);
-            return;
+            return RosterAssertionOutcome.DiscardedStale;
         }
 
         if (storedEpoch != null && storedEpoch != epoch)
@@ -446,6 +454,8 @@ public class MatchChannelService(
             channel.Detached = true;
             Log.Information("ApplyRosterAssertion: match channel {Ref} detached (frozen) by final roster assertion", systemRef);
         }
+
+        return RosterAssertionOutcome.Applied;
     }
 
     /// <summary>

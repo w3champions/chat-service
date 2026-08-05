@@ -218,13 +218,18 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
 
         try
         {
-            await matchChannelService.ApplyRosterAssertion(
+            var outcome = await matchChannelService.ApplyRosterAssertion(
                 @ref, request.Epoch, request.Seq, request.Members,
                 name, request.Detached ?? false);
 
+            // 2026-08-05 fix wave (final review M2): the outcome REPLACES the old unconditional
+            // "succeeded" wording — a discarded assertion (stale/duplicate or against a frozen channel)
+            // used to log a contradictory "succeeded" line here ALONGSIDE the domain layer's own discard
+            // line, exactly on the storm paths (an mm retry storm, or mm asserting a frozen lobby) the
+            // staleness/detach gates exist to absorb. One line, the real outcome.
             Log.Information(
-                "Internal channel roster-assert succeeded {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached}",
-                InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref,
+                "Internal channel roster-assert {Outcome} {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached}",
+                outcome, InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref,
                 request.Epoch, request.Seq, request.Members.Count, request.Detached ?? false);
 
             // A DISCARDED (stale/detached) assertion is still a 200 — it is a successful no-op, not a
