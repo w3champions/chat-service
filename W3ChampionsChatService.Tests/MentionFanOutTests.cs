@@ -455,6 +455,28 @@ public class MentionFanOutTests : IntegrationTestBase
         Assert.That(MentionEventCount("conn-frank"), Is.EqualTo(1));
     }
 
+    // Fix round 1 (F8): D1 suppression is type-agnostic (the class doc says "ALL channel types"), but was
+    // only pinned against a Public channel above — a GroupDm variant of the SAME member-branch scenario
+    // proves the walled-channel path (which never reaches the Public non-member branch) still applies it.
+    [Test]
+    public async Task Notify_BlockedTarget_MemberBranch_GroupDm_NoEntryNoEvent_ControlMemberStillNotified()
+    {
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+        await SeedMembership("frank#789", NotificationLevel.All);
+        RegisterSession("conn-frank", "frank#789");
+
+        var fanOut = BuildFanOutWithBlock(blockingTargetTag: "wolf#456", blockedBattleTag: Sender);
+
+        await fanOut.NotifyAsync(Channel(ChannelType.GroupDm), Message(content: "secret plans"), new[] { "wolf#456", "frank#789" }, Now);
+
+        Assert.That(await InboxOf("wolf#456"), Is.Empty,
+            "a GroupDm member who has blocked the sender gets NO inbox entry — D1 applies to walled channels too");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0), "and NO live push");
+        Assert.That(await InboxOf("frank#789"), Has.Count.EqualTo(1), "a non-blocking member control still gets the mention");
+        Assert.That(MentionEventCount("conn-frank"), Is.EqualTo(1));
+    }
+
     [Test]
     public async Task Notify_BlockedTarget_PublicNonMemberBranch_NoEntryNoEvent_ControlMemberStillNotified()
     {
