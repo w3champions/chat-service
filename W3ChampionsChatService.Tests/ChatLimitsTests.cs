@@ -130,6 +130,27 @@ public class ChatLimitsTests
     }
 
     [Test]
+    public void InternalMaxLiveRefsPerSync_Is512()
+    {
+        // 2026-08-05 reconciliation spec §3 — plan decision, not spec-pinned text; hard-coded,
+        // adjust here only.
+        Assert.AreEqual(512, ChatLimits.InternalMaxLiveRefsPerSync);
+    }
+
+    [Test]
+    public void InternalMaxLiveRefsPerSync_StaysWithinInternalMaxBodyBytes()
+    {
+        // Pins the sizing argument documented on InternalMaxLiveRefsPerSync's declaration: a 64-char
+        // ref plus JSON quoting/comma is ≈68 bytes (InternalRefMaxLength + 4), so the whole array must
+        // stay comfortably inside InternalMaxBodyBytes. If either constant moves, this test catches the
+        // sizing argument going false at CI time instead of mm hitting an unexpected 400 in production.
+        Assert.Less(
+            ChatLimits.InternalMaxLiveRefsPerSync * (ChatLimits.InternalRefMaxLength + 4),
+            ChatLimits.InternalMaxBodyBytes,
+            "InternalMaxLiveRefsPerSync * (InternalRefMaxLength + 4) must stay under InternalMaxBodyBytes");
+    }
+
+    [Test]
     public void DefaultChatRooms_NormalizeToDistinctKeys()
     {
         // C3 Task 3: Guards the static SessionStateAssembler.CatalogOrder initialization invariant.

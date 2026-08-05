@@ -83,6 +83,13 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     private static InternalChannelCreateRequest ValidCreateRequest(string @ref = "match-1", string name = "Match One", params string[] members) =>
         new() { Kind = "match", Ref = @ref, Name = name, Members = members.ToList() };
 
+    private static InternalRosterAssertRequest ValidRosterRequest(
+        string epoch = "e1", long seq = 1, string name = null, bool? detached = null, params string[] members) =>
+        new() { Epoch = epoch, Seq = seq, Members = members.ToList(), Name = name, Detached = detached };
+
+    private static InternalEpochSyncRequest ValidEpochSyncRequest(string epoch = "e1", params string[] liveLobbyRefs) =>
+        new() { Epoch = epoch, LiveLobbyRefs = liveLobbyRefs.ToList() };
+
     private static void AssertBadRequest(IActionResult result)
     {
         var badRequest = result as BadRequestObjectResult;
@@ -265,6 +272,340 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var result = await _controller.UpdateMembers("match-1", new InternalMembersDeltaRequest { Add = tooMany });
 
         AssertBadRequest(result);
+    }
+
+    // ── PUT /internal/channels/{ref}/roster ─────────────────────────────────────────────────────
+
+    [Test]
+    public async Task PutRoster_ValidBody_Returns200_AndAppliesMembership()
+    {
+        var request = ValidRosterRequest(members: "Peter#123");
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        Assert.That(result, Is.InstanceOf<OkResult>());
+        var membership = await _membershipRepository.LoadForUser("Peter#123");
+        Assert.That(membership, Is.Not.Empty, "the assertion must have applied the member");
+    }
+
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task PutRoster_InvalidRef_400(string badRef)
+    {
+        var result = await _controller.AssertRoster(badRef, ValidRosterRequest());
+
+        AssertBadRequest(result);
+    }
+
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task PutRoster_InvalidEpoch_400(string badEpoch)
+    {
+        var request = ValidRosterRequest();
+        request.Epoch = badEpoch;
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_NullMembers_400()
+    {
+        var request = ValidRosterRequest();
+        request.Members = null;
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_EmptyMembers_200_AndClearsMembership()
+    {
+        await _controller.Create(ValidCreateRequest(@ref: "match-1", members: "Peter#123"));
+
+        var result = await _controller.AssertRoster("match-1", ValidRosterRequest());
+
+        Assert.That(result, Is.InstanceOf<OkResult>());
+        var membership = await _membershipRepository.LoadForUser("Peter#123");
+        Assert.That(membership, Is.Empty, "an empty asserted set is legal and must clear existing membership (D7)");
+    }
+
+    [Test]
+    public async Task PutRoster_TooManyMembers_400()
+    {
+        var request = ValidRosterRequest();
+        request.Members = Enumerable.Range(0, ChatLimits.InternalMaxMembersPerCall + 1)
+            .Select(i => $"Player{i}#123")
+            .ToList();
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_BlankMemberEntry_400()
+    {
+        var request = ValidRosterRequest();
+        request.Members = new List<string> { "Peter#123", "   " };
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [TestCase(0L)]
+    [TestCase(-1L)]
+    public async Task PutRoster_SeqBelowOne_400(long badSeq)
+    {
+        var request = ValidRosterRequest();
+        request.Seq = badSeq;
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_UnknownRef_200_CreatesOnDemand()
+    {
+        var request = ValidRosterRequest(name: "Boot-Race Lobby", members: "Peter#123");
+
+        var result = await _controller.AssertRoster("does-not-exist-ref", request);
+
+        Assert.That(result, Is.InstanceOf<OkResult>(), "an assertion for an unknown ref must never 404");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "does-not-exist-ref");
+        Assert.That(channel, Is.Not.Null);
+        Assert.That(channel.Name, Is.EqualTo("Boot-Race Lobby"));
+    }
+
+    [Test]
+    public async Task PutRoster_StaleAssertion_Returns200()
+    {
+        await _controller.AssertRoster("match-1", ValidRosterRequest(epoch: "e1", seq: 5, members: "Peter#123"));
+
+        var result = await _controller.AssertRoster("match-1", ValidRosterRequest(epoch: "e1", seq: 1, members: "Wanda#456"));
+
+        Assert.That(result, Is.InstanceOf<OkResult>(), "a discarded stale assertion is still a 200, not an error");
+        var membership = await _membershipRepository.LoadForUser("Wanda#456");
+        Assert.That(membership, Is.Empty, "the stale assertion's membership must NOT have been applied");
+    }
+
+    [Test]
+    public async Task PutRoster_NullBody_400()
+    {
+        var result = await _controller.AssertRoster("match-1", null);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_NullName_200()
+    {
+        var request = ValidRosterRequest(members: "Peter#123");
+        request.Name = null;
+
+        var result = await _controller.AssertRoster("brand-new-ref", request);
+
+        Assert.That(result, Is.InstanceOf<OkResult>());
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "brand-new-ref");
+        Assert.That(channel.Name, Is.EqualTo("brand-new-ref"), "a null name falls back to the ref placeholder on create-on-demand");
+    }
+
+    [Test]
+    public async Task PutRoster_WhitespaceOnlyName_400()
+    {
+        var request = ValidRosterRequest();
+        request.Name = "   ";
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_OverlongName_400()
+    {
+        var request = ValidRosterRequest();
+        request.Name = new string('a', 101);
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    // ── POST /internal/channels (D10 epoch/seq/detached) ────────────────────────────────────────
+
+    [Test]
+    public async Task PostCreate_WithEpochSeqDetached_200_AndChannelIsBornDetached()
+    {
+        var request = ValidCreateRequest(@ref: "ladder-1", members: "Peter#123");
+        request.Epoch = "e1";
+        request.Seq = 1;
+        request.Detached = true;
+
+        var result = await _controller.Create(request) as OkObjectResult;
+
+        Assert.That(result, Is.Not.Null);
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
+        Assert.That(channel.Detached, Is.True, "a ladder-match create with detached:true must be born frozen");
+        var membership = await _membershipRepository.Load(channel.Id, "Peter#123");
+        Assert.That(membership, Is.Not.Null, "birth members are still added before the freeze");
+    }
+
+    [Test]
+    public async Task PostCreate_EpochWithoutSeq_400()
+    {
+        var request = ValidCreateRequest();
+        request.Epoch = "e1";
+
+        var result = await _controller.Create(request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PostCreate_SeqWithoutEpoch_400()
+    {
+        var request = ValidCreateRequest();
+        request.Seq = 1;
+
+        var result = await _controller.Create(request);
+
+        AssertBadRequest(result);
+    }
+
+    [TestCase(0L)]
+    [TestCase(-1L)]
+    public async Task PostCreate_SeqBelowOne_400(long badSeq)
+    {
+        var request = ValidCreateRequest();
+        request.Epoch = "e1";
+        request.Seq = badSeq;
+
+        var result = await _controller.Create(request);
+
+        AssertBadRequest(result);
+    }
+
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task PostCreate_InvalidEpoch_400(string badEpoch)
+    {
+        var request = ValidCreateRequest();
+        request.Epoch = badEpoch;
+        request.Seq = 1;
+
+        var result = await _controller.Create(request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PostCreate_WithoutNewFields_200_UnchangedBehavior()
+    {
+        var request = ValidCreateRequest(@ref: "match-legacy", members: "Peter#123");
+
+        var result = await _controller.Create(request) as OkObjectResult;
+
+        Assert.That(result, Is.Not.Null);
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-legacy");
+        Assert.That(channel.AssertEpoch, Is.Null, "no stamp is written when epoch/seq are omitted — the back-compat pin for today's mm");
+        Assert.That(channel.Detached, Is.False);
+    }
+
+    // ── POST /internal/channels/epoch-sync ──────────────────────────────────────────────────────
+
+    [Test]
+    public async Task PostEpochSync_ValidBody_Returns200_AndTearsDownUnlistedChannels()
+    {
+        await _controller.Create(ValidCreateRequest(@ref: "match-live", members: "Peter#123"));
+        await _controller.Create(ValidCreateRequest(@ref: "match-dead", members: "Wanda#456"));
+
+        var result = await _controller.EpochSync(ValidEpochSyncRequest(liveLobbyRefs: "match-live"));
+
+        Assert.That(result, Is.InstanceOf<OkResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-live"), Is.Not.Null);
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-dead"), Is.Null);
+    }
+
+    [Test]
+    public async Task PostEpochSync_EmptyLiveRefs_Returns200_AndTearsDownEverythingNonDetached()
+    {
+        await _controller.Create(ValidCreateRequest(@ref: "match-1", members: "Peter#123"));
+
+        var result = await _controller.EpochSync(ValidEpochSyncRequest());
+
+        Assert.That(result, Is.InstanceOf<OkResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1"), Is.Null,
+            "an empty live list (the post-crash case) tears down every non-detached match channel");
+    }
+
+    [Test]
+    public async Task PostEpochSync_NullLiveRefs_400()
+    {
+        var result = await _controller.EpochSync(new InternalEpochSyncRequest { Epoch = "e1", LiveLobbyRefs = null });
+
+        AssertBadRequest(result);
+    }
+
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task PostEpochSync_InvalidRefInLiveList_400(string badRef)
+    {
+        await _controller.Create(ValidCreateRequest(@ref: "match-1", members: "Peter#123"));
+
+        var result = await _controller.EpochSync(new InternalEpochSyncRequest { Epoch = "e1", LiveLobbyRefs = new List<string> { badRef } });
+
+        AssertBadRequest(result);
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1"), Is.Not.Null,
+            "validation must run BEFORE any domain call — an invalid entry must not trigger a partial teardown");
+    }
+
+    [TestCaseSource(nameof(InvalidRefs))]
+    public async Task PostEpochSync_InvalidEpoch_400(string badEpoch)
+    {
+        var result = await _controller.EpochSync(new InternalEpochSyncRequest { Epoch = badEpoch, LiveLobbyRefs = new List<string>() });
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PostEpochSync_TooManyLiveRefs_400()
+    {
+        var tooMany = Enumerable.Range(0, ChatLimits.InternalMaxLiveRefsPerSync + 1)
+            .Select(i => $"ref{i}")
+            .ToList();
+
+        var result = await _controller.EpochSync(new InternalEpochSyncRequest { Epoch = "e1", LiveLobbyRefs = tooMany });
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PostEpochSync_NullBody_400()
+    {
+        var result = await _controller.EpochSync(null);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public void PostEpochSync_RouteDoesNotShadowCreateOrDelete()
+    {
+        // Cheap regression guard (Task 5): proves the three actions carry distinct [Http*] route
+        // templates rather than reasoning about ASP.NET's routing table by inspection alone.
+        var createRoute = typeof(InternalChannelsController)
+            .GetMethod(nameof(InternalChannelsController.Create))
+            .GetCustomAttribute<HttpPostAttribute>()?.Template;
+        var deleteRoute = typeof(InternalChannelsController)
+            .GetMethod(nameof(InternalChannelsController.Delete))
+            .GetCustomAttribute<HttpDeleteAttribute>()?.Template;
+        var epochSyncRoute = typeof(InternalChannelsController)
+            .GetMethod(nameof(InternalChannelsController.EpochSync))
+            .GetCustomAttribute<HttpPostAttribute>()?.Template;
+
+        Assert.That(createRoute, Is.Null.Or.Empty, "Create is the root POST — no template, distinct from epoch-sync");
+        Assert.That(deleteRoute, Is.EqualTo("{ref}"), "Delete's template is a different verb+template from EpochSync's POST epoch-sync");
+        Assert.That(epochSyncRoute, Is.EqualTo("epoch-sync"));
     }
 
     // ── DELETE /internal/channels/{ref} ─────────────────────────────────────────────────────────
