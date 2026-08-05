@@ -495,6 +495,14 @@ public partial class ChatHub
     /// later hard-delete leave (<see cref="LeaveChannel"/>) and get re-seeded on rejoin (<see cref="JoinChannel"/>)
     /// or consulted for a non-member Public mention (<see cref="Mentions.MentionFanOut"/>).
     /// </para>
+    /// <para>
+    /// Fix round 1 (F5): the pref upsert is a SECONDARY, best-effort write — by the time it runs, the
+    /// primary membership update has already succeeded and the caller's request is already satisfied. A
+    /// failure there (e.g. a Mongo hiccup) must NEVER surface as an error for an already-applied level
+    /// change — this matches the "secondary write never breaks the primary ack" posture elsewhere in the
+    /// codebase (<see cref="Mentions.MentionFanOut"/>'s per-target fault isolation, <see cref="FanOut.FanOutEngine"/>'s
+    /// per-recipient fault isolation). Failures are caught and logged; the method still returns Ok.
+    /// </para>
     /// </summary>
     public async Task<ChannelOperationResult> SetNotificationLevel(string channelId, NotificationLevel level)
     {
@@ -527,10 +535,24 @@ public partial class ChatHub
         // PR36 follow-up (D2): persist the just-applied level for name-joinable rooms only, so it
         // survives a later leave/rejoin cycle. A vanished channel (null) is treated as non-name-joinable
         // — no pref write, nothing to seed back into on a rejoin that can never happen.
+        // Fix round 1 (F5): best-effort — the membership update above already succeeded and the caller's
+        // request is already satisfied, so a failure persisting this SECONDARY carrier must not turn an
+        // already-applied level change into an error response.
         if (channel != null && (channel.Type == ChannelType.Public || channel.Type == ChannelType.SemiPublic))
         {
             var now = _timeProvider.GetUtcNow().UtcDateTime;
-            await _notificationPreferenceRepository.Upsert(battleTag, channelId, level, now);
+            try
+            {
+                await _notificationPreferenceRepository.Upsert(battleTag, channelId, level, now);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(
+                    ex,
+                    "NotificationPreference upsert failed for {BattleTag} on channel {ChannelId} — the membership level was already applied; the persisted preference may lag until the next successful set",
+                    battleTag,
+                    channelId);
+            }
         }
 
         return new ChannelOperationResult(ChatResultCode.Ok);

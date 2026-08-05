@@ -51,7 +51,10 @@ public class NotificationPreferenceRepository(MongoClient mongoClient) : MongoDb
     /// so the write MUST go through <c>FindOneAndUpdateAsync</c> for the retry to actually catch the race.
     /// </para>
     /// </summary>
-    public Task<NotificationPreference> Upsert(string battleTag, string channelId, NotificationLevel level, DateTime now)
+    // virtual: a test seam (mirroring MembershipRepository.LoadForChannel / MentionInboxRepository.Insert)
+    // so a test double can simulate a write failure here — exercises the ChatHub.SetNotificationLevel
+    // best-effort posture (fix round 1, F5) without needing a real Mongo fault.
+    public virtual Task<NotificationPreference> Upsert(string battleTag, string channelId, NotificationLevel level, DateTime now)
     {
         var tag = NormalizeTag(battleTag);
         var filter = Builders<NotificationPreference>.Filter.Where(p => p.BattleTag == tag && p.ChannelId == channelId);

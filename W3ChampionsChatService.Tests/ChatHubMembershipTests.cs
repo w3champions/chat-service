@@ -85,7 +85,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
             new MentionInboxRepository(MongoClient));
     }
 
-    private ChatHub BuildHub(string connectionId)
+    private ChatHub BuildHub(string connectionId, NotificationPreferenceRepository notificationPreferenceRepository = null)
     {
         var hub = new ChatHub(
             _connectionMapping,
@@ -112,7 +112,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            _notificationPreferenceRepository);
+            notificationPreferenceRepository ?? _notificationPreferenceRepository);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
@@ -744,5 +744,35 @@ public class ChatHubMembershipTests : IntegrationTestBase
         var inbox = new MentionInboxRepository(MongoClient);
         Assert.That(await inbox.LoadForUser(BattleTag.ToLowerInvariant()), Has.Count.EqualTo(1),
             "a persisted level other than None must not keep suppressing a mention after leaving");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PR36 follow-up (D2), fix round 1 (F5) — the pref upsert is a SECONDARY, best-effort write: a
+    // failure there must never turn an already-applied membership level change into an error response.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task SetNotificationLevel_PrefUpsertThrows_MembershipStillAppliesAndReturnsOk()
+    {
+        var channel = await CreateChannel("general");
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1", new ThrowingNotificationPreferenceRepository(MongoClient));
+        await hub.JoinChannel("general");
+
+        var result = await hub.SetNotificationLevel(channel.Id, NotificationLevel.None);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code,
+            "a failed pref upsert must not fail an already-applied membership level change");
+        var persisted = await _membershipRepository.Load(channel.Id, BattleTag);
+        Assert.AreEqual(NotificationLevel.None, persisted.NotificationLevel,
+            "the membership update itself must still have gone through, unaffected by the pref-write failure");
+    }
+
+    // A NotificationPreferenceRepository whose Upsert always throws — simulating a Mongo write failure on
+    // the secondary preference-persistence path, to prove SetNotificationLevel's best-effort posture (F5).
+    private sealed class ThrowingNotificationPreferenceRepository(MongoClient client) : NotificationPreferenceRepository(client)
+    {
+        public override Task<NotificationPreference> Upsert(string battleTag, string channelId, NotificationLevel level, DateTime now) =>
+            Task.FromException<NotificationPreference>(new InvalidOperationException("simulated NotificationPreference upsert failure"));
     }
 }
