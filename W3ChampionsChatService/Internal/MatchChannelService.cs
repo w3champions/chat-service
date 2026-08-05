@@ -463,13 +463,24 @@ public class MatchChannelService(
     /// <para>DETACHED CHANNELS ARE EXCLUDED ENTIRELY — filtered server-side by
     /// <see cref="ChannelRepository.LoadNonDetachedMatchChannels"/>, so an in-game/post-game room is
     /// never loaded, never torn down, never re-stamped. Its 24h TTL owns it.</para>
+    /// <para>UNSTAMPED CHANNELS ARE EXCLUDED ENTIRELY TOO (2026-08-05 fix wave, final review H1, plan D8
+    /// amendment): the same query additionally requires <c>AssertEpoch</c> to exist — only a channel that
+    /// has participated in the assertion protocol at least once (created with epoch/seq, or asserted via
+    /// the roster endpoint) is a sweep candidate. A channel minted only by the deprecated delta path
+    /// during the transition window has no stamp at all and is invisible to this sweep; it falls to its
+    /// own 24h creation-anchored TTL instead. This is what makes the very first epoch sync after mm's own
+    /// deploy safe against the (measured, ~4,900/day) non-detached ladder-match channels that already
+    /// exist in the database at cutover — that first sync's candidate set does not include them, so it
+    /// cannot tear them down, with no runbook or deploy-order choreography required beyond "chat-service
+    /// ships first".</para>
     /// <para>Each channel is processed under its OWN per-ref gate (never one global lock) and RE-LOADED
     /// inside that gate before teardown, so the teardown/spare decision is always made on FRESHLY loaded
-    /// state: a channel deleted or detached between the discovery scan and its own turn is skipped
-    /// outright (never torn down on stale information), and a channel recreated in that window is judged
-    /// on its NEW document rather than the stale scan-time candidate — a recreated channel whose ref is
-    /// still absent from <paramref name="liveLobbyRefs"/> IS torn down; recreation does not spare it, it
-    /// just means the decision is made on fresh data instead of stale data.</para>
+    /// state: a channel deleted, detached, OR recreated-but-unstamped between the discovery scan and its
+    /// own turn is skipped outright (never torn down on stale information), and a channel recreated in
+    /// that window WITH a stamp is judged on its NEW document rather than the stale scan-time candidate —
+    /// a recreated, still-stamped channel whose ref is still absent from <paramref name="liveLobbyRefs"/>
+    /// IS torn down; recreation does not spare it, it just means the decision is made on fresh data
+    /// instead of stale data.</para>
     /// <para>Conversely, a channel created AFTER the discovery scan is not a candidate at all and is never
     /// swept — by definition any lobby mm creates after boot is live under the new epoch, so it survives
     /// to the next assertion or the 24h TTL (plan residual 4).</para>
@@ -487,10 +498,11 @@ public class MatchChannelService(
             using var _ = await _refGate.AcquireAsync(candidate.SystemRef);
 
             // RE-LOAD inside the gate: the discovery scan above ran outside any per-ref gate, so the
-            // candidate could have been torn down, recreated, or detached by another mutating call
-            // between the scan and this channel's turn — never act on stale information.
+            // candidate could have been torn down, recreated, detached, or (H1) recreated WITHOUT a stamp
+            // by another mutating call between the scan and this channel's turn — never act on stale
+            // information. An unstamped reload is treated exactly like a detached one: skip outright.
             var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, candidate.SystemRef);
-            if (channel == null || channel.Detached)
+            if (channel == null || channel.Detached || channel.AssertEpoch == null)
             {
                 continue;
             }

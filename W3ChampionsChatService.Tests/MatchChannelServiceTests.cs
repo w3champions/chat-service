@@ -1145,8 +1145,12 @@ public class MatchChannelServiceTests : IntegrationTestBase
     public async Task EpochSync_TearsDownChannelsNotInLiveList()
     {
         const string alice = "Alice#1";
-        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false);
-        var kept = await _service.CreateOrGet("match-kept", "Kept Match", Members(alice), focus: false);
+        // 2026-08-05 fix wave (final review H1, plan D8 amendment): stamped via epoch/seq on create — an
+        // UNSTAMPED channel is invisible to the sweep entirely (see the dedicated survives-test below),
+        // so a meaningful "gets torn down" test needs a channel that has participated in the assertion
+        // protocol at least once.
+        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false, epoch: "e1", seq: 1);
+        var kept = await _service.CreateOrGet("match-kept", "Kept Match", Members(alice), focus: false, epoch: "e1", seq: 1);
         var message = NewMessage(gone.Id, 1, alice);
         await _messageRepository.Insert(message);
 
@@ -1170,8 +1174,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
         RegisterOnline("conn-alice", alice);
         RegisterOnline("conn-bob", bob);
 
-        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false);
-        var kept = await _service.CreateOrGet("match-kept", "Kept Match", Members(bob), focus: false);
+        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false, epoch: "e1", seq: 1);
+        var kept = await _service.CreateOrGet("match-kept", "Kept Match", Members(bob), focus: false, epoch: "e1", seq: 1);
         var detachedRef = "match-detached";
         await _service.CreateOrGet(detachedRef, "Detached Match", Members(), focus: false, detached: true);
 
@@ -1212,8 +1216,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
     public async Task EpochSync_EmptyLiveList_TearsDownEveryNonDetachedMatchChannel_ButNotDetachedOnes()
     {
         const string alice = "Alice#1";
-        var matchA = await _service.CreateOrGet("match-a", "Match A", Members(alice), focus: false);
-        var matchB = await _service.CreateOrGet("match-b", "Match B", Members(alice), focus: false);
+        var matchA = await _service.CreateOrGet("match-a", "Match A", Members(alice), focus: false, epoch: "e1", seq: 1);
+        var matchB = await _service.CreateOrGet("match-b", "Match B", Members(alice), focus: false, epoch: "e1", seq: 1);
         var detached = await _service.CreateOrGet("match-detached", "Ladder", Members(alice), focus: false, detached: true);
 
         await _service.ApplyEpochSync("e2", Members());
@@ -1251,25 +1255,46 @@ public class MatchChannelServiceTests : IntegrationTestBase
     public async Task EpochSync_StampsSparedChannelThatHasNoStoredEpoch()
     {
         const string bob = "Bob#2";
-        // Created via the legacy CreateOrGet path and NEVER asserted — AssertEpoch is genuinely ABSENT
-        // on the stored document (not merely a different value from a prior assertion, as the sibling
-        // ReStampsSparedChannels test above exercises via ApplyRosterAssertion("e1", ...) first). This is
-        // the $exists:false disjunct of StampAssertionEpoch's filter — a legacy/transition channel spared
-        // by an epoch sync that has no AssertEpoch to compare against at all.
-        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        // Created via CreateOrGet WITH an epoch/seq stamp (unlike the sibling survives-test below) but
+        // never asserted since — AssertEpoch is set directly by the create's own D10 stamp, so this is
+        // the $exists:false-turned-true disjunct of StampAssertionEpoch's filter: a channel stamped
+        // exactly once, at create time, is still spared and re-anchored like any other candidate.
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false, epoch: "e1", seq: 1);
 
         await _service.ApplyEpochSync("e2", Members("match-1"));
 
         var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
         Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"),
-            "a spared channel with NO stored epoch at all must still be re-anchored to the new epoch — "
-            + "proves the absent-epoch disjunct in StampAssertionEpoch's filter, not just its Ne branch");
+            "a spared channel stamped only once, at create time, must still be re-anchored to the new epoch");
         Assert.That(reloaded.AssertSeq, Is.EqualTo(0), "the seq counter is reset to the 0 sentinel");
 
         await _service.ApplyRosterAssertion("match-1", "e2", 1, Members(bob), name: null, detached: false);
 
         Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null,
             "seq 1 under the new epoch applies cleanly after the re-anchor, confirming the stamp actually landed");
+    }
+
+    [Test]
+    public async Task EpochSync_UnstampedChannel_SurvivesEvenWhenAbsentFromLiveList_FallsToTtl()
+    {
+        const string alice = "Alice#1";
+        // Created via the legacy CreateOrGet path and NEVER stamped by the assertion protocol at all —
+        // AssertEpoch is genuinely ABSENT on the stored document, exactly the shape of a channel minted
+        // by the pre-reconciliation mm via the deprecated delta path during the transition window.
+        // 2026-08-05 fix wave (final review H1, plan D8 amendment): such a channel must NOT be swept by
+        // an epoch sync — LoadNonDetachedMatchChannels's AssertEpoch-exists filter makes it invisible to
+        // the sweep entirely, so it survives regardless of liveLobbyRefs and falls to its own 24h TTL.
+        var channel = await _service.CreateOrGet("match-legacy", "Legacy Match", Members(alice), focus: false);
+
+        // Absent from BOTH the live list AND ever having been stamped — the worst case, and exactly the
+        // shape of the mm-deploy cutover: mm boots with an empty liveLobbyRefs and a fresh epoch, and
+        // every pre-deploy channel in the database looks exactly like this.
+        await _service.ApplyEpochSync("e2", Members());
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-legacy");
+        Assert.That(reloaded, Is.Not.Null, "an unstamped channel must survive an epoch sync even when absent from liveLobbyRefs");
+        Assert.That(reloaded.AssertEpoch, Is.Null, "it is left completely untouched — not re-stamped either, since it was never a candidate");
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "its memberships survive");
     }
 
     [Test]
@@ -1318,8 +1343,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
     {
         const string alice = "Alice#1";
         RegisterOnline("conn-alice", alice);
-        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false);
-        await _service.CreateOrGet("match-kept", "Kept Match", Members(), focus: false);
+        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false, epoch: "e1", seq: 1);
+        await _service.CreateOrGet("match-kept", "Kept Match", Members(), focus: false, epoch: "e1", seq: 1);
 
         await _service.ApplyEpochSync("e2", Members("match-kept"));
         var pushCountAfterFirst = _harness.AllSignals.Count;
@@ -1341,8 +1366,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
     {
         const string alice = "Alice#1";
         const string bob = "Bob#2";
-        await _service.CreateOrGet("match-gone-1", "Gone 1", Members(alice), focus: false);
-        await _service.CreateOrGet("match-gone-2", "Gone 2", Members(alice, bob), focus: false);
+        await _service.CreateOrGet("match-gone-1", "Gone 1", Members(alice), focus: false, epoch: "e1", seq: 1);
+        await _service.CreateOrGet("match-gone-2", "Gone 2", Members(alice, bob), focus: false, epoch: "e1", seq: 1);
         await _service.CreateOrGet("match-kept", "Kept", Members(bob), focus: false);
 
         await _service.ApplyEpochSync("e2", Members("match-kept"));
@@ -1357,7 +1382,7 @@ public class MatchChannelServiceTests : IntegrationTestBase
     [Test]
     public async Task EpochSync_LiveRefMatching_IsCaseSensitive()
     {
-        await _service.CreateOrGet("match-A", "Upper", Members("Alice#1"), focus: false);
+        await _service.CreateOrGet("match-A", "Upper", Members("Alice#1"), focus: false, epoch: "e1", seq: 1);
 
         // A ref differing only in case is a DIFFERENT lobby — refs are exact Mongo keys drawn from
         // [A-Za-z0-9_-] (mm's nanoids use a mixed-case alphabet), unlike battleTags.
@@ -1433,8 +1458,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
             MongoClient, channelRepo, async tornDownId => await channelRepo.SetDetached(tornDownId == idA ? idB : idA));
         var service = new MatchChannelService(channelRepo, memberships, _messageRepository, _fanOutEngine, _time);
 
-        var a = await service.CreateOrGet("match-a", "A", Members("Alice#1"), focus: false);
-        var b = await service.CreateOrGet("match-b", "B", Members("Bob#2"), focus: false);
+        var a = await service.CreateOrGet("match-a", "A", Members("Alice#1"), focus: false, epoch: "e1", seq: 1);
+        var b = await service.CreateOrGet("match-b", "B", Members("Bob#2"), focus: false, epoch: "e1", seq: 1);
         idA = a.Id;
         idB = b.Id;
 
@@ -1468,8 +1493,8 @@ public class MatchChannelServiceTests : IntegrationTestBase
             MongoClient, channelRepo, async tornDownId => await channelRepo.Delete(tornDownId == idA ? idB : idA));
         var service = new MatchChannelService(channelRepo, memberships, _messageRepository, _fanOutEngine, _time);
 
-        var a = await service.CreateOrGet("match-a", "A", Members("Alice#1"), focus: false);
-        var b = await service.CreateOrGet("match-b", "B", Members("Bob#2"), focus: false);
+        var a = await service.CreateOrGet("match-a", "A", Members("Alice#1"), focus: false, epoch: "e1", seq: 1);
+        var b = await service.CreateOrGet("match-b", "B", Members("Bob#2"), focus: false, epoch: "e1", seq: 1);
         idA = a.Id;
         idB = b.Id;
         var pushesBefore = _harness.AllSignals.Count;

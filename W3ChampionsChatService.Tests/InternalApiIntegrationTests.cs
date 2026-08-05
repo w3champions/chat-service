@@ -840,7 +840,10 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         const string alice = "Alice#1";
         RegisterOnline("conn-alice", alice);
 
-        var createBody = "{\"kind\":\"match\",\"ref\":\"match-epoch-1\",\"name\":\"Epoch Match\",\"members\":[\"Alice#1\"]}";
+        // 2026-08-05 fix wave (final review H1, plan D8 amendment): the sweep only considers channels
+        // already stamped by the assertion protocol, so the create carries epoch/seq — an unstamped
+        // channel would be invisible to the sweep and would survive regardless of liveLobbyRefs.
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-epoch-1\",\"name\":\"Epoch Match\",\"members\":[\"Alice#1\"],\"epoch\":\"e1\",\"seq\":1}";
         var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
         Assert.That(createResult, Is.InstanceOf<OkObjectResult>());
 

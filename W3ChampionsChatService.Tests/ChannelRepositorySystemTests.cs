@@ -276,12 +276,19 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task LoadNonDetachedMatchChannels_ReturnsOnlyNonDetachedSystemMatch()
+    public async Task LoadNonDetachedMatchChannels_ReturnsOnlyNonDetachedAssertionStampedSystemMatch()
     {
         var repo = new ChannelRepository(MongoClient);
         var liveMatch = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-live", "Live Match", Now);
+        await repo.TryAdvanceAssertion(liveMatch.Id, "e1", 1);
         var detachedMatch = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-detached", "Detached Match", Now);
+        await repo.TryAdvanceAssertion(detachedMatch.Id, "e1", 1);
         await repo.SetDetached(detachedMatch.Id);
+        // 2026-08-05 fix wave (final review H1, plan D8 amendment): a match channel that has NEVER been
+        // stamped by the assertion protocol — exactly the shape of a channel minted only by the
+        // deprecated delta path during the transition window — must be excluded too, same as a detached
+        // one, not just left to chance alongside the non-match seeds below.
+        await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-unstamped", "Unstamped Match", Now);
         await repo.FindOrCreateSystem(SystemChannelKind.Clan, "clan-1", "Clan Chat", Now);
         await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Pub", NormalizedName = "pub" });
         await repo.Insert(new ChatChannel { Type = ChannelType.Dm, PairKey = "alice#1|bob#2" });

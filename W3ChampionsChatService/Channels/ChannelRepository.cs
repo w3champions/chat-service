@@ -300,8 +300,21 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Detached, true));
 
     /// <summary>
-    /// Every System+Match channel eligible for an epoch sync — i.e. NOT detached (a detached room is
-    /// excluded from every sweep by design, so it is filtered out server-side and never even loaded).
+    /// Every System+Match channel eligible for an epoch sync — NOT detached (a detached room is excluded
+    /// from every sweep by design, so it is filtered out server-side and never even loaded) AND already
+    /// stamped by the assertion protocol (<c>AssertEpoch</c> exists).
+    /// <para>
+    /// The <c>AssertEpoch</c>-exists clause is a 2026-08-05 fix wave amendment (final review H1, plan D8
+    /// amendment). Every channel the reconciliation-era mm creates is stamped by construction (create
+    /// carries epoch/seq; the roster-assertion endpoint stamps on demand), so it is correctly a sweep
+    /// candidate. A channel minted by the PRE-reconciliation mm (deprecated delta protocol only, never an
+    /// assertion) has no <c>AssertEpoch</c> field at all — <see cref="ChatChannel.AssertEpoch"/> is
+    /// <c>[BsonIgnoreIfNull]</c>, so it is genuinely absent from the document, not merely null — and is
+    /// therefore invisible to this query. It falls to its own 24h creation-anchored TTL instead of being
+    /// torn down by the very first post-deploy epoch sync. Without this clause, that first sync would tear
+    /// down every non-detached System+Match channel already in the database at mm's deploy instant,
+    /// including every in-progress ladder game's chat (~4,900 channels/day measured against production).
+    /// </para>
     /// Bounded in practice by the 24h creation-anchored TTL on match channels, which is why this needs
     /// no pagination; served by the ux_systemKind_systemRef index's SystemKind prefix.
     /// </summary>
@@ -311,7 +324,8 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         return Channels.Find(fb.And(
             fb.Eq(c => c.Type, ChannelType.System),
             fb.Eq(c => c.SystemKind, SystemChannelKind.Match),
-            fb.Ne(c => c.Detached, true))).ToListAsync();
+            fb.Ne(c => c.Detached, true),
+            fb.Exists(c => c.AssertEpoch, true))).ToListAsync();
     }
 
     /// <summary>

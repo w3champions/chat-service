@@ -533,11 +533,23 @@ public class InternalChannelsControllerTests : IntegrationTestBase
 
     // ── POST /internal/channels/epoch-sync ──────────────────────────────────────────────────────
 
+    // 2026-08-05 fix wave (final review H1, plan D8 amendment): the sweep only considers channels
+    // already stamped by the assertion protocol (AssertEpoch exists), so every seed below that must be
+    // torn down carries epoch/seq on its create — an unstamped channel would be invisible to the sweep
+    // entirely and would survive regardless of liveLobbyRefs (see the dedicated survives-test below).
+    private static InternalChannelCreateRequest StampedCreateRequest(string @ref, params string[] members)
+    {
+        var request = ValidCreateRequest(@ref: @ref, members: members);
+        request.Epoch = "e1";
+        request.Seq = 1;
+        return request;
+    }
+
     [Test]
     public async Task PostEpochSync_ValidBody_Returns200_AndTearsDownUnlistedChannels()
     {
-        await _controller.Create(ValidCreateRequest(@ref: "match-live", members: "Peter#123"));
-        await _controller.Create(ValidCreateRequest(@ref: "match-dead", members: "Wanda#456"));
+        await _controller.Create(StampedCreateRequest("match-live", "Peter#123"));
+        await _controller.Create(StampedCreateRequest("match-dead", "Wanda#456"));
 
         var result = await _controller.EpochSync(ValidEpochSyncRequest(liveLobbyRefs: "match-live"));
 
@@ -549,13 +561,27 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     [Test]
     public async Task PostEpochSync_EmptyLiveRefs_Returns200_AndTearsDownEverythingNonDetached()
     {
-        await _controller.Create(ValidCreateRequest(@ref: "match-1", members: "Peter#123"));
+        await _controller.Create(StampedCreateRequest("match-1", "Peter#123"));
 
         var result = await _controller.EpochSync(ValidEpochSyncRequest());
 
         Assert.That(result, Is.InstanceOf<OkResult>());
         Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1"), Is.Null,
-            "an empty live list (the post-crash case) tears down every non-detached match channel");
+            "an empty live list (the post-crash case) tears down every non-detached, assertion-stamped match channel");
+    }
+
+    [Test]
+    public async Task PostEpochSync_UnstampedChannel_Returns200_AndSurvives_FallsToTtl()
+    {
+        // A channel created WITHOUT epoch/seq — exactly the shape of a channel minted only by the
+        // deprecated delta protocol (or today's not-yet-deployed mm) — must be invisible to the sweep.
+        await _controller.Create(ValidCreateRequest(@ref: "match-unstamped", members: "Peter#123"));
+
+        var result = await _controller.EpochSync(ValidEpochSyncRequest());
+
+        Assert.That(result, Is.InstanceOf<OkResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-unstamped"), Is.Not.Null,
+            "an unstamped channel survives an epoch sync even when absent from liveLobbyRefs — it falls to its own 24h TTL instead");
     }
 
     [Test]
