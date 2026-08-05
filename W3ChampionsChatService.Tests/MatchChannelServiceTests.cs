@@ -951,6 +951,70 @@ public class MatchChannelServiceTests : IntegrationTestBase
     }
 
     // ============================================================================================
+    // Out-of-order heal — assert creates a shell, delete tears it down, a late create heals it
+    // idempotently. Narrower unit-level replacement for the delta-path
+    // OutOfOrder_PutThenDelete_ThenLatePost_HealsIdempotently test removed in the 2026-08-05
+    // delta-deletion round (task-7-report.md, "Judgment calls"), rewritten onto the surviving
+    // roster-assertion + D10 create-stamping protocol instead of the retired delta endpoint.
+    // ============================================================================================
+
+    [Test]
+    public async Task OutOfOrder_AssertThenDelete_ThenLateCreate_HealsWithFreshChannel()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+
+        // (1) An assertion for an UNKNOWN ref arrives before mm's create POST — the create-on-demand
+        // path stamps (e1, 1) and creates the shell.
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(), name: "My Lobby", detached: false);
+        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(shell, Is.Not.Null, "precondition: the out-of-order assertion created the shell on demand");
+        var shellId = shell.Id;
+        var shellExpiry = shell.ExpiresAt;
+
+        // The clock moves before the delete+late-create below, so a fresh 24h expiry is distinguishable
+        // from the shell's own creation-anchored one.
+        _time.Advance(TimeSpan.FromHours(3));
+
+        // (2) A hard DELETE tears the shell down completely — doc, memberships, messages all gone.
+        await _service.DeleteChannel("match-1");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1"), Is.Null,
+            "the channel doc is torn down");
+        Assert.That(await _membershipRepository.LoadForChannel(shellId), Is.Empty, "its memberships are torn down");
+
+        // (3) A LATE create for the same ref now arrives, carrying the (epoch, seq) pair from BEFORE the
+        // delete (e1, 1) — stale coordinates relative to the vanished channel, but there is no live document
+        // at all for TryAdvanceAssertion to compare against, so it must heal idempotently rather than throw.
+        ChatChannel healed = null;
+        Assert.DoesNotThrowAsync(
+            async () => healed = await _service.CreateOrGet("match-1", "My Lobby", Members(alice), focus: false, epoch: "e1", seq: 1),
+            "the late create must heal idempotently — never throw on a stale (epoch, seq) against a fresh doc");
+
+        Assert.That(healed, Is.Not.Null);
+        Assert.That(healed.Id, Is.Not.EqualTo(shellId), "the heal produces a BRAND-NEW channel doc, not the deleted one");
+
+        // Exactly one physical doc for the ref — the heal does not leave a duplicate/orphaned row behind.
+        var db = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
+        var docCount = await db.GetCollection<ChatChannel>(ChatCollections.Channels).CountDocumentsAsync(c =>
+            c.Type == ChannelType.System && c.SystemKind == SystemChannelKind.Match && c.SystemRef == "match-1");
+        Assert.That(docCount, Is.EqualTo(1), "exactly one channel doc exists for the ref after the heal");
+
+        // The fresh doc carries NO stored stamp going in, so the D10 member-add gate admits (CreateOrGetLocked's
+        // skipAdds reads AssertEpoch off the FRESH doc, which is null) and alice's membership is applied.
+        Assert.That(await _membershipRepository.Load(healed.Id, alice), Is.Not.Null,
+            "the fresh doc's D10 gate admits — members are applied on the healed channel");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1),
+            "alice's live connection receives ChannelAdded for the healed channel");
+
+        // A fresh 24h expiry, anchored to the heal's OWN creation time — not a reuse of the deleted shell's
+        // now-stale expiry.
+        Assert.That((healed.ExpiresAt.Value - Now.AddHours(24)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
+            "the healed channel's expiry is freshly anchored to ITS OWN creation time");
+        Assert.That(healed.ExpiresAt, Is.Not.EqualTo(shellExpiry),
+            "the healed channel's expiry is NOT the stale, deleted shell's expiry");
+    }
+
+    // ============================================================================================
     // 2026-08-05 reconciliation — ApplyEpochSync: startup teardown of orphaned lobby channels
     // (plan D8, Task 4)
     // ============================================================================================
