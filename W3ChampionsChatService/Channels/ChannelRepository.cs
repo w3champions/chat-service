@@ -254,6 +254,65 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         return result.ModifiedCount == 1;
     }
 
+    /// <summary>
+    /// The (epoch, seq) ADMISSION GATE for a roster assertion, expressed as ONE conditional update —
+    /// admit and stamp are atomic (the SetRequestAccepted idiom). Returns true when the assertion may
+    /// be applied. Staleness semantics (plan D3): (a) no epoch stored yet => accept; (b) SAME epoch =>
+    /// accept only when seq is STRICTLY greater than the stored one; (c) DIFFERENT epoch => accept and
+    /// RE-ANCHOR (epochs are opaque and unordered, and a discard rule would permanently wedge a channel
+    /// that survived an mm restart — the caller logs this anomaly). A detached channel is never
+    /// admitted: the domain layer checks Detached first, and this filter re-checks it as the durable
+    /// backstop against a concurrent detach.
+    /// Virtual: a test seam (the MembershipRepository.LoadForChannel idiom) so a subclass can block
+    /// inside this call and prove the per-ref gate actually serializes two concurrent assertions.
+    /// </summary>
+    public virtual async Task<bool> TryAdvanceAssertion(string channelId, string epoch, long seq)
+    {
+        var fb = Builders<ChatChannel>.Filter;
+        var admissible = fb.Or(
+            fb.Exists(c => c.AssertEpoch, false),
+            fb.Ne(c => c.AssertEpoch, epoch),
+            fb.And(
+                fb.Eq(c => c.AssertEpoch, epoch),
+                fb.Or(fb.Exists(c => c.AssertSeq, false), fb.Lt(c => c.AssertSeq, seq))));
+        var filter = fb.And(fb.Eq(c => c.Id, channelId), fb.Ne(c => c.Detached, true), admissible);
+        var update = Builders<ChatChannel>.Update
+            .Set(c => c.AssertEpoch, epoch)
+            .Set(c => c.AssertSeq, seq);
+
+        var result = await Channels.UpdateOneAsync(filter, update);
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Freezes the room (plan D4) — see ChatChannel.Detached. Idempotent.</summary>
+    public Task SetDetached(string channelId) =>
+        Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Detached, true));
+
+    /// <summary>
+    /// Every System+Match channel eligible for an epoch sync — i.e. NOT detached (a detached room is
+    /// excluded from every sweep by design, so it is filtered out server-side and never even loaded).
+    /// Bounded in practice by the 24h creation-anchored TTL on match channels, which is why this needs
+    /// no pagination; served by the ux_systemKind_systemRef index's SystemKind prefix.
+    /// </summary>
+    public Task<List<ChatChannel>> LoadNonDetachedMatchChannels()
+    {
+        var fb = Builders<ChatChannel>.Filter;
+        return Channels.Find(fb.And(
+            fb.Eq(c => c.Type, ChannelType.System),
+            fb.Eq(c => c.SystemKind, SystemChannelKind.Match),
+            fb.Ne(c => c.Detached, true))).ToListAsync();
+    }
+
+    /// <summary>
+    /// Epoch-sync authority reset for the channels a sync SPARES (plan D8): adopt the new epoch and
+    /// reset the per-lobby counter to the 0 sentinel, so mm's first assertion under the new epoch
+    /// (seq >= 1) applies cleanly. Writes 0 rather than $unset — see ChatChannel.AssertSeq.
+    /// </summary>
+    public Task StampAssertionEpoch(string channelId, string epoch) =>
+        Channels.UpdateOneAsync(
+            c => c.Id == channelId,
+            Builders<ChatChannel>.Update.Set(c => c.AssertEpoch, epoch).Set(c => c.AssertSeq, 0L));
+
     /// <summary>Hard-deletes a channel doc (C5 D12 — e.g. the last group member leaving; residual
     /// memberships are cleaned up separately via <see cref="Memberships.MembershipRepository.DeleteAllForChannel"/>).
     /// Messages are left to the 90d message TTL — no reader exists for a deleted channel's history

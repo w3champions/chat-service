@@ -379,4 +379,31 @@ public class ProtocolContractTests
         StringAssert.DoesNotContain("Declined", json);
         StringAssert.DoesNotContain("declined", json);
     }
+
+    // ── 2026-08-05 reconciliation plan Task 1 (D6) — assertion-state leak wall ───────────────
+
+    [Test]
+    public void ChatChannel_AssertionState_IsNeverSerializedToClients()
+    {
+        // D6: AssertEpoch/AssertSeq/Detached are mm<->chat reconciliation bookkeeping, never client
+        // protocol — the raw entity rides ChannelAddedDto.Channel / ChannelDto.Channel to clients.
+        var channel = new ChatChannel
+        {
+            Id = "c1",
+            AssertEpoch = "e1",
+            AssertSeq = 5,
+            Detached = true,
+        };
+
+        var json = JsonSerializer.Serialize(channel);
+
+        StringAssert.DoesNotContain("assertEpoch", json);
+        StringAssert.DoesNotContain("AssertEpoch", json);
+        StringAssert.DoesNotContain("assertSeq", json);
+        StringAssert.DoesNotContain("AssertSeq", json);
+        StringAssert.DoesNotContain("detached", json);
+        StringAssert.DoesNotContain("Detached", json);
+        // Positive control — proves the object really did serialize.
+        StringAssert.Contains("Id", json);
+    }
 }
