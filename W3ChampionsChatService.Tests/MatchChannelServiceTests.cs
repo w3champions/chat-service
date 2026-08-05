@@ -1424,6 +1424,47 @@ public class MatchChannelServiceTests : IntegrationTestBase
             "(e2, 6) still applies — the untouched counter continues advancing normally post-sync");
     }
 
+    // ============================================================================================
+    // 2026-08-05 fix wave (final review H2) — ApplyEpochSync honors the caller's CancellationToken
+    // ============================================================================================
+
+    [Test]
+    public async Task EpochSync_PreCancelledToken_StopsLoopEarly_PartialProcessing()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        await _service.CreateOrGet("match-a", "A", Members(alice), focus: false, epoch: "e1", seq: 1);
+        await _service.CreateOrGet("match-b", "B", Members(bob), focus: false, epoch: "e1", seq: 1);
+
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        // Empty live list: BOTH candidates would normally be torn down. A token that is ALREADY
+        // cancelled before the loop's first iteration must bail before touching either one — the
+        // check-and-bail happens at the TOP of the loop, between channels, never mid-teardown.
+        await _service.ApplyEpochSync("e2", Members(), cts.Token);
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-a"), Is.Not.Null,
+            "a pre-cancelled token must stop the sweep before it processes ANY candidate — partial (here, zero) "
+            + "processing is safe: nothing already-processed is left half-mutated, and the next attempt's "
+            + "candidate set is unchanged, so it makes full durable progress");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-b"), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task EpochSync_NonCancelledToken_CompletesNormally_UnchangedBehavior()
+    {
+        // Back-compat pin: the default CancellationToken (the overload every pre-H2 caller — including
+        // every other test in this file — uses) must behave byte-for-byte as before H2's change.
+        const string alice = "Alice#1";
+        await _service.CreateOrGet("match-gone", "Gone", Members(alice), focus: false, epoch: "e1", seq: 1);
+
+        await _service.ApplyEpochSync("e2", Members(), CancellationToken.None);
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-gone"), Is.Null,
+            "an explicit non-cancelled token completes the sweep exactly as the default-token overload does");
+    }
+
     // Fires a one-shot hook the first time a teardown reads a channel's member list — TearDownChannel's
     // very first statement, and the ONLY caller of LoadForChannel on this path. That instant is inside
     // ApplyEpochSync's loop but strictly AFTER its discovery scan, i.e. exactly the TOCTOU window the

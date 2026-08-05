@@ -269,7 +269,11 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
 
         try
         {
-            await matchChannelService.ApplyEpochSync(request.Epoch, request.LiveLobbyRefs);
+            // 2026-08-05 fix wave (final review H2): thread the client's own abort signal through the
+            // sweep loop. mm's client timeout is far shorter than a large sweep can take; without this,
+            // an aborted mm attempt leaves the sweep running headless while mm's retry launches ANOTHER
+            // overlapping one. A cancelled sweep is safe — see ApplyEpochSync's own doc.
+            await matchChannelService.ApplyEpochSync(request.Epoch, request.LiveLobbyRefs, HttpContext.RequestAborted);
 
             Log.Information(
                 "Internal channel epoch-sync succeeded {Caller} {Verb} epoch={Epoch} liveRefCount={LiveRefCount}",

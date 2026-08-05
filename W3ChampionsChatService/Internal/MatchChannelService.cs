@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
 using W3ChampionsChatService.Channels;
@@ -484,17 +485,39 @@ public class MatchChannelService(
     /// <para>Conversely, a channel created AFTER the discovery scan is not a candidate at all and is never
     /// swept — by definition any lobby mm creates after boot is live under the new epoch, so it survives
     /// to the next assertion or the 24h TTL (plan residual 4).</para>
+    /// <para>
+    /// CANCELLATION (2026-08-05 fix wave, final review H2): <paramref name="cancellationToken"/> — the
+    /// caller's <c>HttpContext.RequestAborted</c> — is checked at the TOP of each loop iteration, i.e.
+    /// BETWEEN channels, never mid-<see cref="TearDownChannel"/>. mm's client timeout (1.5s) is far
+    /// shorter than a large sweep can take, so without this an aborted mm attempt would leave the sweep
+    /// running headless server-side while mm's retry launches ANOTHER overlapping sweep on top of it. A
+    /// cancelled sweep is SAFE: every channel already processed made durable progress (teardown and
+    /// re-stamp are both terminal, idempotent writes), the abort is logged with a partial
+    /// <c>tornDown</c>/<c>spared</c> summary, and mm's next attempt resumes against a strictly smaller
+    /// candidate set — no data is left in a worse state than before the call, it just takes another
+    /// attempt (or several) to fully converge.
+    /// </para>
     /// </summary>
-    public async Task ApplyEpochSync(string epoch, IReadOnlyList<string> liveLobbyRefs)
+    public async Task ApplyEpochSync(string epoch, IReadOnlyList<string> liveLobbyRefs, CancellationToken cancellationToken = default)
     {
         // Refs are exact Mongo keys (unlike battleTags, which are the case-insensitive thing here) —
         // Ordinal, not OrdinalIgnoreCase.
         var live = new HashSet<string>(liveLobbyRefs, StringComparer.Ordinal);
         var tornDown = 0;
         var spared = 0;
+        var aborted = false;
 
         foreach (var candidate in await channelRepository.LoadNonDetachedMatchChannels())
         {
+            // Check-and-bail BETWEEN channels (H2) — never mid-teardown. Each channel already processed
+            // this call made durable, terminal progress, so bailing here is safe: nothing is left
+            // half-mutated, and the next attempt's candidate set is strictly smaller.
+            if (cancellationToken.IsCancellationRequested)
+            {
+                aborted = true;
+                break;
+            }
+
             using var _ = await _refGate.AcquireAsync(candidate.SystemRef);
 
             // RE-LOAD inside the gate: the discovery scan above ran outside any per-ref gate, so the
@@ -521,9 +544,11 @@ public class MatchChannelService(
 
         // Unconditional — a boot-time convergence event is exactly what an operator wants in the log,
         // including the healthy tornDown=0 case (mirrors the class's other Information-level summaries).
+        // aborted=true marks a PARTIAL summary (H2) — the sweep was cut short by the caller's own
+        // cancellation, not a failure; the counts reflect exactly how much durable progress landed.
         Log.Information(
-            "Epoch sync applied {Epoch} liveRefCount={LiveRefCount} tornDown={TornDown} spared={Spared}",
-            epoch, liveLobbyRefs.Count, tornDown, spared);
+            "Epoch sync applied {Epoch} liveRefCount={LiveRefCount} tornDown={TornDown} spared={Spared} aborted={Aborted}",
+            epoch, liveLobbyRefs.Count, tornDown, spared, aborted);
     }
 
     /// <summary>
