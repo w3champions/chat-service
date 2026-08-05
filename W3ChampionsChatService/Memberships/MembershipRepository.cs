@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -151,6 +152,34 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
     /// <see cref="LoadForChannel"/> but returns a bare count.</summary>
     public async Task<int> CountForChannel(string channelId) =>
         (int)await Memberships.CountDocumentsAsync(m => m.ChannelId == channelId);
+
+    /// <summary>
+    /// D1 follow-up (2026-08-05, mention-canonicalization brief): batched member-scope check for
+    /// <c>ChatHub.SearchMentionCandidates</c>' SemiPublic/System lane. Given an already-assembled,
+    /// SMALL candidate battleTag set (bounded to <see cref="ChatLimits.MentionSearchMaxResults"/>, ~20),
+    /// returns the SUBSET that actually has a <c>channel_memberships</c> row for
+    /// <paramref name="channelId"/> — ONE indexed <c>$in</c> query (backed by the same
+    /// <c>ux_channelId_battleTag</c> index <see cref="LoadForChannel"/> uses), never the full-room
+    /// membership scan <see cref="LoadForChannel"/> performs. This is what keeps the search bounded on a
+    /// big SemiPublic/System room: the read is sized to the CANDIDATE list, never the room's total
+    /// membership. A projected read (only <see cref="ChannelMembership.BattleTag"/> crosses the wire).
+    /// Tags are lowercase-normalized both in the query and the returned set (see the class doc's BATTLETAG
+    /// KEY CONVENTION), so callers should compare case-insensitively.
+    /// </summary>
+    public async Task<HashSet<string>> LoadMemberBattleTags(string channelId, IEnumerable<string> battleTags)
+    {
+        var tags = battleTags.Select(NormalizeTag).ToList();
+        if (tags.Count == 0)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var rows = await Memberships
+            .Find(m => m.ChannelId == channelId && tags.Contains(m.BattleTag))
+            .Project(m => m.BattleTag)
+            .ToListAsync();
+        return new HashSet<string>(rows, StringComparer.OrdinalIgnoreCase);
+    }
 
     public Task SetRole(string channelId, string battleTag, MembershipRole role)
     {

@@ -145,18 +145,44 @@ public partial class ChatHub
     /// of what their directory <c>LastSeenAt</c> bookkeeping happens to say.</item>
     /// </list>
     /// <para>
-    /// PRIVATE-LANE SCOPING (<see cref="ChannelType.Dm"/>/<see cref="ChannelType.GroupDm"/> ONLY): every
-    /// tier's universe is additionally restricted to the channel's actual DURABLE member set, resolved
-    /// via <see cref="Memberships.MembershipRepository.LoadForChannel"/> — a non-member is never offered
-    /// as an autocomplete target inside a private conversation (Task 5 already ensures mentioning a
-    /// non-member never actually notifies them; this closes the matching UI-noise gap). Public/
-    /// SemiPublic/System search the full, unrestricted universe (no such read is made for them).
-    /// Tier 3 is resolved DIFFERENTLY in a private lane: rather than the generic UNSCOPED
-    /// <see cref="Users.UserDirectoryRepository.SearchByNormalizedPrefix"/> (whose own Mongo-side cap
-    /// could otherwise let unrelated directory noise crowd out a genuine member's row before it is ever
-    /// fetched — a real member must never be starved out of their own private lane's search), the member
-    /// set's directory rows are loaded ONCE up front (<see cref="Users.UserDirectoryRepository.LoadMany"/>)
-    /// and the prefix/90d filters are applied to that already-known, bounded set in memory instead.
+    /// MEMBER-SCOPING (D1, 2026-08-05 follow-up — <c>SearchMentionCandidates</c> must never OFFER someone
+    /// who isn't a legal mention target for the channel): every non-<see cref="ChannelType.Public"/>
+    /// channel type is member-scoped. Two DIFFERENT mechanisms back this, by channel size:
+    /// <list type="bullet">
+    /// <item><see cref="ChannelType.Dm"/>/<see cref="ChannelType.GroupDm"/> (small, ACL-bound, capped at
+    /// <see cref="ChatLimits.MaxGroupSize"/>): every tier's universe is restricted UP FRONT to the
+    /// channel's actual durable member set, resolved via
+    /// <see cref="Memberships.MembershipRepository.LoadForChannel"/> — safe here because the channel is
+    /// small by construction. A non-member is never offered as an autocomplete target inside a private
+    /// conversation (Task 5 already ensures mentioning a non-member never actually notifies them; this
+    /// closes the matching UI-noise gap). Tier 3 is resolved DIFFERENTLY here too: rather than the
+    /// generic UNSCOPED <see cref="Users.UserDirectoryRepository.SearchByNormalizedPrefix"/> (whose own
+    /// Mongo-side cap could otherwise let unrelated directory noise crowd out a genuine member's row
+    /// before it is ever fetched — a real member must never be starved out of their own private lane's
+    /// search), the member set's directory rows are loaded ONCE up front
+    /// (<see cref="Users.UserDirectoryRepository.LoadMany"/>) and the prefix/90d filters are applied to
+    /// that already-known, bounded set in memory instead.</item>
+    /// <item><see cref="ChannelType.SemiPublic"/>/<see cref="ChannelType.System"/> (any
+    /// <see cref="SystemChannelKind"/> — potentially LARGE rooms): tiers 1-3 run UNSCOPED exactly like
+    /// Public (no <c>LoadForChannel</c> — that could mean scanning an unboundedly large room's full
+    /// membership just to answer one autocomplete keystroke), then the already-assembled, already-capped
+    /// candidate set (≤ <see cref="ChatLimits.MentionSearchMaxResults"/>, ~20) is filtered CANDIDATE-SIDE
+    /// via <see cref="Memberships.MembershipRepository.LoadMemberBattleTags"/> — ONE batched indexed
+    /// <c>$in</c> query sized to the candidate list, not the room. Tier 1 (active viewers of THIS
+    /// channel, <see cref="FanOut.FocusRegistry.GetRoster"/>) is EXEMPT from this re-check: reaching tier
+    /// 1 requires having successfully called <c>FocusChannel</c>, which itself requires
+    /// <see cref="FanOut.OnlineMemberRegistry.IsMember"/> — and every call site that seeds that registry
+    /// (<c>JoinChannel</c>, <c>OpenDm</c>/<c>EnsureCallerMembership</c>, <c>FanOut.FanOutEngine.PushChannelAdded</c>)
+    /// inserts or ensures a durable <c>channel_memberships</c> row FIRST. So a channel's live-viewer
+    /// roster is, by construction, ALWAYS a subset of its actual durable members, for every channel type —
+    /// tier 1 candidates are never sent through the batched check. Tiers 2/3 carry no such guarantee (an
+    /// "online anywhere" or "recently active in the directory" user need not be a member of THIS
+    /// particular room) and are always checked. Results are a strict SUBSET of the pre-D1 unscoped
+    /// output — a genuinely eligible member beyond the pre-filter cap is never backfilled to top the
+    /// result back up to <see cref="ChatLimits.MentionSearchMaxResults"/>.</item>
+    /// </list>
+    /// <see cref="ChannelType.Public"/> is the ONLY type that still searches the full, unrestricted
+    /// universe (§4 "mention anywhere") — no membership read of any kind is made for it.
     /// </para>
     /// <para>
     /// ENRICHMENT: the whole assembled (deduped, capped) candidate list is enriched with display name,
@@ -300,6 +326,21 @@ public partial class ChatHub
                 var directoryMatches = await _userDirectory.SearchByNormalizedPrefix(
                     prefixLower, minLastSeenAt, remaining, seenLower);
                 AddTier(directoryMatches.Select(e => e.DisplayBattleTag ?? e.BattleTag), 3);
+            }
+        }
+
+        // D1 (2026-08-05 follow-up): SemiPublic/System member-scoping — CANDIDATE-SIDE, never
+        // LoadForChannel (see the class doc's MEMBER-SCOPING section for why the two channel groups use
+        // different mechanisms). Tier 1 is exempt from the re-check (a live viewer is, by construction,
+        // already a durable member — see the class doc); tiers 2/3 are batch-verified with ONE indexed
+        // $in query sized to the (already-capped, ~20) candidate list.
+        if (callerState.ChannelType is ChannelType.SemiPublic or ChannelType.System && candidates.Count > 0)
+        {
+            var toVerify = candidates.Where(c => c.Tier != 1).Select(c => c.BattleTag).ToList();
+            if (toVerify.Count > 0)
+            {
+                var verifiedMembers = await _membershipRepository.LoadMemberBattleTags(channelId, toVerify);
+                candidates.RemoveAll(c => c.Tier != 1 && !verifiedMembers.Contains(c.BattleTag));
             }
         }
 
