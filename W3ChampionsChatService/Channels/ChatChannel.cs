@@ -58,8 +58,8 @@ public class ChatChannel
     /// <summary>
     /// System+Match only — the mm authority EPOCH of the last applied full-set roster assertion
     /// (2026-08-05 reconciliation spec). An opaque token: compared for equality ONLY, never parsed or
-    /// ordered. Absent on every channel that predates the assertion protocol (created via the legacy
-    /// create/delta path) — every read must tolerate absence. [JsonIgnore]: mm↔chat reconciliation
+    /// ordered. Absent on every channel created without epoch/seq and never since asserted — every read
+    /// must tolerate absence. [JsonIgnore]: mm↔chat reconciliation
     /// bookkeeping, never client protocol (the raw entity rides ChannelAddedDto/ChannelDto).
     /// </summary>
     [BsonIgnoreIfNull]
@@ -79,9 +79,8 @@ public class ChatChannel
 
     /// <summary>
     /// System+Match only — true once mm's GAME_STARTED final assertion froze this room: membership is
-    /// frozen against BOTH mutating protocols (later assertions AND legacy deltas are discarded), and the
-    /// channel is excluded from EVERY sweep including epoch syncs. The 24h creation-anchored TTL is its
-    /// sole cleanup path.
+    /// frozen (every later roster assertion for this ref is discarded), and the channel is excluded from
+    /// EVERY sweep including epoch syncs. The 24h creation-anchored TTL is its sole cleanup path.
     /// <para>
     /// DELIBERATE BYPASS (2026-08-05 fix wave, final review N2): the freeze does NOT cover
     /// <c>W3ChampionsChatService.Internal.MatchChannelService.AddMemberWithInvariant</c>'s cross-channel

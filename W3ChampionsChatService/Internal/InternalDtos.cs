@@ -46,32 +46,16 @@ public class InternalChannelCreateRequest
     public bool? Detached { get; set; }
 }
 
-// TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): the DELTA path. mm keeps
-// sending deltas until its own deploy; DELETE THIS ENTIRE CLASS in the mm-deploy-confirmed
-// cleanup PR — see docs plan Task 6.
-/// <summary>
-/// <c>PUT /internal/channels/{ref}/members</c> request body (C7 Task 9) — mm's membership delta.
-/// <see cref="Add"/>/<see cref="Remove"/> tolerate a null array on the wire: the controller coerces
-/// either to an empty list before calling <see cref="MatchChannelService.ApplyMembersDelta"/>, which
-/// does NOT null-guard its own list parameters.
-/// </summary>
-public class InternalMembersDeltaRequest
-{
-    public List<string> Add { get; set; }
-    public List<string> Remove { get; set; }
-    public bool? Focus { get; set; }
-}
-
 /// <summary>
 /// <c>PUT /internal/channels/{ref}/roster</c> request body — mm's AUTHORITATIVE full-set membership
-/// assertion (2026-08-05 reconciliation spec §1), the replacement for the delta shape above.
+/// assertion (2026-08-05 reconciliation spec §1), the sole membership-mutation protocol mm drives.
 /// <see cref="Epoch"/> is an OPAQUE token (mm's authority generation, fresh per mm boot) — compared
 /// for equality only, never parsed or ordered, and re-validated against the same character class and
 /// length cap as <c>ref</c>. <see cref="Seq"/> is mm's per-(lobby, epoch) monotonic counter and MUST
 /// be >= 1 (0 is chat-side's "nothing applied yet under this epoch" sentinel).
-/// <see cref="Members"/> is the COMPLETE member set and — unlike the delta's add/remove — is NOT
-/// null-tolerant: null and [] differ by "no-op" vs "tear the whole lobby's membership down", so the
-/// caller must state which it means. <see cref="Name"/> is the display name used ONLY when the
+/// <see cref="Members"/> is the COMPLETE member set and is NOT null-tolerant: null and [] differ by
+/// "no-op" vs "tear the whole lobby's membership down", so the caller must state which it means.
+/// <see cref="Name"/> is the display name used ONLY when the
 /// assertion must create the channel on demand (mm's boot-race healing — a recreated room must not
 /// display its nanoid ref); ignored for an existing channel; optional (null ⇒ ref placeholder).
 /// NORMALIZED, NEVER REJECTED (2026-08-05 fix wave, final review C1): trimmed and clamped to

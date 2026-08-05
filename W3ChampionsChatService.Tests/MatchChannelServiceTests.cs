@@ -297,182 +297,6 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(reloaded.Name, Is.EqualTo("Real Match Name"), "the backfilled name is durably persisted");
     }
 
-    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): this whole region covers the
-    // DELTA path. mm keeps sending deltas until its own deploy; DELETE THIS ENTIRE REGION in the
-    // mm-deploy-confirmed cleanup PR alongside ApplyMembersDelta itself — see docs plan Task 6.
-    // ============================================================================================
-    // C7 Task 7 — ApplyMembersDelta: add creates membership + pushes ChannelAdded
-    // ============================================================================================
-
-    [Test]
-    public async Task Delta_AddCreatesMembership_AndPushesChannelAdded()
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-
-        // The channel already exists (mm's initial CreateOrGet POST already landed) before the delta arrives.
-        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
-
-        await _service.ApplyMembersDelta("match-1", add: Members(bt), remove: Members(), focus: true);
-
-        var membership = await _membershipRepository.Load(channel.Id, bt);
-        Assert.That(membership, Is.Not.Null, "the add creates a durable membership");
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1),
-            "ChannelAdded is pushed for the added member");
-    }
-
-    // ============================================================================================
-    // ApplyMembersDelta — remove deletes membership + pushes ChannelRemoved + force-unfocuses the
-    // removed user's connection (acceptance 4)
-    // ============================================================================================
-
-    [Test]
-    public async Task Delta_RemoveDeletesMembership_PushesChannelRemoved_AndUnfocusesRemovedUsersConnection()
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-
-        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(bt), focus: true);
-        _focusRegistry.Focus("conn-alice", channel.Id, bt);
-        Assert.That(_focusRegistry.GetFocusedChannels("conn-alice"), Does.Contain(channel.Id),
-            "precondition: the connection has the channel focused before the removal");
-
-        await _service.ApplyMembersDelta("match-1", add: Members(), remove: Members(bt), focus: false);
-
-        Assert.That(await _membershipRepository.Load(channel.Id, bt), Is.Null, "the membership is deleted");
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1),
-            "ChannelRemoved is pushed to the removed user's live connection");
-        var dto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelRemoved) as ChannelRemovedDto;
-        Assert.That(dto, Is.Not.Null);
-        Assert.That(dto.ChannelId, Is.EqualTo(channel.Id));
-
-        // Acceptance 4: the removed user's connection is FORCE-UNFOCUSED from the channel — the
-        // FocusRegistry.Unfocus tail of FanOutEngine.PushChannelRemoved (Task 5) IS this force-unfocus.
-        Assert.That(_focusRegistry.GetFocusedChannels("conn-alice"), Does.Not.Contain(channel.Id),
-            "the connection is no longer focused on the removed channel");
-    }
-
-    // ============================================================================================
-    // ApplyMembersDelta — delta-before-create: create-on-demand shell (ref-as-name, 24h expiry from
-    // its OWN creation), and a LATER real CreateOrGet backfills the name WITHOUT resetting expiry (M1)
-    // ============================================================================================
-
-    [Test]
-    public async Task Delta_BeforeCreate_CreatesShell_WithRefAsName_And24hExpiryFromShellCreation()
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-
-        // The delta arrives BEFORE mm's CreateOrGet POST — create-on-demand, never a hard 404 (§3.3, M1).
-        await _service.ApplyMembersDelta("match-1", add: Members(bt), remove: Members(), focus: true);
-
-        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
-        Assert.That(shell, Is.Not.Null, "the shell is created on-demand rather than a hard 404");
-        Assert.That(shell.Name, Is.EqualTo("match-1"), "the placeholder name is the ref itself");
-        Assert.That(shell.ExpiresAt, Is.Not.Null);
-        Assert.That((shell.ExpiresAt.Value - Now.AddHours(24)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
-            "the shell's 24h expiry is anchored to its OWN creation time");
-        Assert.That(await _membershipRepository.Load(shell.Id, bt), Is.Not.Null, "the add still applies to the newly-created shell");
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
-
-        var shellExpiry = shell.ExpiresAt;
-
-        // The clock moves before the LATER real mm CreateOrGet POST arrives.
-        _time.Advance(TimeSpan.FromHours(1));
-
-        var real = await _service.CreateOrGet("match-1", "Real Match Name", Members(), focus: false);
-
-        Assert.That(real.Id, Is.EqualTo(shell.Id), "the same channel (same ref)");
-        Assert.That(real.Name, Is.EqualTo("Real Match Name"), "the later create backfills the placeholder name");
-        Assert.That(real.ExpiresAt, Is.EqualTo(shellExpiry),
-            "the name backfill does NOT reset the shell's original creation-anchored expiry");
-    }
-
-    // ============================================================================================
-    // ApplyMembersDelta — removing an unknown member is a silent no-op, no push
-    // ============================================================================================
-
-    [Test]
-    public async Task Delta_RemoveUnknownMember_SilentNoOp_NoPush()
-    {
-        const string bt = "Ghost#1";
-        RegisterOnline("conn-ghost", bt);
-
-        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
-
-        // bt was never added to this channel — removing them must be a silent no-op.
-        await _service.ApplyMembersDelta("match-1", add: Members(), remove: Members(bt), focus: false);
-
-        Assert.That(_harness.AllSignals, Is.Empty, "no push is emitted for removing a member who was never present");
-        Assert.That(await _membershipRepository.Load(channel.Id, bt), Is.Null);
-    }
-
-    // ============================================================================================
-    // ApplyMembersDelta — add honors the one-match-channel-per-user invariant (acceptance 5, delta path)
-    // ============================================================================================
-
-    [Test]
-    public async Task Delta_AddHonorsOneMatchChannelInvariant()
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-
-        var matchA = await _service.CreateOrGet("match-A", "Match A", Members(bt), focus: true);
-
-        await _service.ApplyMembersDelta("match-B", add: Members(bt), remove: Members(), focus: true);
-
-        var matchB = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-B");
-        Assert.That(await _membershipRepository.Load(matchA.Id, bt), Is.Null,
-            "the stale match-A membership is swapped out on the delta path too");
-        Assert.That(await _membershipRepository.Load(matchB.Id, bt), Is.Not.Null);
-
-        var signals = _harness.AllSignals.Where(s => s.ConnectionId == "conn-alice").ToList();
-        var removedAIndex = signals.FindIndex(s =>
-            s.Method == ChatEvents.ChannelRemoved && ((ChannelRemovedDto)s.Payload).ChannelId == matchA.Id);
-        var addedBIndex = signals.FindIndex(s =>
-            s.Method == ChatEvents.ChannelAdded && ((ChannelAddedDto)s.Payload).Channel.Id == matchB.Id);
-        Assert.That(removedAIndex, Is.GreaterThanOrEqualTo(0), "ChannelRemoved(A) was emitted");
-        Assert.That(addedBIndex, Is.GreaterThanOrEqualTo(0), "ChannelAdded(B) was emitted");
-        Assert.That(removedAIndex, Is.LessThan(addedBIndex), "the swap fires on the delta path too");
-    }
-
-    // ============================================================================================
-    // ApplyMembersDelta — the focus flag is applied to adds
-    // ============================================================================================
-
-    [TestCase(true)]
-    [TestCase(false)]
-    public async Task Delta_FocusFlagAppliedToAdds(bool focus)
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-        await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
-
-        await _service.ApplyMembersDelta("match-1", add: Members(bt), remove: Members(), focus);
-
-        var dto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelAdded) as ChannelAddedDto;
-        Assert.That(dto, Is.Not.Null);
-        Assert.That(dto.Focus, Is.EqualTo(focus), "the focus directive is applied to adds on the delta path");
-    }
-
-    // ============================================================================================
-    // ApplyMembersDelta — a battleTag in BOTH lists ends up REMOVED (adds-then-removes, deterministic;
-    // mm never sends this, but the behavior must be well-defined per §3.4)
-    // ============================================================================================
-
-    [Test]
-    public async Task Delta_BattleTagInBothLists_EndsUpRemoved()
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
-
-        await _service.ApplyMembersDelta("match-1", add: Members(bt), remove: Members(bt), focus: true);
-
-        Assert.That(await _membershipRepository.Load(channel.Id, bt), Is.Null,
-            "adds run first, then removes — a battleTag in both lists ends up removed");
-    }
-
     // ============================================================================================
     // C7 Task 8 — DeleteChannel: hard-delete teardown (messages + memberships + channel), including
     // physically-present soft-deleted/shadow rows; another channel's data is untouched (acceptance 6a)
@@ -941,23 +765,6 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(await memberships.Load(channel.Id, "Alice#1"), Is.Not.Null);
     }
 
-    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): delta-path-only — pins
-    // ApplyMembersDelta's detach guard specifically. DELETE alongside ApplyMembersDelta itself in the
-    // mm-deploy-confirmed cleanup PR — see docs plan Task 6.
-    [Test]
-    public async Task Delta_AfterDetach_IsDiscarded()
-    {
-        const string alice = "Alice#1";
-        const string bob = "Bob#2";
-        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
-        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
-
-        await _service.ApplyMembersDelta("match-1", add: Members(bob), remove: Members(alice), focus: false);
-
-        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the legacy delta path is frozen too");
-        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null);
-    }
-
     [Test]
     public async Task CreateOrGet_AfterDetach_BackfillsName_ButAddsNoMembers()
     {
@@ -1285,9 +1092,9 @@ public class MatchChannelServiceTests : IntegrationTestBase
     public async Task EpochSync_UnstampedChannel_SurvivesEvenWhenAbsentFromLiveList_FallsToTtl()
     {
         const string alice = "Alice#1";
-        // Created via the legacy CreateOrGet path and NEVER stamped by the assertion protocol at all —
+        // Created via CreateOrGet without epoch/seq and NEVER stamped by the assertion protocol at all —
         // AssertEpoch is genuinely ABSENT on the stored document, exactly the shape of a channel minted
-        // by the pre-reconciliation mm via the deprecated delta path during the transition window.
+        // by an mm that has not yet started sending epoch/seq or asserting a roster for this lobby.
         // 2026-08-05 fix wave (final review H1, plan D8 amendment): such a channel must NOT be swept by
         // an epoch sync — LoadNonDetachedMatchChannels's AssertEpoch-exists filter makes it invisible to
         // the sweep entirely, so it survives regardless of liveLobbyRefs and falls to its own 24h TTL.

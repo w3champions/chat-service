@@ -13,19 +13,16 @@ namespace W3ChampionsChatService.Internal;
 /// <summary>
 /// C7 Task 9 — the HTTP surface for the match-channel lifecycle mm drives: <c>POST /internal/channels</c>
 /// (idempotent create-or-get, 200 for BOTH a fresh channel and a duplicate call — the pinned idempotency
-/// contract), <c>PUT /internal/channels/{ref}/members</c> (membership delta), and
-/// <c>DELETE /internal/channels/{ref}</c> (hard teardown, 200 even for an unknown ref — a 404 would only
-/// trigger a pointless mm retry). All three delegate to <see cref="MatchChannelService"/> (Tasks 6-8);
-/// this controller owns ONLY input validation, the HTTP shape, and logging.
+/// contract), <c>PUT /internal/channels/{ref}/roster</c> (the authoritative full-set membership assertion,
+/// 2026-08-05 reconciliation spec, plan D1-D4/D7), <c>POST /internal/channels/epoch-sync</c> (mm's
+/// boot-time convergence sweep, plan D8), and <c>DELETE /internal/channels/{ref}</c> (hard teardown, 200
+/// even for an unknown ref — a 404 would only trigger a pointless mm retry). All four delegate to
+/// <see cref="MatchChannelService"/>; this controller owns ONLY input validation, the HTTP shape, and
+/// logging.
 /// <para>
-/// 2026-08-05 reconciliation spec — two ADDITIVE endpoints replacing the delta protocol above:
-/// <c>PUT /internal/channels/{ref}/roster</c> (the authoritative full-set membership assertion, plan
-/// D1-D4/D7) and <c>POST /internal/channels/epoch-sync</c> (mm's boot-time convergence sweep, plan D8).
-/// Both are named to avoid a one-character collision with the surviving <c>.../members</c> delta route
-/// (<c>.../roster</c>, not <c>.../membership</c>) and both delegate to
-/// <see cref="MatchChannelService.ApplyRosterAssertion"/> / <see cref="MatchChannelService.ApplyEpochSync"/>
-/// respectively. The delta route and <see cref="Create"/> keep working unchanged until mm's own deploy —
-/// see the D9 <c>TRANSITION</c> markers.
+/// The roster route is named <c>.../roster</c> rather than <c>.../membership</c> deliberately — a
+/// one-character-away name from <c>.../members</c> would have collided with the now-removed legacy delta
+/// route this endpoint replaced.
 /// </para>
 /// <para>
 /// SECURITY (H1): gated by <see cref="InternalHmacAuthAttribute"/> at CLASS level with an Mm-only
@@ -128,44 +125,6 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         }
     }
 
-    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): the DELTA path. mm keeps
-    // sending deltas until its own deploy; DELETE THIS ENTIRE METHOD in the mm-deploy-confirmed
-    // cleanup PR — see docs plan Task 6.
-    [HttpPut("{ref}/members")]
-    public async Task<IActionResult> UpdateMembers(string @ref, [FromBody] InternalMembersDeltaRequest request)
-    {
-        if (!IsValidRef(@ref))
-        {
-            return BadRequest(new ErrorResult(GenericValidationError));
-        }
-
-        // Null add/remove arrays are tolerated on the wire — coerced to empty here since
-        // MatchChannelService.ApplyMembersDelta does NOT null-guard its own list parameters.
-        var add = request?.Add ?? new List<string>();
-        var remove = request?.Remove ?? new List<string>();
-
-        if (!IsValidMembers(add) || !IsValidMembers(remove))
-        {
-            return BadRequest(new ErrorResult(GenericValidationError));
-        }
-
-        try
-        {
-            await matchChannelService.ApplyMembersDelta(@ref, add, remove, request?.Focus ?? false);
-
-            Log.Information(
-                "Internal channel members-delta succeeded {Caller} {Verb} {Ref} addCount={AddCount} removeCount={RemoveCount}",
-                InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref, add.Count, remove.Count);
-
-            return Ok();
-        }
-        catch (Exception ex)
-        {
-            LogUnexpected(ex, "PUT", @ref);
-            throw;
-        }
-    }
-
     [HttpPut("{ref}/roster")]
     public async Task<IActionResult> AssertRoster(string @ref, [FromBody] InternalRosterAssertRequest request)
     {
@@ -189,9 +148,9 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
-        // Deliberately NOT coerced to empty (contrast UpdateMembers above): for a full-set assertion,
-        // null and [] are the difference between "no-op" and "tear the whole lobby's membership down"
-        // (plan D7) — the caller must state which it means, so a missing array is a 400.
+        // Deliberately NOT coerced to empty: for a full-set assertion, null and [] are the difference
+        // between "no-op" and "tear the whole lobby's membership down" (plan D7) — the caller must state
+        // which it means, so a missing array is a 400.
         if (request.Members == null)
         {
             return BadRequest(new ErrorResult(GenericValidationError));

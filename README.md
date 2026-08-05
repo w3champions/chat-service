@@ -293,22 +293,10 @@ Optional additive fields (absent ⇒ today's behavior, byte-for-byte):
   refs are never part of mm's live-lobby registry, so without birth-detach the first epoch sync after any
   mm restart would tear down every in-progress ladder game's chat.
 
-### `PUT /internal/channels/{ref}/members` — DEPRECATED
-
-> **This endpoint is scheduled for removal.** It exists only so chat-service can serve both mm's current
-> (delta-based) and upcoming (assertion-based) membership protocols during the deploy window described
-> below. Once mm's deploy to the assertion protocol is confirmed, this route, its request DTO, and the
-> corresponding legacy code paths are deleted in a follow-up chat-service PR — every site that must be
-> touched is marked in code with a grep-able `TRANSITION (2026-08-05 ...)` comment.
-
-The legacy membership delta: `{ add: string[], remove: string[], focus? }`. `add`/`remove` tolerate a
-missing array (treated as empty — "no change" for that half of the call). Tolerant of arriving before the
-channel's own `POST` (create-on-demand, using the ref as a placeholder display name).
-
 ### `PUT /internal/channels/{ref}/roster`
 
-The **authoritative full-set membership assertion** — the replacement for the delta above. mm sends the
-lobby's complete member set; chat-service diffs it against stored membership and converges, idempotently.
+The **authoritative full-set membership assertion** — the sole membership-mutation protocol mm drives. mm
+sends the lobby's complete member set; chat-service diffs it against stored membership and converges, idempotently.
 A user-initiated leave (`ChatHub.LeaveChannel`) on a live match channel is re-converged by the next
 assertion, by design (2026-08-05 reconciliation review, H4) — mm is authoritative for lobby membership.
 
@@ -320,9 +308,8 @@ assertion, by design (2026-08-05 reconciliation review, H4) — mm is authoritat
   generation, fresh per mm boot. Compared for equality only — never parsed or ordered.
 - `seq` — a positive integer (`>= 1`), mm's per-`(lobby, epoch)` monotonic counter. `0` is reserved
   server-side as "nothing applied yet under this epoch".
-- `members` — the **complete** roster. Unlike the delta's `add`/`remove`, this is **not** null-tolerant:
-  omitting it is a `400`, while `[]` is a legal, meaningful value (an empty lobby) and clears every
-  existing member.
+- `members` — the **complete** roster. **Not** null-tolerant: omitting it is a `400`, while `[]` is a
+  legal, meaningful value (an empty lobby) and clears every existing member.
 - `name` — optional; used **only** when the assertion must create the channel on demand (mm's boot-race
   healing, so a recreated room never displays its raw ref as its name). Ignored on an existing channel.
   **Normalized, never rejected**: trimmed and clamped to 100 chars; an empty-after-trim name falls back
@@ -347,7 +334,6 @@ A **discarded** assertion (stale, duplicate, or against a frozen channel — see
 applied first, then the channel **freezes**. Once frozen:
 
 - every later roster assertion for that ref is discarded;
-- the deprecated delta endpoint above is discarded too, regardless of which protocol asks;
 - `POST /internal/channels` still find-or-creates and backfills the name, but adds no members;
 - an explicit `DELETE` (below) still works — detach freezes assertions and sweeps, not an explicit
   teardown command.
@@ -382,28 +368,28 @@ just-finished game's chat must never be swept away by an mm restart; its 24h TTL
 
 **Only assertion-stamped channels are ever sweep candidates.** A channel becomes eligible for an epoch
 sync only once it has participated in the assertion protocol at least once — created with `epoch`/`seq`,
-or asserted via the roster endpoint above. A channel that predates this protocol (created only through
-the deprecated delta endpoint, never asserted) carries no stamp at all and is **invisible to the sweep**:
-it survives regardless of `liveLobbyRefs` and falls to its own 24h creation-anchored TTL instead. This is
+or asserted via the roster endpoint above. A channel created via `POST /internal/channels` without
+`epoch`/`seq` and never since asserted carries no stamp at all and is **invisible to the sweep**: it
+survives regardless of `liveLobbyRefs` and falls to its own 24h creation-anchored TTL instead. This is
 what makes it safe to deploy mm's epoch-sync call against the match channels chat already holds from
 before mm's own deploy — the first sync after mm's release simply never sees them, so it cannot tear them
-down. No backfill, feature flag, or deploy-order choreography is required for this beyond "chat-service
-ships first" (see Deploy order below).
+down. No backfill, feature flag, or deploy-order choreography is required for this beyond "chat deploys
+first" (see Deploy order below).
 
 ### `DELETE /internal/channels/{ref}`
 
 Explicit, unconditional teardown: messages purged, memberships deleted, the channel doc removed, and
 `ChannelRemoved` pushed to every member who was online. `200` even for an unknown `ref` (a `404` would
-only trigger a pointless mm retry), and — unlike the roster assertion and the deprecated delta — this
-still tears down an **already-frozen** channel: detach guards the automated paths (assertions, sweeps),
-not an explicit authoritative teardown mm chooses to send.
+only trigger a pointless mm retry), and — unlike the roster assertion — this still tears down an
+**already-frozen** channel: detach guards the automated paths (assertions, sweeps), not an explicit
+authoritative teardown mm chooses to send.
 
 ### Deploy order
 
-**chat-service ships first.** It accepts both the deprecated delta shape and the new roster-assertion
-shape simultaneously, so today's not-yet-deployed mm keeps working unchanged through its own release.
-Once mm's deploy to the assertion protocol is confirmed, the delta endpoint and its supporting code are
-removed in a follow-up chat-service PR.
+**chat-service deploys before (or with) mm.** Until mm's own deploy lands, its still-running deployment
+keeps calling the old membership-delta endpoint this service no longer serves — those calls `404`
+harmlessly (fail-soft: no chat functionality depends on them succeeding) until mm's own deploy switches it
+over to the roster-assertion protocol above.
 
 **Rollback is a one-way door once mm has deployed the assertion protocol.** After mm starts calling
 `PUT .../roster` and `POST .../epoch-sync`, rolling chat-service back below this version `404`s both

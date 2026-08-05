@@ -15,11 +15,12 @@ namespace W3ChampionsChatService.Internal;
 /// <summary>
 /// C7 Tasks 6-8 — the match-channel domain core the /internal/* match endpoints drive. Owns
 /// <see cref="CreateOrGet"/> (idempotent System+Match find-or-create + display-name backfill, the
-/// <c>PUT /internal/channels/{ref}</c>-style upsert), <see cref="ApplyMembersDelta"/> (the
-/// <c>PUT /internal/channels/{ref}/members</c> delta — tolerant of arriving before the create),
-/// <see cref="DeleteChannel"/> (the <c>DELETE /internal/channels/{ref}</c> hard-teardown — tolerant of
-/// arriving before the create too), and the shared <see cref="AddMemberWithInvariant"/> that enforces the
-/// ONE-MATCH-CHANNEL-PER-USER invariant — every add path (both public add methods) reuses it.
+/// <c>PUT /internal/channels/{ref}</c>-style upsert), <see cref="ApplyRosterAssertion"/> (the
+/// <c>PUT /internal/channels/{ref}/roster</c> authoritative full-set membership assertion — tolerant of
+/// arriving before the create), <see cref="DeleteChannel"/> (the <c>DELETE /internal/channels/{ref}</c>
+/// hard-teardown — tolerant of arriving before the create too), and the shared
+/// <see cref="AddMemberWithInvariant"/> that enforces the ONE-MATCH-CHANNEL-PER-USER invariant — every
+/// add path (both public add methods) reuses it.
 /// <para>
 /// Singleton (registered in <see cref="Startup"/>): it holds no per-call state. Its
 /// <see cref="ChannelRepository"/>/<see cref="MembershipRepository"/>/<see cref="MessageRepository"/> deps
@@ -50,9 +51,9 @@ namespace W3ChampionsChatService.Internal;
 /// </para>
 /// <para>
 /// 2026-08-05 RECONCILIATION (plan D5, D10): adds <see cref="ApplyRosterAssertion"/> — the authoritative
-/// full-set protocol that supersedes <see cref="ApplyMembersDelta"/> — plus a <see cref="MatchChannelRefGate"/>
+/// full-set membership protocol mm drives — plus a <see cref="MatchChannelRefGate"/>
 /// (<see cref="_refGate"/>) that every mutating match-channel path IN THIS CLASS now acquires FIRST, and
-/// detach guards (plan D4) on the assertion and legacy delta paths. TWO DOCUMENTED EXCEPTIONS (2026-08-05
+/// a detach guard (plan D4) on the assertion path. TWO DOCUMENTED EXCEPTIONS (2026-08-05
 /// fix wave, final review H4 + M1): <c>ChatHub.LeaveChannel</c> (<c>Chats/ChatHub.Channels.cs</c>) deletes
 /// a membership row directly with no channel-type guard and no gate at all — it lives OUTSIDE this class
 /// and races <see cref="ApplyRosterAssertion"/>'s diff, a divergence bounded by the next assertion
@@ -65,8 +66,8 @@ namespace W3ChampionsChatService.Internal;
 /// <c>TearDownChannel</c>, shared by <see cref="ApplyEpochSync"/> — the startup mm-crash-recovery sweep
 /// (plan D8) that tears down every non-detached, assertion-stamped match channel absent from mm's
 /// freshly-booted <c>liveLobbyRefs</c> and re-anchors the channels it spares to the new epoch (an
-/// UNSTAMPED legacy/transition channel is excluded from the sweep entirely and falls to its own 24h TTL
-/// instead — 2026-08-05 fix wave, final review H1).
+/// UNSTAMPED channel — created without <c>epoch</c>/<c>seq</c> and never asserted — is excluded from the
+/// sweep entirely and falls to its own 24h TTL instead — 2026-08-05 fix wave, final review H1).
 /// </para>
 /// </summary>
 public class MatchChannelService(
@@ -230,72 +231,6 @@ public class MatchChannelService(
     }
 
     /// <summary>
-    /// <c>PUT /internal/channels/{ref}/members</c> domain logic (C7 Task 7) — applies an mm-driven
-    /// membership delta to the System+Match channel keyed by <paramref name="systemRef"/>, tolerant of the
-    /// delta arriving BEFORE the channel's own create (M1 — never a hard 404).
-    /// <list type="number">
-    /// <item>CREATE-ON-DEMAND (§3.3): if no channel exists yet for <paramref name="systemRef"/>, find-or-create
-    /// a shell via <see cref="ChannelRepository.FindOrCreateSystem"/> with a PLACEHOLDER name equal to the ref
-    /// itself. The shell's 24h expiry is anchored to its OWN creation time (set by <c>FindOrCreateSystem</c>
-    /// via <c>$setOnInsert</c>); a later real <see cref="CreateOrGet"/> backfills the display name and — per
-    /// that method's own idempotent $setOnInsert semantics — does NOT reset this expiry.</item>
-    /// <item><paramref name="add"/> is processed FIRST, each battleTag via the shared
-    /// <see cref="AddMemberWithInvariant"/> — so the one-match-channel-per-user invariant (swap) and the
-    /// focus-hinted <c>ChannelAdded</c> push fire on this path exactly as they do from <see cref="CreateOrGet"/>.</item>
-    /// <item><paramref name="remove"/> is processed AFTER: per battleTag, <see cref="MembershipRepository.Load"/>
-    /// — ABSENT is a silent no-op (no push, mm's delta can legitimately race a membership that already left);
-    /// PRESENT is <see cref="MembershipRepository.Delete"/> then <see cref="FanOutEngine.PushChannelRemoved"/>,
-    /// whose <see cref="FanOut.FocusRegistry.Unfocus"/> tail IS the server force-unfocus of the removed user's
-    /// connection (acceptance 4).</item>
-    /// </list>
-    /// A battleTag appearing in BOTH lists ends up REMOVED — adds run before removes, so this is
-    /// deterministic even though mm never legitimately sends such an overlapping delta.
-    /// <para>
-    /// DETACH FREEZE (2026-08-05 reconciliation spec, plan D4): if the resolved channel is already
-    /// <see cref="ChatChannel.Detached"/>, the whole delta is discarded (logged once at Information) —
-    /// membership stays frozen regardless of which protocol (assertion or legacy delta) asks.
-    /// </para>
-    /// </summary>
-    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): the DELTA path. mm keeps
-    // sending deltas until its own deploy; DELETE THIS ENTIRE MEMBER in the mm-deploy-confirmed
-    // cleanup PR — see docs plan Task 6.
-    public async Task ApplyMembersDelta(string systemRef, IReadOnlyList<string> add, IReadOnlyList<string> remove, bool focus)
-    {
-        using var _ = await _refGate.AcquireAsync(systemRef);
-        await ApplyMembersDeltaLocked(systemRef, add, remove, focus);
-    }
-
-    private async Task ApplyMembersDeltaLocked(string systemRef, IReadOnlyList<string> add, IReadOnlyList<string> remove, bool focus)
-    {
-        var now = timeProvider.GetUtcNow().UtcDateTime;
-
-        var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef)
-            ?? await channelRepository.FindOrCreateSystem(SystemChannelKind.Match, systemRef, systemRef, now);
-
-        if (channel.Detached)
-        {
-            Log.Information("ApplyMembersDelta: discarded — match channel {Ref} is detached (frozen)", systemRef);
-            return;
-        }
-
-        foreach (var battleTag in add)
-        {
-            await AddMemberWithInvariant(channel, battleTag, focus, now);
-        }
-
-        foreach (var battleTag in remove)
-        {
-            if (await membershipRepository.Load(channel.Id, battleTag) == null)
-            {
-                continue;
-            }
-
-            await membershipRepository.Delete(channel.Id, battleTag);
-            await fanOutEngine.PushChannelRemoved(channel.Id, battleTag);
-        }
-    }
-
-    /// <summary>
     /// <c>DELETE /internal/channels/{ref}</c> domain logic (C7 Task 8) — hard-tears-down the System+Match
     /// channel keyed by <paramref name="systemRef"/>: its membership rows AND its messages (a HARD purge,
     /// distinct from moderation's TTL-only soft-delete — see <see cref="MessageRepository.DeleteAllForChannel"/>),
@@ -315,9 +250,9 @@ public class MatchChannelService(
     /// </list>
     /// <para>
     /// NOT DETACH-GUARDED, DELIBERATELY (2026-08-05 reconciliation spec, plan D4): unlike
-    /// <see cref="ApplyRosterAssertion"/> and <see cref="ApplyMembersDelta"/>, an explicit DELETE still
-    /// tears down an already-detached channel — detach freezes ASSERTIONS and SWEEPS, not an explicit
-    /// authoritative teardown command. If mm sends one after detaching a channel, it means it.
+    /// <see cref="ApplyRosterAssertion"/>, an explicit DELETE still tears down an already-detached
+    /// channel — detach freezes ASSERTIONS and SWEEPS, not an explicit authoritative teardown command.
+    /// If mm sends one after detaching a channel, it means it.
     /// </para>
     /// </summary>
     public async Task DeleteChannel(string systemRef)
@@ -361,16 +296,16 @@ public class MatchChannelService(
     }
 
     /// <summary>
-    /// The AUTHORITATIVE full-set roster assertion (2026-08-05 reconciliation spec §1) — replaces the
-    /// delta protocol. mm sends the lobby's COMPLETE member set for <paramref name="systemRef"/>; this
-    /// converges the stored membership rows onto it, idempotently.
+    /// The AUTHORITATIVE full-set roster assertion (2026-08-05 reconciliation spec §1) — the sole
+    /// membership-mutation protocol mm drives. mm sends the lobby's COMPLETE member set for
+    /// <paramref name="systemRef"/>; this converges the stored membership rows onto it, idempotently.
     /// <list type="number">
-    /// <item>Serialize on <paramref name="systemRef"/> (plan D5) so two in-flight assertions — or an
-    /// assertion racing a transition-era delta — cannot interleave their diffs.</item>
+    /// <item>Serialize on <paramref name="systemRef"/> (plan D5) so two in-flight assertions for the same
+    /// ref cannot interleave their diffs.</item>
     /// <item>CREATE-ON-DEMAND: an assertion arriving before mm's create POST — or after an epoch sync
     /// tore the channel down (the boot race) — find-or-creates the shell, using <paramref name="name"/>
     /// when provided (so a recreated room never displays its nanoid ref) and the ref as placeholder
-    /// otherwise, exactly like <see cref="ApplyMembersDelta"/> (never a 404). On an EXISTING channel
+    /// otherwise (never a 404). On an EXISTING channel
     /// <paramref name="name"/> is ignored — CreateOrGet remains the name authority.</item>
     /// <item>DETACH FREEZE (plan D4): a detached channel discards the assertion outright.</item>
     /// <item>STALENESS GATE (plan D3): <see cref="ChannelRepository.TryAdvanceAssertion"/> admits and
@@ -381,7 +316,7 @@ public class MatchChannelService(
     /// <item>DIFF, case-insensitively (stored battleTags are LOWERCASED, mm sends JWT casing): missing
     /// => <c>AddMemberWithInvariant</c> (keeps the one-match-channel-per-user eviction invariant);
     /// extra => Delete then <c>PushChannelRemoved</c> (whose FocusRegistry.Unfocus tail force-unfocuses
-    /// the removed user). Adds run before removes, mirroring <see cref="ApplyMembersDelta"/>.</item>
+    /// the removed user). Adds run before removes.</item>
     /// <item>DETACH LAST: when <paramref name="detached"/>, the final member set is applied FIRST, then
     /// the channel is marked detached — so the freeze rule never has to special-case its own trigger.</item>
     /// </list>
@@ -451,7 +386,7 @@ public class MatchChannelService(
             .ToList();
         var extra = current.Where(row => !asserted.Contains(row.BattleTag)).ToList();
 
-        // Adds before removes — mirrors ApplyMembersDelta.
+        // Adds before removes.
         foreach (var battleTag in missing)
         {
             await AddMemberWithInvariant(channel, battleTag, focus: false, now);
@@ -492,9 +427,9 @@ public class MatchChannelService(
     /// <para>UNSTAMPED CHANNELS ARE EXCLUDED ENTIRELY TOO (2026-08-05 fix wave, final review H1, plan D8
     /// amendment): the same query additionally requires <c>AssertEpoch</c> to exist — only a channel that
     /// has participated in the assertion protocol at least once (created with epoch/seq, or asserted via
-    /// the roster endpoint) is a sweep candidate. A channel minted only by the deprecated delta path
-    /// during the transition window has no stamp at all and is invisible to this sweep; it falls to its
-    /// own 24h creation-anchored TTL instead. This is what makes the very first epoch sync after mm's own
+    /// the roster endpoint) is a sweep candidate. A channel created via <c>POST /internal/channels</c>
+    /// without epoch/seq and never since asserted has no stamp at all and is invisible to this sweep; it
+    /// falls to its own 24h creation-anchored TTL instead. This is what makes the very first epoch sync after mm's own
     /// deploy safe against the (measured, ~4,900/day) non-detached ladder-match channels that already
     /// exist in the database at cutover — that first sync's candidate set does not include them, so it
     /// cannot tear them down, with no runbook or deploy-order choreography required beyond "chat-service

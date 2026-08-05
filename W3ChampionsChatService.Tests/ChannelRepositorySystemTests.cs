@@ -285,9 +285,9 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
         await repo.TryAdvanceAssertion(detachedMatch.Id, "e1", 1);
         await repo.SetDetached(detachedMatch.Id);
         // 2026-08-05 fix wave (final review H1, plan D8 amendment): a match channel that has NEVER been
-        // stamped by the assertion protocol — exactly the shape of a channel minted only by the
-        // deprecated delta path during the transition window — must be excluded too, same as a detached
-        // one, not just left to chance alongside the non-match seeds below.
+        // stamped by the assertion protocol — exactly the shape of a channel created without epoch/seq
+        // and never since asserted — must be excluded too, same as a detached one, not just left to
+        // chance alongside the non-match seeds below.
         await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-unstamped", "Unstamped Match", Now);
         await repo.FindOrCreateSystem(SystemChannelKind.Clan, "clan-1", "Clan Chat", Now);
         await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Pub", NormalizedName = "pub" });
@@ -323,8 +323,8 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
     [Test]
     public async Task LegacyChannelDocument_WithoutAssertionFields_Deserializes_AndIsAdmissible()
     {
-        // Backward-compatibility pin: a channel created via the legacy create/delta path never wrote
-        // the three new fields — every read must tolerate absence, and the CAS must still admit.
+        // Backward-compatibility pin: a channel created without epoch/seq never wrote the three new
+        // fields — every read must tolerate absence, and the CAS must still admit.
         var repo = new ChannelRepository(MongoClient);
         var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
 

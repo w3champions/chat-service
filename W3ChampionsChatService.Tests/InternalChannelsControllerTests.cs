@@ -243,60 +243,6 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         AssertBadRequest(result);
     }
 
-    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): this whole region covers the
-    // DELTA path. mm keeps sending deltas until its own deploy; DELETE THIS ENTIRE REGION in the
-    // mm-deploy-confirmed cleanup PR alongside UpdateMembers/InternalMembersDeltaRequest — see docs
-    // plan Task 6.
-    // ── PUT /internal/channels/{ref}/members ────────────────────────────────────────────────────
-
-    [Test]
-    public async Task Put_NullArrays_TreatedAsEmpty()
-    {
-        var request = new InternalMembersDeltaRequest { Add = null, Remove = null };
-
-        var result = await _controller.UpdateMembers("match-null-arrays", request);
-
-        Assert.That(result, Is.InstanceOf<OkResult>(), "null add/remove must be coerced to empty lists, not throw or 400");
-    }
-
-    [Test]
-    public async Task Put_AddsAndRemoves_AppliesDelta()
-    {
-        await _controller.Create(ValidCreateRequest(@ref: "match-2", members: "Peter#123"));
-
-        var result = await _controller.UpdateMembers("match-2", new InternalMembersDeltaRequest
-        {
-            Add = new List<string> { "Wanda#456" },
-            Remove = new List<string> { "Peter#123" },
-        });
-
-        Assert.That(result, Is.InstanceOf<OkResult>());
-        var membership = await _membershipRepository.LoadForUser("Wanda#456");
-        Assert.That(membership, Is.Not.Empty, "the add must have been applied");
-        var removed = await _membershipRepository.LoadForUser("Peter#123");
-        Assert.That(removed, Is.Empty, "the remove must have been applied");
-    }
-
-    [TestCaseSource(nameof(InvalidRefs))]
-    public async Task Put_RefWithDotSegments_400(string badRef)
-    {
-        var result = await _controller.UpdateMembers(badRef, new InternalMembersDeltaRequest());
-
-        AssertBadRequest(result);
-    }
-
-    [Test]
-    public async Task Put_TooManyMembers_400()
-    {
-        var tooMany = Enumerable.Range(0, ChatLimits.InternalMaxMembersPerCall + 1)
-            .Select(i => $"Player{i}#123")
-            .ToList();
-
-        var result = await _controller.UpdateMembers("match-1", new InternalMembersDeltaRequest { Add = tooMany });
-
-        AssertBadRequest(result);
-    }
-
     // ── PUT /internal/channels/{ref}/roster ─────────────────────────────────────────────────────
 
     [Test]
@@ -598,8 +544,7 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     [Test]
     public async Task PostEpochSync_UnstampedChannel_Returns200_AndSurvives_FallsToTtl()
     {
-        // A channel created WITHOUT epoch/seq — exactly the shape of a channel minted only by the
-        // deprecated delta protocol (or today's not-yet-deployed mm) — must be invisible to the sweep.
+        // A channel created WITHOUT epoch/seq and never since asserted must be invisible to the sweep.
         await _controller.Create(ValidCreateRequest(@ref: "match-unstamped", members: "Peter#123"));
 
         var result = await _controller.EpochSync(ValidEpochSyncRequest());
@@ -660,8 +605,8 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     [Test]
     public void PostEpochSync_RouteDoesNotShadowCreateOrDelete()
     {
-        // Cheap regression guard (Task 5): proves the three actions carry distinct [Http*] route
-        // templates rather than reasoning about ASP.NET's routing table by inspection alone.
+        // Cheap regression guard (Task 5): proves the actions carry distinct [Http*] route templates
+        // rather than reasoning about ASP.NET's routing table by inspection alone.
         var createRoute = typeof(InternalChannelsController)
             .GetMethod(nameof(InternalChannelsController.Create))
             .GetCustomAttribute<HttpPostAttribute>()?.Template;
@@ -674,16 +619,11 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var assertRosterRoute = typeof(InternalChannelsController)
             .GetMethod(nameof(InternalChannelsController.AssertRoster))
             .GetCustomAttribute<HttpPutAttribute>()?.Template;
-        var updateMembersRoute = typeof(InternalChannelsController)
-            .GetMethod(nameof(InternalChannelsController.UpdateMembers))
-            .GetCustomAttribute<HttpPutAttribute>()?.Template;
 
         Assert.That(createRoute, Is.Null.Or.Empty, "Create is the root POST — no template, distinct from epoch-sync");
         Assert.That(deleteRoute, Is.EqualTo("{ref}"), "Delete's template is a different verb+template from EpochSync's POST epoch-sync");
         Assert.That(epochSyncRoute, Is.EqualTo("epoch-sync"));
         Assert.That(assertRosterRoute, Is.EqualTo("{ref}/roster"));
-        Assert.That(updateMembersRoute, Is.EqualTo("{ref}/members"));
-        Assert.That(assertRosterRoute, Is.Not.EqualTo(updateMembersRoute), "the two PUT routes must not collide (§2.3 one-character hazard)");
     }
 
     // ── DELETE /internal/channels/{ref} ─────────────────────────────────────────────────────────

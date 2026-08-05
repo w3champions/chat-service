@@ -307,8 +307,8 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// The <c>AssertEpoch</c>-exists clause is a 2026-08-05 fix wave amendment (final review H1, plan D8
     /// amendment). Every channel the reconciliation-era mm creates is stamped by construction (create
     /// carries epoch/seq; the roster-assertion endpoint stamps on demand), so it is correctly a sweep
-    /// candidate. A channel minted by the PRE-reconciliation mm (deprecated delta protocol only, never an
-    /// assertion) has no <c>AssertEpoch</c> field at all — <see cref="ChatChannel.AssertEpoch"/> is
+    /// candidate. A channel created via <c>POST /internal/channels</c> without epoch/seq and never since
+    /// asserted has no <c>AssertEpoch</c> field at all — <see cref="ChatChannel.AssertEpoch"/> is
     /// <c>[BsonIgnoreIfNull]</c>, so it is genuinely absent from the document, not merely null — and is
     /// therefore invisible to this query. It falls to its own 24h creation-anchored TTL instead of being
     /// torn down by the very first post-deploy epoch sync. Without this clause, that first sync would tear
