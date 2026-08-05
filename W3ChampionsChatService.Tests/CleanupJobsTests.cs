@@ -160,4 +160,65 @@ public class CleanupJobsTests : IntegrationTestBase
             "no orphaned row may survive across the batch boundary");
         Assert.IsNotNull(await membershipRepo.Load(liveChannel.Id, "Peter#123"), "the live membership must survive untouched");
     }
+
+    // Fix round 1 (finding F7): the multi-batch test above only ever exercises the ORPHAN half of the
+    // per-page existence-check $in — every id in its batches is missing. This test crosses the SAME
+    // pagination boundary with EXISTING channels instead, so the existence check itself is proven
+    // correct at full OrphanSweepBatchSize width, not merely "an empty $in never matches".
+    [Test]
+    public async Task OrphanSweep_ExistingChannelsAtFullBatchWidth_AllSurvive_OnlyTheGenuineOrphanIsDeleted()
+    {
+        var db = MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName);
+        var channelsCollection = db.GetCollection<ChatChannel>(ChatCollections.Channels);
+        var membershipsCollection = db.GetCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+        var membershipRepo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+
+        // Strictly more than one batch's worth of EXISTING channels, each with exactly one membership —
+        // a discovery page's distinct-ChannelId batch composed ENTIRELY (or almost entirely) of ids that
+        // must all resolve "exists" via the existence-check $in, at full OrphanSweepBatchSize width.
+        var liveCount = CleanupJobs.OrphanSweepBatchSize + 1;
+        var liveChannels = Enumerable.Range(0, liveCount)
+            .Select(i => new ChatChannel { Type = ChannelType.SemiPublic, Name = $"room-{i}", NormalizedName = $"room-{i}" })
+            .ToList();
+        await channelsCollection.InsertManyAsync(liveChannels);
+        var liveMemberships = liveChannels
+            .Select((c, i) => new ChannelMembership { ChannelId = c.Id, BattleTag = $"liveuser{i}#1", JoinedAt = DateTime.UtcNow })
+            .ToList();
+        await membershipsCollection.InsertManyAsync(liveMemberships);
+
+        // One genuine orphan alongside the live set, so the sweep still does REAL work in the same run —
+        // not merely a no-op pass over an all-live dataset.
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "gone-channel", BattleTag = "orphan#1", JoinedAt = DateTime.UtcNow });
+
+        var deleted = await new CleanupJobs(MongoClient).SweepOrphanedMemberships();
+
+        Assert.AreEqual(1, deleted, "only the single genuine orphan is deleted — none of the live channels' memberships");
+        var liveChannelIds = liveChannels.Select(c => c.Id).ToList();
+        Assert.AreEqual((long)liveCount, await membershipsCollection.CountDocumentsAsync(
+            Builders<ChannelMembership>.Filter.In(m => m.ChannelId, liveChannelIds)),
+            "every live channel's membership must survive — the existence check must resolve all of them correctly even at full batch width");
+        Assert.IsNull(await membershipRepo.Load("gone-channel", "orphan#1"), "the genuine orphan must still be reaped");
+    }
+
+    // Fix round 1 (finding F3): RunOnce's wiring of the orphan sweep was untested — deleting the
+    // SweepOrphanedMemberships() call from RunOnce would survive the full suite (only the method in
+    // isolation was pinned). This proves RunOnce itself reaps an orphan, not just the method directly.
+    [Test]
+    public async Task RunOnce_AlsoSweepsOrphanedMemberships()
+    {
+        var channelRepo = new ChannelRepository(MongoClient);
+        var membershipRepo = new MembershipRepository(MongoClient, channelRepo);
+        var now = DateTime.UtcNow;
+
+        var liveChannel = new ChatChannel { Type = ChannelType.Public, Name = "W3C Lounge", NormalizedName = "w3c lounge" };
+        await channelRepo.Insert(liveChannel);
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = liveChannel.Id, BattleTag = "Peter#123", JoinedAt = now });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "gone-channel", BattleTag = "Peter#123", JoinedAt = now });
+
+        await new CleanupJobs(MongoClient).RunOnce(now);
+
+        Assert.IsNull(await membershipRepo.Load("gone-channel", "Peter#123"),
+            "RunOnce must invoke the orphan sweep — an undeleted orphaned row here means the wiring, not just the method, regressed");
+        Assert.IsNotNull(await membershipRepo.Load(liveChannel.Id, "Peter#123"), "the live membership must survive RunOnce");
+    }
 }
