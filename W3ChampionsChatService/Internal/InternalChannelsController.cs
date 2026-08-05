@@ -118,6 +118,9 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         }
     }
 
+    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): the DELTA path. mm keeps
+    // sending deltas until its own deploy; DELETE THIS ENTIRE METHOD in the mm-deploy-confirmed
+    // cleanup PR — see docs plan Task 6.
     [HttpPut("{ref}/members")]
     public async Task<IActionResult> UpdateMembers(string @ref, [FromBody] InternalMembersDeltaRequest request)
     {

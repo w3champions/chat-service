@@ -299,6 +299,35 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         return await _channelsController.Delete(@ref);
     }
 
+    // 2026-08-05 reconciliation spec, Task 6 — the same hand-signed-through-the-real-filter idiom as the
+    // three helpers above, for the two ADDITIVE endpoints.
+
+    private async Task<IActionResult> PutChannelRoster(string @ref, string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
+    {
+        var (passed, http) = await ThroughFilter("PUT", $"/internal/channels/{@ref}/roster", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
+        if (!passed)
+        {
+            return new UnauthorizedResult();
+        }
+
+        var dto = await JsonSerializer.DeserializeAsync<InternalRosterAssertRequest>(http.Request.Body, JsonOptions);
+        _channelsController.ControllerContext.HttpContext = http;
+        return await _channelsController.AssertRoster(@ref, dto);
+    }
+
+    private async Task<IActionResult> PostEpochSync(string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
+    {
+        var (passed, http) = await ThroughFilter("POST", "/internal/channels/epoch-sync", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
+        if (!passed)
+        {
+            return new UnauthorizedResult();
+        }
+
+        var dto = await JsonSerializer.DeserializeAsync<InternalEpochSyncRequest>(http.Request.Body, JsonOptions);
+        _channelsController.ControllerContext.HttpContext = http;
+        return await _channelsController.EpochSync(dto);
+    }
+
     private async Task<IActionResult> PostRelationshipChange(string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
     {
         var (passed, http) = await ThroughFilter("POST", "/internal/relationship-changes", Utf8(bodyJson), secret, timestamp, allowed ?? WbOnlyAllowed);
@@ -734,5 +763,213 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         var finalChannel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, @ref);
         Assert.That(finalChannel, Is.Not.Null);
         Assert.That(finalChannel.Id, Is.EqualTo(healedDto.Id));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // 2026-08-05 RECONCILIATION — Task 6: the two ADDITIVE endpoints proved through the REAL HMAC
+    // byte-path (mirrors ACCEPTANCE 1's Hmac_PinnedVectors_AcceptedEndToEnd / CrossCaller shape), plus
+    // the transition-coexistence pins (spec §"Verification gates" — chat must accept BOTH the legacy
+    // delta shape and the new authoritative assertion shape until mm's own deploy).
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+
+    [Test]
+    public async Task RosterAssert_SignedRequest_AcceptedEndToEnd()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-roster-1\",\"name\":\"Roster Match\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null);
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        // The full-set assertion drops Alice (absent from the asserted set) and adds Bob — through the
+        // REAL filter, then the REAL controller/domain/repository stack.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[\"Bob#2\"]}";
+        var rosterResult = await PutChannelRoster("match-roster-1", rosterBody, MmSecret, NowTimestamp());
+
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>(), "a correctly signed roster assertion must be accepted end-to-end");
+        Assert.That(await _membershipRepository.Load(channelDto.Id, alice), Is.Null, "Alice, absent from the asserted set, converges away");
+        Assert.That(await _membershipRepository.Load(channelDto.Id, bob), Is.Not.Null, "Bob, present in the asserted set, is durably added");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1));
+        Assert.That(_harness.SignalCount("conn-bob", ChatEvents.ChannelAdded), Is.EqualTo(1));
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-roster-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1L));
+    }
+
+    [Test]
+    public async Task RosterAssert_WrongSecret_Rejected401_AndNoMembershipChange()
+    {
+        const string alice = "Alice#1";
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-roster-2\",\"name\":\"Roster Match 2\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null);
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        // A signature computed with the WRONG secret never verifies — the real filter must reject before
+        // model binding, so ApplyRosterAssertion (which would empty the membership below) never runs.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[]}";
+        var result = await PutChannelRoster("match-roster-2", rosterBody, "not-the-real-secret", NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<UnauthorizedResult>());
+        Assert.That(await _membershipRepository.Load(channelDto.Id, alice), Is.Not.Null,
+            "a rejected request must never reach the domain layer — the pre-existing membership is untouched");
+    }
+
+    [Test]
+    public async Task RosterAssert_WbCaller_Rejected401()
+    {
+        // Least privilege (mirror CrossCaller_WbSecretOnChannelsEndpoint_401): a cryptographically VALID
+        // wb signature is not enough — wb is not in InternalChannelsController's Mm-only allow-list.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[]}";
+
+        var result = await PutChannelRoster("cross-caller-roster", rosterBody, WbSecret, NowTimestamp(), MmOnlyAllowed);
+
+        Assert.That(result, Is.InstanceOf<UnauthorizedResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "cross-caller-roster"), Is.Null,
+            "a rejected request must never reach the controller/DB — not even a create-on-demand shell");
+    }
+
+    [Test]
+    public async Task EpochSync_SignedRequest_AcceptedEndToEnd()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-epoch-1\",\"name\":\"Epoch Match\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>());
+
+        // mm rebooted under a fresh epoch and no longer knows this lobby — the sync tears it down.
+        var syncBody = "{\"epoch\":\"e2\",\"liveLobbyRefs\":[]}";
+        var result = await PostEpochSync(syncBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(), "a correctly signed epoch sync must be accepted end-to-end");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-epoch-1"), Is.Null,
+            "the channel absent from liveLobbyRefs is torn down");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1),
+            "ChannelRemoved reaches the online member's captured connection");
+    }
+
+    [Test]
+    public async Task EpochSync_WrongSecret_Rejected401_AndNothingTornDown()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-epoch-2\",\"name\":\"Epoch Match 2\",\"members\":[]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>());
+
+        var syncBody = "{\"epoch\":\"e2\",\"liveLobbyRefs\":[]}";
+        var result = await PostEpochSync(syncBody, "not-the-real-secret", NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<UnauthorizedResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-epoch-2"), Is.Not.Null,
+            "a rejected epoch sync must never reach ApplyEpochSync — nothing is torn down");
+    }
+
+    [Test]
+    public async Task Transition_DeltaThenAssertion_Converges()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+
+        // mm's legacy delta lands first — create-on-demand shell, no stored epoch yet (the pre-protocol state).
+        var deltaBody = "{\"add\":[\"Alice#1\"],\"remove\":[]}";
+        var deltaResult = await PutChannelMembers("match-transition-1", deltaBody, MmSecret, NowTimestamp());
+        Assert.That(deltaResult, Is.InstanceOf<OkResult>());
+        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-transition-1");
+        Assert.That(shell.AssertEpoch, Is.Null, "a channel born via the legacy delta path carries no stored epoch");
+        Assert.That(await _membershipRepository.Load(shell.Id, alice), Is.Not.Null);
+
+        // The FIRST assertion converges to the asserted set, removing whoever the delta added who is absent.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[\"Bob#2\"]}";
+        var rosterResult = await PutChannelRoster("match-transition-1", rosterBody, MmSecret, NowTimestamp());
+
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>());
+        Assert.That(await _membershipRepository.Load(shell.Id, alice), Is.Null,
+            "the assertion converges — Alice, added only by the delta, is absent from the asserted set");
+        Assert.That(await _membershipRepository.Load(shell.Id, bob), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task Transition_AssertionThenDelta_DeltaStillApplies()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+
+        var rosterBody1 = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[\"Alice#1\"],\"name\":\"Transition Match\"}";
+        var rosterResult1 = await PutChannelRoster("match-transition-2", rosterBody1, MmSecret, NowTimestamp());
+        Assert.That(rosterResult1, Is.InstanceOf<OkResult>());
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-transition-2");
+
+        // A straggler delta on a NON-detached channel during the overlap window still mutates membership —
+        // it bypasses the (epoch, seq) guard by design (it does not call TryAdvanceAssertion at all).
+        var deltaBody = "{\"add\":[\"Bob#2\"],\"remove\":[]}";
+        var deltaResult = await PutChannelMembers("match-transition-2", deltaBody, MmSecret, NowTimestamp());
+        Assert.That(deltaResult, Is.InstanceOf<OkResult>());
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null, "the straggler delta genuinely mutated membership");
+        var afterDelta = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-transition-2");
+        Assert.That(afterDelta.AssertSeq, Is.EqualTo(1L), "the delta does NOT bump the stored (epoch, seq)");
+
+        // The NEXT assertion re-converges — a late delta can never permanently desync the room (the exact
+        // behavior the transition window relies on).
+        var rosterBody2 = "{\"epoch\":\"e1\",\"seq\":2,\"members\":[\"Alice#1\"]}";
+        var rosterResult2 = await PutChannelRoster("match-transition-2", rosterBody2, MmSecret, NowTimestamp());
+        Assert.That(rosterResult2, Is.InstanceOf<OkResult>());
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null,
+            "the next assertion re-converges, removing the straggler delta's member");
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task Transition_CreateThenAssertion_SharesOneChannel()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-transition-3\",\"name\":\"Real Display Name\",\"members\":[]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null);
+        var createDto = createResult.Value as InternalChannelDto;
+
+        _time.Advance(TimeSpan.FromHours(1));
+
+        // name is provided but IGNORED — CreateOrGet already established the real name on an existing channel.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[],\"name\":\"Should Be Ignored\"}";
+        var rosterResult = await PutChannelRoster("match-transition-3", rosterBody, MmSecret, NowTimestamp());
+
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>());
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-transition-3");
+        Assert.That(channel.Id, Is.EqualTo(createDto.Id), "the create and the assertion resolve to the SAME channel doc");
+        Assert.That(channel.Name, Is.EqualTo("Real Display Name"), "the real display name is preserved — name is ignored on an existing channel");
+        Assert.That(channel.ExpiresAt, Is.EqualTo(createDto.ExpiresAt), "the 24h creation-anchored expiry is NOT reset by the assertion");
+    }
+
+    [Test]
+    public async Task Transition_AssertionBeforeCreate_ThenCreate_BackfillsNameWithoutResettingExpiry()
+    {
+        // The assertion arrives BEFORE mm's own create POST (the boot-race healing case) — create-on-demand
+        // shell, no name provided, so the ref itself is the placeholder.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[]}";
+        var rosterResult = await PutChannelRoster("match-transition-4", rosterBody, MmSecret, NowTimestamp());
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>());
+        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-transition-4");
+        Assert.That(shell.Name, Is.EqualTo("match-transition-4"), "no name was provided — the ref itself is the placeholder");
+        var shellExpiry = shell.ExpiresAt;
+
+        _time.Advance(TimeSpan.FromHours(1));
+
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-transition-4\",\"name\":\"Real Match Name\",\"members\":[]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+
+        Assert.That(createResult, Is.Not.Null, "the late create must succeed against the assertion-created shell");
+        var createDto = createResult.Value as InternalChannelDto;
+        Assert.That(createDto.Id, Is.EqualTo(shell.Id), "the create resolves to the SAME shell channel");
+        Assert.That(createDto.Name, Is.EqualTo("Real Match Name"), "the real create backfills the placeholder name");
+        Assert.That(createDto.ExpiresAt, Is.EqualTo(shellExpiry), "the create does NOT reset the shell's own creation-anchored expiry");
     }
 }

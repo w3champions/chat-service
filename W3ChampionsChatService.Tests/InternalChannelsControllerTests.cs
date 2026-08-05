@@ -224,6 +224,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         AssertBadRequest(result);
     }
 
+    // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): this whole region covers the
+    // DELTA path. mm keeps sending deltas until its own deploy; DELETE THIS ENTIRE REGION in the
+    // mm-deploy-confirmed cleanup PR alongside UpdateMembers/InternalMembersDeltaRequest — see docs
+    // plan Task 6.
     // ── PUT /internal/channels/{ref}/members ────────────────────────────────────────────────────
 
     [Test]

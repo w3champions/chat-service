@@ -38,6 +38,9 @@ public class InternalChannelCreateRequest
     public bool? Detached { get; set; }
 }
 
+// TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): the DELTA path. mm keeps
+// sending deltas until its own deploy; DELETE THIS ENTIRE CLASS in the mm-deploy-confirmed
+// cleanup PR — see docs plan Task 6.
 /// <summary>
 /// <c>PUT /internal/channels/{ref}/members</c> request body (C7 Task 9) — mm's membership delta.
 /// <see cref="Add"/>/<see cref="Remove"/> tolerate a null array on the wire: the controller coerces
