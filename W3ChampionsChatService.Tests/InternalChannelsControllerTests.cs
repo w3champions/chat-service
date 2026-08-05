@@ -230,6 +230,19 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         AssertBadRequest(result);
     }
 
+    [Test]
+    public async Task Post_MemberEntryWithControlChar_400()
+    {
+        // 2026-08-05 fix wave (final review M5): mirrors PutRoster_MemberEntryWithControlChar_400 —
+        // IsValidMembers must reject a control-char member entry, not just a blank one.
+        var request = ValidCreateRequest();
+        request.Members = new List<string> { "Peter#123", "Wanda\n#456" };
+
+        var result = await _controller.Create(request);
+
+        AssertBadRequest(result);
+    }
+
     // TRANSITION (2026-08-05 reconciliation spec §"Verification gates"): this whole region covers the
     // DELTA path. mm keeps sending deltas until its own deploy; DELETE THIS ENTIRE REGION in the
     // mm-deploy-confirmed cleanup PR alongside UpdateMembers/InternalMembersDeltaRequest — see docs
@@ -358,6 +371,18 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     {
         var request = ValidRosterRequest();
         request.Members = new List<string> { "Peter#123", "   " };
+
+        var result = await _controller.AssertRoster("match-1", request);
+
+        AssertBadRequest(result);
+    }
+
+    [Test]
+    public async Task PutRoster_MemberEntryWithControlChar_400()
+    {
+        // 2026-08-05 fix wave (final review M5): IsValidMembers is shared across routes — pin it here too.
+        var request = ValidRosterRequest();
+        request.Members = new List<string> { "Peter#123", "Wanda\r#456" };
 
         var result = await _controller.AssertRoster("match-1", request);
 
