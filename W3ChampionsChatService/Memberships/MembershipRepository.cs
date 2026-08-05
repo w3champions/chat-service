@@ -95,6 +95,27 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
         return Memberships.DeleteOneAsync(m => m.ChannelId == channelId && m.BattleTag == tag);
     }
 
+    /// <summary>
+    /// Match-channel-hygiene brief (2026-08-05), Part 1 — connect-time orphan self-heal. Batched delete of
+    /// membership rows whose channel no longer exists (e.g. a lost mm→chat member-removal left the row
+    /// behind after the System channel's <c>ttl_expiresAt</c> TTL'd the doc). Called ONLY from
+    /// <see cref="Protocol.SessionStateAssembler.AssembleAndSeed"/> with the CONNECTING user's own
+    /// excluded (channel-less) <see cref="ChannelMembership.ChannelId"/> set — every row therefore shares
+    /// the SAME BattleTag, so a single equality ANDed with a ChannelId <c>$in</c> serves the whole batch
+    /// through the unique <c>ux_channelId_battleTag</c> index (one index seek per channel id, bounded by
+    /// the — typically tiny — orphan count, never a collection scan). Virtual: a test seam so a throwing
+    /// double can prove the caller's best-effort posture (a delete failure must never fail connect).
+    /// </summary>
+    public virtual async Task<long> DeleteOrphanedForUser(string battleTag, IReadOnlyCollection<string> channelIds)
+    {
+        var tag = NormalizeTag(battleTag);
+        var filter = Builders<ChannelMembership>.Filter.And(
+            Builders<ChannelMembership>.Filter.In(m => m.ChannelId, channelIds),
+            Builders<ChannelMembership>.Filter.Eq(m => m.BattleTag, tag));
+        var result = await Memberships.DeleteManyAsync(filter);
+        return result.DeletedCount;
+    }
+
     /// <summary>Monotonic read-state advance ($max) — a lower/stale seq from an out-of-order
     /// or duplicate MarkRead call never regresses LastReadSeq.</summary>
     public Task UpdateLastReadSeq(string channelId, string battleTag, long seq)
