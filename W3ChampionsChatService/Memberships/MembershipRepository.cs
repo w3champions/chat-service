@@ -74,8 +74,10 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
 
     /// <summary>
     /// Minimal-payload sibling of <see cref="LoadForUser"/> (2026-08-05 PR36 feedback, Part 3) — a
-    /// projected read returning ONLY the <see cref="ChannelMembership.ChannelId"/> values for a user,
-    /// never the full membership documents. Backs <see cref="CountNameJoinableMembershipsForUser"/>,
+    /// projected read returning ONLY the <see cref="ChannelMembership.ChannelId"/> values for a user —
+    /// minimal WIRE payload (the server still fetches the documents; ix_battleTag_joinedAt is
+    /// BattleTag-prefixed only, so the projection is not index-covered — the point is that no document
+    /// bodies cross the wire). Backs <see cref="CountNameJoinableMembershipsForUser"/>,
     /// which only ever needs the id set. No sort (callers of this projection don't need ordering; unlike
     /// <see cref="LoadForUser"/>, whose JoinedAt-ascending sort is a client-order contract).
     /// </summary>

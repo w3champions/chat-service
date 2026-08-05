@@ -138,11 +138,13 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
-    /// D7 (consumed by a later C4 task's unread math): count of rows in <paramref name="channelId"/>
-    /// visible to <paramref name="viewerBattleTag"/> (same rule as <see cref="UserVisible"/>) with
+    /// D7: count of rows in <paramref name="channelId"/> visible to
+    /// <paramref name="viewerBattleTag"/> (same rule as <see cref="UserVisible"/>) with
     /// <c>Seq &gt; afterSeq</c>. The filter leads with ChannelId equality + a Seq range so the
     /// count is an INDEXED RANGE COUNT bounded by <c>ux_channelId_seq</c> — never a full-collection
-    /// scan.
+    /// scan. Retained as the documented single-channel primitive and as the equivalence baseline for
+    /// <see cref="CountUserVisibleAfterMany"/>'s tests; no production call site since 2026-08-05
+    /// (both former callers migrated to the batched sibling — do NOT remove as dead code).
     /// </summary>
     public Task<long> CountUserVisibleAfter(string channelId, string viewerBattleTag, long afterSeq)
     {
