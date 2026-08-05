@@ -87,7 +87,13 @@ public class ChatHubMembershipTests : IntegrationTestBase
             new MentionInboxRepository(MongoClient));
     }
 
-    private ChatHub BuildHub(string connectionId, NotificationPreferenceRepository notificationPreferenceRepository = null)
+    // Fix round 1 (finding F2b): optional channelRepository lets a single test swap in
+    // CountingChannelRepository (spy) without touching the shared _channelRepository field every other
+    // test in this file relies on — mirrors the existing notificationPreferenceRepository override.
+    private ChatHub BuildHub(
+        string connectionId,
+        NotificationPreferenceRepository notificationPreferenceRepository = null,
+        ChannelRepository channelRepository = null)
     {
         var hub = new ChatHub(
             _connectionMapping,
@@ -101,7 +107,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
             _messageRateLimiter,
             _readRateLimiter,
             TimeProvider.System,
-            _channelRepository,
+            channelRepository ?? _channelRepository,
             _membershipRepository,
             _channelCreationRateLimiter,
             new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
@@ -235,6 +241,41 @@ public class ChatHubMembershipTests : IntegrationTestBase
 
         var membership = await _membershipRepository.Load(systemChannel.Id, BattleTag);
         Assert.IsNull(membership, "No membership must have been created against the ACL channel");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Match-channel-hygiene brief (2026-08-05), Part 3 hardening — fix round 1, finding F2b: a
+    // null/whitespace-only name is now rejected BEFORE any DB read, returning the SAME PermissionDenied
+    // the (still-kept, defense-in-depth) ACL-type denial branch above would otherwise yield reaching it
+    // via {NormalizedName: null} matching every absent-field System/Dm/GroupDm document.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task JoinChannel_NullName_ReturnsPermissionDenied_WithZeroChannelCollectionReads()
+    {
+        var spy = new CountingChannelRepository(MongoClient);
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1", channelRepository: spy);
+
+        var result = await hub.JoinChannel(null);
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
+        Assert.AreEqual(0, spy.LoadAnyByNormalizedNameCallCount,
+            "a null name must be rejected before ANY channel-collection read");
+    }
+
+    [Test]
+    public async Task JoinChannel_WhitespaceOnlyName_ReturnsPermissionDenied_WithZeroChannelCollectionReads()
+    {
+        var spy = new CountingChannelRepository(MongoClient);
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1", channelRepository: spy);
+
+        var result = await hub.JoinChannel("   ");
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
+        Assert.AreEqual(0, spy.LoadAnyByNormalizedNameCallCount,
+            "a whitespace-only name must be rejected before ANY channel-collection read");
     }
 
     [Test]
