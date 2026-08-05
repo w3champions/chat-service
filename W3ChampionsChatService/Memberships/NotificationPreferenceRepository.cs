@@ -39,8 +39,19 @@ public class NotificationPreferenceRepository(MongoClient mongoClient) : MongoDb
     /// by the unique <c>ux_battleTag_channelId</c> index (<see cref="Domain.ChatDomainIndexes"/>), so a
     /// repeated set for the same (battleTag, channelId) overwrites the existing row rather than
     /// accumulating duplicates.
+    /// <para>
+    /// Fix round 1 (F1): a plain <c>$setOnInsert</c> + <c>IsUpsert</c> races against the unique index —
+    /// two callers upserting the same not-yet-existing (battleTag, channelId) at the same instant can
+    /// make the LOSING call's insert half violate <c>ux_battleTag_channelId</c>. Mirrors
+    /// <see cref="MembershipRepository.InsertIfAbsent"/> / <c>ChannelRepository.FindOrCreate*</c>'s
+    /// established fix for this exact race: use the findAndModify form (<c>FindOneAndUpdateAsync</c>,
+    /// NOT <c>UpdateOneAsync</c>) wrapped in <see cref="MongoDbRepositoryBase.RetryOnceOnDuplicateKey{T}"/>
+    /// — that helper only catches the <see cref="MongoCommandException"/>{Code==11000} shape findAndModify
+    /// throws, not the <see cref="MongoWriteException"/> a plain <c>UpdateOneAsync</c> would throw instead,
+    /// so the write MUST go through <c>FindOneAndUpdateAsync</c> for the retry to actually catch the race.
+    /// </para>
     /// </summary>
-    public Task Upsert(string battleTag, string channelId, NotificationLevel level, DateTime now)
+    public Task<NotificationPreference> Upsert(string battleTag, string channelId, NotificationLevel level, DateTime now)
     {
         var tag = NormalizeTag(battleTag);
         var filter = Builders<NotificationPreference>.Filter.Where(p => p.BattleTag == tag && p.ChannelId == channelId);
@@ -54,7 +65,8 @@ public class NotificationPreferenceRepository(MongoClient mongoClient) : MongoDb
             // string-typed Id property here cannot deserialize back (a BsonSerializationException on the
             // very next Load).
             .SetOnInsert(p => p.Id, ObjectId.GenerateNewId().ToString());
+        var options = new FindOneAndUpdateOptions<NotificationPreference> { IsUpsert = true };
 
-        return Prefs.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
+        return RetryOnceOnDuplicateKey(() => Prefs.FindOneAndUpdateAsync(filter, update, options));
     }
 }
