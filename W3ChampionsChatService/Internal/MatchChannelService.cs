@@ -46,7 +46,11 @@ namespace W3ChampionsChatService.Internal;
 /// (<see cref="_refGate"/>) that every mutating match-channel path now acquires FIRST, and detach guards
 /// (plan D4) on the assertion and legacy delta paths. <see cref="CreateOrGet"/> gains OPTIONAL
 /// <c>epoch</c>/<c>seq</c>/<c>detached</c> parameters (plan D10) so a create can also participate in the
-/// (epoch, seq) staleness protocol and birth ladder-match channels already detached.
+/// (epoch, seq) staleness protocol and birth ladder-match channels already detached. The teardown body
+/// of <see cref="DeleteChannel"/> is extracted into the private <c>TearDownChannel</c>, shared by
+/// <see cref="ApplyEpochSync"/> — the startup mm-crash-recovery sweep (plan D8) that tears down every
+/// non-detached match channel absent from mm's freshly-booted <c>liveLobbyRefs</c> and re-anchors the
+/// channels it spares to the new epoch.
 /// </para>
 /// </summary>
 public class MatchChannelService(
@@ -310,6 +314,18 @@ public class MatchChannelService(
             return;
         }
 
+        await TearDownChannel(channel);
+    }
+
+    /// <summary>
+    /// The shared match-channel TEARDOWN, authoritative-DB-first then best-effort live pushes.
+    /// Used by BOTH the explicit DELETE endpoint and the startup epoch sync, so an mm-crash sweep is
+    /// byte-for-byte the same teardown an explicit mm teardown performs (and leaves no orphaned
+    /// membership rows for CleanupJobs.SweepOrphanedMemberships to find).
+    /// Callers MUST already hold the per-ref gate.
+    /// </summary>
+    private async Task TearDownChannel(ChatChannel channel)
+    {
         var memberBattleTags = (await membershipRepository.LoadForChannel(channel.Id))
             .Select(m => m.BattleTag)
             .ToList();
@@ -425,6 +441,60 @@ public class MatchChannelService(
             channel.Detached = true;
             Log.Information("ApplyRosterAssertion: match channel {Ref} detached (frozen) by final roster assertion", systemRef);
         }
+    }
+
+    /// <summary>
+    /// STARTUP EPOCH SYNC (2026-08-05 reconciliation spec §3) — mm asserts its authoritative world
+    /// once at boot under a fresh epoch. Every NON-DETACHED System+Match channel whose SystemRef is
+    /// absent from <paramref name="liveLobbyRefs"/> is torn down (memberships deleted, ChannelRemoved
+    /// pushed so stuck rows vanish from connected clients immediately, channel doc removed); the
+    /// channels that ARE listed are SPARED and re-anchored to the new epoch with the seq counter
+    /// reset to the 0 sentinel (plan D8), so mm's first assertion under the new epoch applies cleanly.
+    /// <para>DETACHED CHANNELS ARE EXCLUDED ENTIRELY — filtered server-side by
+    /// <see cref="ChannelRepository.LoadNonDetachedMatchChannels"/>, so an in-game/post-game room is
+    /// never loaded, never torn down, never re-stamped. Its 24h TTL owns it.</para>
+    /// <para>Each channel is processed under its OWN per-ref gate (never one global lock) and
+    /// RE-LOADED inside that gate before teardown, so a channel that was (re)created or detached
+    /// between the discovery scan and its turn is not torn down on stale information.</para>
+    /// </summary>
+    public async Task ApplyEpochSync(string epoch, IReadOnlyList<string> liveLobbyRefs)
+    {
+        // Refs are exact Mongo keys (unlike battleTags, which are the case-insensitive thing here) —
+        // Ordinal, not OrdinalIgnoreCase.
+        var live = new HashSet<string>(liveLobbyRefs, StringComparer.Ordinal);
+        var tornDown = 0;
+        var spared = 0;
+
+        foreach (var candidate in await channelRepository.LoadNonDetachedMatchChannels())
+        {
+            using var _ = await _refGate.AcquireAsync(candidate.SystemRef);
+
+            // RE-LOAD inside the gate: the discovery scan above ran outside any per-ref gate, so the
+            // candidate could have been torn down, recreated, or detached by another mutating call
+            // between the scan and this channel's turn — never act on stale information.
+            var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, candidate.SystemRef);
+            if (channel == null || channel.Detached)
+            {
+                continue;
+            }
+
+            if (live.Contains(channel.SystemRef))
+            {
+                await channelRepository.StampAssertionEpoch(channel.Id, epoch);
+                spared++;
+            }
+            else
+            {
+                await TearDownChannel(channel);
+                tornDown++;
+            }
+        }
+
+        // Unconditional — a boot-time convergence event is exactly what an operator wants in the log,
+        // including the healthy tornDown=0 case (mirrors the class's other Information-level summaries).
+        Log.Information(
+            "Epoch sync applied {Epoch} liveRefCount={LiveRefCount} tornDown={TornDown} spared={Spared}",
+            epoch, liveLobbyRefs.Count, tornDown, spared);
     }
 
     /// <summary>

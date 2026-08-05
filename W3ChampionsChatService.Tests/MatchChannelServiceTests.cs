@@ -1135,4 +1135,197 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(reloaded.AssertEpoch, Is.Null, "no (epoch, seq) stamp is written when the fields are omitted — the transition pin");
         Assert.That(reloaded.Detached, Is.False);
     }
+
+    // ============================================================================================
+    // 2026-08-05 reconciliation — ApplyEpochSync: startup teardown of orphaned lobby channels
+    // (plan D8, Task 4)
+    // ============================================================================================
+
+    [Test]
+    public async Task EpochSync_TearsDownChannelsNotInLiveList()
+    {
+        const string alice = "Alice#1";
+        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false);
+        var kept = await _service.CreateOrGet("match-kept", "Kept Match", Members(alice), focus: false);
+        var message = NewMessage(gone.Id, 1, alice);
+        await _messageRepository.Insert(message);
+
+        await _service.ApplyEpochSync("e2", Members("match-kept"));
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-gone"), Is.Null,
+            "the unlisted channel doc is torn down");
+        Assert.That(await _membershipRepository.LoadForChannel(gone.Id), Is.Empty, "its memberships are gone");
+        Assert.That(await _messageRepository.Load(message.Id), Is.Null, "its messages are purged");
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-kept"), Is.Not.Null,
+            "the listed channel is fully intact");
+        Assert.That(await _membershipRepository.Load(kept.Id, alice), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task EpochSync_PushesChannelRemovedToOnlineMembersOfTornDownChannels()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+
+        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false);
+        var kept = await _service.CreateOrGet("match-kept", "Kept Match", Members(bob), focus: false);
+        var detachedRef = "match-detached";
+        await _service.CreateOrGet(detachedRef, "Detached Match", Members(), focus: false, detached: true);
+
+        await _service.ApplyEpochSync("e2", Members("match-kept"));
+
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1),
+            "the torn-down channel's online member receives ChannelRemoved");
+        var dto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelRemoved) as ChannelRemovedDto;
+        Assert.That(dto, Is.Not.Null);
+        Assert.That(dto.ChannelId, Is.EqualTo(gone.Id));
+
+        Assert.That(_harness.SignalCount("conn-bob", ChatEvents.ChannelRemoved), Is.EqualTo(0),
+            "the spared channel's member receives nothing");
+        Assert.That(kept.Id, Is.Not.Null);
+    }
+
+    [Test]
+    public async Task EpochSync_SparesDetachedChannels()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+        var detached = await _service.CreateOrGet("match-detached", "Ladder", Members(alice), focus: false, detached: true);
+        var message = NewMessage(detached.Id, 1, alice);
+        await _messageRepository.Insert(message);
+
+        // The detached channel's ref is NOT in the live list — the empty live set is the post-crash case.
+        await _service.ApplyEpochSync("e2", Members());
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-detached"), Is.Not.Null,
+            "a detached channel survives an epoch sync even when absent from liveLobbyRefs");
+        Assert.That(await _membershipRepository.Load(detached.Id, alice), Is.Not.Null, "its memberships survive");
+        Assert.That(await _messageRepository.Load(message.Id), Is.Not.Null, "its messages survive");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(0),
+            "a spared detached channel's member receives no push");
+    }
+
+    [Test]
+    public async Task EpochSync_EmptyLiveList_TearsDownEveryNonDetachedMatchChannel_ButNotDetachedOnes()
+    {
+        const string alice = "Alice#1";
+        var matchA = await _service.CreateOrGet("match-a", "Match A", Members(alice), focus: false);
+        var matchB = await _service.CreateOrGet("match-b", "Match B", Members(alice), focus: false);
+        var detached = await _service.CreateOrGet("match-detached", "Ladder", Members(alice), focus: false, detached: true);
+
+        await _service.ApplyEpochSync("e2", Members());
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-a"), Is.Null);
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-b"), Is.Null);
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-detached"), Is.Not.Null,
+            "the post-crash empty live list still spares detached channels");
+        Assert.That(matchA.Id, Is.Not.Null);
+        Assert.That(matchB.Id, Is.Not.Null);
+        Assert.That(detached.Id, Is.Not.Null);
+    }
+
+    [Test]
+    public async Task EpochSync_ReStampsSparedChannels_SoNewEpochSeq1Applies()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 9, Members(alice), name: null, detached: false);
+
+        await _service.ApplyEpochSync("e2", Members("match-1"));
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"), "the spared channel is re-anchored to the new epoch");
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(0), "the seq counter is reset to the 0 sentinel");
+
+        await _service.ApplyRosterAssertion("match-1", "e2", 1, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null,
+            "seq 1 under the new epoch applies cleanly after the re-anchor");
+    }
+
+    [Test]
+    public async Task EpochSync_LeavesNonMatchChannelsUntouched()
+    {
+        const string alice = "Alice#1";
+
+        var publicChannel = new ChatChannel { Type = ChannelType.Public, Name = "W3C Lounge", NormalizedName = ChannelNames.Normalize("W3C Lounge") };
+        await _channelRepository.Insert(publicChannel);
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = publicChannel.Id, BattleTag = alice, JoinedAt = Now });
+
+        var dm = new ChatChannel { Type = ChannelType.Dm, PairKey = DmPairKey.For(alice, "Bob#2") };
+        await _channelRepository.Insert(dm);
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = dm.Id, BattleTag = alice, JoinedAt = Now });
+
+        var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastMessageAt = Now, ExpiresAt = Now.AddDays(365) };
+        await _channelRepository.Insert(group);
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = group.Id, BattleTag = alice, JoinedAt = Now });
+
+        var clan = await _channelRepository.FindOrCreateSystem(SystemChannelKind.Clan, "clan-1", "Clan Chat", Now);
+        await _membershipRepository.Insert(new ChannelMembership { ChannelId = clan.Id, BattleTag = alice, JoinedAt = Now });
+
+        await _service.ApplyEpochSync("e2", Members());
+
+        Assert.That(await _channelRepository.Load(publicChannel.Id), Is.Not.Null, "Public channels are untouched");
+        Assert.That(await _channelRepository.Load(dm.Id), Is.Not.Null, "Dm channels are untouched");
+        Assert.That(await _channelRepository.Load(group.Id), Is.Not.Null, "GroupDm channels are untouched");
+        Assert.That(await _channelRepository.Load(clan.Id), Is.Not.Null, "System+Clan channels are untouched");
+        Assert.That(await _membershipRepository.Load(publicChannel.Id, alice), Is.Not.Null);
+        Assert.That(await _membershipRepository.Load(dm.Id, alice), Is.Not.Null);
+        Assert.That(await _membershipRepository.Load(group.Id, alice), Is.Not.Null);
+        Assert.That(await _membershipRepository.Load(clan.Id, alice), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task EpochSync_UnknownRefInLiveList_IsANoOp()
+    {
+        Assert.DoesNotThrowAsync(async () => await _service.ApplyEpochSync("e2", Members("never-existed")));
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "never-existed"), Is.Null,
+            "listing a ref with no channel neither creates one nor throws");
+    }
+
+    [Test]
+    public async Task EpochSync_IsIdempotent()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+        var gone = await _service.CreateOrGet("match-gone", "Gone Match", Members(alice), focus: false);
+        await _service.CreateOrGet("match-kept", "Kept Match", Members(), focus: false);
+
+        await _service.ApplyEpochSync("e2", Members("match-kept"));
+        var pushCountAfterFirst = _harness.AllSignals.Count;
+        var keptAfterFirst = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-kept");
+
+        await _service.ApplyEpochSync("e2", Members("match-kept"));
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-gone"), Is.Null,
+            "the torn-down channel stays torn down");
+        var keptAfterSecond = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-kept");
+        Assert.That(keptAfterSecond.AssertEpoch, Is.EqualTo(keptAfterFirst.AssertEpoch), "same end state on the spared channel");
+        Assert.That(keptAfterSecond.AssertSeq, Is.EqualTo(keptAfterFirst.AssertSeq));
+        Assert.That(_harness.AllSignals.Count, Is.EqualTo(pushCountAfterFirst), "no additional pushes on the second run");
+        Assert.That(gone.Id, Is.Not.Null);
+    }
+
+    [Test]
+    public async Task EpochSync_LeavesNoOrphanedMembershipRows()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        await _service.CreateOrGet("match-gone-1", "Gone 1", Members(alice), focus: false);
+        await _service.CreateOrGet("match-gone-2", "Gone 2", Members(alice, bob), focus: false);
+        await _service.CreateOrGet("match-kept", "Kept", Members(bob), focus: false);
+
+        await _service.ApplyEpochSync("e2", Members("match-kept"));
+
+        var orphansDeleted = await new CleanupJobs(MongoClient).SweepOrphanedMemberships();
+
+        Assert.That(orphansDeleted, Is.EqualTo(0),
+            "the shared TearDownChannel routine deletes messages, memberships AND the channel doc together — "
+            + "so no orphaned membership row is left behind for CleanupJobs to find");
+    }
 }
