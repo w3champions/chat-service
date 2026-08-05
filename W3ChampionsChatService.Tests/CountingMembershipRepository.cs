@@ -20,12 +20,18 @@ namespace W3ChampionsChatService.Tests;
 /// the Public lane — the ONLY channel type that must never perform ANY membership-scoping read at all —
 /// genuinely performs zero, not merely zero of the full-room variant.
 /// </para>
+/// <para>
+/// Match-channel-hygiene brief (2026-08-05), Part 1: also counts <see cref="DeleteOrphanedForUser"/>
+/// calls, so a test can assert SessionStateAssembler.AssembleAndSeed's zero-orphans common case issues
+/// no extra delete query, and that a second (already-healed) connect doesn't call it again.
+/// </para>
 /// </summary>
 internal sealed class CountingMembershipRepository(MongoClient client, ChannelRepository channelRepository)
     : MembershipRepository(client, channelRepository)
 {
     public int LoadForChannelCallCount { get; private set; }
     public int LoadMemberBattleTagsCallCount { get; private set; }
+    public int DeleteOrphanedForUserCallCount { get; private set; }
 
     public override Task<List<ChannelMembership>> LoadForChannel(string channelId)
     {
@@ -37,5 +43,11 @@ internal sealed class CountingMembershipRepository(MongoClient client, ChannelRe
     {
         LoadMemberBattleTagsCallCount++;
         return base.LoadMemberBattleTags(channelId, battleTags);
+    }
+
+    public override Task<long> DeleteOrphanedForUser(string battleTag, IReadOnlyCollection<string> channelIds)
+    {
+        DeleteOrphanedForUserCallCount++;
+        return base.DeleteOrphanedForUser(battleTag, channelIds);
     }
 }

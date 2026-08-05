@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using Serilog;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
@@ -93,10 +94,57 @@ public class SessionStateAssembler(
         // Channel-backed memberships only (row exists AND the channel it points at still exists) —
         // the single filtered set both the DTO's Channels list and the OnlineMemberRegistry seed are
         // built from, so a membership orphaned by a deleted channel never fans out to a channel with
-        // no row even though it doesn't reach the client either.
+        // no row even though it doesn't reach the client either. An orphaned row (channel doc gone —
+        // e.g. a lost mm→chat member-removal that leaves the row behind after the System channel's
+        // ttl_expiresAt TTLs the doc, 2026-08-05 match-channel-hygiene incident) drops AND deletes
+        // (self-heal, 2026-08-05): it is excluded from this filtered set exactly as before, but the
+        // excluded set is ALSO collected and best-effort batch-deleted right below, so the connect path
+        // itself repairs the desync instead of waiting for CleanupJobs' weekly orphan sweep or the
+        // 365-day idle-membership prune to eventually catch it.
         var channelBackedMemberships = memberships
             .Where(m => channelsById.ContainsKey(m.ChannelId))
             .ToList();
+
+        // Self-heal (2026-08-05): the channel ids behind this connecting user's own orphaned rows — every
+        // row shares this user's BattleTag, which is what lets MembershipRepository.DeleteOrphanedForUser
+        // serve the whole batch off the unique ux_channelId_battleTag index. Guarded on non-empty so the
+        // common case (no orphans) issues zero extra queries.
+        var orphanedChannelIds = memberships
+            .Where(m => !channelsById.ContainsKey(m.ChannelId))
+            .Select(m => m.ChannelId)
+            .ToList();
+        if (orphanedChannelIds.Count > 0)
+        {
+            // Best-effort: a delete failure must never fail connect — the snapshot above already
+            // excludes these rows regardless of whether the delete below succeeds, so the client
+            // experience is unaffected either way; the next connect (or the weekly CleanupJobs sweep,
+            // match-channel-hygiene brief Part 2) gets another chance to reap them.
+            try
+            {
+                // Fix round 1 (finding F6): log the ACTUAL DeletedCount the delete returned, not the
+                // requested orphanedChannelIds.Count — a concurrent healer (a second connection for the
+                // SAME user, or the weekly CleanupJobs sweep, Part 2) can race this delete and already
+                // remove some of these rows first, so the requested count can overstate what THIS call
+                // actually healed. Logged only when > 0 (mirrors the guard above — nothing to report on
+                // a fully-raced no-op delete).
+                var deletedCount = await membershipRepository.DeleteOrphanedForUser(identity.BattleTag, orphanedChannelIds);
+                if (deletedCount > 0)
+                {
+                    Log.Information(
+                        "AssembleAndSeed: self-healed {Count} orphaned membership row(s) for {BattleTag} — channel doc(s) gone, membership row(s) deleted",
+                        deletedCount,
+                        identity.BattleTag);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(
+                    ex,
+                    "AssembleAndSeed: failed to self-heal {Count} orphaned membership row(s) for {BattleTag} — snapshot proceeds with the dropped set regardless",
+                    orphanedChannelIds.Count,
+                    identity.BattleTag);
+            }
+        }
 
         // Follow-up spec §6: bound the 1:1-DM slice of the snapshot. The SELECTED set feeds the DTO's
         // Channels list, the pending tray, AND the OnlineMemberRegistry seed below — the registry set

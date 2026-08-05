@@ -225,6 +225,10 @@ public partial class ChatHub
     /// <list type="number">
     /// <item>Fail-closed: an unregistered connection (never authenticated, or displaced/torn down) is
     /// denied outright — there is no identity to join a channel under.</item>
+    /// <item>Fix round 1 (finding F2b): a null/whitespace-only <paramref name="name"/> is rejected here,
+    /// BEFORE any DB read — <see cref="ChatResultCode.PermissionDenied"/>, zero channel-collection reads.
+    /// See the guard's own inline comment for the mechanism this pre-empts: a proven, reachable-today
+    /// path into the ACL-type denial branch below.</item>
     /// <item><see cref="Channels.ChannelRepository.LoadAnyByNormalizedName"/> resolves ANY channel
     /// with that normalized name, across every <see cref="ChannelType"/>:
     /// <list type="bullet">
@@ -272,6 +276,21 @@ public partial class ChatHub
             return new JoinChannelResult(ChatResultCode.PermissionDenied);
         }
 
+        // Fix round 1 (finding F2b): reject a null/whitespace-only name BEFORE any DB read. Proven:
+        // without this guard, ChannelNames.Normalize(null) -> null, and LoadAnyByNormalizedName(null)
+        // renders the Mongo filter {NormalizedName: null} — because ChatChannel.NormalizedName is
+        // [BsonIgnoreIfNull], that filter matches every document where the field is ABSENT, i.e. EVERY
+        // System/Dm/GroupDm document (none of their creation paths — FindOrCreateSystem, FindOrCreateDm,
+        // the GroupDm creation path — ever populate NormalizedName). So JoinChannel(null) matched the
+        // first such document and landed in the ACL-type denial branch below on EVERY call — a LIVE
+        // guard reached via a guaranteed COLLSCAN (the partial index ux_type_normalizedName can't serve
+        // a null match), not dead code. This guard pre-empts that path entirely, returning the SAME
+        // PermissionDenied the branch below would have yielded, with zero channel-collection reads.
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return new JoinChannelResult(ChatResultCode.PermissionDenied);
+        }
+
         var battleTag = session.Identity.BattleTag;
         var now = _timeProvider.GetUtcNow().UtcDateTime;
         var normalizedName = ChannelNames.Normalize(name);
@@ -293,6 +312,26 @@ public partial class ChatHub
             {
                 // System / Dm / GroupDm — ACL-governed, not joinable by name. NOT an implicit-create
                 // case: a name collision with an existing ACL channel must be rejected outright.
+                //
+                // Match-channel-hygiene brief (2026-08-05), Part 3 — CORRECTED, fix round 1 (finding F2):
+                // the original comment here claimed this branch was structurally unreachable. That claim
+                // was WRONG. Proven: ChannelNames.Normalize(null) -> null, and
+                // LoadAnyByNormalizedName(null) renders the Mongo filter {NormalizedName: null} — because
+                // ChatChannel.NormalizedName is [BsonIgnoreIfNull], that filter matches every document
+                // where the field is ABSENT, which is EVERY System/Dm/GroupDm document (none of their
+                // creation paths — FindOrCreateSystem, FindOrCreateDm, the GroupDm creation path — ever
+                // populate NormalizedName). So JoinChannel(null) matched the first such document and
+                // landed HERE on every call — a LIVE ACL guard, reached via a guaranteed COLLSCAN (the
+                // partial index ux_type_normalizedName can't serve a null match), not dead code.
+                //
+                // Fix round 1 (finding F2b) added an explicit null/whitespace-name guard at the top of
+                // JoinChannel that now pre-empts this exact path before any DB read — so for a
+                // null/whitespace name this branch is unreachable again TODAY. It stays as
+                // defense-in-depth for the ORIGINAL concern this comment used to (wrongly) dismiss: a
+                // real, non-blank name that collides with a System/Dm/GroupDm channel the moment any
+                // future write path ever populates NormalizedName on one of those types — and as a
+                // backstop if the F2b guard above is ever weakened or removed without re-reading this
+                // history.
                 return new JoinChannelResult(ChatResultCode.PermissionDenied);
             }
 

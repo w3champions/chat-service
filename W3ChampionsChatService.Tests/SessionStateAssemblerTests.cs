@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+using MongoDB.Driver;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
@@ -917,5 +918,121 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             new[] { chanC.Id, chanA.Id, chanB.Id },
             dto.Channels.Select(c => c.Channel.Id).ToList(),
             "Channels must come back in membership JoinedAt-ascending order, not Mongo insertion/natural order");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Match-channel-hygiene brief (2026-08-05), Part 1 — connect-time orphan self-heal: a membership row
+    // whose channel doc is gone (TTL'd System match channel, or a lost mm→chat member-removal) is
+    // excluded from the snapshot exactly as before (pre-existing behavior — see channelBackedMemberships'
+    // doc comment), AND its row is now best-effort deleted so it doesn't linger until CleanupJobs' weekly
+    // orphan sweep (Part 2) or the 365-day idle-membership prune.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Connect_WithOrphanedMembership_ExcludesFromSnapshot_AndDeletesTheRow_AndSecondConnectIsNoOp()
+    {
+        var identity = Identity("peter#123");
+        var liveChannel = await InsertChannel(ChannelType.Public, "General", lastSeq: 0);
+        await InsertMembership(liveChannel.Id, identity.BattleTag, lastReadSeq: 0);
+
+        // A membership row whose channel was deleted/TTL'd out from under it — inserted directly (the
+        // repository has no channel-existence check on Insert), exactly reproducing a genuine orphan.
+        const string goneChannelId = "gone-channel-id";
+        await InsertMembership(goneChannelId, identity.BattleTag, lastReadSeq: 0);
+
+        var spy = new CountingMembershipRepository(MongoClient, _channelRepository);
+        var assembler = BuildAssembler(spy);
+
+        var (dto, _) = await assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        Assert.AreEqual(1, dto.Channels.Count, "the orphaned membership must not reach the snapshot");
+        Assert.AreEqual(liveChannel.Id, dto.Channels.Single().Channel.Id);
+        Assert.AreEqual(1, spy.DeleteOrphanedForUserCallCount);
+        Assert.IsNull(await spy.Load(goneChannelId, identity.BattleTag), "the orphaned row must be deleted");
+        Assert.IsNotNull(await spy.Load(liveChannel.Id, identity.BattleTag), "the live membership must survive untouched");
+
+        // Second connect: the orphan is already gone, so nothing is left to self-heal.
+        var (dto2, _) = await assembler.AssembleAndSeed(identity, "conn-2", DateTime.UtcNow, ChatUserFor(identity));
+
+        Assert.AreEqual(1, dto2.Channels.Count);
+        Assert.AreEqual(1, spy.DeleteOrphanedForUserCallCount,
+            "an already-healed, orphan-free connect must not invoke the delete path again");
+    }
+
+    // Fix round 1 (finding F4): the self-heal delete's BattleTag scoping was untested — replacing the
+    // filter with a bare In(ChannelId) (deleting EVERY user's rows on that channel id, not just the
+    // connecting user's) would have survived the full suite. A second user's membership on the SAME
+    // gone channel must survive this connect untouched.
+    [Test]
+    public async Task Connect_OrphanSelfHeal_ScopedToConnectingUser_OtherUsersMembershipOnSameGoneChannelSurvives()
+    {
+        var identity = Identity("peter#123");
+        const string goneChannelId = "gone-channel-id";
+        const string otherBattleTag = "otheruser#456";
+        await InsertMembership(goneChannelId, identity.BattleTag, lastReadSeq: 0);
+        await InsertMembership(goneChannelId, otherBattleTag, lastReadSeq: 0);
+
+        await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        Assert.IsNull(await _membershipRepository.Load(goneChannelId, identity.BattleTag),
+            "the connecting user's own orphaned row must be deleted");
+        Assert.IsNotNull(await _membershipRepository.Load(goneChannelId, otherBattleTag),
+            "another user's membership on the SAME gone channel must survive — the delete filter is scoped by BattleTag, not a bare ChannelId $in");
+    }
+
+    [Test]
+    public async Task Connect_WithZeroOrphans_IssuesNoOrphanDeleteCall()
+    {
+        var identity = Identity("peter#123");
+        var liveChannel = await InsertChannel(ChannelType.Public, "General", lastSeq: 0);
+        await InsertMembership(liveChannel.Id, identity.BattleTag, lastReadSeq: 0);
+
+        var spy = new CountingMembershipRepository(MongoClient, _channelRepository);
+        var assembler = BuildAssembler(spy);
+
+        await assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        Assert.AreEqual(0, spy.DeleteOrphanedForUserCallCount,
+            "zero orphans is the common case — it must issue zero extra delete queries");
+    }
+
+    [Test]
+    public async Task Connect_WhenOrphanDeleteThrows_ConnectStillSucceeds_WithTheSameSnapshot()
+    {
+        var identity = Identity("peter#123");
+        var liveChannel = await InsertChannel(ChannelType.Public, "General", lastSeq: 0);
+        await InsertMembership(liveChannel.Id, identity.BattleTag, lastReadSeq: 0);
+        const string goneChannelId = "gone-channel-id";
+        await InsertMembership(goneChannelId, identity.BattleTag, lastReadSeq: 0);
+
+        var throwing = new ThrowingOrphanDeleteMembershipRepository(MongoClient, _channelRepository);
+        var assembler = BuildAssembler(throwing);
+
+        var (dto, muteStatus) = await assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        Assert.AreEqual(1, dto.Channels.Count, "the snapshot must still exclude the orphan even though the delete failed");
+        Assert.AreEqual(liveChannel.Id, dto.Channels.Single().Channel.Id);
+        Assert.AreEqual(MuteStatus.None, muteStatus, "a failed best-effort delete must not fail (or otherwise alter) connect");
+        Assert.IsNotNull(await _membershipRepository.Load(goneChannelId, identity.BattleTag),
+            "a failed delete must leave the orphaned row in place — retried on a later connect or the weekly sweep");
+    }
+
+    private SessionStateAssembler BuildAssembler(MembershipRepository membershipRepository) => new(
+        membershipRepository,
+        _channelRepository,
+        _messageRepository,
+        _muteRepository,
+        _onlineMemberRegistry,
+        _connectionMapping,
+        _mentionInboxRepository);
+
+    // A MembershipRepository whose DeleteOrphanedForUser always throws — simulating a Mongo write
+    // failure on the connect-time self-heal's best-effort delete (mirrors ChatHubMembershipTests'
+    // ThrowingNotificationPreferenceRepository idiom).
+    private sealed class ThrowingOrphanDeleteMembershipRepository(MongoClient client, ChannelRepository channelRepository)
+        : MembershipRepository(client, channelRepository)
+    {
+        public override Task<long> DeleteOrphanedForUser(string battleTag, IReadOnlyCollection<string> channelIds) =>
+            Task.FromException<long>(new InvalidOperationException("simulated orphan-delete failure"));
     }
 }

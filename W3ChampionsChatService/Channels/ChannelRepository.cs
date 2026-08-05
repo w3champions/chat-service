@@ -53,8 +53,13 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// ChannelType) — backs the join resolution order: a name match on an existing
     /// non-name-joinable type (e.g. System) must be distinguishable from "no match" so the
     /// caller can reject with PermissionDenied instead of falling through to implicit create.
+    /// Virtual: a test seam (fix round 1, finding F2b — mirrors <c>MembershipRepository</c>'s
+    /// virtual-method spy idiom) so a test can prove <c>ChatHub.Channels.JoinChannel</c>'s new
+    /// null/whitespace-name guard issues ZERO channel-collection reads — this is the FIRST such
+    /// read the method performs, so a zero call count here proves the whole DB-read path was
+    /// pre-empted.
     /// </summary>
-    public Task<ChatChannel> LoadAnyByNormalizedName(string normalizedName) =>
+    public virtual Task<ChatChannel> LoadAnyByNormalizedName(string normalizedName) =>
         Channels.Find(c => c.NormalizedName == normalizedName).FirstOrDefaultAsync();
 
     public Task<List<ChatChannel>> LoadAllOfType(ChannelType type) =>
