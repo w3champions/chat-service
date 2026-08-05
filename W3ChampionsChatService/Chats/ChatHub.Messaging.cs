@@ -277,6 +277,13 @@ public partial class ChatHub
         // channel. OnMessagePersisted consumes nothing the mention fan-out produces (no shared write, no
         // read-after-write dependency), so swapping the order is behavior-preserving for channel delivery;
         // it only changes which of the two a mention target's client observes first.
+        // ACCEPTED CEILING (Marco round 2026-08-05, decision I2): the reordering above fixes OTHER
+        // viewers only. The SENDER's own ack still awaits step 8's mention fan-out below, whose stage 2
+        // resolves every otherwise-eligible target's D1 block snapshot CONCURRENTLY — so a mention-bearing
+        // send pays AT MOST ONE wb HTTP timeout (~2s, WebsiteBackendRelationshipSource's client timeout)
+        // when wb is degraded, never one per mention. This is a chosen trade, not an unaddressed artifact
+        // of the reordering — consistent with the DM-send path's existing wb coupling in
+        // ApplyPrivateLaneGates.
         await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow, now);
 
         // 8. Mention fan-out (C6 Task 5, D3/D4). Runs AFTER the Dm recipient is materialized (7.5) — so a
@@ -297,7 +304,11 @@ public partial class ChatHub
         // C1-amendment-1 wiring, 30d and always <= the message TTL) and pushes a targeted MentionNotified.
         // Per-target fault isolation lives inside NotifyAsync (mirrors FanOutEngine's idiom), so a dead
         // target socket or a single failed insert never turns this already-persisted send's Ok ack into an
-        // error, nor blocks the other targets.
+        // error, nor blocks the other targets. It does NOT shield the SENDER's own ack from latency,
+        // though: this call is awaited before step 9 returns, so the ack pays NotifyAsync's stage 2 wb
+        // round-trip (block-check snapshots resolved CONCURRENTLY, so at most ONE ~2s wb HTTP timeout when
+        // wb is degraded — see the F2b comment above). That is an accepted trade (Marco round 2026-08-05),
+        // not an artifact; other viewers' delivery is unaffected because the fan-out engine above already ran.
         if (!isShadow && mentionTags.Count > 0)
         {
             await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
@@ -340,7 +351,7 @@ public partial class ChatHub
     /// channel" (<see cref="ChatResultCode.NotFound"/>) from "channel exists, caller just isn't in it"
     /// (<see cref="ChatResultCode.NotMember"/>) — EXCEPT for a <see cref="ChannelType.Public"/> channel
     /// (follow-up spec §4, the mention-inbox jump into an unjoined public room), where a non-member falls
-    /// through to the same paging step 4 uses for a member instead of being rejected. That exception
+    /// through to the same paging step 5 uses for a member instead of being rejected. That exception
     /// itself excludes a full-banned non-member (<see cref="ConnectionMapping.GetEffectiveMuteStatus"/>
     /// == <see cref="MuteStatus.Full"/>, mirroring <see cref="JoinChannel"/>'s gate), which still gets
     /// <see cref="ChatResultCode.NotMember"/> — the same result a non-member got before this fallthrough

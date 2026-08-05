@@ -753,7 +753,7 @@ public partial class ChatHub
                 item.Channel, MembershipDto.From(item.Membership), unreadCount, unreadCount > 0));
 
             // JoinPreservingReadCursor (not the plain Join): membership.LastReadSeq was captured back at
-            // step 5 (LoadForUser), and this method awaits the channel LoadByIds AND the batched
+            // step 6 (LoadForUser), and this method awaits the channel LoadByIds AND the batched
             // unread-count aggregation before reaching this seed loop — a concurrent MarkRead landing on an
             // already-seeded (channel, connection) entry during that window must never be regressed back
             // down by the DB-loaded LastReadSeq captured earlier.

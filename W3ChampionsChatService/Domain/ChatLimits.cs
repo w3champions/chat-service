@@ -233,7 +233,7 @@ public static class ChatLimits
     /// <see cref="FanOut.MessageRateLimiter"/>'s <see cref="AutoThrottleTierDecay"/>-anchored sweep, but this
     /// limiter has no violation ladder to protect, only the single bucket's fullness. INVARIANT (pinned
     /// by <c>ChatLimitsTests</c>): this MUST stay strictly greater than the bucket's own full-refill time
-    /// (<see cref="ReadBurst"/> / <see cref="ReadRefillPerSecond"/> seconds = 6s) — otherwise an entry
+    /// (<see cref="ReadBurst"/> / <see cref="ReadRefillPerSecond"/> seconds = 12s) — otherwise an entry
     /// pruned at this horizon and silently recreated fresh (full capacity) would NOT be behaviour-
     /// preserving relative to a live bucket that had only refilled for that same idle duration.</summary>
     public static readonly TimeSpan ReadRateLimiterPruneHorizon = TimeSpan.FromMinutes(2);

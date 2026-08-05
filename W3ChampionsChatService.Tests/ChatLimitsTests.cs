@@ -122,7 +122,7 @@ public class ChatLimitsTests
         // entry and letting a later call recreate it fresh (a full ReadBurst-token bucket) is only
         // behaviour-preserving if a LIVE bucket, left untouched for that same idle duration, would ALSO
         // have refilled all the way back to capacity — i.e. the prune horizon must exceed the bucket's
-        // own full-refill time (ReadBurst / ReadRefillPerSecond seconds = 6s).
+        // own full-refill time (ReadBurst / ReadRefillPerSecond seconds = 12s).
         var fullRefillTime = TimeSpan.FromSeconds((double)ChatLimits.ReadBurst / ChatLimits.ReadRefillPerSecond);
         Assert.Greater(ChatLimits.ReadRateLimiterPruneHorizon, fullRefillTime,
             "ReadRateLimiterPruneHorizon must strictly exceed the bucket's full-refill time, or a pruned " +
