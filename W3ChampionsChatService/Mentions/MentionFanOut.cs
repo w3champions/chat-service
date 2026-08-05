@@ -65,6 +65,16 @@ namespace W3ChampionsChatService.Mentions;
 /// their next connect.
 /// </para>
 /// <para>
+/// D2 (2026-08-05, mention-canonicalization decision): <see cref="ChatHub.SendMessage(string, string)"/>'s
+/// step 5.26 now independently evaluates the SAME base condition as rule (c) below (membership OR
+/// Public-and-directory-resolvable) to decide whether a mention RENDERS, and rewrites an unrenderable
+/// token's markup to plain text in the persisted content before this class ever runs. <c>NotifyAsync</c>'s
+/// <c>mentionTags</c> is still the FULL original extracted list (unaffected by that rewrite — this class never re-parses
+/// <c>message.Content</c>), so nothing here changes: rule (c)'s membership/Public-directory wall is left
+/// UNCHANGED deliberately, per the brief, and now doubles as a redundant second line of defense — any
+/// target it would exclude was, by construction, already excluded from rendering by step 5.26 too.
+/// </para>
+/// <para>
 /// Singleton (registered in <see cref="Startup"/>): it holds no per-call state and is shared by every
 /// hub invocation, mirroring the C3 fan-out registries. It pushes through its OWN
 /// <see cref="IHubContext{ChatHub}"/> (targeting the resolved connection), NOT the invoking hub's

@@ -662,16 +662,17 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(0L),
             "the over-cap send allocated no seq and persisted nothing");
 
-        // --- Strip & deliver as plain: an UNRESOLVABLE mention is NOT rejected — it delivers VERBATIM and
-        // simply notifies nobody. This channel is Public, so membership is not the gate here (§4) — the
-        // fan-out drops "nobody#404" because it has NO user_directory row, the directory-resolvability
-        // check §4 substitutes for the membership wall on Public rooms. NOT TooLong.
+        // --- Strip & deliver as plain, amended by D2 (2026-08-05): an UNRESOLVABLE mention is NOT
+        // rejected, but its markup IS stripped to plain text before persist (step 5.26) — this channel is
+        // Public, so membership is not the gate here (§4), but "nobody#404" has NO user_directory row
+        // either, so it fails the renderability predicate entirely. The fan-out (a redundant second line
+        // of defense here) independently drops it for notification too. NOT TooLong.
         var unresolvableContent = "who is <@nobody#404>";
         var unresolvable = await aHub.SendMessage(channel.Id, unresolvableContent);
         Assert.That(unresolvable.Code, Is.EqualTo(ChatResultCode.Ok),
             "an unresolvable battleTag is legal content — the send is never rejected for resolvability");
-        Assert.That((await _messageRepository.Load(unresolvable.MessageId)).Content, Is.EqualTo(unresolvableContent),
-            "the message delivers verbatim — the invalid <@…> token is kept as plain text");
+        Assert.That((await _messageRepository.Load(unresolvable.MessageId)).Content, Is.EqualTo("who is @nobody#404"),
+            "D2: a non-renderable mention token is stripped to its plain-text form in the persisted content");
         Assert.That(await _mentionInboxRepository.LoadForUser("nobody#404"), Is.Empty,
             "the unresolvable target gets no inbox entry (nobody#404 has no user_directory row — unresolvable, not merely a non-member)");
         Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(1L),
