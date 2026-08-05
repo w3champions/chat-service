@@ -202,9 +202,11 @@ public partial class ChatHub
         // RENDERABILITY PREDICATE (exact — deliberately mirrors, but is independent of, MentionFanOut's
         // notification eligibility below): the target has a channel_memberships row for THIS channel, OR
         // the channel is Public AND the target is user-directory-resolvable. Mongo point reads only — the
-        // channel doc is already loaded (step 5), so this is at most one membership read plus (Public,
-        // non-member only) one directory read per target, bounded to MaxMentionsPerMessage (5); the
-        // relationship provider is NEVER consulted here. The predicate deliberately IGNORES blocks,
+        // channel doc is already loaded (step 5), so this is ONE batched, indexed $in membership read
+        // covering every distinct target (fix round 1, finding F3 — MembershipRepository.LoadMemberBattleTags,
+        // replacing what was up to MaxMentionsPerMessage (5) sequential membership Loads) plus (Public,
+        // non-member only) up to one sequential directory read per still-unresolved target, bounded to
+        // MaxMentionsPerMessage (5); the relationship provider is NEVER consulted here. The predicate deliberately IGNORES blocks,
         // NotificationLevel, notification preferences, and DeclinedUntil — those suppress the PING
         // (MentionFanOut, step 8), never the RENDER: a member who has blocked the sender must still SEE a
         // normal chip (stripping it would leak the block state to the sender — an explicit Marco pin), and
@@ -215,10 +217,16 @@ public partial class ChatHub
         // persisted and fanned out regardless of which path the send takes afterward.
         if (mentionTags.Count > 0)
         {
+            // Fix round 1 (finding F3): ONE batched, indexed $in membership read
+            // (MembershipRepository.LoadMemberBattleTags) covering every distinct target, replacing what
+            // was up to MaxMentionsPerMessage (5) sequential point-reads. The Public/directory fallback
+            // stays sequential and bounded, exactly as before — only ever reached for a target this
+            // batched check already found has no membership row.
+            var memberTags = await _membershipRepository.LoadMemberBattleTags(channel.Id, mentionTags);
             var renderableByTag = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
             foreach (var tag in mentionTags)
             {
-                var isRenderable = await _membershipRepository.Load(channel.Id, tag) != null;
+                var isRenderable = memberTags.Contains(tag);
                 if (!isRenderable && channel.Type == ChannelType.Public)
                 {
                     isRenderable = await _userDirectory.Load(tag) != null;
