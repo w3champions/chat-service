@@ -510,6 +510,46 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         Assert.That((await bHub.GetMentionInbox()).Entries, Is.Empty, "and no durable inbox entry either");
     }
 
+    // Fix round 1 (F2b) ordering pin: ChatHub.Messaging.cs's SendMessage now awaits the channel fan-out
+    // (FanOutEngine.OnMessagePersisted, which pushes MessageReceived to FOCUSED viewers) BEFORE the
+    // mention fan-out (MentionFanOut.NotifyAsync, which pushes the targeted MentionNotified) — see that
+    // method's step 7.75/8 comments for why. For a member who is BOTH focused on the channel AND the
+    // mention's target, both events land on the SAME connection, so the dispatch order is directly
+    // observable. Both services are constructed (SetupBeforeEach) against the ONE shared
+    // HubPushCaptureHarness — its `_sends` list is a single lock-guarded, insertion-ordered list across
+    // ALL connections, and SignalsFor(connectionId) filters that ONE list without reordering — so the
+    // index comparison below reflects the real cross-service dispatch order, not two independent capture
+    // lists that happen to agree.
+    [Test]
+    public async Task MentionOfFocusedMember_EndToEnd_MessageReceivedPrecedesMentionNotified()
+    {
+        const string ATag = "author#1";
+        const string BTag = "bob#2";
+
+        var channel = await CreateChannel("W3C Lounge", ChannelType.Public);
+        await SeedMembership(channel.Id, ATag);
+        await SeedMembership(channel.Id, BTag);
+
+        var aHub = await Connect("conn-a", ATag);
+        var bHub = await Connect("conn-b", BTag);
+        Assert.That((await bHub.FocusChannel(channel.Id)).Code, Is.EqualTo(ChatResultCode.Ok),
+            "B must be FOCUSED on the channel to receive MessageReceived (FanOutEngine's focused-viewers-only guardrail)");
+
+        var send = await aHub.SendMessage(channel.Id, $"hey <@{BTag}> look at this");
+        Assert.That(send.Code, Is.EqualTo(ChatResultCode.Ok));
+
+        var signals = _harness.SignalsFor("conn-b").ToList();
+        var messageReceivedIndex = signals.FindIndex(s => s.Method == ChatEvents.MessageReceived);
+        var mentionNotifiedIndex = signals.FindIndex(s => s.Method == ChatEvents.MentionNotified);
+
+        Assert.That(messageReceivedIndex, Is.GreaterThanOrEqualTo(0), "sanity: B (focused) received MessageReceived");
+        Assert.That(mentionNotifiedIndex, Is.GreaterThanOrEqualTo(0), "sanity: B (mentioned) received MentionNotified");
+        Assert.That(messageReceivedIndex, Is.LessThan(mentionNotifiedIndex),
+            "F2b: the channel fan-out's MessageReceived must be DISPATCHED before the mention fan-out's " +
+            "MentionNotified for a target who is both focused and mentioned — pinning the accepted ordering " +
+            "(and its sender-ack latency trade, see ChatHub.Messaging.cs's F2b comment) as a tested outcome");
+    }
+
     // ============================================================================================
     // Slate 2 — ModerationDelete_ScrubsInbox_EndToEnd (acceptance 3).
     // A real mention → moderator DeleteMessage physically removes the referenced inbox entry; and a

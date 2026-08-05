@@ -519,9 +519,13 @@ public class MentionFanOutTests : IntegrationTestBase
     }
 
     // Always throws, simulating a relationship-provider outage with nothing cached to fall back to
-    // (RelationshipUnavailableException) — proves NotifyAsync's LOCAL catch around the block check
-    // (not the outer per-target catch, which would instead SKIP the target — the wrong, fail-closed
-    // outcome this test guards against).
+    // (RelationshipUnavailableException) — proves NotifyAsync's LOCAL catch inside IsBlockedFailOpenAsync
+    // is what keeps the block check fail-open. After the three-stage restructure there is no OUTER
+    // per-target catch around stage 2's Task.WhenAll that could instead skip just this target: were
+    // IsBlockedFailOpenAsync's internal catch removed, the exception would escape the WhenAll, escape
+    // NotifyAsync entirely (uncaught at the ChatHub.Messaging.cs step 8 call site), and turn this
+    // already-persisted send's Ok ack into an ERROR ack — worse than merely skipping the target, and
+    // worse than the fail-open delivery this test asserts.
     private sealed class ThrowingRelationshipProvider : IRelationshipProvider
     {
         public Task<RelationshipSnapshot> GetSnapshotAsync(string battleTag) =>

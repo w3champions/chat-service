@@ -351,7 +351,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     {
         // The Moderation role claim must not bypass the full-ban gate: a non-member moderator who is
         // ALSO full-banned is denied exactly like any other full-banned non-member — the ban check runs
-        // in step 3, strictly before step 4's moderator/user branch split.
+        // in step 4, strictly before step 5's moderator/user branch split.
         var channel = await CreateChannel(); // Public by default
         await SeedMessage(channel.Id, OtherBattleTag, "hello public");
         RegisterModeratorSession("mod-conn", ModeratorBattleTag);
@@ -488,28 +488,6 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         var otherHub = BuildHub("conn-2");
         var unaffected = await otherHub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
         Assert.AreEqual(ChatResultCode.Ok, unaffected.Code, "a distinct battleTag has its own independent read budget");
-    }
-
-    [Test]
-    public async Task GetMessages_ReadLimit_SharedBudget_WithGetConversationsStyleUsage()
-    {
-        // Deliverable 4: "all acquisitions share one bucket per battleTag" — proven at the hub level by
-        // spending the WHOLE budget via direct TryAcquire calls (standing in for a prior GetConversations
-        // burst against the SAME singleton instance production wires into both methods) and confirming
-        // GetMessages is denied by the very next call, with none of ITS OWN calls having been needed to
-        // exhaust the budget.
-        var channel = await CreateChannel();
-        SeedMember("conn-1", BattleTag, channel.Id);
-        var hub = BuildHub("conn-1");
-
-        for (var i = 0; i < ChatLimits.ReadBurst; i++)
-        {
-            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
-        }
-
-        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
-        Assert.AreEqual(ChatResultCode.Throttled, result.Code,
-            "GetMessages must be denied once the SHARED budget is spent, even though none of the spending calls went through GetMessages itself");
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -675,10 +653,10 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         Assert.IsNull(result.Messages);
     }
 
-    // 2026-08-04 follow-up (Minor finding): step 4's comment previously read as if the privileged
+    // 2026-08-04 follow-up (Minor finding): step 5's comment previously read as if the privileged
     // ForModerator view were NEVER reachable outside the REST endpoint. That is imprecise for Public
-    // channels specifically — step 3's non-member Public fallthrough (§4) lets a NON-MEMBER moderator
-    // reach step 4's moderator branch too, so they get the SAME ForModerator projection (deleted rows +
+    // channels specifically — step 4's non-member Public fallthrough (§4) lets a NON-MEMBER moderator
+    // reach step 5's moderator branch too, so they get the SAME ForModerator projection (deleted rows +
     // every author's real shadow flag) a member-moderator would, through THIS hub method. Pinning that
     // explicitly so the behavior is a chosen, tested outcome rather than an accidental side effect of
     // the §4 fallthrough. The full-banned variant of this exact scenario is already covered by
@@ -694,13 +672,13 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
 
         RegisterModeratorSession("mod-conn", ModeratorBattleTag);
         // Deliberately NO membership seed and NO full-ban — a non-member moderator reaching the Public
-        // fallthrough (step 3) with a clean mute status.
+        // fallthrough (step 4) with a clean mute status.
         var hub = BuildHub("mod-conn");
 
         var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
 
         Assert.AreEqual(ChatResultCode.Ok, result.Code,
-            "a non-member moderator reads a Public channel via step 3's fallthrough, then step 4's moderator branch");
+            "a non-member moderator reads a Public channel via step 4's fallthrough, then step 5's moderator branch");
         CollectionAssert.AreEqual(
             new[] { normal.Seq, deleted.Seq, foreignShadow.Seq },
             result.Messages.Select(m => m.Seq).ToArray(),

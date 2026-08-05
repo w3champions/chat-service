@@ -528,13 +528,14 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         Assert.AreEqual(ChatResultCode.Ok, unaffected.Code, "a distinct battleTag has its own independent read budget");
     }
 
-    // Fix round 1, finding F4: proves the CROSS-METHOD sharing claim a limiter-level test cannot — a
-    // real GetConversations call and a real GetMessages call, on the SAME hub instance, drawing from the
-    // SAME injected ReadRateLimiter singleton. A second-instance mis-wiring in Startup.cs (each method
-    // getting its own limiter) would still pass every OTHER read-limit test in this file, since those
-    // only ever call TryAcquire directly on the test's own _readRateLimiter field — but it would fail
-    // this one, because GetMessages would then find an independent, still-full budget instead of the one
-    // GetConversations just drained.
+    // Fix round 1, finding F4: proves that a real GetConversations call and a real GetMessages call, on
+    // the SAME hub instance, draw from the SAME instance of the ReadRateLimiter this test injected via
+    // BuildHub — i.e. that GetConversations and GetMessages share ONE limiter reference inside ChatHub,
+    // not two independent ones. It does NOT — and cannot — detect a Startup.cs mis-wiring (e.g. each
+    // method's call site somehow resolving its own separate limiter instance from DI): BuildHub always
+    // constructs the hub with the test's own single _readRateLimiter field, so a Startup-level singleton
+    // regression would still pass this test unchanged. That composition-root guarantee is
+    // ReadRateLimiter_IsSingleton_SharedAcrossResolutions in StartupDependencyInjectionTests.cs.
     [Test]
     public async Task GetConversations_ReadLimit_SharedBudget_RealCallDrainsGetMessagesBudget()
     {
