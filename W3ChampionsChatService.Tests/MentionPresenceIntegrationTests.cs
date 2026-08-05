@@ -619,8 +619,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
 
     // ============================================================================================
     // Slate 3 — MentionValidation_EndToEnd (acceptance 4).
-    // >5 distinct rejected (the COUNT cap); an unresolvable mention is NOT rejected — it delivers verbatim
-    // and simply notifies nobody (strip & deliver as plain); exactly 5 valid mentions fan out to EXACTLY
+    // >5 distinct rejected (the COUNT cap); an unresolvable mention is NOT rejected — it delivers with its
+    // markup stripped to plain text (step 5.26) and simply notifies nobody; exactly 5 valid mentions fan out to EXACTLY
     // those 5 members (a co-present non-mentioned member and the sender get nothing); a mentioned resolvable
     // NON-member of this PUBLIC channel DOES get notified (follow-up spec §4 — Public rooms are
     // membership-independent for a directory-resolvable target).

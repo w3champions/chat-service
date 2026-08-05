@@ -29,7 +29,7 @@ namespace W3ChampionsChatService.Tests;
 /// gates (step 5.5) and the mute gate (step 6). After the amendment the gate validates EXACTLY ONE thing:
 /// the mention COUNT cap (an anti-abuse bound). A message is NEVER rejected for the resolvability or
 /// access of its mentions — an unresolvable/garbage tag, or a tag naming a non-member, is legal content
-/// that delivers VERBATIM and simply never fans out (the membership wall in <see cref="MentionFanOut"/>
+/// that delivers with its markup rewritten to plain text by step 5.26 and never fans out (the membership wall in <see cref="MentionFanOut"/>
 /// is the sole authority on who is notified — proven directly in <see cref="MentionFanOutTests"/> and
 /// end-to-end in <see cref="ChatHubSendMessageTests"/>). Two properties are load-bearing here: (1) the
 /// COUNT cap is content-intrinsic, so a blocked sender and an unblocked sender must get an IDENTICAL
