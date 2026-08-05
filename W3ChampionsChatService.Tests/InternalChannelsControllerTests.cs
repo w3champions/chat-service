@@ -449,6 +449,8 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         Assert.That(result, Is.Not.Null);
         var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
         Assert.That(channel.Detached, Is.True, "a ladder-match create with detached:true must be born frozen");
+        Assert.That(channel.AssertEpoch, Is.EqualTo("e1"), "the request's epoch must be stamped through to the channel");
+        Assert.That(channel.AssertSeq, Is.EqualTo(1), "the request's seq must be stamped through to the channel");
         var membership = await _membershipRepository.Load(channel.Id, "Peter#123");
         Assert.That(membership, Is.Not.Null, "birth members are still added before the freeze");
     }
@@ -602,10 +604,19 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var epochSyncRoute = typeof(InternalChannelsController)
             .GetMethod(nameof(InternalChannelsController.EpochSync))
             .GetCustomAttribute<HttpPostAttribute>()?.Template;
+        var assertRosterRoute = typeof(InternalChannelsController)
+            .GetMethod(nameof(InternalChannelsController.AssertRoster))
+            .GetCustomAttribute<HttpPutAttribute>()?.Template;
+        var updateMembersRoute = typeof(InternalChannelsController)
+            .GetMethod(nameof(InternalChannelsController.UpdateMembers))
+            .GetCustomAttribute<HttpPutAttribute>()?.Template;
 
         Assert.That(createRoute, Is.Null.Or.Empty, "Create is the root POST — no template, distinct from epoch-sync");
         Assert.That(deleteRoute, Is.EqualTo("{ref}"), "Delete's template is a different verb+template from EpochSync's POST epoch-sync");
         Assert.That(epochSyncRoute, Is.EqualTo("epoch-sync"));
+        Assert.That(assertRosterRoute, Is.EqualTo("{ref}/roster"));
+        Assert.That(updateMembersRoute, Is.EqualTo("{ref}/members"));
+        Assert.That(assertRosterRoute, Is.Not.EqualTo(updateMembersRoute), "the two PUT routes must not collide (§2.3 one-character hazard)");
     }
 
     // ── DELETE /internal/channels/{ref} ─────────────────────────────────────────────────────────
