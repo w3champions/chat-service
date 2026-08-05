@@ -1248,6 +1248,31 @@ public class MatchChannelServiceTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task EpochSync_StampsSparedChannelThatHasNoStoredEpoch()
+    {
+        const string bob = "Bob#2";
+        // Created via the legacy CreateOrGet path and NEVER asserted — AssertEpoch is genuinely ABSENT
+        // on the stored document (not merely a different value from a prior assertion, as the sibling
+        // ReStampsSparedChannels test above exercises via ApplyRosterAssertion("e1", ...) first). This is
+        // the $exists:false disjunct of StampAssertionEpoch's filter — a legacy/transition channel spared
+        // by an epoch sync that has no AssertEpoch to compare against at all.
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+
+        await _service.ApplyEpochSync("e2", Members("match-1"));
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"),
+            "a spared channel with NO stored epoch at all must still be re-anchored to the new epoch — "
+            + "proves the absent-epoch disjunct in StampAssertionEpoch's filter, not just its Ne branch");
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(0), "the seq counter is reset to the 0 sentinel");
+
+        await _service.ApplyRosterAssertion("match-1", "e2", 1, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null,
+            "seq 1 under the new epoch applies cleanly after the re-anchor, confirming the stamp actually landed");
+    }
+
+    [Test]
     public async Task EpochSync_LeavesNonMatchChannelsUntouched()
     {
         const string alice = "Alice#1";
