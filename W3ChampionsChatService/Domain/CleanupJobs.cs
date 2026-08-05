@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Driver;
@@ -18,14 +19,31 @@ namespace W3ChampionsChatService.Domain;
 ///     rows, so that carrier doesn't outlive the membership it was written to survive. The pref
 ///     collection has no TTL of its own (PR36 D2 — it must persist indefinitely across an ordinary
 ///     leave/rejoin), so this job is its ONLY GC path.
+/// (c) match-channel-hygiene brief (2026-08-05), Part 2 — orphaned-membership sweep: a channel doc can TTL
+///     out (e.g. a System match channel's ttl_expiresAt, 24h after creation) while its membership rows
+///     survive — normally self-healed at connect time (<see cref="Protocol.SessionStateAssembler.AssembleAndSeed"/>),
+///     but a user who never reconnects would otherwise leave those rows stranded until the 365-day idle
+///     sweep (b). This DB-hygiene pass catches them on the same weekly cadence instead.
 /// Group/DM shells need no job — their ExpiresAt TTL handles them.
 /// </summary>
 public class CleanupJobs(MongoClient mongoClient) : MongoDbRepositoryBase(mongoClient)
 {
+    /// <summary>
+    /// Part 2 batch size: distinct-channel-id cardinality behind <see cref="SweepOrphanedMemberships"/> is
+    /// bounded by total channels + orphans, which can grow large — this caps each existence-check/delete
+    /// round so the sweep never issues a single unbounded <c>$in</c> over the whole collection. Not spec
+    /// text; hard-coded, adjust here only (mirrors <c>ChatHub.Channels.MaxPresenceRegisterAttempts</c>'s
+    /// local-const-not-ChatLimits precedent — this is an internal job-tuning knob, not a client-facing
+    /// limit). Internal (assembly has InternalsVisibleTo, ChatHub.cs) so a test can pin the batching
+    /// boundary without hardcoding a duplicate magic number.
+    /// </summary>
+    internal const int OrphanSweepBatchSize = 1000;
+
     public async Task RunOnce(DateTime now)
     {
         await DeleteEmptySemiPublicChannels();
         await PruneIdleMemberships(now);
+        await SweepOrphanedMemberships();
     }
 
     public async Task<long> DeleteEmptySemiPublicChannels()
@@ -84,5 +102,48 @@ public class CleanupJobs(MongoClient mongoClient) : MongoDbRepositoryBase(mongoC
             Builders<NotificationPreference>.Filter.In(p => p.BattleTag, idleMembershipKeys));
 
         return result.DeletedCount;
+    }
+
+    /// <summary>
+    /// Match-channel-hygiene brief (2026-08-05), Part 2 — DB-hygiene sweep for membership rows whose
+    /// channel no longer exists (see the class doc's item (c)). This is the slow-path complement to the
+    /// connect-time self-heal (<see cref="Protocol.SessionStateAssembler.AssembleAndSeed"/>): it catches
+    /// users who never reconnect, so an orphaned row doesn't linger until the 365-day idle sweep above.
+    /// <para>
+    /// Mechanics: distinct ChannelIds across ALL memberships, processed <see cref="OrphanSweepBatchSize"/>
+    /// at a time (cardinality is bounded by total channels + orphans, which can be large) — per batch, an
+    /// existence check against the channels collection (<c>$in</c>) yields the missing subset, which is
+    /// then batch-deleted from memberships in one round-trip. A channel id with zero memberships never
+    /// enters the distinct set in the first place, so this never scans healthy channels.
+    /// </para>
+    /// </summary>
+    public async Task<long> SweepOrphanedMemberships()
+    {
+        var db = CreateClient();
+        var channels = db.GetCollection<ChatChannel>(ChatCollections.Channels);
+        var memberships = db.GetCollection<ChannelMembership>(ChatCollections.ChannelMemberships);
+
+        var distinctChannelIds = await memberships
+            .DistinctAsync(m => m.ChannelId, Builders<ChannelMembership>.Filter.Empty);
+        var allChannelIds = await distinctChannelIds.ToListAsync();
+        if (allChannelIds.Count == 0) return 0;
+
+        long deleted = 0;
+        foreach (var batch in allChannelIds.Chunk(OrphanSweepBatchSize))
+        {
+            var existingIds = await channels
+                .Find(Builders<ChatChannel>.Filter.In(c => c.Id, batch))
+                .Project(c => c.Id)
+                .ToListAsync();
+            var existingSet = new HashSet<string>(existingIds);
+            var missingIds = batch.Where(id => !existingSet.Contains(id)).ToList();
+            if (missingIds.Count == 0) continue;
+
+            var result = await memberships.DeleteManyAsync(
+                Builders<ChannelMembership>.Filter.In(m => m.ChannelId, missingIds));
+            deleted += result.DeletedCount;
+        }
+
+        return deleted;
     }
 }
