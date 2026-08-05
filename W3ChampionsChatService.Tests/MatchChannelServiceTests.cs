@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using MongoDB.Driver;
 using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
@@ -575,5 +577,485 @@ public class MatchChannelServiceTests : IntegrationTestBase
 
         Assert.That(_harness.AllSignals, Is.Empty, "an offline member receives zero live signals, and no error is thrown");
         Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Is.Empty, "the teardown still completes for an offline-only channel");
+    }
+
+    // ============================================================================================
+    // 2026-08-05 reconciliation — ApplyRosterAssertion: diff + idempotency (plan D3, D4, D10)
+    // ============================================================================================
+
+    [Test]
+    public async Task Assert_AddsMissingMembers_PushesChannelAdded_NeverFocused()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the missing member is added");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
+        var dto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(dto, Is.Not.Null);
+        Assert.That(dto.Focus, Is.False, "the roster assertion contract carries no focus field — adds are always focus:false");
+    }
+
+    [Test]
+    public async Task Assert_RemovesExtraMembers_DeletesRow_PushesChannelRemoved_AndUnfocuses()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice), focus: true);
+        _focusRegistry.Focus("conn-alice", channel.Id, alice);
+        Assert.That(_focusRegistry.GetFocusedChannels("conn-alice"), Does.Contain(channel.Id), "precondition: focused");
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Null, "the extra member is removed");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1));
+        var dto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelRemoved) as ChannelRemovedDto;
+        Assert.That(dto, Is.Not.Null);
+        Assert.That(dto.ChannelId, Is.EqualTo(channel.Id));
+        Assert.That(_focusRegistry.GetFocusedChannels("conn-alice"), Does.Not.Contain(channel.Id),
+            "the removed member's connection is force-unfocused");
+    }
+
+    [Test]
+    public async Task Assert_ReAssertingIdenticalSet_IsIdempotent_ZeroPushes()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+        await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice, bob), name: null, detached: false);
+        var pushCountAfterFirst = _harness.AllSignals.Count;
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 2, Members(alice, bob), name: null, detached: false);
+
+        Assert.That(_harness.AllSignals.Count, Is.EqualTo(pushCountAfterFirst), "an identical re-assertion pushes nothing new");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Has.Count.EqualTo(2), "membership rows are unchanged");
+    }
+
+    [Test]
+    public async Task Assert_MixedAddAndRemove_ConvergesInOneCall()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice), focus: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Null, "alice is removed");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null, "bob is added");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1));
+        Assert.That(_harness.SignalCount("conn-bob", ChatEvents.ChannelAdded), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Assert_EmptyMemberSet_RemovesEveryMember()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice, bob), focus: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Is.Empty,
+            "D7: an empty member set is meaningful and removes every member — it is NOT a no-op");
+    }
+
+    [Test]
+    public async Task Assert_CaseOnlyDifference_DoesNotChurnMembership()
+    {
+        const string alice = "Alice#1";
+        await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+        var pushCountAfterFirst = _harness.AllSignals.Count;
+
+        // Re-assert with a DIFFERENT casing of the same tag.
+        await _service.ApplyRosterAssertion("match-1", "e1", 2, Members("alice#1"), name: null, detached: false);
+
+        Assert.That(_harness.AllSignals.Count, Is.EqualTo(pushCountAfterFirst),
+            "a case-only difference between stored (lowercased) and asserted (JWT-cased) battleTags must not churn membership");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(await _membershipRepository.LoadForChannel(channel.Id), Has.Count.EqualTo(1), "exactly one membership row — no delete+re-add");
+    }
+
+    [Test]
+    public async Task Assert_HonorsOneMatchChannelInvariant_RemovedBeforeAdded()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+        var matchA = await _service.CreateOrGet("match-A", "Match A", Members(alice), focus: true);
+        await _service.CreateOrGet("match-B", "Match B", Members(), focus: false);
+
+        await _service.ApplyRosterAssertion("match-B", "e1", 1, Members(alice), name: null, detached: false);
+
+        var matchB = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-B");
+        Assert.That(await _membershipRepository.Load(matchA.Id, alice), Is.Null, "the stale match-A membership is evicted");
+        Assert.That(await _membershipRepository.Load(matchB.Id, alice), Is.Not.Null);
+
+        var signals = _harness.AllSignals.Where(s => s.ConnectionId == "conn-alice").ToList();
+        var removedAIndex = signals.FindIndex(s =>
+            s.Method == ChatEvents.ChannelRemoved && ((ChannelRemovedDto)s.Payload).ChannelId == matchA.Id);
+        var addedBIndex = signals.FindIndex(s =>
+            s.Method == ChatEvents.ChannelAdded && ((ChannelAddedDto)s.Payload).Channel.Id == matchB.Id);
+        Assert.That(removedAIndex, Is.GreaterThanOrEqualTo(0), "ChannelRemoved(A) was emitted");
+        Assert.That(addedBIndex, Is.GreaterThanOrEqualTo(0), "ChannelAdded(B) was emitted");
+        Assert.That(removedAIndex, Is.LessThan(addedBIndex),
+            "ChannelRemoved(A) is emitted STRICTLY BEFORE ChannelAdded(B) on the assertion path too");
+    }
+
+    [Test]
+    public async Task Assert_BeforeCreate_CreatesShell_WithProvidedName_And24hExpiry()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: "My Lobby", detached: false);
+
+        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(shell, Is.Not.Null, "the shell is created on-demand rather than a hard 404");
+        Assert.That(shell.Name, Is.EqualTo("My Lobby"));
+        Assert.That(shell.ExpiresAt, Is.Not.Null);
+        Assert.That((shell.ExpiresAt.Value - Now.AddHours(24)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
+            "the shell's 24h expiry is anchored to its OWN creation time");
+        Assert.That(await _membershipRepository.Load(shell.Id, alice), Is.Not.Null);
+
+        var shellExpiry = shell.ExpiresAt;
+        _time.Advance(TimeSpan.FromHours(1));
+        var real = await _service.CreateOrGet("match-1", "Real Match Name", Members(), focus: false);
+        Assert.That(real.ExpiresAt, Is.EqualTo(shellExpiry), "a later real CreateOrGet does not reset the shell's expiry");
+    }
+
+    [Test]
+    public async Task Assert_BeforeCreate_NullName_UsesRefPlaceholder()
+    {
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(), name: null, detached: false);
+
+        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(shell.Name, Is.EqualTo("match-1"), "a null name falls back to the ref placeholder");
+
+        var real = await _service.CreateOrGet("match-1", "Real Match Name", Members(), focus: false);
+        Assert.That(real.Name, Is.EqualTo("Real Match Name"), "a later real CreateOrGet backfills the real name");
+    }
+
+    [Test]
+    public async Task Assert_OnExistingChannel_IgnoresName()
+    {
+        await _service.CreateOrGet("match-1", "Real Name", Members(), focus: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(), name: "Different Name", detached: false);
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.Name, Is.EqualTo("Real Name"), "an assertion never renames an EXISTING channel — CreateOrGet remains the name authority");
+    }
+
+    // ============================================================================================
+    // ApplyRosterAssertion — staleness (plan D3)
+    // ============================================================================================
+
+    [Test]
+    public async Task Assert_SameEpochLowerSeq_IsDiscarded_MembershipUnchanged()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 5, Members(alice), name: null, detached: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 4, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "membership unchanged");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "the stale assertion never applied");
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(5), "the stamp is not regressed");
+    }
+
+    [Test]
+    public async Task Assert_SameEpochEqualSeq_IsDiscarded_MembershipUnchanged()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 5, Members(alice), name: null, detached: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 5, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "membership unchanged");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "a same-(epoch,seq) replay is a no-op");
+    }
+
+    [Test]
+    public async Task Assert_SameEpochHigherSeq_Applies()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 2, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Null);
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null);
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(2));
+    }
+
+    [Test]
+    public async Task Assert_DifferentEpoch_IsAccepted_AndReAnchors()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        const string carol = "Carol#3";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 9, Members(alice), name: null, detached: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e2", 1, Members(bob), name: null, detached: false);
+
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1));
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null, "the different-epoch assertion is accepted and applies");
+
+        // A follow-up under the SAME new epoch — proves the re-anchor stuck (a higher seq is now required).
+        await _service.ApplyRosterAssertion("match-1", "e2", 2, Members(carol), name: null, detached: false);
+
+        var reloadedAgain = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloadedAgain.AssertSeq, Is.EqualTo(2));
+        Assert.That(await _membershipRepository.Load(channel.Id, carol), Is.Not.Null);
+    }
+
+    [Test]
+    public async Task Assert_OnChannelWithNoStoredEpoch_Applies()
+    {
+        const string alice = "Alice#1";
+        // Created via the legacy CreateOrGet path — no assertion state stored yet (the transition pin).
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null);
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1));
+    }
+
+    // ============================================================================================
+    // Detach freeze (plan D4)
+    // ============================================================================================
+
+    [Test]
+    public async Task Assert_WithDetachedTrue_AppliesFinalSet_ThenFreezes()
+    {
+        const string alice = "Alice#1";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the final set converges FIRST");
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.Detached, Is.True, "then the channel is frozen");
+    }
+
+    [Test]
+    public async Task Assert_AfterDetach_IsDiscarded_EvenWithHigherSeq_AndNewEpoch()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
+
+        await _service.ApplyRosterAssertion("match-1", "e2", 99, Members(bob), name: null, detached: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the frozen set is untouched");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "a post-detach assertion never applies, even with a higher seq and a different epoch");
+    }
+
+    [Test]
+    public async Task Delta_AfterDetach_IsDiscarded()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
+
+        await _service.ApplyMembersDelta("match-1", add: Members(bob), remove: Members(alice), focus: false);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the legacy delta path is frozen too");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null);
+    }
+
+    [Test]
+    public async Task CreateOrGet_AfterDetach_BackfillsName_ButAddsNoMembers()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        var channel = await _service.CreateOrGet("match-1", "Placeholder", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
+
+        var result = await _service.CreateOrGet("match-1", "Real Name", Members(bob), focus: false);
+
+        Assert.That(result.Name, Is.EqualTo("Real Name"), "the name backfill still runs on a detached channel");
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "the frozen membership is untouched");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null, "no new members are added to a detached channel");
+    }
+
+    [Test]
+    public async Task Delete_AfterDetach_StillTearsDownChannel()
+    {
+        const string alice = "Alice#1";
+        await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: true);
+
+        await _service.DeleteChannel("match-1");
+
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1"), Is.Null,
+            "an explicit DELETE still tears down a detached channel — detach guards assertions/sweeps, not an explicit teardown");
+    }
+
+    // ============================================================================================
+    // Concurrency (plan D5) — the per-ref gate serializes the whole "admit, diff, converge" operation
+    // ============================================================================================
+
+    // Blocks the FIRST TryAdvanceAssertion call it sees, signalling `Entered` on entry and awaiting
+    // `Release` before delegating to the real implementation — lets a test prove a second concurrent
+    // caller cannot reach this call until the first one (and hence the per-ref gate) releases.
+    private sealed class BlockingAssertionChannelRepository(MongoClient mongoClient) : ChannelRepository(mongoClient)
+    {
+        public readonly TaskCompletionSource Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public readonly TaskCompletionSource Release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _callCount;
+
+        public int CallCount => Volatile.Read(ref _callCount);
+
+        public override async Task<bool> TryAdvanceAssertion(string channelId, string epoch, long seq)
+        {
+            if (Interlocked.Increment(ref _callCount) == 1)
+            {
+                Entered.SetResult();
+                await Release.Task;
+            }
+
+            return await base.TryAdvanceAssertion(channelId, epoch, seq);
+        }
+    }
+
+    [Test]
+    public async Task ConcurrentAssertions_SameRef_DoNotInterleave()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+
+        var blockingRepo = new BlockingAssertionChannelRepository(MongoClient);
+        var membershipRepo = new MembershipRepository(MongoClient, blockingRepo);
+        var messageRepo = new MessageRepository(MongoClient);
+        var service = new MatchChannelService(blockingRepo, membershipRepo, messageRepo, _fanOutEngine, _time);
+
+        await service.CreateOrGet("match-1", "Match 1", Members(), focus: false);
+
+        var taskA = service.ApplyRosterAssertion("match-1", "e1", 1, Members(alice), name: null, detached: false);
+        await blockingRepo.Entered.Task; // A is confirmed inside TryAdvanceAssertion, holding the per-ref gate.
+
+        var taskB = service.ApplyRosterAssertion("match-1", "e1", 2, Members(bob), name: null, detached: false);
+
+        // Give B every opportunity to (incorrectly) race past the gate while A is still inside its CAS call.
+        await Task.WhenAny(taskB, Task.Delay(TimeSpan.FromMilliseconds(300)));
+        Assert.That(blockingRepo.CallCount, Is.EqualTo(1), "B must not have entered TryAdvanceAssertion while A still holds the per-ref gate");
+        Assert.That(taskB.IsCompleted, Is.False, "B is blocked on the per-ref gate, not merely slow");
+
+        blockingRepo.Release.SetResult();
+        await taskA;
+        await taskB;
+
+        Assert.That(blockingRepo.CallCount, Is.EqualTo(2));
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(channel.AssertSeq, Is.EqualTo(2), "B's assertion (the later, higher seq) is the final stamped state");
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Null, "B's full-set assertion supersedes A's — alice is not in B's set");
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Not.Null);
+    }
+
+    // ============================================================================================
+    // Create-route stamping (plan D10)
+    // ============================================================================================
+
+    [Test]
+    public async Task CreateOrGet_WithDetached_AppliesMembers_ThenFreezes()
+    {
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+
+        var channel = await _service.CreateOrGet("match-1", "Ladder Match", Members(alice), focus: false, detached: true);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null, "members are added at birth");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.Detached, Is.True, "a ladder-match channel is born detached");
+
+        // A follow-up assertion must be discarded — the channel is frozen from birth.
+        await _service.ApplyRosterAssertion("match-1", "e1", 1, Members(bob), name: null, detached: false);
+        Assert.That(await _membershipRepository.Load(channel.Id, bob), Is.Null);
+    }
+
+    [Test]
+    public async Task CreateOrGet_DetachedRetry_OnAlreadyDetachedChannel_IsIdempotent()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+        var first = await _service.CreateOrGet("match-1", "Ladder Match", Members(alice), focus: false, detached: true);
+        var pushCountAfterFirst = _harness.AllSignals.Count;
+
+        var second = await _service.CreateOrGet("match-1", "Ladder Match", Members(alice), focus: false, detached: true);
+
+        Assert.That(second.Id, Is.EqualTo(first.Id));
+        Assert.That(_harness.AllSignals.Count, Is.EqualTo(pushCountAfterFirst), "the retried detached create pushes nothing new");
+        Assert.That(await _membershipRepository.LoadForChannel(first.Id), Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public async Task CreateOrGet_WithEpochSeq_StaleAgainstNewerAssertion_DoesNotResurrectMembers()
+    {
+        const string alice = "Alice#1";
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice), focus: false, epoch: "e1", seq: 1);
+        await _service.ApplyRosterAssertion("match-1", "e1", 5, Members(), name: null, detached: false); // removes alice
+
+        await _service.CreateOrGet("match-1", "Match 1", Members(alice), focus: false, epoch: "e1", seq: 4);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Null,
+            "a late create carrying a STALE (epoch, seq) must not resurrect a member a newer assertion already removed");
+    }
+
+    [Test]
+    public async Task CreateOrGet_WithEqualSeq_StillAddsMembers()
+    {
+        const string alice = "Alice#1";
+        // Simulates the crashed-first-attempt case: the (epoch, seq) stamp landed, but the process crashed
+        // before the member add — so the retry below arrives with the SAME (epoch, seq) and alice missing.
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(), focus: false, epoch: "e1", seq: 4);
+
+        await _service.CreateOrGet("match-1", "Match 1", Members(alice), focus: false, epoch: "e1", seq: 4);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null,
+            "an EQUAL stored seq still proceeds with adds — they are idempotent, so a crash between stamp and add never loses the member");
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(4));
+    }
+
+    [Test]
+    public async Task CreateOrGet_WithoutNewFields_BehavesExactlyAsToday()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+
+        var channel = await _service.CreateOrGet("match-1", "Match 1", Members(alice), focus: true);
+
+        Assert.That(await _membershipRepository.Load(channel.Id, alice), Is.Not.Null);
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(reloaded.AssertEpoch, Is.Null, "no (epoch, seq) stamp is written when the fields are omitted — the transition pin");
+        Assert.That(reloaded.Detached, Is.False);
     }
 }
