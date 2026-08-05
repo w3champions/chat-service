@@ -528,6 +528,40 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         Assert.AreEqual(ChatResultCode.Ok, unaffected.Code, "a distinct battleTag has its own independent read budget");
     }
 
+    // Fix round 1, finding F4: proves the CROSS-METHOD sharing claim a limiter-level test cannot — a
+    // real GetConversations call and a real GetMessages call, on the SAME hub instance, drawing from the
+    // SAME injected ReadRateLimiter singleton. A second-instance mis-wiring in Startup.cs (each method
+    // getting its own limiter) would still pass every OTHER read-limit test in this file, since those
+    // only ever call TryAcquire directly on the test's own _readRateLimiter field — but it would fail
+    // this one, because GetMessages would then find an independent, still-full budget instead of the one
+    // GetConversations just drained.
+    [Test]
+    public async Task GetConversations_ReadLimit_SharedBudget_RealCallDrainsGetMessagesBudget()
+    {
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        // Spend all but one token directly, then make ONE real GetConversations call that consumes the
+        // very last token in the shared budget. No DM shell needs to exist — GetConversations returns Ok
+        // with an empty page, same as GetConversations_ReadLimit_IsIndependentPerBattleTag's "unaffected"
+        // case above.
+        for (var i = 0; i < ChatLimits.ReadBurst - 1; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+        var conversations = await hub.GetConversations(null, null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Ok, conversations.Code,
+            "the last token in the shared budget is consumed by this real GetConversations call");
+
+        // A real GetMessages call, right after, must be denied. The channelId doesn't need to resolve to
+        // anything real: the limiter (guarded FIRST THING in GetMessages too, per finding F5) denies
+        // before the membership/channel-load steps are ever reached.
+        var messages = await hub.GetMessages("any-channel-id", beforeSeq: null, aroundSeq: null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Throttled, messages.Code,
+            "GetMessages must be denied by the budget GetConversations just exhausted, proving both hub " +
+            "methods share ONE ReadRateLimiter instance");
+    }
+
     // ---------------------------------------------------------------------
     // Task 8 fix round — finding 4 (minor): a null-stamped LastMessageAt is data-impossible in
     // production (FindOrCreateDm always stamps it) but would otherwise dead-end the client's wire

@@ -131,21 +131,13 @@ public class ReadRateLimiterTests
         Assert.IsFalse(differentCasing.Allowed, "casing variants of one battleTag share one bucket");
     }
 
-    [Test]
-    public void SharedBudget_AcrossGuardedMethods_OneBattleTagBucket()
-    {
-        // Deliverable 4: "all acquisitions share one bucket per battleTag" — simulated here by simply
-        // calling TryAcquire repeatedly for the same battleTag (the hub wires the SAME limiter instance
-        // into both GetConversations and GetMessages, so from the limiter's own perspective there is no
-        // way to distinguish "method A's call" from "method B's call" — it is the same call shape either
-        // way). Spending the WHOLE burst must deny the very next call regardless of which "method" it
-        // represents.
-        for (var i = 0; i < ChatLimits.ReadBurst; i++)
-        {
-            Assert.IsTrue(_limiter.TryAcquire(User, _t0).Allowed, $"call {i + 1} within the shared budget must be allowed");
-        }
-        Assert.IsFalse(_limiter.TryAcquire(User, _t0).Allowed, "the shared per-battleTag budget is exhausted regardless of which guarded method spent it");
-    }
+    // Fix round 1, finding F4: SharedBudget_AcrossGuardedMethods_OneBattleTagBucket was deleted from
+    // here — it only proved "spending the budget via repeated TryAcquire denies the next TryAcquire,"
+    // which is untestable-by-construction as a cross-method claim at the LIMITER level (the limiter
+    // itself has no notion of "method"; a second-instance mis-wiring in Startup.cs would still pass it).
+    // The real cross-method-sharing property — a real GetConversations call and a real GetMessages call
+    // drawing from the SAME limiter INSTANCE — is now pinned at the hub level instead:
+    // ChatHubGetConversationsTests.GetConversations_ReadLimit_SharedBudget_RealCallDrainsGetMessagesBudget.
 
     [Test]
     public void Deny_LogsAtMostOncePerDenyLogInterval_PerUser()
