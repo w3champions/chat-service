@@ -68,7 +68,7 @@ public class NotificationPreferenceRepository(MongoClient mongoClient) : MongoDb
             // string-typed Id property here cannot deserialize back (a BsonSerializationException on the
             // very next Load).
             .SetOnInsert(p => p.Id, ObjectId.GenerateNewId().ToString());
-        var options = new FindOneAndUpdateOptions<NotificationPreference> { IsUpsert = true };
+        var options = new FindOneAndUpdateOptions<NotificationPreference> { IsUpsert = true, ReturnDocument = ReturnDocument.After };
 
         return RetryOnceOnDuplicateKey(() => Prefs.FindOneAndUpdateAsync(filter, update, options));
     }
