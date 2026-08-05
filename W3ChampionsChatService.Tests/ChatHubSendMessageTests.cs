@@ -586,7 +586,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
 
     // ---------------------------------------------------------------------------------------------
     // C6 Task 5 — mention fan-out (D3/D4), end-to-end through the SendMessage pipeline. These exercise
-    // the step-7.75 call site (validated mention list → MentionFanOut → durable entry + targeted event),
+    // the step-8 call site (fix round 1 F2b renumbered it — validated mention list → MentionFanOut →
+    // durable entry + targeted event),
     // the shadow call-site skip, focus-irrelevance, and the sender-ack fault isolation. The per-rule
     // eligibility boundary is covered directly in MentionFanOutTests.
     // ---------------------------------------------------------------------------------------------

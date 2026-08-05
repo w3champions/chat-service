@@ -79,7 +79,8 @@ public partial class ChatHub(
     // FreshFromWb to decide whether it may replace the cached Profile) — one wb round-trip serves both,
     // where the pre-D9 path resolved it twice.
     IChatAuthenticationService chatAuthenticationService,
-    // C6 (Task 5, D3/D4): the mention fan-out. SendMessage's step 7.75 (ChatHub.Messaging.cs) hands it
+    // C6 (Task 5, D3/D4): the mention fan-out. SendMessage's step 8 (ChatHub.Messaging.cs; fix round 1
+    // F2b moved it after the step-7.75 channel fan-out seam) hands it
     // the validated mention-tag list for each persisted, NON-shadow message; per eligible member it
     // writes a mention-inbox entry + a targeted MentionNotified push. Singleton (Startup).
     MentionFanOut mentionFanOut,
@@ -130,7 +131,7 @@ public partial class ChatHub(
     private readonly DmInitiationTracker _dmInitiationTracker = dmInitiationTracker;
     // D9 (C6 Task 3): the hoisted chat-flair resolution — see the constructor param doc comment above.
     private readonly IChatAuthenticationService _chatAuthenticationService = chatAuthenticationService;
-    // C6 (Task 5): the mention fan-out seam consumed by SendMessage's step 7.75 (ChatHub.Messaging.cs).
+    // C6 (Task 5): the mention fan-out seam consumed by SendMessage's step 8 (ChatHub.Messaging.cs).
     private readonly MentionFanOut _mentionFanOut = mentionFanOut;
     // C6 (Task 5, D15): injected now, first CONSUMED in Task 9 (presence-interest derivation). No T5
     // reader — see the ctor param doc comment for why it lands in this single ctor growth.

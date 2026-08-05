@@ -60,7 +60,7 @@ public partial class ChatHub
     /// <c>&lt;@…&gt;</c> as plain text) and simply produces no mention-inbox entry and no notification. So
     /// there is NO directory read and NO membership check here — resolvability ≠ selectability (that is
     /// <c>SearchMentionCandidates</c>' job), and who is actually notified is decided SOLELY by the uniform
-    /// membership wall in <see cref="Mentions.MentionFanOut"/> (step 7.75 below). The count cap is
+    /// membership wall in <see cref="Mentions.MentionFanOut"/> (step 8 below). The count cap is
     /// content-intrinsic and deterministic, so it runs BEFORE the private-lane gates and the mute gate
     /// below BY DESIGN: a blocked sender and an unblocked sender must see an IDENTICAL outcome for the same
     /// over-cap content (running it after the private-lane gate's silent short-circuit would let a fake-Ok
@@ -171,10 +171,12 @@ public partial class ChatHub
         // invalid `<@…>` as plain text) and that target simply gets no inbox entry and no notification. So
         // the send path performs NO directory read and NO membership check: resolvability ≠ selectability
         // (that's SearchMentionCandidates' job), and who is actually notified is decided SOLELY by the
-        // uniform membership wall in MentionFanOut (step 7.75). The cap reject maps to TooLong (the pinned
+        // uniform membership wall in MentionFanOut (step 8). The cap reject maps to TooLong (the pinned
         // 7-member enum has no InvalidContent — same C3 precedent as empty-after-trim).
         // mentionTags (all extracted, deduped, post-cap) threads forward to the (Task 5) mention fan-out
-        // call site that lands after DM materialization (7.5) and before FanOutEngine.OnMessagePersisted (8).
+        // call site that lands after DM materialization (7.5) and AFTER FanOutEngine.OnMessagePersisted
+        // (7.75, fix round 1 F2b — moved earlier so channel delivery never waits on the mention fan-out's
+        // relationship reads).
         var mentionTags = MentionMarkup.ExtractTags(content);
         if (mentionTags.Count > ChatLimits.MaxMentionsPerMessage)
         {
@@ -263,19 +265,34 @@ public partial class ChatHub
             await MaterializeDmRecipientAndNotify(channel, session.Identity.BattleTag, now);
         }
 
-        // 7.75 Mention fan-out (C6 Task 5, D3/D4). Runs AFTER the Dm recipient is materialized (7.5) — so
-        // a first-message Dm mention of the counterpart finds their just-created membership row — and
-        // BEFORE the C3 fan-out seam (8). SKIPPED ENTIRELY (zero cost) when the message is shadow — a
-        // shadow sender's mentions must notify NOBODY, the shadow illusion (the C3 fan-out below already
-        // routes a shadow message to its author only) — or when there are no mention tags (the common case:
-        // `mentionTags` came from the step-5.25 gate, empty for a message with no `<@…>` markup, so the hot
-        // path pays nothing). MentionFanOut is the SOLE authority on who gets an inbox entry + notification:
-        // for each ELIGIBLE target (D3: not the sender). Dm/GroupDm/SemiPublic/System keep the membership
-        // PRIVACY WALL — a real channel_memberships row is required (a.k.a. the Dm/GroupDm excerpt wall).
-        // Public rooms are the one exception (2026-08-04 follow-up §4): a target with no membership row is
-        // still eligible there provided the tag resolves to a UserDirectoryRepository row, since a public
-        // room's excerpt is public content and the membership wall protects nothing there. For a JOINED
-        // target of any channel type, NotificationLevel != None remains the opt-out.
+        // 7.75 Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
+        // delivery + shadow-author-only routing, then unfocused level-All members are routed to the
+        // ActivityCoalescer. `now` is threaded in (not re-read) so the whole send — rate limit, persist,
+        // expiry, and fan-out coalescing — decides against the SAME server instant. Per-recipient sends
+        // are fault-isolated inside FanOutEngine, so a fan-out hiccup never turns this already-persisted
+        // message's ack into an error below.
+        // Fix round 1 (F2b): this now runs BEFORE the mention fan-out (step 8, below) — previously it ran
+        // after, so a degraded relationship service (mention fan-out's D1 block check, up to
+        // MaxMentionsPerMessage wb round-trips) could delay MessageReceived for every OTHER viewer of the
+        // channel. OnMessagePersisted consumes nothing the mention fan-out produces (no shared write, no
+        // read-after-write dependency), so swapping the order is behavior-preserving for channel delivery;
+        // it only changes which of the two a mention target's client observes first.
+        await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow, now);
+
+        // 8. Mention fan-out (C6 Task 5, D3/D4). Runs AFTER the Dm recipient is materialized (7.5) — so a
+        // first-message Dm mention of the counterpart finds their just-created membership row — and AFTER
+        // the C3 fan-out seam (7.75, fix round 1 F2b — see that step's comment for why). SKIPPED ENTIRELY
+        // (zero cost) when the message is shadow — a shadow sender's mentions must notify NOBODY, the
+        // shadow illusion (the C3 fan-out above already routes a shadow message to its author only) — or
+        // when there are no mention tags (the common case: `mentionTags` came from the step-5.25 gate,
+        // empty for a message with no `<@…>` markup, so the hot path pays nothing). MentionFanOut is the
+        // SOLE authority on who gets an inbox entry + notification: for each ELIGIBLE target (D3: not the
+        // sender). Dm/GroupDm/SemiPublic/System keep the membership PRIVACY WALL — a real
+        // channel_memberships row is required (a.k.a. the Dm/GroupDm excerpt wall). Public rooms are the
+        // one exception (2026-08-04 follow-up §4): a target with no membership row is still eligible there
+        // provided the tag resolves to a UserDirectoryRepository row, since a public room's excerpt is
+        // public content and the membership wall protects nothing there. For a JOINED target of any
+        // channel type, NotificationLevel != None remains the opt-out.
         // NotifyAsync writes a mention-inbox entry (expiry via ExpiryCalculator.ForMentionInboxEntry — the
         // C1-amendment-1 wiring, 30d and always <= the message TTL) and pushes a targeted MentionNotified.
         // Per-target fault isolation lives inside NotifyAsync (mirrors FanOutEngine's idiom), so a dead
@@ -285,14 +302,6 @@ public partial class ChatHub
         {
             await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
         }
-
-        // 8. Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
-        // delivery + shadow-author-only routing, then unfocused level-All members are routed to the
-        // ActivityCoalescer. `now` is threaded in (not re-read) so the whole send — rate limit, persist,
-        // expiry, and fan-out coalescing — decides against the SAME server instant. Per-recipient sends
-        // are fault-isolated inside FanOutEngine, so a fan-out hiccup never turns this already-persisted
-        // message's ack into an error below.
-        await _fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: connectionId, isShadow, now);
 
         // 9. Typed ack.
         return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq);

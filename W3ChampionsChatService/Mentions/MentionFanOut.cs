@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
@@ -17,7 +18,8 @@ namespace W3ChampionsChatService.Mentions;
 
 /// <summary>
 /// C6 (Task 5, C6-plan.md D3/D4): the mention fan-out. Called by the send pipeline
-/// (<c>ChatHub.SendMessage</c> step 7.75) once a message is durably persisted, with the validated,
+/// (<c>ChatHub.SendMessage</c> step 8 — fix round 1 (F2b) moved it after the step-7.75 channel fan-out
+/// seam, see that method's doc) once a message is durably persisted, with the validated,
 /// deduped mention-tag list produced by the Task 4 markup gate. For each ELIGIBLE target it writes an
 /// offline <see cref="MentionInboxEntry"/> and pushes a targeted <see cref="ChatEvents.MentionNotified"/>
 /// to that target's live connection.
@@ -75,6 +77,17 @@ namespace W3ChampionsChatService.Mentions;
 /// abort delivery to the OTHER eligible targets — each target's whole body is wrapped, failures
 /// log-and-continue. The inbox insert happens BEFORE the push because the entry's id rides in the event
 /// payload; if the insert fails there is nothing to notify about, so that target is skipped entirely.
+/// </para>
+/// <para>
+/// Fix round 1 (F2a): <see cref="NotifyAsync"/> runs three STAGES rather than one per-target loop that
+/// awaits everything in-line. Stage 1 resolves the cheap eligibility rules (b)-(e) per target, exactly as
+/// before (sequential — these are local Mongo point-reads). Stage 2 resolves EVERY otherwise-eligible
+/// target's D1 block snapshot CONCURRENTLY (<see cref="Task.WhenAll{TResult}(System.Collections.Generic.IEnumerable{Task{TResult}})"/>),
+/// each individually fail-open — at steady state nearly every one is a wb HTTP round-trip (the 5-min
+/// cache TTL), so resolving them serially ahead of the C3 channel fan-out could otherwise delay
+/// <c>MessageReceived</c> for the whole channel by up to <see cref="ChatLimits.MaxMentionsPerMessage"/>
+/// timeouts; concurrently, the worst case is ONE. Stage 3 writes (insert + push) for every non-blocked
+/// target, sequentially, under the SAME per-target fault isolation described above.
 /// </para>
 /// </summary>
 public class MentionFanOut(
@@ -136,6 +149,12 @@ public class MentionFanOut(
         // sender tag simply never self-matches below (tagLower is never null), which is the safe outcome.
         var senderTagLower = message.Sender?.BattleTag?.ToLowerInvariant();
 
+        // STAGE 1 — cheap eligibility (rules (b)-(e) plus the Public non-member directory/pref checks —
+        // IsOtherwiseEligibleAsync). Sequential, exactly as before this fix: these are local Mongo
+        // point-reads, not the wb round-trip stage 2 batches. Each target's check is still individually
+        // fault-isolated (mirrors the old single-catch-per-target loop) so a Mongo hiccup here skips only
+        // that target, logs, and never breaks the sender's already-persisted Ok ack.
+        var otherwiseEligible = new List<(string Tag, string TagLower)>();
         foreach (var tag in mentionTags)
         {
             var tagLower = tag.ToLowerInvariant();
@@ -146,133 +165,56 @@ public class MentionFanOut(
                 continue;
             }
 
-            // PER-TARGET FAULT ISOLATION (mirrors FanOutEngine.OnMessagePersisted): the whole per-target
-            // body — membership read, inbox insert, and live push — is wrapped so a single target's Mongo
-            // hiccup or dead socket can never break the sender's already-persisted Ok ack or abort delivery
-            // to the OTHER eligible targets. Failures log-and-continue.
             try
             {
-                // Rule (c): the excerpt PRIVACY WALL — two branches. When a durable channel_memberships
-                // row exists, the target is JOINED and rules (d)/(e) below decide. When it does NOT: for
-                // every non-Public channel type (Dm/GroupDm/SemiPublic/System) the wall holds and the
-                // target is dropped — an inbox entry carries a ~120-char content excerpt, and a private
-                // conversation's excerpt must NEVER reach a non-participant; for Public specifically (§4
-                // below) the wall is replaced by a directory-resolvability check instead. Load lowercases
-                // the tag internally (C5 T4 key convention), so the display-cased mention tag matches.
-                var membership = await _membershipRepository.Load(channel.Id, tag);
-                if (membership != null)
+                if (await IsOtherwiseEligibleAsync(channel, tag, now))
                 {
-                    // Rules (d)/(e) — unchanged for JOINED targets: an explicit NotificationLevel.None
-                    // opt-out outranks mentions, and a decline-suppressed Dm recipient is never pinged.
-                    if (membership.NotificationLevel == NotificationLevel.None)
-                    {
-                        continue;
-                    }
-                    if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
-                    {
-                        continue;
-                    }
+                    otherwiseEligible.Add((tag, tagLower));
                 }
-                else if (channel.Type == ChannelType.Public)
-                {
-                    // Follow-up spec §4: PUBLIC rooms are mentionable WITHOUT membership — a public
-                    // room's excerpt is public content, so rule (c)'s wall protects nothing here. The
-                    // target must still be a RESOLVABLE user (a user_directory row; Load lowercases the
-                    // display-cased tag), so garbage tags keep producing nothing. PR36 follow-up (D2)
-                    // narrowed the v1 gap here — see the pref check right below.
-                    var directoryEntry = await _userDirectory.Load(tag);
-                    if (directoryEntry == null)
-                    {
-                        continue;
-                    }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(
+                    ex,
+                    "Mention fan-out eligibility check for {Tag} on channel {ChannelId} for message {MessageId} failed — skipping; other targets and the sender ack are unaffected",
+                    tag,
+                    channel.Id,
+                    message.Id);
+            }
+        }
 
-                    // PR36 follow-up (D2): the narrowed v1 gap — a non-member can silence mentions from
-                    // a room they haven't (re)joined by: join → NotificationLevel.None → leave. Leave
-                    // hard-deletes the membership row (so rule (c) above no longer sees it), but the
-                    // LAST EXPLICITLY-SET level persists independently here (written by
-                    // ChatHub.SetNotificationLevel, and seeded back into a rejoined membership by
-                    // JoinChannel). Only an explicit None suppresses; any other level, or no pref at all
-                    // (never explicitly set), delivers normally.
-                    var pref = await _notificationPreferenceRepository.Load(tag, channel.Id);
-                    if (pref != null && pref.NotificationLevel == NotificationLevel.None)
-                    {
-                        continue;
-                    }
-                }
-                else
-                {
-                    // Rule (c) — UNCHANGED for every non-public type: the Dm/GroupDm excerpt PRIVACY
-                    // WALL, and SemiPublic/System keep the membership wall too (§4 widens Public only).
-                    continue;
-                }
+        if (otherwiseEligible.Count == 0)
+        {
+            return;
+        }
 
-                // PR36 follow-up (D1): block suppression, consulted LAST — the target has cleared every
-                // cheap check above and is otherwise ELIGIBLE, so this is the only point a relationship
-                // snapshot fetch (worst case a wb HTTP round-trip) ever runs, bounded to at most
-                // ChatLimits.MaxMentionsPerMessage calls for this message. Direction is deliberate: only
-                // the TARGET's OWN block list matters here — sender-side blocking (the sender having
-                // blocked the target) is out of scope for mention gating and is never consulted.
-                // OUTAGE POSTURE — FAIL OPEN: this catch is LOCAL (not the per-target catch below), so a
-                // relationship-provider failure — including RelationshipUnavailableException once the
-                // provider's own stale-cache fallback is exhausted — DELIVERS the mention instead of
-                // suppressing it. A relationship outage must never blanket-mute every mention or break
-                // the send pipeline; it only means this one target's block state couldn't be proven, and
-                // we default to delivering rather than guessing a block.
-                try
-                {
-                    var targetSnapshot = await _relationshipProvider.GetSnapshotAsync(tag);
-                    if (targetSnapshot.HasBlocked(message.Sender?.BattleTag))
-                    {
-                        continue;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Log.Warning(
-                        ex,
-                        "Relationship snapshot unavailable for mention target {Tag} on channel {ChannelId} for message {MessageId} — delivering fail-open",
-                        tag,
-                        channel.Id,
-                        message.Id);
-                }
+        // STAGE 2 — PR36 follow-up (D1), fix round 1 (F2a): resolve every otherwise-eligible target's
+        // block snapshot CONCURRENTLY rather than one at a time. Direction is deliberate: only the
+        // TARGET's OWN block list matters here — sender-side blocking (the sender having blocked the
+        // target) is out of scope for mention gating and is never consulted. Bounded to at most
+        // ChatLimits.MaxMentionsPerMessage concurrent calls for this message. Each call still fails open
+        // individually (IsBlockedFailOpenAsync) — a relationship-provider outage on ONE target's fetch
+        // never suppresses another target whose own snapshot resolves fine, and never blanket-mutes the
+        // whole message or breaks the send pipeline.
+        var senderTag = message.Sender?.BattleTag;
+        var blockedFlags = await Task.WhenAll(
+            otherwiseEligible.Select(target => IsBlockedFailOpenAsync(target.Tag, senderTag, channel.Id, message.Id)));
 
-                // Eligible. Write the offline inbox entry FIRST — its id rides in the event payload. Expiry
-                // via ExpiryCalculator.ForMentionInboxEntry (30d, always <= the message TTL) — the wiring
-                // of the C1 amendment-1 calculator into a production write path. BattleTag is stored
-                // LOWERCASED (D8 key convention); author fields keep the sender's DISPLAY casing.
-                var entry = new MentionInboxEntry
-                {
-                    BattleTag = tagLower,
-                    ChannelId = channel.Id,
-                    MessageId = message.Id,
-                    Seq = message.Seq,
-                    AuthorBattleTag = message.Sender.BattleTag,
-                    AuthorName = message.Sender.Name,
-                    Excerpt = Excerpts.Bounded(message.Content),
-                    CreatedAt = now,
-                    ExpiresAt = ExpiryCalculator.ForMentionInboxEntry(now),
-                };
-                await _mentionInboxRepository.Insert(entry);
+        // STAGE 3 — write (inbox insert + live push) for every non-blocked target, sequentially. PER-TARGET
+        // FAULT ISOLATION (mirrors FanOutEngine.OnMessagePersisted): a single target's failed inbox insert
+        // or dead/torn-down socket must NEVER break the sender's already-persisted Ok ack, and must never
+        // abort delivery to the OTHER eligible targets. Failures log-and-continue.
+        for (var i = 0; i < otherwiseEligible.Count; i++)
+        {
+            if (blockedFlags[i])
+            {
+                continue;
+            }
 
-                // Targeted live push — ONLY to this target's own connection (never a broadcast), and only
-                // if online. A focused target STILL gets it (the server never guesses "seen"; the client
-                // acks — Task 6). An OFFLINE target gets the durable entry above only; Task 6's
-                // GetMentionInbox / SessionState.MentionUnreadCount surface it on their next connect.
-                // GetByBattleTag is case-insensitive, so the display-cased mention tag resolves the session.
-                var session = _sessionRegistry.GetByBattleTag(tag);
-                if (session != null)
-                {
-                    var dto = new MentionNotifiedDto(
-                        entry.Id,
-                        entry.ChannelId,
-                        entry.MessageId,
-                        entry.Seq,
-                        entry.AuthorBattleTag,
-                        entry.AuthorName,
-                        entry.Excerpt,
-                        entry.CreatedAt);
-                    await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.MentionNotified, dto);
-                }
+            var (tag, tagLower) = otherwiseEligible[i];
+            try
+            {
+                await DeliverAsync(channel, message, tag, tagLower, now);
             }
             catch (Exception ex)
             {
@@ -283,6 +225,135 @@ public class MentionFanOut(
                     channel.Id,
                     message.Id);
             }
+        }
+    }
+
+    /// <summary>
+    /// STAGE 1 body: rules (c)/(d)/(e) plus the Public non-member directory + PR36 (D2) pref checks —
+    /// everything EXCEPT the D1 block check (stage 2, batched) and the actual write (stage 3). Returns
+    /// false for every outcome the original inline loop used to <c>continue</c> past; a throw here is the
+    /// caller's problem to fault-isolate (mirrors the old per-target catch).
+    /// </summary>
+    private async Task<bool> IsOtherwiseEligibleAsync(ChatChannel channel, string tag, DateTime now)
+    {
+        // Rule (c): the excerpt PRIVACY WALL — two branches. When a durable channel_memberships row
+        // exists, the target is JOINED and rules (d)/(e) below decide. When it does NOT: for every
+        // non-Public channel type (Dm/GroupDm/SemiPublic/System) the wall holds and the target is dropped
+        // — an inbox entry carries a ~120-char content excerpt, and a private conversation's excerpt must
+        // NEVER reach a non-participant; for Public specifically (§4 below) the wall is replaced by a
+        // directory-resolvability check instead. Load lowercases the tag internally (C5 T4 key
+        // convention), so the display-cased mention tag matches.
+        var membership = await _membershipRepository.Load(channel.Id, tag);
+        if (membership != null)
+        {
+            // Rules (d)/(e) — unchanged for JOINED targets: an explicit NotificationLevel.None opt-out
+            // outranks mentions, and a decline-suppressed Dm recipient is never pinged.
+            if (membership.NotificationLevel == NotificationLevel.None)
+            {
+                return false;
+            }
+            if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        if (channel.Type != ChannelType.Public)
+        {
+            // Rule (c) — UNCHANGED for every non-public type: the Dm/GroupDm excerpt PRIVACY WALL, and
+            // SemiPublic/System keep the membership wall too (§4 widens Public only).
+            return false;
+        }
+
+        // Follow-up spec §4: PUBLIC rooms are mentionable WITHOUT membership — a public room's excerpt
+        // is public content, so rule (c)'s wall protects nothing here. The target must still be a
+        // RESOLVABLE user (a user_directory row; Load lowercases the display-cased tag), so garbage tags
+        // keep producing nothing. PR36 follow-up (D2) narrowed the v1 gap here — see the pref check below.
+        var directoryEntry = await _userDirectory.Load(tag);
+        if (directoryEntry == null)
+        {
+            return false;
+        }
+
+        // PR36 follow-up (D2): the narrowed v1 gap — a non-member can silence mentions from a room they
+        // haven't (re)joined by: join → NotificationLevel.None → leave. Leave hard-deletes the membership
+        // row (so rule (c) above no longer sees it), but the LAST EXPLICITLY-SET level persists
+        // independently here (written by ChatHub.SetNotificationLevel, and seeded back into a rejoined
+        // membership by JoinChannel). Only an explicit None suppresses; any other level, or no pref at all
+        // (never explicitly set), delivers normally.
+        var pref = await _notificationPreferenceRepository.Load(tag, channel.Id);
+        return pref == null || pref.NotificationLevel != NotificationLevel.None;
+    }
+
+    /// <summary>
+    /// STAGE 2 body: PR36 follow-up (D1), the TARGET's own block-check, individually fail-open.
+    /// OUTAGE POSTURE — FAIL OPEN: this catch DELIVERS (returns false / "not blocked") on any failure —
+    /// including <see cref="RelationshipUnavailableException"/> once the provider's own stale-cache
+    /// fallback is exhausted — rather than suppressing the mention. A relationship outage must never
+    /// blanket-mute every mention or break the send pipeline; it only means this one target's block state
+    /// couldn't be proven, and we default to delivering rather than guessing a block.
+    /// </summary>
+    private async Task<bool> IsBlockedFailOpenAsync(string tag, string senderTag, string channelId, string messageId)
+    {
+        try
+        {
+            var targetSnapshot = await _relationshipProvider.GetSnapshotAsync(tag);
+            return targetSnapshot.HasBlocked(senderTag);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(
+                ex,
+                "Relationship snapshot unavailable for mention target {Tag} on channel {ChannelId} for message {MessageId} — delivering fail-open",
+                tag,
+                channelId,
+                messageId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// STAGE 3 body: writes the durable inbox entry FIRST — its id rides in the event payload — then the
+    /// targeted live push, for one already-eligible, non-blocked target. Expiry via
+    /// ExpiryCalculator.ForMentionInboxEntry (30d, always &lt;= the message TTL) — the wiring of the C1
+    /// amendment-1 calculator into a production write path. BattleTag is stored LOWERCASED (D8 key
+    /// convention); author fields keep the sender's DISPLAY casing.
+    /// </summary>
+    private async Task DeliverAsync(ChatChannel channel, ChannelMessage message, string tag, string tagLower, DateTime now)
+    {
+        var entry = new MentionInboxEntry
+        {
+            BattleTag = tagLower,
+            ChannelId = channel.Id,
+            MessageId = message.Id,
+            Seq = message.Seq,
+            AuthorBattleTag = message.Sender.BattleTag,
+            AuthorName = message.Sender.Name,
+            Excerpt = Excerpts.Bounded(message.Content),
+            CreatedAt = now,
+            ExpiresAt = ExpiryCalculator.ForMentionInboxEntry(now),
+        };
+        await _mentionInboxRepository.Insert(entry);
+
+        // Targeted live push — ONLY to this target's own connection (never a broadcast), and only if
+        // online. A focused target STILL gets it (the server never guesses "seen"; the client acks —
+        // Task 6). An OFFLINE target gets the durable entry above only; Task 6's GetMentionInbox /
+        // SessionState.MentionUnreadCount surface it on their next connect. GetByBattleTag is
+        // case-insensitive, so the display-cased mention tag resolves the session.
+        var session = _sessionRegistry.GetByBattleTag(tag);
+        if (session != null)
+        {
+            var dto = new MentionNotifiedDto(
+                entry.Id,
+                entry.ChannelId,
+                entry.MessageId,
+                entry.Seq,
+                entry.AuthorBattleTag,
+                entry.AuthorName,
+                entry.Excerpt,
+                entry.CreatedAt);
+            await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.MentionNotified, dto);
         }
     }
 }
