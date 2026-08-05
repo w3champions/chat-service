@@ -168,6 +168,15 @@ public static class ChatLimits
     /// channel are never bounded by this.</summary>
     public const int DmSnapshotRecentConversations = 30;
 
+    /// <summary>2026-08-05 PR36 feedback, Part 2 — safety ceiling against pathological accounts on the
+    /// connect-snapshot rule-(e) tail (<see cref="Protocol.SessionStateAssembler.SelectSnapshotMemberships"/>):
+    /// the ordered (recency-desc) scan keeps at most this many OLDER-with-unread 1:1 Dm shells beyond the
+    /// <see cref="DmSnapshotRecentConversations"/> most-recent window; anything beyond is still reachable
+    /// via <c>GetConversations</c> pagination. The Messages badge may undercount ONLY for an account with
+    /// MORE than this many unread older 1:1 conversations at once — an accepted trade-off (Marco,
+    /// 2026-08-05), never a silently-wrong count for anyone under the cap.</summary>
+    public const int DmSnapshotMaxOlderUnread = 100;
+
     /// <summary>GetConversations page-size cap (2026-08-04 follow-up spec §6 — not spec §13; requested
     /// limits above this are clamped down, never rejected — the <see cref="MessagePageSize"/> precedent).</summary>
     public const int ConversationsPageSize = 50;

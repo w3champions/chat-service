@@ -262,6 +262,51 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         Assert.IsTrue(dto.HasUnread);
     }
 
+    // 2026-08-05 PR36 feedback (Part 1): unread hydration for the whole page now runs through ONE batched
+    // CountUserVisibleAfterMany aggregation instead of one CountUserVisibleAfter round-trip per shell.
+    // Pins that distinct per-shell cursors on the SAME page never cross-contaminate each other's counts.
+    [Test]
+    public async Task GetConversations_ReturnsCorrectUnreadCounts_ForMultipleShellsOnOnePage_ViaBatchedQuery()
+    {
+        var shellA = await CreateDmShell($"{OtherPrefix}a#1", Now.AddMinutes(-1), lastSeq: 2, lastReadSeq: 0);
+        for (var seq = 1L; seq <= 2; seq++)
+        {
+            await _messageRepository.Insert(new ChannelMessage
+            {
+                ChannelId = shellA.Id,
+                Seq = seq,
+                Sender = new MessageSender { BattleTag = $"{OtherPrefix}a#1", Name = "friendA" },
+                Content = $"a-{seq}",
+                SentAt = Now.AddMinutes(-1),
+            });
+        }
+
+        var shellB = await CreateDmShell($"{OtherPrefix}b#1", Now.AddMinutes(-2), lastSeq: 3, lastReadSeq: 1);
+        for (var seq = 1L; seq <= 3; seq++)
+        {
+            await _messageRepository.Insert(new ChannelMessage
+            {
+                ChannelId = shellB.Id,
+                Seq = seq,
+                Sender = new MessageSender { BattleTag = $"{OtherPrefix}b#1", Name = "friendB" },
+                Content = $"b-{seq}",
+                SentAt = Now.AddMinutes(-2),
+            });
+        }
+
+        // No messages at all for shellC — a genuine zero that must not pick up A's or B's $or-branch match.
+        var shellC = await CreateDmShell($"{OtherPrefix}c#1", Now.AddMinutes(-3), lastSeq: 0, lastReadSeq: 0);
+
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        Assert.AreEqual(2, page.Conversations.Single(c => c.Channel.Id == shellA.Id).UnreadCount, "shellA: 2 visible rows after cursor 0");
+        Assert.AreEqual(2, page.Conversations.Single(c => c.Channel.Id == shellB.Id).UnreadCount, "shellB: rows 2,3 after cursor 1");
+        Assert.AreEqual(0, page.Conversations.Single(c => c.Channel.Id == shellC.Id).UnreadCount, "shellC: no messages — must not leak another shell's count");
+    }
+
     [Test]
     public async Task GetConversations_ExcludesNonDmChannels()
     {

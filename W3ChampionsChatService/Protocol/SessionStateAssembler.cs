@@ -107,15 +107,17 @@ public class SessionStateAssembler(
             channelBackedMemberships, channelsById, relationshipSnapshot, identity.BattleTag);
 
         // D7 (Amendment 3): unread is computed per channel as the COUNT of user-visible rows after the
-        // member's read cursor (see ToChannelDto) — an async, index-bounded Mongo count per membership.
-        // Sequential await (not Task.WhenAll): memberships are bounded (the public+semiPublic cap plus
-        // DMs/groups/match), and each count is a fast indexed range count, so the simpler sequential loop
-        // is preferred over parallelizing across the Mongo connection pool.
-        var channelDtos = new List<ChannelDto>(snapshotMemberships.Count);
-        foreach (var membership in snapshotMemberships)
-        {
-            channelDtos.Add(await ToChannelDto(channelsById[membership.ChannelId], membership, identity.BattleTag));
-        }
+        // member's read cursor (see ToChannelDto). 2026-08-05 PR36 feedback (Part 1): this used to be a
+        // deliberately sequential per-shell Mongo count — bounded but still ONE round-trip per kept
+        // membership (a 500-DM account with 40 older-unread shells meant 70 sequential queries per
+        // connect). Now a SINGLE CountUserVisibleAfterMany aggregation covers the whole kept set in one
+        // round-trip; ToChannelDto is a pure in-memory lookup against the returned per-channel dictionary.
+        var unreadCounts = await messageRepository.CountUserVisibleAfterMany(
+            snapshotMemberships.Select(m => new ChannelUnreadCursor(m.ChannelId, m.LastReadSeq)).ToList(),
+            identity.BattleTag);
+        var channelDtos = snapshotMemberships
+            .Select(m => ToChannelDto(channelsById[m.ChannelId], m, unreadCounts))
+            .ToList();
 
         // C6 (Task 6, D6): the live unread-mention count — CountUnread(ReadAt == null). identity.BattleTag
         // is passed straight through (JWT-cased); the repository normalizes it to the lowercased
@@ -146,7 +148,12 @@ public class SessionStateAssembler(
     /// most-recent remaining shells by LastMessageAt; (e) any OLDER remaining shell with a POSSIBLE
     /// unread (raw channel.LastSeq &gt; membership.LastReadSeq — the cheap candidate test; the real D7
     /// user-visible count is computed on the selected set afterwards, so a phantom candidate rides
-    /// with UnreadCount 0: bounded over-inclusion, never an understated badge).
+    /// with UnreadCount 0: bounded over-inclusion, never an understated badge) — CAPPED at
+    /// <see cref="ChatLimits.DmSnapshotMaxOlderUnread"/> (2026-08-05 PR36 feedback, Part 2): the ordered
+    /// (recency-desc) scan stops applying rule (e) once that many older-unread shells have been kept, so
+    /// the kept tail is always the MOST RECENT older-unread shells, never an unbounded scan of a
+    /// pathological account's entire history. Rules (a)-(d) and pending/blocked handling are unaffected
+    /// by the cap.
     /// </summary>
     internal static List<ChannelMembership> SelectSnapshotMemberships(
         List<ChannelMembership> channelBackedMemberships,
@@ -189,12 +196,31 @@ public class SessionStateAssembler(
             .OrderByDescending(x => x.SortTime)
             .ThenByDescending(x => x.Channel.Id, StringComparer.Ordinal)
             .ToList();
+
+        // Part 2 (2026-08-05 PR36 feedback): olderUnreadKept counts rule-(e) keeps ONLY — once it hits
+        // the DmSnapshotMaxOlderUnread cap, rule (e) stops applying entirely. The list is already
+        // recency-ordered, so the cap naturally keeps the MOST RECENT older-unread shells and drops the
+        // rest of the (older still) tail.
+        var olderUnreadKept = 0;
         for (var i = 0; i < ordered.Count; i++)
         {
-            if (i < ChatLimits.DmSnapshotRecentConversations                 // (d)
-                || ordered[i].Channel.LastSeq > ordered[i].Membership.LastReadSeq) // (e)
+            if (i < ChatLimits.DmSnapshotRecentConversations) // (d)
             {
                 kept.Add(ordered[i].Membership);
+                continue;
+            }
+
+            if (olderUnreadKept >= ChatLimits.DmSnapshotMaxOlderUnread)
+            {
+                // Cap reached: every remaining index is past rule (d)'s threshold already, and rule (e)
+                // is now closed too, so nothing further in this recency-ordered list can ever be kept.
+                break;
+            }
+
+            if (ordered[i].Channel.LastSeq > ordered[i].Membership.LastReadSeq) // (e)
+            {
+                kept.Add(ordered[i].Membership);
+                olderUnreadKept++;
             }
         }
 
@@ -209,16 +235,19 @@ public class SessionStateAssembler(
         return mute.isShadowBan ? MuteStatus.Shadow : MuteStatus.Full;
     }
 
-    private async Task<ChannelDto> ToChannelDto(ChatChannel channel, ChannelMembership membership, string viewerBattleTag)
+    private static ChannelDto ToChannelDto(
+        ChatChannel channel, ChannelMembership membership, IReadOnlyDictionary<string, long> unreadCounts)
     {
         // D7 (Amendment 3): unread is the COUNT of USER-VISIBLE rows after the member's read cursor —
         // NOT channel.LastSeq − membership.LastReadSeq. That raw-seq delta counts INVISIBLE rows
         // (foreign-author shadow rows + soft-deleted rows), so on reconnect it produced PHANTOM unread
         // for a shadow-banned author's message or a purged message — the exact defect pinned acceptance 2
-        // ("shadow messages generate NO unread for others") forbids. CountUserVisibleAfter applies the
-        // UserVisible predicate (Deleted == null AND (Shadow == false OR sender == viewer)) with
-        // Seq > LastReadSeq, index-bounded on ux_channelId_seq. The viewer's OWN shadow rows still count
-        // toward THEIR own unread (via the sender == viewer disjunct) — the symmetric illusion.
+        // ("shadow messages generate NO unread for others") forbids. CountUserVisibleAfterMany (2026-08-05
+        // PR36 feedback, Part 1 — one batched aggregation for the whole kept set, see AssembleAndSeed)
+        // applies the UserVisible predicate (Deleted == null AND (Shadow == false OR sender == viewer))
+        // with Seq > LastReadSeq per channel, index-bounded on ux_channelId_seq. The viewer's OWN shadow
+        // rows still count toward THEIR own unread (via the sender == viewer disjunct) — the symmetric
+        // illusion. A channel absent from unreadCounts (fully caught up, or zero matching rows) is 0.
         //
         // KNOWN LIVE-PATH RESIDUAL (documented here, deliberately NOT fixed — a launcher/L4 concern, out
         // of C4 scope, and self-healing): this fixes the CONNECT-time snapshot only. A shadow/soft-deleted
@@ -228,7 +257,7 @@ public class SessionStateAssembler(
         // the unread gap — until the next MarkRead (sets lastReadSeq to the max VISIBLE seq the member
         // rendered → the count returns to correct) or the next reconnect (re-baselines via this D7
         // snapshot). Bounded, rare (shadow bans are rare), and self-healing.
-        var unreadCount = await messageRepository.CountUserVisibleAfter(channel.Id, viewerBattleTag, membership.LastReadSeq);
+        var unreadCount = unreadCounts.GetValueOrDefault(channel.Id, 0L);
         return new ChannelDto(
             channel,
             MembershipDto.From(membership),

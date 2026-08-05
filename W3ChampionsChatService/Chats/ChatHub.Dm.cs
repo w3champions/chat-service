@@ -9,6 +9,7 @@ using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Users;
@@ -630,17 +631,22 @@ public partial class ChatHub
     /// non-null <see cref="ChatChannel.LastMessageAt"/> (a null-stamped doc is data-impossible in
     /// production but would otherwise dead-end the client's wire cursor); order, cursor-filter, take the
     /// page.</item>
-    /// <item>Per shell: D7 unread count → <see cref="ChannelDto"/>; seed the registry via
-    /// <see cref="OnlineMemberRegistry.JoinPreservingReadCursor"/> (never regresses a newer in-flight
-    /// <c>MarkRead</c>); return Ok.</item>
+    /// <item>ONE batched <see cref="Messages.MessageRepository.CountUserVisibleAfterMany"/> aggregation
+    /// covers D7 unread for the WHOLE page (2026-08-05 PR36 feedback, Part 1 — previously one
+    /// <c>CountUserVisibleAfter</c> round-trip PER shell, up to <see cref="ChatLimits.ConversationsPageSize"/>
+    /// round-trips per call); per shell: build the <see cref="ChannelDto"/> from the batched result, seed
+    /// the registry via <see cref="OnlineMemberRegistry.JoinPreservingReadCursor"/> (never regresses a
+    /// newer in-flight <c>MarkRead</c>); return Ok.</item>
     /// </list>
     /// Per-page cost scales with the caller's TOTAL membership count (one <c>LoadForUser</c> + one
     /// <c>LoadByIds</c> per call, independent of the requested page size) — an explicit brief decision,
-    /// acceptable because a client is expected to need only 1-3 pages before reaching the end. Paging
-    /// deliberately relaxes Task 6's "registry set == connect-snapshot DTO set" invariant: the registry
-    /// can now hold MORE than what any single SessionState carried. The broader property still holds —
-    /// registry membership implies the client actually knows about the channel — because every shell
-    /// seeded here is returned in this SAME response.
+    /// acceptable because a client is expected to need only 1-3 pages before reaching the end. The unread
+    /// hydration step above, by contrast, is now O(1) round-trips regardless of page size (was O(page
+    /// size) before the 2026-08-05 batching fix). Paging deliberately relaxes Task 6's "registry set ==
+    /// connect-snapshot DTO set" invariant: the registry can now hold MORE than what any single
+    /// SessionState carried. The broader property still holds — registry membership implies the client
+    /// actually knows about the channel — because every shell seeded here is returned in this SAME
+    /// response.
     /// </summary>
     public async Task<GetConversationsResult> GetConversations(DateTime? cursorLastMessageAt, string cursorChannelId, int limit)
     {
@@ -679,8 +685,9 @@ public partial class ChatHub
         }
 
         // 5. Membership-first (user→channels — the only supported direction), then the channel docs in
-        // ONE LoadByIds. In-memory ordering over the caller's own bounded conversation count mirrors
-        // the CountNameJoinableMembershipsForUser precedent — no new aggregation pipeline.
+        // ONE LoadByIds. In-memory ordering over the caller's own bounded conversation count — no new
+        // aggregation pipeline needed here (unlike the batched unread counts in step 6 below, this step
+        // needs the full membership/channel docs, not just a count).
         var memberships = await _membershipRepository.LoadForUser(battleTag);
         var channelsById = (await _channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
             .ToDictionary(c => c.Id);
@@ -713,18 +720,26 @@ public partial class ChatHub
             .Take(effectiveLimit)
             .ToList();
 
-        // 6. Project (same D7 unread as the connect snapshot) + seed the registry per returned shell.
+        // 6. Project (same D7 unread as the connect snapshot) — ONE batched CountUserVisibleAfterMany
+        // aggregation for the whole page (2026-08-05 PR36 feedback, Part 1: this used to be one
+        // CountUserVisibleAfter round-trip PER shell, up to ConversationsPageSize == 50 round-trips per
+        // call) — then seed the registry per returned shell.
+        var unreadCounts = await _messageRepository.CountUserVisibleAfterMany(
+            page.Select(item => new ChannelUnreadCursor(item.Channel.Id, item.Membership.LastReadSeq)).ToList(),
+            battleTag);
+
         var conversations = new List<ChannelDto>(page.Count);
         foreach (var item in page)
         {
-            var unreadCount = await _messageRepository.CountUserVisibleAfter(
-                item.Channel.Id, battleTag, item.Membership.LastReadSeq);
+            var unreadCount = unreadCounts.GetValueOrDefault(item.Channel.Id, 0L);
             conversations.Add(new ChannelDto(
                 item.Channel, MembershipDto.From(item.Membership), unreadCount, unreadCount > 0));
 
-            // JoinPreservingReadCursor (not the plain Join): this loop awaits Mongo per shell, so a
-            // concurrent MarkRead landing on an already-seeded (channel, connection) entry during that
-            // window must never be regressed back down by the DB-loaded LastReadSeq captured before it.
+            // JoinPreservingReadCursor (not the plain Join): membership.LastReadSeq was captured back at
+            // step 5 (LoadForUser), and this method awaits the relationship snapshot fetch AND the batched
+            // unread-count aggregation before reaching this seed loop — a concurrent MarkRead landing on an
+            // already-seeded (channel, connection) entry during that window must never be regressed back
+            // down by the DB-loaded LastReadSeq captured earlier.
             _onlineMemberRegistry.JoinPreservingReadCursor(
                 item.Channel.Id,
                 Context.ConnectionId,

@@ -754,6 +754,84 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             "an older 1:1 shell with unread > 0 must ride the snapshot (truthful Messages badge)");
     }
 
+    // 2026-08-05 PR36 feedback (Part 1) — unread hydration across the kept set now runs through ONE
+    // batched CountUserVisibleAfterMany aggregation instead of one query per shell; this pins that the
+    // per-channel $or branches never cross-contaminate each other's counts.
+    [Test]
+    public async Task Snapshot_UnreadCounts_AreCorrectPerChannel_AcrossMultipleDmShells_ViaBatchedQuery()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        var shellA = await InsertAcceptedDmWithMembership(viewer, "alpha#1", t0.AddMinutes(1), lastSeq: 3, lastReadSeq: 0);
+        for (var seq = 1L; seq <= 3; seq++) await InsertMessage(shellA.Id, "alpha#1", seq);
+
+        var shellB = await InsertAcceptedDmWithMembership(viewer, "bravo#1", t0.AddMinutes(2), lastSeq: 5, lastReadSeq: 2);
+        for (var seq = 1L; seq <= 5; seq++) await InsertMessage(shellB.Id, "bravo#1", seq);
+
+        // No messages at all for shellC — a genuine zero that must not pick up A's or B's $or-branch match.
+        var shellC = await InsertAcceptedDmWithMembership(viewer, "charlie#1", t0.AddMinutes(3), lastSeq: 0, lastReadSeq: 0);
+
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        Assert.AreEqual(3L, dto.Channels.Single(c => c.Channel.Id == shellA.Id).UnreadCount, "shellA: 3 visible rows after cursor 0");
+        Assert.AreEqual(3L, dto.Channels.Single(c => c.Channel.Id == shellB.Id).UnreadCount, "shellB: rows 3,4,5 after cursor 2");
+        Assert.AreEqual(0L, dto.Channels.Single(c => c.Channel.Id == shellC.Id).UnreadCount, "shellC: no messages — must not leak another channel's count");
+    }
+
+    // 2026-08-05 PR36 feedback (Part 2) — the rule-(e) older-unread tail is capped at
+    // ChatLimits.DmSnapshotMaxOlderUnread so a pathological account can never force an unbounded scan.
+    [Test]
+    public async Task Snapshot_CapsOlderUnreadTail_AtDmSnapshotMaxOlderUnread_KeepingTheMostRecentOfTheTail()
+    {
+        var viewer = "peter#123";
+        var t0 = new DateTime(2026, 8, 1, 12, 0, 0, DateTimeKind.Utc);
+
+        // 30 recent, fully-read shells — rule (d), entirely unaffected by the rule-(e) cap below.
+        for (var i = 0; i < ChatLimits.DmSnapshotRecentConversations; i++)
+        {
+            await InsertAcceptedDmWithMembership(viewer, $"friend{i}#1", t0.AddMinutes(i));
+        }
+
+        // 101 OLDER shells, each with a possible unread (LastSeq 3 > LastReadSeq 1). older[0] is the
+        // MOST RECENT of this tail (closest to t0); older[100] is the OLDEST. Every one of them is older
+        // than every "recent" shell above (t0.AddDays(-1)-ish vs t0.AddMinutes(0..29)).
+        const int olderCount = ChatLimits.DmSnapshotMaxOlderUnread + 1;
+        var older = new List<ChatChannel>();
+        for (var k = 0; k < olderCount; k++)
+        {
+            older.Add(await InsertAcceptedDmWithMembership(
+                viewer, $"olduna{k}#1", t0.AddDays(-1).AddMinutes(-k), lastSeq: 3, lastReadSeq: 1));
+        }
+
+        // Realism extras: a pending request and a non-Dm channel — neither ever enters the ordered/capped
+        // rule-(d)/(e) scan, so both must ride the snapshot regardless of the cap above.
+        var pending = await InsertDmChannel("stranger#7", viewer, DmRequestState.Pending, t0.AddDays(-500));
+        await InsertMembership(pending.Id, viewer, 0);
+        var nonDm = await InsertChannel(ChannelType.SemiPublic, "MyClan", lastSeq: 0);
+        await InsertMembership(nonDm.Id, viewer, 0);
+
+        var identity = Identity(viewer);
+        var (dto, _) = await _assembler.AssembleAndSeed(identity, "conn-1", t0.AddHours(1), ChatUserFor(identity));
+
+        var keptIds = dto.Channels.Select(c => c.Channel.Id).ToHashSet();
+        var olderIdsKept = older.Select(c => c.Id).Where(keptIds.Contains).ToHashSet();
+
+        Assert.AreEqual(ChatLimits.DmSnapshotMaxOlderUnread, olderIdsKept.Count,
+            "exactly the cap's worth of older-unread shells ride the snapshot, not all 101");
+        for (var k = 0; k < ChatLimits.DmSnapshotMaxOlderUnread; k++)
+        {
+            Assert.IsTrue(olderIdsKept.Contains(older[k].Id),
+                $"older[{k}] is within the {ChatLimits.DmSnapshotMaxOlderUnread}-most-recent slice of the tail and must be kept");
+        }
+        Assert.IsFalse(olderIdsKept.Contains(older[olderCount - 1].Id),
+            "the 101st (oldest) older-unread shell must be excluded once the cap is reached");
+
+        Assert.IsTrue(keptIds.Contains(pending.Id), "pending requests are unaffected by the rule-(e) cap");
+        Assert.IsTrue(keptIds.Contains(nonDm.Id), "non-Dm channels are unaffected by the rule-(e) cap");
+    }
+
     [Test]
     public async Task Snapshot_KeepsPendingAndBlockedDms_RegardlessOfRecency_AndAllGroupDms()
     {
