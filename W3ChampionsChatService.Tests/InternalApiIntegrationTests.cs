@@ -274,19 +274,6 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         return await _channelsController.Create(dto);
     }
 
-    private async Task<IActionResult> PutChannelMembers(string @ref, string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
-    {
-        var (passed, http) = await ThroughFilter("PUT", $"/internal/channels/{@ref}/members", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
-        if (!passed)
-        {
-            return new UnauthorizedResult();
-        }
-
-        var dto = await JsonSerializer.DeserializeAsync<InternalMembersDeltaRequest>(http.Request.Body, JsonOptions);
-        _channelsController.ControllerContext.HttpContext = http;
-        return await _channelsController.UpdateMembers(@ref, dto);
-    }
-
     private async Task<IActionResult> DeleteChannelThroughFilter(string @ref, string secret, string timestamp, InternalCaller[] allowed = null)
     {
         var (passed, http) = await ThroughFilter("DELETE", $"/internal/channels/{@ref}", Array.Empty<byte>(), secret, timestamp, allowed ?? MmOnlyAllowed);
@@ -297,6 +284,35 @@ public class InternalApiIntegrationTests : IntegrationTestBase
 
         _channelsController.ControllerContext.HttpContext = http;
         return await _channelsController.Delete(@ref);
+    }
+
+    // 2026-08-05 reconciliation spec, Task 6 — the same hand-signed-through-the-real-filter idiom as the
+    // two helpers above, for the roster-assertion and epoch-sync endpoints.
+
+    private async Task<IActionResult> PutChannelRoster(string @ref, string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
+    {
+        var (passed, http) = await ThroughFilter("PUT", $"/internal/channels/{@ref}/roster", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
+        if (!passed)
+        {
+            return new UnauthorizedResult();
+        }
+
+        var dto = await JsonSerializer.DeserializeAsync<InternalRosterAssertRequest>(http.Request.Body, JsonOptions);
+        _channelsController.ControllerContext.HttpContext = http;
+        return await _channelsController.AssertRoster(@ref, dto);
+    }
+
+    private async Task<IActionResult> PostEpochSync(string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
+    {
+        var (passed, http) = await ThroughFilter("POST", "/internal/channels/epoch-sync", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
+        if (!passed)
+        {
+            return new UnauthorizedResult();
+        }
+
+        var dto = await JsonSerializer.DeserializeAsync<InternalEpochSyncRequest>(http.Request.Body, JsonOptions);
+        _channelsController.ControllerContext.HttpContext = http;
+        return await _channelsController.EpochSync(dto);
     }
 
     private async Task<IActionResult> PostRelationshipChange(string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
@@ -495,45 +511,6 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════
-    // ACCEPTANCE 4 — member delta: add creates membership + pushes ChannelAdded; remove deletes +
-    // pushes ChannelRemoved + force-unfocuses the removed user's connection.
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-
-    [Test]
-    public async Task MemberDelta_AddPushes_RemoveDeletesPushesAndForceUnfocuses()
-    {
-        const string bt = "Alice#1";
-        RegisterOnline("conn-alice", bt);
-
-        var createBody = "{\"kind\":\"match\",\"ref\":\"match-ac4\",\"name\":\"AC4 Match\",\"members\":[]}";
-        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
-        var channelDto = createResult.Value as InternalChannelDto;
-
-        // ADD via PUT — through the real filter + real controller.
-        var addBody = "{\"add\":[\"Alice#1\"],\"remove\":[],\"focus\":true}";
-        var addResult = await PutChannelMembers("match-ac4", addBody, MmSecret, NowTimestamp());
-        Assert.That(addResult, Is.InstanceOf<OkResult>());
-        Assert.That(await _membershipRepository.Load(channelDto.Id, bt), Is.Not.Null, "the add creates a durable membership");
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
-
-        _focusRegistry.Focus("conn-alice", channelDto.Id, bt);
-        Assert.That(_focusRegistry.GetFocusedChannels("conn-alice"), Does.Contain(channelDto.Id),
-            "precondition: the connection genuinely has the channel focused before the removal");
-
-        // REMOVE via PUT — pushes ChannelRemoved and force-unfocuses the connection.
-        var removeBody = "{\"add\":[],\"remove\":[\"Alice#1\"]}";
-        var removeResult = await PutChannelMembers("match-ac4", removeBody, MmSecret, NowTimestamp());
-        Assert.That(removeResult, Is.InstanceOf<OkResult>());
-        Assert.That(await _membershipRepository.Load(channelDto.Id, bt), Is.Null, "the remove deletes the membership");
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1));
-        var removedDto = _harness.PayloadFor("conn-alice", ChatEvents.ChannelRemoved) as ChannelRemovedDto;
-        Assert.That(removedDto, Is.Not.Null);
-        Assert.That(removedDto.ChannelId, Is.EqualTo(channelDto.Id));
-        Assert.That(_focusRegistry.GetFocusedChannels("conn-alice"), Does.Not.Contain(channelDto.Id),
-            "the removed user's connection is FORCE-UNFOCUSED from the channel");
-    }
-
-    // ════════════════════════════════════════════════════════════════════════════════════════════
     // ACCEPTANCE 5 — one-match-channel-per-user invariant: ChannelRemoved(A) STRICTLY before
     // ChannelAdded(B); exactly one System+Match membership remains.
     // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -689,50 +666,154 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════════════
-    // PLUS — the M1 fire-and-forget reordering story, end-to-end: a members-PUT can arrive before the
-    // create, a DELETE can then race ahead of the create too, and a LATE create POST must still heal
-    // idempotently (no exception, no orphaned/duplicate data) rather than resurrecting stale state.
+    // 2026-08-05 RECONCILIATION — Task 6: the two roster-assertion/epoch-sync endpoints proved through
+    // the REAL HMAC byte-path (mirrors ACCEPTANCE 1's Hmac_PinnedVectors_AcceptedEndToEnd / CrossCaller
+    // shape), plus a handful of create/assertion interaction pins.
     // ════════════════════════════════════════════════════════════════════════════════════════════
 
     [Test]
-    public async Task OutOfOrder_PutThenDelete_ThenLatePost_HealsIdempotently()
+    public async Task RosterAssert_SignedRequest_AcceptedEndToEnd()
     {
-        const string bt = "Alice#1";
-        const string @ref = "match-reorder";
-        RegisterOnline("conn-alice", bt);
+        const string alice = "Alice#1";
+        const string bob = "Bob#2";
+        RegisterOnline("conn-alice", alice);
+        RegisterOnline("conn-bob", bob);
 
-        // 1. The members-PUT arrives FIRST (mm's delta call raced ahead of its own create call) —
-        // create-on-demand shell (ref-as-placeholder-name), tolerant of delta-before-create (M1).
-        var putBody = "{\"add\":[\"Alice#1\"],\"remove\":[],\"focus\":true}";
-        var putResult = await PutChannelMembers(@ref, putBody, MmSecret, NowTimestamp());
-        Assert.That(putResult, Is.InstanceOf<OkResult>());
-        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, @ref);
-        Assert.That(shell, Is.Not.Null, "the shell is created on demand rather than a hard 404");
-        Assert.That(await _membershipRepository.Load(shell.Id, bt), Is.Not.Null);
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(1));
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-roster-1\",\"name\":\"Roster Match\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null);
+        var channelDto = createResult.Value as InternalChannelDto;
 
-        // 2. The DELETE arrives NEXT (mm canceled the lobby before its own retried create POST landed) —
-        // hard teardown, tolerant of delete-before-(real)create.
-        var deleteResult = await DeleteChannelThroughFilter(@ref, MmSecret, NowTimestamp());
-        Assert.That(deleteResult, Is.InstanceOf<OkResult>());
-        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, @ref), Is.Null);
+        // The full-set assertion drops Alice (absent from the asserted set) and adds Bob — through the
+        // REAL filter, then the REAL controller/domain/repository stack.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[\"Bob#2\"]}";
+        var rosterResult = await PutChannelRoster("match-roster-1", rosterBody, MmSecret, NowTimestamp());
+
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>(), "a correctly signed roster assertion must be accepted end-to-end");
+        Assert.That(await _membershipRepository.Load(channelDto.Id, alice), Is.Null, "Alice, absent from the asserted set, converges away");
+        Assert.That(await _membershipRepository.Load(channelDto.Id, bob), Is.Not.Null, "Bob, present in the asserted set, is durably added");
         Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1));
+        Assert.That(_harness.SignalCount("conn-bob", ChatEvents.ChannelAdded), Is.EqualTo(1));
 
-        // 3. The ORIGINAL create POST finally arrives LAST (after retries/reordering) — must heal
-        // idempotently: no exception, no orphaned/duplicate data. Since the prior shell was hard-deleted,
-        // this legitimately creates a BRAND-NEW channel (a fresh Id, a fresh 24h expiry) rather than
-        // resurrecting the torn-down one — there is nothing left to resurrect.
-        var postBody = $"{{\"kind\":\"match\",\"ref\":\"{@ref}\",\"name\":\"Reorder Match\",\"members\":[\"Alice#1\"],\"focus\":true}}";
-        var postResult = await PostChannelsCreate(postBody, MmSecret, NowTimestamp()) as OkObjectResult;
-        Assert.That(postResult, Is.Not.Null, "the late create must succeed, not error, even though its own channel was already torn down");
-        var healedDto = postResult.Value as InternalChannelDto;
-        Assert.That(healedDto.Id, Is.Not.EqualTo(shell.Id), "the healed channel is a brand-new document — the deleted one is gone for good");
-        Assert.That(await _membershipRepository.Load(healedDto.Id, bt), Is.Not.Null, "Alice is (re)added to the healed channel");
-        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelAdded), Is.EqualTo(2), "a second ChannelAdded for the healed channel");
+        var reloaded = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-roster-1");
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1L));
+    }
 
-        // Exactly ONE channel exists for this ref at the end — no duplicates, no orphans left behind.
-        var finalChannel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, @ref);
-        Assert.That(finalChannel, Is.Not.Null);
-        Assert.That(finalChannel.Id, Is.EqualTo(healedDto.Id));
+    [Test]
+    public async Task RosterAssert_WrongSecret_Rejected401_AndNoMembershipChange()
+    {
+        const string alice = "Alice#1";
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-roster-2\",\"name\":\"Roster Match 2\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null);
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        // A signature computed with the WRONG secret never verifies — the real filter must reject before
+        // model binding, so ApplyRosterAssertion (which would empty the membership below) never runs.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[]}";
+        var result = await PutChannelRoster("match-roster-2", rosterBody, "not-the-real-secret", NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<UnauthorizedResult>());
+        Assert.That(await _membershipRepository.Load(channelDto.Id, alice), Is.Not.Null,
+            "a rejected request must never reach the domain layer — the pre-existing membership is untouched");
+    }
+
+    [Test]
+    public async Task RosterAssert_WbCaller_Rejected401()
+    {
+        // Least privilege (mirror CrossCaller_WbSecretOnChannelsEndpoint_401): a cryptographically VALID
+        // wb signature is not enough — wb is not in InternalChannelsController's Mm-only allow-list.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[]}";
+
+        var result = await PutChannelRoster("cross-caller-roster", rosterBody, WbSecret, NowTimestamp(), MmOnlyAllowed);
+
+        Assert.That(result, Is.InstanceOf<UnauthorizedResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "cross-caller-roster"), Is.Null,
+            "a rejected request must never reach the controller/DB — not even a create-on-demand shell");
+    }
+
+    [Test]
+    public async Task EpochSync_SignedRequest_AcceptedEndToEnd()
+    {
+        const string alice = "Alice#1";
+        RegisterOnline("conn-alice", alice);
+
+        // 2026-08-05 fix wave (final review H1, plan D8 amendment): the sweep only considers channels
+        // already stamped by the assertion protocol, so the create carries epoch/seq — an unstamped
+        // channel would be invisible to the sweep and would survive regardless of liveLobbyRefs.
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-epoch-1\",\"name\":\"Epoch Match\",\"members\":[\"Alice#1\"],\"epoch\":\"e1\",\"seq\":1}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>());
+
+        // mm rebooted under a fresh epoch and no longer knows this lobby — the sync tears it down.
+        var syncBody = "{\"epoch\":\"e2\",\"liveLobbyRefs\":[]}";
+        var result = await PostEpochSync(syncBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(), "a correctly signed epoch sync must be accepted end-to-end");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-epoch-1"), Is.Null,
+            "the channel absent from liveLobbyRefs is torn down");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.ChannelRemoved), Is.EqualTo(1),
+            "ChannelRemoved reaches the online member's captured connection");
+    }
+
+    [Test]
+    public async Task EpochSync_WrongSecret_Rejected401_AndNothingTornDown()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-epoch-2\",\"name\":\"Epoch Match 2\",\"members\":[]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>());
+
+        var syncBody = "{\"epoch\":\"e2\",\"liveLobbyRefs\":[]}";
+        var result = await PostEpochSync(syncBody, "not-the-real-secret", NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<UnauthorizedResult>());
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-epoch-2"), Is.Not.Null,
+            "a rejected epoch sync must never reach ApplyEpochSync — nothing is torn down");
+    }
+
+    [Test]
+    public async Task RosterAssert_CreateThenAssertion_SharesOneChannel()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-roster-3\",\"name\":\"Real Display Name\",\"members\":[]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null);
+        var createDto = createResult.Value as InternalChannelDto;
+
+        _time.Advance(TimeSpan.FromHours(1));
+
+        // name is provided but IGNORED — CreateOrGet already established the real name on an existing channel.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[],\"name\":\"Should Be Ignored\"}";
+        var rosterResult = await PutChannelRoster("match-roster-3", rosterBody, MmSecret, NowTimestamp());
+
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>());
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-roster-3");
+        Assert.That(channel.Id, Is.EqualTo(createDto.Id), "the create and the assertion resolve to the SAME channel doc");
+        Assert.That(channel.Name, Is.EqualTo("Real Display Name"), "the real display name is preserved — name is ignored on an existing channel");
+        Assert.That(channel.ExpiresAt, Is.EqualTo(createDto.ExpiresAt), "the 24h creation-anchored expiry is NOT reset by the assertion");
+    }
+
+    [Test]
+    public async Task RosterAssert_AssertionBeforeCreate_ThenCreate_BackfillsNameWithoutResettingExpiry()
+    {
+        // The assertion arrives BEFORE mm's own create POST (the boot-race healing case) — create-on-demand
+        // shell, no name provided, so the ref itself is the placeholder.
+        var rosterBody = "{\"epoch\":\"e1\",\"seq\":1,\"members\":[]}";
+        var rosterResult = await PutChannelRoster("match-roster-4", rosterBody, MmSecret, NowTimestamp());
+        Assert.That(rosterResult, Is.InstanceOf<OkResult>());
+        var shell = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-roster-4");
+        Assert.That(shell.Name, Is.EqualTo("match-roster-4"), "no name was provided — the ref itself is the placeholder");
+        var shellExpiry = shell.ExpiresAt;
+
+        _time.Advance(TimeSpan.FromHours(1));
+
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-roster-4\",\"name\":\"Real Match Name\",\"members\":[]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+
+        Assert.That(createResult, Is.Not.Null, "the late create must succeed against the assertion-created shell");
+        var createDto = createResult.Value as InternalChannelDto;
+        Assert.That(createDto.Id, Is.EqualTo(shell.Id), "the create resolves to the SAME shell channel");
+        Assert.That(createDto.Name, Is.EqualTo("Real Match Name"), "the real create backfills the placeholder name");
+        Assert.That(createDto.ExpiresAt, Is.EqualTo(shellExpiry), "the create does NOT reset the shell's own creation-anchored expiry");
     }
 }

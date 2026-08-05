@@ -254,6 +254,113 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         return result.ModifiedCount == 1;
     }
 
+    /// <summary>
+    /// The (epoch, seq) ADMISSION GATE for a roster assertion, expressed as ONE conditional update —
+    /// admit and stamp are atomic (the SetRequestAccepted idiom). Returns true when the assertion may
+    /// be applied. Staleness semantics (plan D3): (a) no epoch stored yet => accept; (b) SAME epoch =>
+    /// accept only when seq is STRICTLY greater than the stored one; (c) DIFFERENT epoch => accept and
+    /// RE-ANCHOR (epochs are opaque and unordered, and a discard rule would permanently wedge a channel
+    /// that survived an mm restart — the caller logs this anomaly). A detached channel is never
+    /// admitted: the domain layer checks Detached first, and this filter re-checks it as the durable
+    /// backstop against a concurrent detach.
+    /// Virtual: a test seam (the MembershipRepository.LoadForChannel idiom) so a subclass can block
+    /// inside this call and prove the per-ref gate actually serializes two concurrent assertions.
+    /// </summary>
+    public virtual async Task<bool> TryAdvanceAssertion(string channelId, string epoch, long seq)
+    {
+        var fb = Builders<ChatChannel>.Filter;
+        var admissible = fb.Or(
+            fb.Exists(c => c.AssertEpoch, false),
+            fb.Ne(c => c.AssertEpoch, epoch),
+            fb.And(
+                fb.Eq(c => c.AssertEpoch, epoch),
+                // Strict Lt (not Lte) is REDUNDANT BY DESIGN with the ModifiedCount check below: either
+                // one alone already rejects an equal-seq replay (Lt excludes the doc from the filter;
+                // ModifiedCount==0 catches a no-op $set when the filter is relaxed to Lte). Only the
+                // COMBINATION is mutation-tested/pinned — do not relax one on the assumption the other
+                // is independently test-pinned (Task 1 review r1, mutations M1/M3).
+                fb.Or(fb.Exists(c => c.AssertSeq, false), fb.Lt(c => c.AssertSeq, seq))));
+        var filter = fb.And(fb.Eq(c => c.Id, channelId), fb.Ne(c => c.Detached, true), admissible);
+        var update = Builders<ChatChannel>.Update
+            .Set(c => c.AssertEpoch, epoch)
+            .Set(c => c.AssertSeq, seq);
+
+        var result = await Channels.UpdateOneAsync(filter, update);
+        // ModifiedCount (not MatchedCount) is REDUNDANT BY DESIGN with the strict Lt above — see the
+        // comment there. Do not switch to MatchedCount on the assumption "TryAdvanceAssertion always
+        // writes when it matches"; that assumption breaks the moment Lt is ever relaxed to Lte.
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>Freezes the room (plan D4) — see ChatChannel.Detached. Idempotent.
+    /// Virtual: a test seam (the TryAdvanceAssertion idiom) so a subclass can observe WHEN the latch
+    /// lands and pin the plan's DETACH-LAST / adds-before-detach ordering, which is otherwise
+    /// invisible in-process (nothing between the latch and the member writes reads Detached).</summary>
+    public virtual Task SetDetached(string channelId) =>
+        Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Detached, true));
+
+    /// <summary>
+    /// Every System+Match channel eligible for an epoch sync — NOT detached (a detached room is excluded
+    /// from every sweep by design, so it is filtered out server-side and never even loaded) AND already
+    /// stamped by the assertion protocol (<c>AssertEpoch</c> exists).
+    /// <para>
+    /// The <c>AssertEpoch</c>-exists clause is a 2026-08-05 fix wave amendment (final review H1, plan D8
+    /// amendment). Every channel the reconciliation-era mm creates is stamped by construction (create
+    /// carries epoch/seq; the roster-assertion endpoint stamps on demand), so it is correctly a sweep
+    /// candidate. A channel created via <c>POST /internal/channels</c> without epoch/seq and never since
+    /// asserted has no <c>AssertEpoch</c> field at all — <see cref="ChatChannel.AssertEpoch"/> is
+    /// <c>[BsonIgnoreIfNull]</c>, so it is genuinely absent from the document, not merely null — and is
+    /// therefore invisible to this query. It falls to its own 24h creation-anchored TTL instead of being
+    /// torn down by the very first post-deploy epoch sync. Without this clause, that first sync would tear
+    /// down every non-detached System+Match channel already in the database at mm's deploy instant,
+    /// including every in-progress ladder game's chat (~4,900 channels/day measured against production).
+    /// </para>
+    /// Bounded in practice by the 24h creation-anchored TTL on match channels, which is why this needs
+    /// no pagination; served by the ux_systemKind_systemRef index's SystemKind prefix.
+    /// </summary>
+    public Task<List<ChatChannel>> LoadNonDetachedMatchChannels()
+    {
+        var fb = Builders<ChatChannel>.Filter;
+        return Channels.Find(fb.And(
+            fb.Eq(c => c.Type, ChannelType.System),
+            fb.Eq(c => c.SystemKind, SystemChannelKind.Match),
+            fb.Ne(c => c.Detached, true),
+            fb.Exists(c => c.AssertEpoch, true))).ToListAsync();
+    }
+
+    /// <summary>
+    /// Epoch-sync authority reset for the channels a sync SPARES (plan D8) — CONDITIONAL: the update
+    /// only lands when the stored <c>AssertEpoch</c> differs from <paramref name="epoch"/> (absent
+    /// counts as different, mirroring <see cref="TryAdvanceAssertion"/>'s rule (a)/(c) split). When it
+    /// does, adopt the new epoch and reset the per-lobby counter to the 0 sentinel, so mm's first
+    /// assertion under the new epoch (seq >= 1) applies cleanly. Writes 0 rather than $unset — see
+    /// ChatChannel.AssertSeq.
+    /// <para>
+    /// A channel ALREADY anchored to the sync's own epoch is left completely untouched. Such a channel
+    /// was created or asserted by mm DURING this same boot — a new lobby, or a retried assertion, that
+    /// landed while the epoch sync was still retrying — so it is not "stale" in the sense this reset
+    /// exists to fix. Resetting it anyway would zero out an already-advancing seq counter, re-opening
+    /// the duplicate-replay window for every assertion already applied under this epoch (2026-08-05
+    /// Task-4 review r1, INFO-1): a retried lower-seq assertion would be wrongly re-admitted and would
+    /// apply a stale full member set, reverting the roster until mm's next assertion re-converges it.
+    /// The conditional keeps the reset scoped to its actual purpose — re-anchoring channels stamped
+    /// under a now-dead PRE-restart epoch — and keeps <see cref="TryAdvanceAssertion"/>'s D3(c) anomaly
+    /// Warning meaningful (it fires on a genuine mismatch, not on every graceful restart).
+    /// </para>
+    /// </summary>
+    public Task StampAssertionEpoch(string channelId, string epoch)
+    {
+        var fb = Builders<ChatChannel>.Filter;
+        var filter = fb.And(
+            fb.Eq(c => c.Id, channelId),
+            fb.Or(fb.Exists(c => c.AssertEpoch, false), fb.Ne(c => c.AssertEpoch, epoch)));
+        var update = Builders<ChatChannel>.Update
+            .Set(c => c.AssertEpoch, epoch)
+            .Set(c => c.AssertSeq, 0L);
+
+        return Channels.UpdateOneAsync(filter, update);
+    }
+
     /// <summary>Hard-deletes a channel doc (C5 D12 — e.g. the last group member leaving; residual
     /// memberships are cleaned up separately via <see cref="Memberships.MembershipRepository.DeleteAllForChannel"/>).
     /// Messages are left to the 90d message TTL — no reader exists for a deleted channel's history

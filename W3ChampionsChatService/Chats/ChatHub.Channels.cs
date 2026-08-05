@@ -417,6 +417,23 @@ public partial class ChatHub
     /// private-lane teardown): the last member leaving deletes the channel doc + residual memberships; a
     /// departing LAST owner auto-promotes the longest-standing remaining member.</item>
     /// </list>
+    /// <para>
+    /// H4 (2026-08-05 reconciliation review, <c>final-review-fable.md</c>) — product decision (Marco,
+    /// 2026-08-05): the membership delete below stays deliberately TYPE-AGNOSTIC and UNGATED, no
+    /// <see cref="ChannelType"/> check and no ref lock. That is what keeps the launcher's stuck-row escape
+    /// hatch working — a user can always force-leave a channel the client considers stuck, whatever kind
+    /// it is. Accepted cost: on a LIVE (non-detached, still assertion-reachable) match channel this races
+    /// <c>MatchChannelService.ApplyRosterAssertion</c>'s full-set diff, so a leave landing between two
+    /// assertions is silently reverted by the next one. That is correct, not a bug — mm is authoritative
+    /// for lobby membership while a channel is live; membership of a live lobby belongs to mm, not the
+    /// user. It is also UI-unreachable in practice: the launcher hides Leave for the caller's
+    /// currently-live match channel (<c>launcher-e/src/components/chat/ChannelListRow.tsx</c>,
+    /// <c>!isCurrentLiveMatchChannel</c>) and shows it only for stale/stuck System rows. Stale rows (dead
+    /// lobby ⇒ no assertion ever reaches them again) and detached/frozen post-game rooms (assertions
+    /// discarded once frozen) get no further assertions either way, so a leave on either of THOSE sticks —
+    /// exactly the case the escape hatch exists for. No behavior change; this codifies the decision to
+    /// keep the exception as-is rather than adding a server-side no-op-for-live-match-channel guard.
+    /// </para>
     /// </summary>
     public async Task<ChannelOperationResult> LeaveChannel(string channelId)
     {

@@ -154,4 +154,185 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
         Assert.That(index["key"]["SystemRef"].ToInt32(), Is.EqualTo(1));
         Assert.That(index["partialFilterExpression"]["Type"].AsString, Is.EqualTo("System"));
     }
+
+    // ── 2026-08-05 reconciliation plan Task 1 (D3/D4/D8) — (epoch, seq) assertion admission +
+    // detach latch + epoch-sync repository primitives ────────────────────────────────────────
+
+    [Test]
+    public async Task TryAdvanceAssertion_NoEpochStored_Accepts_AndStamps()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e1", 1);
+
+        Assert.That(accepted, Is.True, "a channel with no stored epoch must admit the first assertion");
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1L));
+    }
+
+    [Test]
+    public async Task TryAdvanceAssertion_SameEpochHigherSeq_Accepts_AndAdvances()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        await repo.TryAdvanceAssertion(channel.Id, "e1", 3);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e1", 4);
+
+        Assert.That(accepted, Is.True);
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(4L));
+    }
+
+    [Test]
+    public async Task TryAdvanceAssertion_SameEpochEqualSeq_Rejects_AndLeavesStampUnchanged()
+    {
+        // Pins equal-seq REJECTION (the observable boolean/stamp), not the ModifiedCount vs MatchedCount
+        // choice — the strict Lt and the ModifiedCount check mutually mask each other here; neither is
+        // independently distinguished by this test alone (see ChannelRepository.TryAdvanceAssertion).
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        await repo.TryAdvanceAssertion(channel.Id, "e1", 3);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e1", 3);
+
+        Assert.That(accepted, Is.False);
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(3L));
+    }
+
+    [Test]
+    public async Task TryAdvanceAssertion_SameEpochLowerSeq_Rejects_AndLeavesStampUnchanged()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        await repo.TryAdvanceAssertion(channel.Id, "e1", 5);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e1", 4);
+
+        Assert.That(accepted, Is.False);
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e1"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(5L));
+    }
+
+    [Test]
+    public async Task TryAdvanceAssertion_DifferentEpoch_Accepts_AndReAnchors()
+    {
+        // D3(c): epochs are opaque and unordered, so a mismatch is accepted and re-anchored rather
+        // than discarded (a discard rule could permanently wedge a channel after an mm restart).
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        await repo.TryAdvanceAssertion(channel.Id, "e1", 9);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e2", 1);
+
+        Assert.That(accepted, Is.True);
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1L));
+    }
+
+    [Test]
+    public async Task TryAdvanceAssertion_DetachedChannel_Rejects()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        await repo.TryAdvanceAssertion(channel.Id, "e1", 1);
+        await repo.SetDetached(channel.Id);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e1", 99);
+
+        Assert.That(accepted, Is.False, "a detached channel must never re-admit an assertion, even with a strictly greater seq");
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(1L));
+    }
+
+    [Test]
+    public async Task TryAdvanceAssertion_UnknownChannelId_Rejects()
+    {
+        var repo = new ChannelRepository(MongoClient);
+
+        var accepted = await repo.TryAdvanceAssertion("does-not-exist", "e1", 1);
+
+        Assert.That(accepted, Is.False);
+    }
+
+    [Test]
+    public async Task SetDetached_IsIdempotent_AndPersists()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+
+        await repo.SetDetached(channel.Id);
+        await repo.SetDetached(channel.Id);
+
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.Detached, Is.True);
+    }
+
+    [Test]
+    public async Task LoadNonDetachedMatchChannels_ReturnsOnlyNonDetachedAssertionStampedSystemMatch()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var liveMatch = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-live", "Live Match", Now);
+        await repo.TryAdvanceAssertion(liveMatch.Id, "e1", 1);
+        var detachedMatch = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-detached", "Detached Match", Now);
+        await repo.TryAdvanceAssertion(detachedMatch.Id, "e1", 1);
+        await repo.SetDetached(detachedMatch.Id);
+        // 2026-08-05 fix wave (final review H1, plan D8 amendment): a match channel that has NEVER been
+        // stamped by the assertion protocol — exactly the shape of a channel created without epoch/seq
+        // and never since asserted — must be excluded too, same as a detached one, not just left to
+        // chance alongside the non-match seeds below.
+        await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-unstamped", "Unstamped Match", Now);
+        await repo.FindOrCreateSystem(SystemChannelKind.Clan, "clan-1", "Clan Chat", Now);
+        await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Pub", NormalizedName = "pub" });
+        await repo.Insert(new ChatChannel { Type = ChannelType.Dm, PairKey = "alice#1|bob#2" });
+        // Pins the Type == System clause (Task 1 review r1, mutation M8): SystemKind == Match alone
+        // would otherwise admit this non-System doc. The unique ux_systemKind_systemRef index is
+        // partial on Type == System, so a Public doc with a SystemKind cannot collide with it.
+        await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Impostor", NormalizedName = "impostor", SystemKind = SystemChannelKind.Match, SystemRef = "match-impostor" });
+
+        var result = await repo.LoadNonDetachedMatchChannels();
+
+        Assert.That(result.Select(c => c.Id).ToList(), Is.EquivalentTo(new[] { liveMatch.Id }));
+    }
+
+    [Test]
+    public async Task StampAssertionEpoch_SetsEpoch_AndResetsSeqToZeroSentinel()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+        await repo.TryAdvanceAssertion(channel.Id, "e1", 9);
+
+        await repo.StampAssertionEpoch(channel.Id, "e2");
+
+        var reloaded = await repo.Load(channel.Id);
+        Assert.That(reloaded.AssertEpoch, Is.EqualTo("e2"));
+        Assert.That(reloaded.AssertSeq, Is.EqualTo(0L));
+
+        // proves the 0 sentinel (never $unset) does not wedge the channel against the new epoch.
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e2", 1);
+        Assert.That(accepted, Is.True);
+    }
+
+    [Test]
+    public async Task LegacyChannelDocument_WithoutAssertionFields_Deserializes_AndIsAdmissible()
+    {
+        // Backward-compatibility pin: a channel created without epoch/seq never wrote the three new
+        // fields — every read must tolerate absence, and the CAS must still admit.
+        var repo = new ChannelRepository(MongoClient);
+        var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
+
+        Assert.That(channel.Detached, Is.False);
+        Assert.That(channel.AssertSeq, Is.EqualTo(0L));
+        Assert.That(channel.AssertEpoch, Is.Null);
+
+        var accepted = await repo.TryAdvanceAssertion(channel.Id, "e1", 1);
+        Assert.That(accepted, Is.True);
+    }
 }

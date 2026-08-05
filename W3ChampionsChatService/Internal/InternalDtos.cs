@@ -12,27 +12,80 @@ namespace W3ChampionsChatService.Internal;
 /// re-validated server-side against the M1 dot-segment defense regardless of what the caller sent.
 /// <see cref="Members"/> is the initial battleTag roster; <see cref="Focus"/> hints whether newly-added
 /// members should have the channel auto-focused client-side (defaults to <c>false</c> when omitted).
+/// <para>
+/// <see cref="Epoch"/>/<see cref="Seq"/>/<see cref="Detached"/> are OPTIONAL additions (2026-08-05
+/// reconciliation spec, plan D10) — absent ⇒ today's create behavior, byte-for-byte (the transition
+/// guarantee for today's not-yet-deployed mm). They MUST come together: exactly one of
+/// <see cref="Epoch"/>/<see cref="Seq"/> present is a 400. When present, they stamp
+/// <c>(epoch, seq)</c> so a late-landing create retry cannot resurrect a member a newer roster
+/// assertion already removed (<see cref="MatchChannelService.CreateOrGet"/>'s member handling is
+/// additive). <see cref="Detached"/> marks a channel born already frozen — the LADDER-MATCH case:
+/// chat-service uses one <c>SystemKind=Match</c> for both custom-lobby and ladder-match channels, and
+/// ladder refs are never in mm's <c>liveLobbyRefs</c> (that registry only holds custom lobbies), so
+/// without birth-detach the FIRST epoch sync after any mm restart would tear down every in-progress
+/// ladder game's chat.
+/// </para>
 /// </summary>
 public class InternalChannelCreateRequest
 {
     public string Kind { get; set; }
     public string Ref { get; set; }
+
+    /// <summary>
+    /// Cosmetic display name — NORMALIZED, NEVER REJECTED (2026-08-05 fix wave, final review C1):
+    /// trimmed and clamped to <see cref="Domain.ChatLimits.InternalChannelNameMaxLength"/> (100 chars);
+    /// empty-after-trim falls back to <see cref="Ref"/> as a placeholder. mm applies no length/trim/
+    /// charset validation of its own before sending this, so a name chat cannot store must never be able
+    /// to reject an otherwise-valid create.
+    /// </summary>
     public string Name { get; set; }
     public List<string> Members { get; set; }
     public bool? Focus { get; set; }
+    public string Epoch { get; set; }
+    public long? Seq { get; set; }
+    public bool? Detached { get; set; }
 }
 
 /// <summary>
-/// <c>PUT /internal/channels/{ref}/members</c> request body (C7 Task 9) — mm's membership delta.
-/// <see cref="Add"/>/<see cref="Remove"/> tolerate a null array on the wire: the controller coerces
-/// either to an empty list before calling <see cref="MatchChannelService.ApplyMembersDelta"/>, which
-/// does NOT null-guard its own list parameters.
+/// <c>PUT /internal/channels/{ref}/roster</c> request body — mm's AUTHORITATIVE full-set membership
+/// assertion (2026-08-05 reconciliation spec §1), the sole membership-mutation protocol mm drives.
+/// <see cref="Epoch"/> is an OPAQUE token (mm's authority generation, fresh per mm boot) — compared
+/// for equality only, never parsed or ordered, and re-validated against the same character class and
+/// length cap as <c>ref</c>. <see cref="Seq"/> is mm's per-(lobby, epoch) monotonic counter and MUST
+/// be >= 1 (0 is chat-side's "nothing applied yet under this epoch" sentinel).
+/// <see cref="Members"/> is the COMPLETE member set and is NOT null-tolerant: null and [] differ by
+/// "no-op" vs "tear the whole lobby's membership down", so the caller must state which it means.
+/// <see cref="Name"/> is the display name used ONLY when the
+/// assertion must create the channel on demand (mm's boot-race healing — a recreated room must not
+/// display its nanoid ref); ignored for an existing channel; optional (null ⇒ ref placeholder).
+/// NORMALIZED, NEVER REJECTED (2026-08-05 fix wave, final review C1): trimmed and clamped to
+/// <see cref="Domain.ChatLimits.InternalChannelNameMaxLength"/>; empty-after-trim also falls back to the
+/// ref placeholder — a cosmetic field must never block an authoritative roster.
+/// <see cref="Detached"/> marks mm's GAME_STARTED final assertion: the set is applied, then the
+/// room freezes. There is deliberately NO Focus field — mm has never sent one on any internal call,
+/// and a new contract carries no dead parameters (plan §2.3).
 /// </summary>
-public class InternalMembersDeltaRequest
+public class InternalRosterAssertRequest
 {
-    public List<string> Add { get; set; }
-    public List<string> Remove { get; set; }
-    public bool? Focus { get; set; }
+    public string Epoch { get; set; }
+    public long Seq { get; set; }
+    public List<string> Members { get; set; }
+    public string Name { get; set; }
+    public bool? Detached { get; set; }
+}
+
+/// <summary>
+/// <c>POST /internal/channels/epoch-sync</c> request body — mm's boot-time authoritative world
+/// (2026-08-05 reconciliation spec §3). <see cref="LiveLobbyRefs"/> is the COMPLETE set of lobby
+/// refs mm still knows about (the EMPTY set after a crash, since lobbies are ephemeral in mm) and is
+/// NOT null-tolerant for the same reason <see cref="InternalRosterAssertRequest.Members"/> isn't.
+/// Every entry is re-validated against the same ref character class, and the array is capped at
+/// <see cref="Domain.ChatLimits.InternalMaxLiveRefsPerSync"/>.
+/// </summary>
+public class InternalEpochSyncRequest
+{
+    public string Epoch { get; set; }
+    public List<string> LiveLobbyRefs { get; set; }
 }
 
 /// <summary>

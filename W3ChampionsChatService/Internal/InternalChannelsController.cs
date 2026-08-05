@@ -13,10 +13,17 @@ namespace W3ChampionsChatService.Internal;
 /// <summary>
 /// C7 Task 9 — the HTTP surface for the match-channel lifecycle mm drives: <c>POST /internal/channels</c>
 /// (idempotent create-or-get, 200 for BOTH a fresh channel and a duplicate call — the pinned idempotency
-/// contract), <c>PUT /internal/channels/{ref}/members</c> (membership delta), and
-/// <c>DELETE /internal/channels/{ref}</c> (hard teardown, 200 even for an unknown ref — a 404 would only
-/// trigger a pointless mm retry). All three delegate to <see cref="MatchChannelService"/> (Tasks 6-8);
-/// this controller owns ONLY input validation, the HTTP shape, and logging.
+/// contract), <c>PUT /internal/channels/{ref}/roster</c> (the authoritative full-set membership assertion,
+/// 2026-08-05 reconciliation spec, plan D1-D4/D7), <c>POST /internal/channels/epoch-sync</c> (mm's
+/// boot-time convergence sweep, plan D8), and <c>DELETE /internal/channels/{ref}</c> (hard teardown, 200
+/// even for an unknown ref — a 404 would only trigger a pointless mm retry). All four delegate to
+/// <see cref="MatchChannelService"/>; this controller owns ONLY input validation, the HTTP shape, and
+/// logging.
+/// <para>
+/// The roster route is named <c>.../roster</c> rather than <c>.../membership</c> deliberately — a
+/// one-character-away name from <c>.../members</c> would have collided with the now-removed legacy delta
+/// route this endpoint replaced.
+/// </para>
 /// <para>
 /// SECURITY (H1): gated by <see cref="InternalHmacAuthAttribute"/> at CLASS level with an Mm-only
 /// allow-list — the disjoint HMAC auth realm, never <see cref="UserHasPermissionAttribute"/>. See
@@ -60,10 +67,20 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
+        // 2026-08-05 fix wave (final review C1): `name` is cosmetic — members is the authoritative
+        // payload — so a name chat cannot store must NEVER reject the whole create. mm applies no
+        // length/trim/charset validation of its own to a custom-game lobby name before sending it (any
+        // authenticated player can trigger a whitespace-only or >100-char name), and CreateOrGet already
+        // knows how to fall back to the ref placeholder for a null name. Empty-after-trim normalizes to
+        // null; overlong is truncated. Neither is ever a 400.
         var name = request.Name?.Trim();
-        if (string.IsNullOrEmpty(name) || name.Length > ChatLimits.InternalChannelNameMaxLength)
+        if (string.IsNullOrEmpty(name))
         {
-            return BadRequest(new ErrorResult(GenericValidationError));
+            name = null;
+        }
+        else if (name.Length > ChatLimits.InternalChannelNameMaxLength)
+        {
+            name = name[..ChatLimits.InternalChannelNameMaxLength];
         }
 
         if (!IsValidMembers(request.Members))
@@ -71,13 +88,33 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
+        // D10 pair rule (2026-08-05 reconciliation spec): epoch/seq must come TOGETHER — a lone one is
+        // ambiguous (an unstamped seq, or a seq with no epoch to compare it against), so exactly one
+        // present is a 400.
+        if ((request.Epoch != null) != request.Seq.HasValue)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.Epoch != null && !IsValidEpoch(request.Epoch))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.Seq.HasValue && request.Seq.Value < 1)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
         try
         {
-            var channel = await matchChannelService.CreateOrGet(request.Ref, name, request.Members, request.Focus ?? false);
+            var channel = await matchChannelService.CreateOrGet(
+                request.Ref, name, request.Members, request.Focus ?? false,
+                request.Epoch, request.Seq, request.Detached ?? false);
 
             Log.Information(
-                "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount}",
-                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count);
+                "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount} detached={Detached}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count, request.Detached ?? false);
 
             return Ok(InternalChannelDto.FromChannel(channel));
         }
@@ -88,37 +125,129 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         }
     }
 
-    [HttpPut("{ref}/members")]
-    public async Task<IActionResult> UpdateMembers(string @ref, [FromBody] InternalMembersDeltaRequest request)
+    [HttpPut("{ref}/roster")]
+    public async Task<IActionResult> AssertRoster(string @ref, [FromBody] InternalRosterAssertRequest request)
     {
+        if (request == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
         if (!IsValidRef(@ref))
         {
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
-        // Null add/remove arrays are tolerated on the wire — coerced to empty here since
-        // MatchChannelService.ApplyMembersDelta does NOT null-guard its own list parameters.
-        var add = request?.Add ?? new List<string>();
-        var remove = request?.Remove ?? new List<string>();
+        if (!IsValidEpoch(request.Epoch))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
 
-        if (!IsValidMembers(add) || !IsValidMembers(remove))
+        if (request.Seq < 1)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        // Deliberately NOT coerced to empty: for a full-set assertion, null and [] are the difference
+        // between "no-op" and "tear the whole lobby's membership down" (plan D7) — the caller must state
+        // which it means, so a missing array is a 400.
+        if (request.Members == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (!IsValidMembers(request.Members))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        // The assertion's authoritative payload is `members`. `name` is cosmetic (create-on-demand only,
+        // ignored on an existing channel), so a name chat cannot store must NEVER reject the roster — mm
+        // has no per-status retry policy and would re-send the same rejected name forever (2026-08-05 fix
+        // wave, final review C1).
+        var name = request.Name?.Trim();
+        if (string.IsNullOrEmpty(name))
+        {
+            name = null; // ⇒ ApplyRosterAssertion falls back to the ref placeholder
+        }
+        else if (name.Length > ChatLimits.InternalChannelNameMaxLength)
+        {
+            name = name[..ChatLimits.InternalChannelNameMaxLength];
+        }
+
+        try
+        {
+            var outcome = await matchChannelService.ApplyRosterAssertion(
+                @ref, request.Epoch, request.Seq, request.Members,
+                name, request.Detached ?? false);
+
+            // 2026-08-05 fix wave (final review M2): the outcome REPLACES the old unconditional
+            // "succeeded" wording — a discarded assertion (stale/duplicate or against a frozen channel)
+            // used to log a contradictory "succeeded" line here ALONGSIDE the domain layer's own discard
+            // line, exactly on the storm paths (an mm retry storm, or mm asserting a frozen lobby) the
+            // staleness/detach gates exist to absorb. One line, the real outcome.
+            Log.Information(
+                "Internal channel roster-assert {Outcome} {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached}",
+                outcome, InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref,
+                request.Epoch, request.Seq, request.Members.Count, request.Detached ?? false);
+
+            // A DISCARDED (stale/detached) assertion is still a 200 — it is a successful no-op, not a
+            // failure. mm must not retry a correctly-rejected stale assertion; the domain layer already
+            // logged the discard.
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            LogUnexpected(ex, "PUT", @ref);
+            throw;
+        }
+    }
+
+    [HttpPost("epoch-sync")]
+    public async Task<IActionResult> EpochSync([FromBody] InternalEpochSyncRequest request)
+    {
+        if (request == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (!IsValidEpoch(request.Epoch))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.LiveLobbyRefs == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.LiveLobbyRefs.Count > ChatLimits.InternalMaxLiveRefsPerSync)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.LiveLobbyRefs.Any(r => !IsValidRef(r)))
         {
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
         try
         {
-            await matchChannelService.ApplyMembersDelta(@ref, add, remove, request?.Focus ?? false);
+            // 2026-08-05 fix wave (final review H2): thread the client's own abort signal through the
+            // sweep loop. mm's client timeout is far shorter than a large sweep can take; without this,
+            // an aborted mm attempt leaves the sweep running headless while mm's retry launches ANOTHER
+            // overlapping one. A cancelled sweep is safe — see ApplyEpochSync's own doc.
+            await matchChannelService.ApplyEpochSync(request.Epoch, request.LiveLobbyRefs, HttpContext.RequestAborted);
 
             Log.Information(
-                "Internal channel members-delta succeeded {Caller} {Verb} {Ref} addCount={AddCount} removeCount={RemoveCount}",
-                InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref, add.Count, remove.Count);
+                "Internal channel epoch-sync succeeded {Caller} {Verb} epoch={Epoch} liveRefCount={LiveRefCount}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Epoch, request.LiveLobbyRefs.Count);
 
             return Ok();
         }
         catch (Exception ex)
         {
-            LogUnexpected(ex, "PUT", @ref);
+            LogUnexpected(ex, "POST", "epoch-sync");
             throw;
         }
     }
@@ -149,10 +278,25 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
 
     private static bool IsValidRef(string @ref) => @ref != null && RefPattern.IsMatch(@ref);
 
+    // The epoch is an OPAQUE token, never parsed — the SAME character class and length cap that
+    // defends `ref` (log injection into the Serilog {Epoch} sink; a polluted Mongo key) is exactly the
+    // defense it needs, so it reuses RefPattern deliberately rather than inventing a second regex.
+    private static bool IsValidEpoch(string epoch) => epoch != null && RefPattern.IsMatch(epoch);
+
     private static bool IsValidMembers(List<string> members) =>
         members != null
         && members.Count <= ChatLimits.InternalMaxMembersPerCall
-        && members.All(m => !string.IsNullOrWhiteSpace(m));
+        && members.All(IsValidMemberEntry);
+
+    // 2026-08-05 fix wave (final review M5): mirrors InternalRelationshipChangesController's
+    // IsValidParticipant EXACTLY — non-blank AND control-char-free. Before this, a member entry was
+    // bounded only by the 64 KB body cap and landed as a lowercased Mongo BattleTag key with no
+    // per-entry length or control-char guard, asymmetric with the relationship-changes surface's
+    // identical-shaped field. char.IsControl catches an embedded '\n'/'\r'/'\t'/NUL (log-injection);
+    // U+2028/U+2029 are checked explicitly because they are category Zl/Zp, not Cc, so char.IsControl
+    // alone misses them.
+    private static bool IsValidMemberEntry(string value) =>
+        !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
 
     private void LogUnexpected(Exception ex, string verb, string @ref) =>
         Log.Error(ex, "Internal channels endpoint failed {Caller} {Verb} {Ref}", InternalHmacAuthFilter.ResolveCaller(HttpContext), verb, @ref);

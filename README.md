@@ -251,3 +251,149 @@ of what it proxies for moderation.
 - **`DELETE api/loungeMute/{bTag}`** — `404 Not Found` if no mute exists for `bTag`; otherwise `200 OK`,
   and the target's live connections have their cached mute cleared immediately (the client's hidden
   rooms/ban banner still only refresh on reconnect — no live "ban lifted" event is sent, by design).
+
+## Internal API for the matchmaking service (HMAC realm)
+
+Every endpoint below lives under `/internal/channels` and is gated by a per-caller HMAC signature —
+**a disjoint auth realm from the JWT/ticket scheme above**, never `[UserHasPermission]`. mm signs the
+raw request body and presents two headers:
+
+- `X-W3C-Webhook-Timestamp` — unix seconds.
+- `X-W3C-Signature` — `"v1=" + hex(HMAC_SHA256(key = the caller's configured secret, msg = "v1." +
+  timestamp + "." + rawBodyBytes))`, taken over the **exact** raw body bytes (never a re-serialized
+  copy). Hex is verified case-insensitively.
+
+A request is rejected with a bare, body-free `401` when either header is missing, the body exceeds the
+internal size cap, the signature does not verify, the clock skew between `now` and the timestamp exceeds
+a **±300s freshness window**, or the caller the signature resolves to is not on the endpoint's allow-list
+(only mm may call this surface). Each caller (mm, website-backend) is provisioned its own secret out of
+band — this document intentionally carries no secret value, hostname, or environment name.
+
+Every `ref` (a lobby/match identifier) and `epoch` is re-validated server-side against the same character
+class regardless of what the caller sent, and every `400` returns a generic body that never echoes which
+rule failed — mm should treat any `4xx` as "fix the request", not parse the message.
+
+### `POST /internal/channels`
+
+Idempotent create-or-get of a match channel: `{ kind: "match", ref, name, members: string[], focus? }`.
+A duplicate call for the same `ref` is `200`, not a conflict — same channel, no duplicate memberships, no
+re-push for members already present, and the 24h creation-anchored expiry is never reset by a re-get.
+
+`name` is **normalized, never rejected**: trimmed, and clamped to 100 chars. An empty-after-trim name
+falls back to `ref` as a placeholder display name — a cosmetic field must never be able to block an
+otherwise-valid create.
+
+Optional additive fields (absent ⇒ today's behavior, byte-for-byte):
+
+- `epoch` (string) / `seq` (integer, >= 1) — must arrive **together**; a lone one is a `400`. When
+  present they stamp the same `(epoch, seq)` staleness state the roster assertion below uses, so a
+  late-landing create retry can never resurrect a member a newer assertion already removed.
+- `detached` (bool) — marks the channel born already frozen. **Ladder matches must send `detached: true`
+  on create**: chat-service uses one channel kind for both custom lobbies and ladder matches, and ladder
+  refs are never part of mm's live-lobby registry, so without birth-detach the first epoch sync after any
+  mm restart would tear down every in-progress ladder game's chat.
+
+### `PUT /internal/channels/{ref}/roster`
+
+The **authoritative full-set membership assertion** — the sole membership-mutation protocol mm drives. mm
+sends the lobby's complete member set; chat-service diffs it against stored membership and converges, idempotently.
+A user-initiated leave (`ChatHub.LeaveChannel`) on a live match channel is re-converged by the next
+assertion, by design (2026-08-05 reconciliation review, H4) — mm is authoritative for lobby membership.
+
+```json
+{ "epoch": "<opaque token>", "seq": 1, "members": ["Tag#1", "Tag#2"], "name": "My Lobby", "detached": false }
+```
+
+- `epoch` — an **opaque string** (the same character class/length cap as `ref`), mm's authority
+  generation, fresh per mm boot. Compared for equality only — never parsed or ordered.
+- `seq` — a positive integer (`>= 1`), mm's per-`(lobby, epoch)` monotonic counter. `0` is reserved
+  server-side as "nothing applied yet under this epoch".
+- `members` — the **complete** roster. **Not** null-tolerant: omitting it is a `400`, while `[]` is a
+  legal, meaningful value (an empty lobby) and clears every existing member.
+- `name` — optional; used **only** when the assertion must create the channel on demand (mm's boot-race
+  healing, so a recreated room never displays its raw ref as its name). Ignored on an existing channel.
+  **Normalized, never rejected**: trimmed and clamped to 100 chars; an empty-after-trim name falls back
+  to the ref placeholder, exactly like create-on-demand above. `name` is cosmetic — mm applies no
+  length/trim/charset validation of its own to a custom-game lobby name before sending it, and a field
+  chat cannot store must never be able to reject the entire authoritative roster.
+- `detached` — see below.
+
+**Staleness — `(epoch, seq)` admission table**, persisted per channel:
+
+| Stored state | Incoming | Result |
+|---|---|---|
+| no epoch stored yet | any | **accept**, stamp `(epoch, seq)` — covers channels that predate this protocol |
+| same epoch | `seq` strictly greater than stored | **accept**, advance the stamp |
+| same epoch | `seq` equal to or lower than stored | **discard** (duplicate/reordered delivery — a no-op) |
+| different epoch | any | **accept and re-anchor** to the incoming epoch (logged as an anomaly) — epochs are opaque and unordered, so a discard rule here would permanently wedge a channel that outlived an mm restart |
+
+A **discarded** assertion (stale, duplicate, or against a frozen channel — see below) still returns
+`200`: it is a successful no-op, not a failure, and mm must not retry a correctly-discarded assertion.
+
+`detached: true` marks mm's final assertion for a lobby (sent once, at game start): the member set is
+applied first, then the channel **freezes**. Once frozen:
+
+- every later roster assertion for that ref is discarded;
+- `POST /internal/channels` still find-or-creates and backfills the name, but adds no members;
+- an explicit `DELETE` (below) still works — detach freezes assertions and sweeps, not an explicit
+  teardown command.
+
+A frozen channel is excluded from every sweep, including the epoch sync below; the 24h creation-anchored
+TTL is its sole cleanup path from there.
+
+### `POST /internal/channels/epoch-sync`
+
+mm's boot-time convergence sweep, sent once per mm process start under a fresh `epoch`:
+
+```json
+{ "epoch": "<opaque token>", "liveLobbyRefs": ["abc123XYZ0", "..."] }
+```
+
+`liveLobbyRefs` is the **complete** set of lobby refs mm still knows about right now (the empty set after
+a crash, since lobbies are ephemeral state in mm) — like `members` above, it is **not** null-tolerant
+(omitting it is a `400`) but `[]` is honored as a legal, meaningful value. Every entry is re-validated
+against the ref character class and the array is capped at 512 entries; an over-cap body is a `400` (mm
+should retry rather than send a partial world).
+
+Every non-frozen match channel is then resolved one of two ways:
+
+- **absent** from `liveLobbyRefs` ⇒ torn down (same routine as the explicit `DELETE` below: messages and
+  memberships purged, channel doc removed, `ChannelRemoved` pushed to every member who was online).
+- **present** ⇒ spared, and re-anchored to the new epoch with its `seq` counter reset, so mm's first
+  assertion under the new epoch applies cleanly.
+
+**Frozen (`detached`) channels are never touched by an epoch sync** — not loaded, not torn down, not
+re-anchored — regardless of whether their ref appears in `liveLobbyRefs`. A live in-progress or
+just-finished game's chat must never be swept away by an mm restart; its 24h TTL is its only cleanup path.
+
+**Only assertion-stamped channels are ever sweep candidates.** A channel becomes eligible for an epoch
+sync only once it has participated in the assertion protocol at least once — created with `epoch`/`seq`,
+or asserted via the roster endpoint above. A channel created via `POST /internal/channels` without
+`epoch`/`seq` and never since asserted carries no stamp at all and is **invisible to the sweep**: it
+survives regardless of `liveLobbyRefs` and falls to its own 24h creation-anchored TTL instead. This is
+what makes it safe to deploy mm's epoch-sync call against the match channels chat already holds from
+before mm's own deploy — the first sync after mm's release simply never sees them, so it cannot tear them
+down. No backfill, feature flag, or deploy-order choreography is required for this beyond "chat deploys
+first" (see Deploy order below).
+
+### `DELETE /internal/channels/{ref}`
+
+Explicit, unconditional teardown: messages purged, memberships deleted, the channel doc removed, and
+`ChannelRemoved` pushed to every member who was online. `200` even for an unknown `ref` (a `404` would
+only trigger a pointless mm retry), and — unlike the roster assertion — this still tears down an
+**already-frozen** channel: detach guards the automated paths (assertions, sweeps), not an explicit
+authoritative teardown mm chooses to send.
+
+### Deploy order
+
+**chat-service deploys before (or with) mm.** Until mm's own deploy lands, its still-running deployment
+keeps calling the old membership-delta endpoint this service no longer serves — those calls `404`
+harmlessly (fail-soft: no chat functionality depends on them succeeding) until mm's own deploy switches it
+over to the roster-assertion protocol above.
+
+**Rollback is a one-way door once mm has deployed the assertion protocol.** After mm starts calling
+`PUT .../roster` and `POST .../epoch-sync`, rolling chat-service back below this version `404`s both
+routes. mm's assertion scheduler has no attempt cap, so every dirty lobby retries at a steady ~30s cadence
+forever and the boot-time epoch sync never converges — a silent, total desync whose only tell is a pegged
+`matchmaking_chat_dirty_channels` gauge on the mm side. **Never roll chat-service back below this version
+while assertion-era mm is live; if a rollback is ever needed, roll mm back first.**

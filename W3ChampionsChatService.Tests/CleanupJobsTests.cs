@@ -200,6 +200,33 @@ public class CleanupJobsTests : IntegrationTestBase
         Assert.IsNull(await membershipRepo.Load("gone-channel", "orphan#1"), "the genuine orphan must still be reaped");
     }
 
+    // 2026-08-05 reconciliation (plan D4/D8, Task 4): a detached System+Match channel keeps its doc —
+    // detach freezes ASSERTIONS and SWEEPS, not the channel's existence — so its membership rows are
+    // NOT orphans and must survive this sweep untouched. Pins the composition the brief calls out
+    // (ApplyEpochSync's own exclusion filter is a separate, redundant guard against ever reaching here).
+    [Test]
+    public async Task SweepOrphanedMemberships_LeavesDetachedMatchChannelMembershipsAlone()
+    {
+        var channelRepo = new ChannelRepository(MongoClient);
+        var membershipRepo = new MembershipRepository(MongoClient, channelRepo);
+
+        var detachedChannel = new ChatChannel
+        {
+            Type = ChannelType.System,
+            SystemKind = SystemChannelKind.Match,
+            SystemRef = "match-detached",
+            Name = "Detached Match",
+            Detached = true,
+        };
+        await channelRepo.Insert(detachedChannel);
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = detachedChannel.Id, BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+
+        var deleted = await new CleanupJobs(MongoClient).SweepOrphanedMemberships();
+
+        Assert.AreEqual(0, deleted, "the detached channel's doc still exists, so its membership rows are not orphans");
+        Assert.IsNotNull(await membershipRepo.Load(detachedChannel.Id, "Peter#123"), "the detached channel's membership row survives");
+    }
+
     // Fix round 1 (finding F3): RunOnce's wiring of the orphan sweep was untested — deleting the
     // SweepOrphanedMemberships() call from RunOnce would survive the full suite (only the method in
     // isolation was pinned). This proves RunOnce itself reaps an orphan, not just the method directly.
