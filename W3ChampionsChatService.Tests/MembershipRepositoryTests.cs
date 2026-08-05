@@ -173,6 +173,34 @@ public class MembershipRepositoryTests : IntegrationTestBase
         Assert.AreEqual(2, count);
     }
 
+    // 2026-08-05 PR36 feedback (Part 3): a user with zero memberships must short-circuit to 0 without
+    // the second (channel-count) round-trip ever needing to run against a real id set.
+    [Test]
+    public async Task CountNameJoinableMembershipsForUser_ZeroMemberships_ReturnsZero()
+    {
+        var membershipRepo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+
+        var count = await membershipRepo.CountNameJoinableMembershipsForUser("Nobody#999");
+
+        Assert.AreEqual(0, count);
+    }
+
+    // 2026-08-05 PR36 feedback (Part 3): CountNameJoinableMembershipsForUser was rewritten from a
+    // full-document double-load to a projected ChannelId read + a server-side CountDocumentsAsync — pins
+    // the projection itself returns exactly the caller's own channel ids, nobody else's.
+    [Test]
+    public async Task LoadChannelIdsForUser_ReturnsOnlyThatUsersChannelIds()
+    {
+        var membershipRepo = new MembershipRepository(MongoClient, new ChannelRepository(MongoClient));
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "chan2", BattleTag = "Peter#123", JoinedAt = DateTime.UtcNow });
+        await membershipRepo.Insert(new ChannelMembership { ChannelId = "chan1", BattleTag = "Wolf#456", JoinedAt = DateTime.UtcNow });
+
+        var ids = await membershipRepo.LoadChannelIdsForUser("Peter#123");
+
+        CollectionAssert.AreEquivalent(new[] { "chan1", "chan2" }, ids);
+    }
+
     // ── C5 Task 2 — DM/group repository foundation additions ─────────────────────────────
 
     [Test]

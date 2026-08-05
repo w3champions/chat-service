@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Threading.Tasks;
 using MongoDB.Bson;
 using MongoDB.Driver;
@@ -73,6 +72,19 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
         return Memberships.Find(m => m.BattleTag == tag).SortBy(m => m.JoinedAt).ToListAsync();
     }
 
+    /// <summary>
+    /// Minimal-payload sibling of <see cref="LoadForUser"/> (2026-08-05 PR36 feedback, Part 3) — a
+    /// projected read returning ONLY the <see cref="ChannelMembership.ChannelId"/> values for a user,
+    /// never the full membership documents. Backs <see cref="CountNameJoinableMembershipsForUser"/>,
+    /// which only ever needs the id set. No sort (callers of this projection don't need ordering; unlike
+    /// <see cref="LoadForUser"/>, whose JoinedAt-ascending sort is a client-order contract).
+    /// </summary>
+    public Task<List<string>> LoadChannelIdsForUser(string battleTag)
+    {
+        var tag = NormalizeTag(battleTag);
+        return Memberships.Find(m => m.BattleTag == tag).Project(m => m.ChannelId).ToListAsync();
+    }
+
     public Task Delete(string channelId, string battleTag)
     {
         var tag = NormalizeTag(battleTag);
@@ -99,24 +111,27 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
 
     /// <summary>
     /// Membership cap gate (acceptance 10) — counts only name-joinable (Public + SemiPublic)
-    /// memberships; System/Dm/GroupDm never count against the cap. KISS at realistic
-    /// per-user scale (a user's channel count is bounded, in practice far under 50):
-    /// LoadForUser + ChannelRepository.LoadByIds type filter, no new aggregation pipeline.
+    /// memberships; System/Dm/GroupDm never count against the cap.
+    /// <para>
+    /// 2026-08-05 PR36 feedback (Part 3): previously loaded the caller's FULL membership documents
+    /// (<c>LoadForUser</c>, DMs included) and the FULL channel documents behind them
+    /// (<c>ChannelRepository.LoadByIds</c>) just to count a type-filtered subset client-side — wasted
+    /// payload for a call site (<c>ChatHub.Channels.JoinChannel</c>'s join-by-name path) that only ever
+    /// needs a number. Rewritten to two minimal round-trips: (1) <see cref="LoadChannelIdsForUser"/>, a
+    /// projected membership read returning ONLY ChannelId values; (2)
+    /// <see cref="Channels.ChannelRepository.CountNameJoinableAmongIds"/>, a server-side
+    /// <c>CountDocumentsAsync(Id ∈ ids AND (Type == Public OR Type == SemiPublic))</c>. Same semantics as
+    /// before — the unique <c>ux_channelId_battleTag</c> index guarantees at most one membership per
+    /// (channel, user), so distinct channel ids among a user's memberships correspond 1:1 with the
+    /// memberships themselves.
+    /// </para>
     /// </summary>
     public async Task<int> CountNameJoinableMembershipsForUser(string battleTag)
     {
-        var memberships = await LoadForUser(battleTag);
-        if (memberships.Count == 0) return 0;
+        var channelIds = await LoadChannelIdsForUser(battleTag);
+        if (channelIds.Count == 0) return 0;
 
-        // Reuses the injected ChannelRepository so the type filter reuses LoadByIds rather than
-        // duplicating its query.
-        var channels = await channelRepository.LoadByIds(memberships.Select(m => m.ChannelId));
-        var nameJoinableChannelIds = channels
-            .Where(c => c.Type == ChannelType.Public || c.Type == ChannelType.SemiPublic)
-            .Select(c => c.Id)
-            .ToHashSet();
-
-        return memberships.Count(m => nameJoinableChannelIds.Contains(m.ChannelId));
+        return (int)await channelRepository.CountNameJoinableAmongIds(channelIds);
     }
 
     /// <summary>All memberships of one channel (C5 D12) — legitimate here: the never-enumerate-

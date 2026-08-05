@@ -229,6 +229,41 @@ public class ChannelRepositoryTests : IntegrationTestBase
         CollectionAssert.AreEquivalent(new[] { a.Id, c.Id }, loaded.Select(x => x.Id).ToList());
     }
 
+    // 2026-08-05 PR36 feedback (Part 3): backs the CountNameJoinableMembershipsForUser rewrite — a
+    // server-side count of the Public/SemiPublic subset of a given id set, mirroring exactly what
+    // LoadByIds + a client-side type filter used to compute.
+    [Test]
+    public async Task CountNameJoinableAmongIds_CountsOnlyPublicAndSemiPublic_AmongGivenIds()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var pub = new ChatChannel { Type = ChannelType.Public, Name = "Pub", NormalizedName = "pub" };
+        var semi = new ChatChannel { Type = ChannelType.SemiPublic, Name = "Semi", NormalizedName = "semi" };
+        var sys = new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, SystemRef = "m1" };
+        var dm = new ChatChannel { Type = ChannelType.Dm, PairKey = DmPairKey.For("Peter#123", "Wolf#456") };
+        var otherPub = new ChatChannel { Type = ChannelType.Public, Name = "Other", NormalizedName = "other" };
+        await repo.Insert(pub);
+        await repo.Insert(semi);
+        await repo.Insert(sys);
+        await repo.Insert(dm);
+        await repo.Insert(otherPub);
+
+        // otherPub is deliberately excluded from the id set — it must NOT count even though it is
+        // name-joinable, proving the filter is (Id ∈ ids) AND (type), not type alone.
+        var count = await repo.CountNameJoinableAmongIds(new[] { pub.Id, semi.Id, sys.Id, dm.Id });
+
+        Assert.AreEqual(2, count);
+    }
+
+    [Test]
+    public async Task CountNameJoinableAmongIds_EmptyIds_ReturnsZero()
+    {
+        var repo = new ChannelRepository(MongoClient);
+
+        var count = await repo.CountNameJoinableAmongIds(Array.Empty<string>());
+
+        Assert.AreEqual(0, count);
+    }
+
     [Test]
     public async Task LoadAnyByNormalizedName_FindsAcrossTypes()
     {
