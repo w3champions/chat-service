@@ -18,6 +18,16 @@ namespace W3ChampionsChatService.Internal;
 /// trigger a pointless mm retry). All three delegate to <see cref="MatchChannelService"/> (Tasks 6-8);
 /// this controller owns ONLY input validation, the HTTP shape, and logging.
 /// <para>
+/// 2026-08-05 reconciliation spec — two ADDITIVE endpoints replacing the delta protocol above:
+/// <c>PUT /internal/channels/{ref}/roster</c> (the authoritative full-set membership assertion, plan
+/// D1-D4/D7) and <c>POST /internal/channels/epoch-sync</c> (mm's boot-time convergence sweep, plan D8).
+/// Both are named to avoid a one-character collision with the surviving <c>.../members</c> delta route
+/// (<c>.../roster</c>, not <c>.../membership</c>) and both delegate to
+/// <see cref="MatchChannelService.ApplyRosterAssertion"/> / <see cref="MatchChannelService.ApplyEpochSync"/>
+/// respectively. The delta route and <see cref="Create"/> keep working unchanged until mm's own deploy —
+/// see the D9 <c>TRANSITION</c> markers.
+/// </para>
+/// <para>
 /// SECURITY (H1): gated by <see cref="InternalHmacAuthAttribute"/> at CLASS level with an Mm-only
 /// allow-list — the disjoint HMAC auth realm, never <see cref="UserHasPermissionAttribute"/>. See
 /// <c>InternalChannelsControllerTests</c>'s dynamic reflection sweep, which fails CI the day any future
@@ -71,13 +81,33 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
+        // D10 pair rule (2026-08-05 reconciliation spec): epoch/seq must come TOGETHER — a lone one is
+        // ambiguous (an unstamped seq, or a seq with no epoch to compare it against), so exactly one
+        // present is a 400.
+        if ((request.Epoch != null) != request.Seq.HasValue)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.Epoch != null && !IsValidEpoch(request.Epoch))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.Seq.HasValue && request.Seq.Value < 1)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
         try
         {
-            var channel = await matchChannelService.CreateOrGet(request.Ref, name, request.Members, request.Focus ?? false);
+            var channel = await matchChannelService.CreateOrGet(
+                request.Ref, name, request.Members, request.Focus ?? false,
+                request.Epoch, request.Seq, request.Detached ?? false);
 
             Log.Information(
-                "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount}",
-                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count);
+                "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount} detached={Detached}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count, request.Detached ?? false);
 
             return Ok(InternalChannelDto.FromChannel(channel));
         }
@@ -123,6 +153,116 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         }
     }
 
+    [HttpPut("{ref}/roster")]
+    public async Task<IActionResult> AssertRoster(string @ref, [FromBody] InternalRosterAssertRequest request)
+    {
+        if (request == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (!IsValidRef(@ref))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (!IsValidEpoch(request.Epoch))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.Seq < 1)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        // Deliberately NOT coerced to empty (contrast UpdateMembers above): for a full-set assertion,
+        // null and [] are the difference between "no-op" and "tear the whole lobby's membership down"
+        // (plan D7) — the caller must state which it means, so a missing array is a 400.
+        if (request.Members == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (!IsValidMembers(request.Members))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        var name = request.Name?.Trim();
+        if (request.Name != null && (string.IsNullOrEmpty(name) || name.Length > ChatLimits.InternalChannelNameMaxLength))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        try
+        {
+            await matchChannelService.ApplyRosterAssertion(
+                @ref, request.Epoch, request.Seq, request.Members,
+                name, request.Detached ?? false);
+
+            Log.Information(
+                "Internal channel roster-assert succeeded {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref,
+                request.Epoch, request.Seq, request.Members.Count, request.Detached ?? false);
+
+            // A DISCARDED (stale/detached) assertion is still a 200 — it is a successful no-op, not a
+            // failure. mm must not retry a correctly-rejected stale assertion; the domain layer already
+            // logged the discard.
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            LogUnexpected(ex, "PUT", @ref);
+            throw;
+        }
+    }
+
+    [HttpPost("epoch-sync")]
+    public async Task<IActionResult> EpochSync([FromBody] InternalEpochSyncRequest request)
+    {
+        if (request == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (!IsValidEpoch(request.Epoch))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.LiveLobbyRefs == null)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.LiveLobbyRefs.Count > ChatLimits.InternalMaxLiveRefsPerSync)
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        if (request.LiveLobbyRefs.Any(r => !IsValidRef(r)))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        try
+        {
+            await matchChannelService.ApplyEpochSync(request.Epoch, request.LiveLobbyRefs);
+
+            Log.Information(
+                "Internal channel epoch-sync succeeded {Caller} {Verb} epoch={Epoch} liveRefCount={LiveRefCount}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Epoch, request.LiveLobbyRefs.Count);
+
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            LogUnexpected(ex, "POST", "epoch-sync");
+            throw;
+        }
+    }
+
     [HttpDelete("{ref}")]
     public async Task<IActionResult> Delete(string @ref)
     {
@@ -148,6 +288,11 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
     }
 
     private static bool IsValidRef(string @ref) => @ref != null && RefPattern.IsMatch(@ref);
+
+    // The epoch is an OPAQUE token, never parsed — the SAME character class and length cap that
+    // defends `ref` (log injection into the Serilog {Epoch} sink; a polluted Mongo key) is exactly the
+    // defense it needs, so it reuses RefPattern deliberately rather than inventing a second regex.
+    private static bool IsValidEpoch(string epoch) => epoch != null && RefPattern.IsMatch(epoch);
 
     private static bool IsValidMembers(List<string> members) =>
         members != null

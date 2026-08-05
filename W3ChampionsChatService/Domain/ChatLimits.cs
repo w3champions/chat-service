@@ -209,6 +209,17 @@ public static class ChatLimits
     /// here only.</summary>
     public const int InternalChannelNameMaxLength = 100;
 
+    /// <summary>
+    /// 2026-08-05 reconciliation spec §3: `liveLobbyRefs` array cap on POST /internal/channels/epoch-sync.
+    /// Plan decision, not spec-pinned text; hard-coded, adjust here only. Sized to stay comfortably
+    /// inside <see cref="InternalMaxBodyBytes"/> (a 64-char ref plus JSON quoting/comma is ≈68 bytes, so
+    /// 512 refs ≈ 35 KB of a 64 KB budget) while sitting far above any realistic count of simultaneously
+    /// OPEN (not-yet-started) lobbies — mm creates a lobby moments before its game starts, so the live
+    /// set is tens, not hundreds. An over-cap body is a 400: mm would retry, which is the correct
+    /// fail-loud behavior for "chat cannot safely reconcile a world it only partially received".
+    /// </summary>
+    public const int InternalMaxLiveRefsPerSync = 512;
+
     /// <summary>2026-08-05 PR36 feedback, Part 3: <see cref="FanOut.ReadRateLimiter"/>'s single per-
     /// battleTag token bucket, shared across every READ-shaped hub method it guards
     /// (<c>GetConversations</c>, <c>GetMessages</c>). This is a server-protection abuse guard, not UX
