@@ -121,11 +121,20 @@ public class SessionStateAssembler(
             // match-channel-hygiene brief Part 2) gets another chance to reap them.
             try
             {
-                await membershipRepository.DeleteOrphanedForUser(identity.BattleTag, orphanedChannelIds);
-                Log.Information(
-                    "AssembleAndSeed: self-healed {Count} orphaned membership row(s) for {BattleTag} — channel doc(s) gone, membership row(s) deleted",
-                    orphanedChannelIds.Count,
-                    identity.BattleTag);
+                // Fix round 1 (finding F6): log the ACTUAL DeletedCount the delete returned, not the
+                // requested orphanedChannelIds.Count — a concurrent healer (a second connection for the
+                // SAME user, or the weekly CleanupJobs sweep, Part 2) can race this delete and already
+                // remove some of these rows first, so the requested count can overstate what THIS call
+                // actually healed. Logged only when > 0 (mirrors the guard above — nothing to report on
+                // a fully-raced no-op delete).
+                var deletedCount = await membershipRepository.DeleteOrphanedForUser(identity.BattleTag, orphanedChannelIds);
+                if (deletedCount > 0)
+                {
+                    Log.Information(
+                        "AssembleAndSeed: self-healed {Count} orphaned membership row(s) for {BattleTag} — channel doc(s) gone, membership row(s) deleted",
+                        deletedCount,
+                        identity.BattleTag);
+                }
             }
             catch (Exception ex)
             {
