@@ -959,6 +959,27 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             "an already-healed, orphan-free connect must not invoke the delete path again");
     }
 
+    // Fix round 1 (finding F4): the self-heal delete's BattleTag scoping was untested — replacing the
+    // filter with a bare In(ChannelId) (deleting EVERY user's rows on that channel id, not just the
+    // connecting user's) would have survived the full suite. A second user's membership on the SAME
+    // gone channel must survive this connect untouched.
+    [Test]
+    public async Task Connect_OrphanSelfHeal_ScopedToConnectingUser_OtherUsersMembershipOnSameGoneChannelSurvives()
+    {
+        var identity = Identity("peter#123");
+        const string goneChannelId = "gone-channel-id";
+        const string otherBattleTag = "otheruser#456";
+        await InsertMembership(goneChannelId, identity.BattleTag, lastReadSeq: 0);
+        await InsertMembership(goneChannelId, otherBattleTag, lastReadSeq: 0);
+
+        await _assembler.AssembleAndSeed(identity, "conn-1", DateTime.UtcNow, ChatUserFor(identity));
+
+        Assert.IsNull(await _membershipRepository.Load(goneChannelId, identity.BattleTag),
+            "the connecting user's own orphaned row must be deleted");
+        Assert.IsNotNull(await _membershipRepository.Load(goneChannelId, otherBattleTag),
+            "another user's membership on the SAME gone channel must survive — the delete filter is scoped by BattleTag, not a bare ChannelId $in");
+    }
+
     [Test]
     public async Task Connect_WithZeroOrphans_IssuesNoOrphanDeleteCall()
     {
