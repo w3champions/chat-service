@@ -117,7 +117,11 @@ public class MatchChannelService(
         string epoch, long? seq, bool detached)
     {
         var now = timeProvider.GetUtcNow().UtcDateTime;
-        var trimmedName = name.Trim();
+        // 2026-08-05 fix wave (final review C1): name is nullable — mirrors ApplyRosterAssertion's own
+        // ref-placeholder fallback (below) so an empty-after-trim / omitted name never blocks creation.
+        // The controller is the only production caller and now normalizes (never rejects) before calling
+        // in, but this fallback keeps CreateOrGet itself correct independent of that caller behavior.
+        var trimmedName = string.IsNullOrWhiteSpace(name) ? systemRef : name.Trim();
 
         var channel = await channelRepository.FindOrCreateSystem(SystemChannelKind.Match, systemRef, trimmedName, now);
 

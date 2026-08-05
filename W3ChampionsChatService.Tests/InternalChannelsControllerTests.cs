@@ -181,25 +181,31 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Post_BlankName_400()
+    public async Task Post_BlankName_200_UsesRefPlaceholder()
     {
+        // 2026-08-05 fix wave (final review C1): name is cosmetic and must never reject an otherwise-valid
+        // create — mm applies no trim/length validation of its own before sending it.
         var request = ValidCreateRequest();
         request.Name = "   ";
 
-        var result = await _controller.Create(request);
+        var result = await _controller.Create(request) as OkObjectResult;
 
-        AssertBadRequest(result);
+        Assert.That(result, Is.Not.Null, "a whitespace-only name must normalize, never 400");
+        var dto = result.Value as InternalChannelDto;
+        Assert.That(dto.Name, Is.EqualTo("match-1"), "empty-after-trim falls back to the ref placeholder");
     }
 
     [Test]
-    public async Task Post_NameOver100Chars_400()
+    public async Task Post_NameOver100Chars_200_TruncatesName()
     {
         var request = ValidCreateRequest();
         request.Name = new string('a', 101);
 
-        var result = await _controller.Create(request);
+        var result = await _controller.Create(request) as OkObjectResult;
 
-        AssertBadRequest(result);
+        Assert.That(result, Is.Not.Null, "an overlong name must normalize (truncate), never 400");
+        var dto = result.Value as InternalChannelDto;
+        Assert.That(dto.Name, Is.EqualTo(new string('a', 100)), "clamped to the 100-char cap, not rejected");
     }
 
     [Test]
@@ -417,25 +423,31 @@ public class InternalChannelsControllerTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task PutRoster_WhitespaceOnlyName_400()
+    public async Task PutRoster_WhitespaceOnlyName_200_UsesRefPlaceholder()
     {
+        // 2026-08-05 fix wave (final review C1): a name mm sends that chat cannot store must never
+        // permanently wedge a lobby's chat — normalize, never reject.
         var request = ValidRosterRequest();
         request.Name = "   ";
 
         var result = await _controller.AssertRoster("match-1", request);
 
-        AssertBadRequest(result);
+        Assert.That(result, Is.InstanceOf<OkResult>(), "a whitespace-only name must normalize, never 400");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(channel.Name, Is.EqualTo("match-1"), "empty-after-trim falls back to the ref placeholder");
     }
 
     [Test]
-    public async Task PutRoster_OverlongName_400()
+    public async Task PutRoster_OverlongName_200_TruncatesName()
     {
         var request = ValidRosterRequest();
         request.Name = new string('a', 101);
 
         var result = await _controller.AssertRoster("match-1", request);
 
-        AssertBadRequest(result);
+        Assert.That(result, Is.InstanceOf<OkResult>(), "an overlong name must normalize (truncate), never 400");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-1");
+        Assert.That(channel.Name, Is.EqualTo(new string('a', 100)), "clamped to the 100-char cap, not rejected");
     }
 
     // ── POST /internal/channels (D10 epoch/seq/detached) ────────────────────────────────────────

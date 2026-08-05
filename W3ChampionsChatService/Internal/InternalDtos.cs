@@ -30,6 +30,14 @@ public class InternalChannelCreateRequest
 {
     public string Kind { get; set; }
     public string Ref { get; set; }
+
+    /// <summary>
+    /// Cosmetic display name — NORMALIZED, NEVER REJECTED (2026-08-05 fix wave, final review C1):
+    /// trimmed and clamped to <see cref="Domain.ChatLimits.InternalChannelNameMaxLength"/> (100 chars);
+    /// empty-after-trim falls back to <see cref="Ref"/> as a placeholder. mm applies no length/trim/
+    /// charset validation of its own before sending this, so a name chat cannot store must never be able
+    /// to reject an otherwise-valid create.
+    /// </summary>
     public string Name { get; set; }
     public List<string> Members { get; set; }
     public bool? Focus { get; set; }
@@ -66,6 +74,9 @@ public class InternalMembersDeltaRequest
 /// caller must state which it means. <see cref="Name"/> is the display name used ONLY when the
 /// assertion must create the channel on demand (mm's boot-race healing — a recreated room must not
 /// display its nanoid ref); ignored for an existing channel; optional (null ⇒ ref placeholder).
+/// NORMALIZED, NEVER REJECTED (2026-08-05 fix wave, final review C1): trimmed and clamped to
+/// <see cref="Domain.ChatLimits.InternalChannelNameMaxLength"/>; empty-after-trim also falls back to the
+/// ref placeholder — a cosmetic field must never block an authoritative roster.
 /// <see cref="Detached"/> marks mm's GAME_STARTED final assertion: the set is applied, then the
 /// room freezes. There is deliberately NO Focus field — mm has never sent one on any internal call,
 /// and a new contract carries no dead parameters (plan §2.3).

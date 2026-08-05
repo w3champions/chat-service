@@ -70,10 +70,20 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
+        // 2026-08-05 fix wave (final review C1): `name` is cosmetic — members is the authoritative
+        // payload — so a name chat cannot store must NEVER reject the whole create. mm applies no
+        // length/trim/charset validation of its own to a custom-game lobby name before sending it (any
+        // authenticated player can trigger a whitespace-only or >100-char name), and CreateOrGet already
+        // knows how to fall back to the ref placeholder for a null name. Empty-after-trim normalizes to
+        // null; overlong is truncated. Neither is ever a 400.
         var name = request.Name?.Trim();
-        if (string.IsNullOrEmpty(name) || name.Length > ChatLimits.InternalChannelNameMaxLength)
+        if (string.IsNullOrEmpty(name))
         {
-            return BadRequest(new ErrorResult(GenericValidationError));
+            name = null;
+        }
+        else if (name.Length > ChatLimits.InternalChannelNameMaxLength)
+        {
+            name = name[..ChatLimits.InternalChannelNameMaxLength];
         }
 
         if (!IsValidMembers(request.Members))
@@ -192,10 +202,18 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
+        // The assertion's authoritative payload is `members`. `name` is cosmetic (create-on-demand only,
+        // ignored on an existing channel), so a name chat cannot store must NEVER reject the roster — mm
+        // has no per-status retry policy and would re-send the same rejected name forever (2026-08-05 fix
+        // wave, final review C1).
         var name = request.Name?.Trim();
-        if (request.Name != null && (string.IsNullOrEmpty(name) || name.Length > ChatLimits.InternalChannelNameMaxLength))
+        if (string.IsNullOrEmpty(name))
         {
-            return BadRequest(new ErrorResult(GenericValidationError));
+            name = null; // ⇒ ApplyRosterAssertion falls back to the ref placeholder
+        }
+        else if (name.Length > ChatLimits.InternalChannelNameMaxLength)
+        {
+            name = name[..ChatLimits.InternalChannelNameMaxLength];
         }
 
         try
