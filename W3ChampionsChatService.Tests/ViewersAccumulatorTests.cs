@@ -245,6 +245,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
     private OnlineMemberRegistry _onlineMemberRegistry;
     private SessionRegistry _sessionRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ConnectionMapping _connectionMapping;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
@@ -269,6 +270,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _sessionRegistry = new SessionRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _connectionMapping = new ConnectionMapping();
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
@@ -305,6 +307,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,

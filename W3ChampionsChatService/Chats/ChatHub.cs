@@ -30,6 +30,10 @@ public partial class ChatHub(
     FocusRegistry focusRegistry,
     OnlineMemberRegistry onlineMemberRegistry,
     MessageRateLimiter messageRateLimiter,
+    // 2026-08-05 PR36 feedback, Part 3: the read-shaped hub methods' abuse guard (GetConversations,
+    // GetMessages), added right beside MessageRateLimiter — same singleton-sharing rationale, deliberately
+    // NOT the same instance/type (see FanOut/ReadRateLimiter.cs class doc for why they stay separate).
+    ReadRateLimiter readRateLimiter,
     TimeProvider timeProvider,
     // C3 (Task 9): resolves a channel for the FocusChannel NotFound-vs-NotMember split (cold path,
     // only reached when the caller is NOT already a member per OnlineMemberRegistry).
@@ -111,6 +115,9 @@ public partial class ChatHub(
     private readonly FocusRegistry _focusRegistry = focusRegistry;
     private readonly OnlineMemberRegistry _onlineMemberRegistry = onlineMemberRegistry;
     private readonly MessageRateLimiter _messageRateLimiter = messageRateLimiter;
+    // 2026-08-05 PR36 feedback, Part 3: the read-shaped hub methods' abuse guard — see the ctor param
+    // doc comment above.
+    private readonly ReadRateLimiter _readRateLimiter = readRateLimiter;
     private readonly TimeProvider _timeProvider = timeProvider;
     private readonly ChannelRepository _channelRepository = channelRepository;
     // C3 (Task 10): membership self-service deps — see the constructor param doc comment above.

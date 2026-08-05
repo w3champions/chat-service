@@ -616,6 +616,14 @@ public partial class ChatHub
     /// extra OpenDm round-trip. Resolution order:
     /// <list type="number">
     /// <item>Fail-closed identity → <see cref="ChatResultCode.PermissionDenied"/>.</item>
+    /// <item>Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3): invoked FIRST THING after identity
+    /// resolution — before the cursor validation, the clamp, and the relationship-snapshot fetch below —
+    /// so a denied caller never reaches ANY further work. ONE per-battleTag token bucket
+    /// (<see cref="FanOut.ReadRateLimiter"/>) shared with <see cref="GetMessages"/> (per the task
+    /// report's scope determination). Not allowed → <see cref="ChatResultCode.Throttled"/> with the
+    /// retry-after — the SAME reject shape the relationship-outage path below already uses. Limits are
+    /// generous (burst 30, sustained 5/s) — server protection only, not UX pacing (Marco) — so no
+    /// legitimate client should ever observe this in normal operation.</item>
     /// <item>Malformed cursor (exactly one half supplied) → <see cref="HubException"/> (the
     /// <c>GetMessages</c> client-bug mapping).</item>
     /// <item>Clamp <paramref name="limit"/> to [1, <see cref="ChatLimits.ConversationsPageSize"/>].</item>
@@ -655,8 +663,18 @@ public partial class ChatHub
         {
             return new GetConversationsResult(ChatResultCode.PermissionDenied);
         }
+        var battleTag = session.Identity.BattleTag;
 
-        // 2. The cursor is a PAIR — both halves or neither (first page).
+        // 2. Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3) — FIRST THING, before any further
+        // work (cursor validation, clamp, relationship-snapshot fetch, Mongo). Shares ONE per-battleTag
+        // bucket with GetMessages — see FanOut/ReadRateLimiter.cs and the task report's scope determination.
+        var readDecision = _readRateLimiter.TryAcquire(battleTag, _timeProvider.GetUtcNow().UtcDateTime);
+        if (!readDecision.Allowed)
+        {
+            return new GetConversationsResult(ChatResultCode.Throttled, readDecision.RetryAfterSeconds);
+        }
+
+        // 3. The cursor is a PAIR — both halves or neither (first page).
         var hasCursorTime = cursorLastMessageAt.HasValue;
         var hasCursorId = !string.IsNullOrEmpty(cursorChannelId);
         if (hasCursorTime != hasCursorId)
@@ -664,12 +682,10 @@ public partial class ChatHub
             throw new HubException("GetConversations: cursorLastMessageAt and cursorChannelId form one cursor — supply both or neither.");
         }
 
-        // 3. Clamp — never Limit(0)/unbounded, never rejected.
+        // 4. Clamp — never Limit(0)/unbounded, never rejected.
         var effectiveLimit = Math.Clamp(limit, 1, ChatLimits.ConversationsPageSize);
 
-        var battleTag = session.Identity.BattleTag;
-
-        // 4. Resolve the CALLER's relationship snapshot ONCE (mirrors OpenDm step 3): blocked shells stay
+        // 5. Resolve the CALLER's relationship snapshot ONCE (mirrors OpenDm step 3): blocked shells stay
         // in the connect snapshot unconditionally (Task 6's Blocked tray) but must NEVER page in here as
         // an ordinary, live conversation — e.g. a 2-year-old blocked shell must not re-surface and get
         // registry-Joined as a live fan-out target. No usable snapshot at all is an outage: fail closed
@@ -684,9 +700,9 @@ public partial class ChatHub
             return new GetConversationsResult(ChatResultCode.Throttled, ChatLimits.RelationshipRetryAfterSeconds);
         }
 
-        // 5. Membership-first (user→channels — the only supported direction), then the channel docs in
+        // 6. Membership-first (user→channels — the only supported direction), then the channel docs in
         // ONE LoadByIds. In-memory ordering over the caller's own bounded conversation count — no new
-        // aggregation pipeline needed here (unlike the batched unread counts in step 6 below, this step
+        // aggregation pipeline needed here (unlike the batched unread counts in step 7 below, this step
         // needs the full membership/channel docs, not just a count).
         var memberships = await _membershipRepository.LoadForUser(battleTag);
         var channelsById = (await _channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
@@ -720,7 +736,7 @@ public partial class ChatHub
             .Take(effectiveLimit)
             .ToList();
 
-        // 6. Project (same D7 unread as the connect snapshot) — ONE batched CountUserVisibleAfterMany
+        // 7. Project (same D7 unread as the connect snapshot) — ONE batched CountUserVisibleAfterMany
         // aggregation for the whole page (2026-08-05 PR36 feedback, Part 1: this used to be one
         // CountUserVisibleAfter round-trip PER shell, up to ConversationsPageSize == 50 round-trips per
         // call) — then seed the registry per returned shell.

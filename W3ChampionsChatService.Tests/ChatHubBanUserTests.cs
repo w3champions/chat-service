@@ -79,6 +79,7 @@ public class ChatHubBanUserTests : IntegrationTestBase
             new FocusRegistry(),
             _onlineMemberRegistry,
             new MessageRateLimiter(),
+            new ReadRateLimiter(),
             TimeProvider.System,
             _channelRepository,
             _membershipRepository,

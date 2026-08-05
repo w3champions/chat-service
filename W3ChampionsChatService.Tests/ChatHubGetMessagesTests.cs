@@ -55,6 +55,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
@@ -85,6 +86,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
         _assembler = new SessionStateAssembler(
@@ -109,6 +111,7 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -386,6 +389,99 @@ public class ChatHubGetMessagesTests : IntegrationTestBase
 
         Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code);
         Assert.IsNull(result.Messages);
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // 2026-08-05 PR36 feedback, Part 3: GetMessages shares the SAME ReadRateLimiter instance/budget as
+    // GetConversations (per the task report's scope determination — old/current shipped clients already
+    // treat any non-Ok GetMessages result as a silent no-op). Guarded BEFORE any DB work.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task GetMessages_OverReadLimit_ReturnsThrottled_WithRetryAfter()
+    {
+        var channel = await CreateChannel();
+        SeedMember("conn-1", BattleTag, channel.Id);
+        await SeedMessage(channel.Id, BattleTag, "hello");
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code, "over the shared read budget must be rejected");
+        Assert.IsNull(result.Messages, "a Throttled reject must never carry a payload");
+        Assert.IsNotNull(result.RetryAfterSeconds);
+        Assert.Greater(result.RetryAfterSeconds.Value, 0);
+    }
+
+    [Test]
+    public async Task GetMessages_OverReadLimit_UnknownChannel_ReturnsThrottled_NotNotFound()
+    {
+        // Ordering proof (no Mongo-call mocking available in this hub harness — see
+        // GetMessages_UnknownChannel_ReturnsNotFound above for the SAME unknown-channel call succeeding
+        // through to a Mongo-backed NotFound when the limiter is NOT exhausted): if the rate limiter ran
+        // AFTER the channel load, an unknown channelId would still reach Mongo and come back NotFound. It
+        // instead comes back Throttled, proving the limiter denies BEFORE the channel load ever runs.
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        var result = await hub.GetMessages("no-such-channel-id", beforeSeq: null, aroundSeq: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code,
+            "the read-abuse guard must deny BEFORE the channel load — an unknown channel must never reach Mongo once denied");
+        Assert.IsNull(result.Messages);
+    }
+
+    [Test]
+    public async Task GetMessages_ReadLimit_IsIndependentPerBattleTag()
+    {
+        var channel = await CreateChannel();
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+        var throttled = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Throttled, throttled.Code, "BattleTag's own budget is spent");
+
+        const string OtherBattleTag2 = "shadow#999";
+        SeedMember("conn-2", OtherBattleTag2, channel.Id);
+        var otherHub = BuildHub("conn-2");
+        var unaffected = await otherHub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Ok, unaffected.Code, "a distinct battleTag has its own independent read budget");
+    }
+
+    [Test]
+    public async Task GetMessages_ReadLimit_SharedBudget_WithGetConversationsStyleUsage()
+    {
+        // Deliverable 4: "all acquisitions share one bucket per battleTag" — proven at the hub level by
+        // spending the WHOLE budget via direct TryAcquire calls (standing in for a prior GetConversations
+        // burst against the SAME singleton instance production wires into both methods) and confirming
+        // GetMessages is denied by the very next call, with none of ITS OWN calls having been needed to
+        // exhaust the budget.
+        var channel = await CreateChannel();
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        var result = await hub.GetMessages(channel.Id, beforeSeq: null, aroundSeq: null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Throttled, result.Code,
+            "GetMessages must be denied once the SHARED budget is spent, even though none of the spending calls went through GetMessages itself");
     }
 
     // ---------------------------------------------------------------------------------------------

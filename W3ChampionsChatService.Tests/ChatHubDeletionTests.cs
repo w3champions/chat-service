@@ -98,6 +98,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             new MessageRateLimiter(),
+            new ReadRateLimiter(),
             TimeProvider.System,
             _channelRepository,
             new MembershipRepository(MongoClient, _channelRepository),

@@ -79,6 +79,7 @@ public class MuteReconciliationTests : IntegrationTestBase
             new FocusRegistry(),
             _onlineMemberRegistry,
             new MessageRateLimiter(),
+            new ReadRateLimiter(),
             TimeProvider.System,
             _channelRepository,
             new MembershipRepository(MongoClient, _channelRepository),

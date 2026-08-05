@@ -322,6 +322,15 @@ public partial class ChatHub
     /// client programming error, not a user-facing rejection, so it throws <see cref="HubException"/>
     /// (decision 5's client-error mapping — the same graceful-throw style as
     /// <see cref="Authentication.ChatHubPermissionFilter"/>) rather than a typed result code.</item>
+    /// <item>Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3), BEFORE any DB work — mirrors
+    /// <see cref="SendMessage(string, string)"/>'s "rate limit before the first DB read" ordering. ONE
+    /// per-battleTag token bucket (<see cref="FanOut.ReadRateLimiter"/>) shared with
+    /// <see cref="GetConversations"/> — the task report records the launcher-e investigation establishing
+    /// that a <see cref="ChatResultCode.Throttled"/> GetMessages reject already degrades gracefully on
+    /// both old and current shipped clients (silent no-op, no retry storm, no error modal), which is why
+    /// this method is guarded at all. Not allowed → <see cref="ChatResultCode.Throttled"/> with the
+    /// retry-after. Limits are generous (burst 30, sustained 5/s) — server protection only, not UX pacing
+    /// (Marco) — so no legitimate client should ever observe this in normal operation.</item>
     /// <item>Membership: the hot path reads <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (zero
     /// DB) and, if the caller is a member, pages directly — no channel load. A non-member falls to the
     /// cold path: a single <see cref="Channels.ChannelRepository.Load"/> distinguishes "no such
@@ -363,8 +372,18 @@ public partial class ChatHub
 
         var connectionId = Context.ConnectionId;
         var battleTag = session.Identity.BattleTag;
+        var now = _timeProvider.GetUtcNow().UtcDateTime;
 
-        // 3. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
+        // 3. Read-abuse rate limit (2026-08-05 PR36 feedback, Part 3), BEFORE any DB work — mirrors
+        // SendMessage's "rate limit before the first DB read" ordering. Shares ONE per-battleTag bucket
+        // with GetConversations — see FanOut/ReadRateLimiter.cs and the task report's scope determination.
+        var readDecision = _readRateLimiter.TryAcquire(battleTag, now);
+        if (!readDecision.Allowed)
+        {
+            return new GetMessagesResult(ChatResultCode.Throttled, readDecision.RetryAfterSeconds);
+        }
+
+        // 4. Membership (hot path, zero DB). A non-member falls to the cold path: a single Load
         // distinguishes NotFound from NotMember — EXCEPT for PUBLIC channels (follow-up spec §4's
         // mention-inbox jump): a public room is name-joinable by anyone, so its history is not
         // privileged and a non-member may READ it. Pull-only and UserVisible-filtered exactly like a
@@ -391,21 +410,20 @@ public partial class ChatHub
             {
                 return new GetMessagesResult(ChatResultCode.NotMember);
             }
-            var now = _timeProvider.GetUtcNow().UtcDateTime;
             if (_connections.GetEffectiveMuteStatus(connectionId, now) == MuteStatus.Full)
             {
                 return new GetMessagesResult(ChatResultCode.NotMember);
             }
-            // Public, not full-banned: fall through to step 4's normal paging below.
+            // Public, not full-banned: fall through to step 5's normal paging below.
         }
 
-        // 4. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no
+        // 5. Page + project. A MODERATOR (C4 D9) reads through the moderator repo variants — no
         // UserVisible filter, so deleted rows and EVERY author's shadow rows come back — and projects
         // with the REAL flags (ForModerator). This is the moderator's own in-channel focused view, so
         // their OWN shadow/deleted rows are flagged too, not illusion-forced (they are a moderator). The
         // membership gate above is UNCHANGED for non-Public channels — a non-member is still rejected
         // regardless of permission there. On a Public channel, though, a NON-MEMBER moderator DOES reach
-        // this branch (step 3's fallthrough, full-ban excluded) and gets the SAME privileged ForModerator
+        // this branch (step 4's fallthrough, full-ban excluded) and gets the SAME privileged ForModerator
         // projection a member-moderator would — a deliberate, narrow consequence of §4's non-member read
         // allowance for Public channels, chosen rather than accidental (pinned by
         // GetMessages_NonMemberModerator_PublicChannel_ReturnsForModeratorProjection). It stays bounded to
@@ -427,7 +445,7 @@ public partial class ChatHub
                 ? await _messageRepository.LoadPageAroundForModerator(channelId, aroundSeq.Value, limit)
                 : await _messageRepository.LoadPageBeforeForModerator(channelId, beforeSeq, limit);
             var moderatorMessages = moderatorPage.Select(m => MessageDto.ForModerator(channelId, m)).ToList();
-            return new GetMessagesResult(ChatResultCode.Ok, moderatorMessages);
+            return new GetMessagesResult(ChatResultCode.Ok, Messages: moderatorMessages);
         }
 
         // Non-moderator: the repo applies UserVisible filtering and clamps the limit — passed straight
@@ -437,7 +455,7 @@ public partial class ChatHub
             ? await _messageRepository.LoadPageAround(channelId, battleTag, aroundSeq.Value, limit)
             : await _messageRepository.LoadPageBefore(channelId, battleTag, beforeSeq, limit);
         var messages = page.Select(m => MessageDto.ForUserDelivery(channelId, m)).ToList();
-        return new GetMessagesResult(ChatResultCode.Ok, messages);
+        return new GetMessagesResult(ChatResultCode.Ok, Messages: messages);
     }
 
     /// <summary>

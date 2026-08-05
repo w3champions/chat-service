@@ -127,6 +127,10 @@ public class Startup
         services.AddSingleton<FocusRegistry>();
         services.AddSingleton<OnlineMemberRegistry>();
         services.AddSingleton<MessageRateLimiter>();
+        // 2026-08-05 PR36 feedback, Part 3: the read-shaped hub methods' abuse guard (GetConversations,
+        // GetMessages — see FanOut/ReadRateLimiter.cs). Singleton for the same reason as MessageRateLimiter:
+        // its per-battleTag budget must be shared across every connection/method that guards against it.
+        services.AddSingleton<ReadRateLimiter>();
 
         // Task 13: the coalescing/suppressing sink for unfocused level-All ChannelActivity. Singleton —
         // it holds the per-(connection, channel) coalescing window state that the fan-out routing (every

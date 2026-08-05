@@ -70,6 +70,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
@@ -104,6 +105,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _presenceInterestRegistry = new PresenceInterestRegistry();
         _userDirectory = new UserDirectoryRepository(MongoClient);
@@ -164,6 +166,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,

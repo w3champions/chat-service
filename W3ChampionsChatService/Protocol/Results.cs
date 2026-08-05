@@ -32,8 +32,14 @@ public record FocusChannelResult(
     ChatResultCode Code,
     IReadOnlyList<ChannelViewerDto> Viewers = null);
 
+/// <summary><see cref="RetryAfterSeconds"/> (2026-08-05 PR36 feedback, Part 3) carries the retry hint on
+/// a <see cref="ChatResultCode.Throttled"/> reject from the shared <see cref="FanOut.ReadRateLimiter"/> —
+/// mirrors every other Throttled-capable result's <c>RetryAfterSeconds</c> field. Purely additive: an
+/// older client that doesn't read the field is unaffected (it already treats any non-Ok code as a silent
+/// no-op — see the task report's GetMessages scope determination).</summary>
 public record GetMessagesResult(
     ChatResultCode Code,
+    double? RetryAfterSeconds = null,
     IReadOnlyList<MessageDto> Messages = null);
 
 /// <summary>Leave/SetNotificationLevel/MarkRead/Unfocus — no result payload beyond the code.</summary>

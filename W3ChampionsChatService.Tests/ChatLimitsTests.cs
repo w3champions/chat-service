@@ -104,6 +104,30 @@ public class ChatLimitsTests
     }
 
     [Test]
+    public void ReadRateLimiterConstants_MatchPr36FeedbackPart3()
+    {
+        // 2026-08-05 PR36 feedback, Part 3 — NOT spec §13; hard-coded, adjust here only.
+        Assert.AreEqual(30, ChatLimits.ReadBurst);
+        Assert.AreEqual(5, ChatLimits.ReadRefillPerSecond);
+        Assert.AreEqual(TimeSpan.FromMinutes(2), ChatLimits.ReadRateLimiterPruneHorizon);
+    }
+
+    [Test]
+    public void ReadRateLimiterPruneHorizon_ExceedsBucketFullRefillTime()
+    {
+        // Pins the invariant documented at ReadRateLimiterPruneHorizon's declaration — mirrors
+        // AutoThrottleTierDurations_AreAllBelowTierDecay above, but for ReadRateLimiter: pruning an idle
+        // entry and letting a later call recreate it fresh (a full ReadBurst-token bucket) is only
+        // behaviour-preserving if a LIVE bucket, left untouched for that same idle duration, would ALSO
+        // have refilled all the way back to capacity — i.e. the prune horizon must exceed the bucket's
+        // own full-refill time (ReadBurst / ReadRefillPerSecond seconds = 6s).
+        var fullRefillTime = TimeSpan.FromSeconds((double)ChatLimits.ReadBurst / ChatLimits.ReadRefillPerSecond);
+        Assert.Greater(ChatLimits.ReadRateLimiterPruneHorizon, fullRefillTime,
+            "ReadRateLimiterPruneHorizon must strictly exceed the bucket's full-refill time, or a pruned " +
+            "entry recreated fresh could diverge from what a live, un-pruned bucket would actually hold");
+    }
+
+    [Test]
     public void DefaultChatRooms_NormalizeToDistinctKeys()
     {
         // C3 Task 3: Guards the static SessionStateAssembler.CatalogOrder initialization invariant.

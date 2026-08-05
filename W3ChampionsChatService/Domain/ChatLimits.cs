@@ -208,4 +208,24 @@ public static class ChatLimits
     /// endpoint bodies pin this field; plan decision, not itself brief-pinned text; hard-coded, adjust
     /// here only.</summary>
     public const int InternalChannelNameMaxLength = 100;
+
+    /// <summary>2026-08-05 PR36 feedback, Part 3: <see cref="FanOut.ReadRateLimiter"/>'s single per-
+    /// battleTag token bucket, shared across every READ-shaped hub method it guards
+    /// (<c>GetConversations</c>, <c>GetMessages</c>). This is a server-protection abuse guard, not UX
+    /// pacing (Marco) — burst 30, sustained 5/s is far above any legitimate client's per-user-action
+    /// handful of loads, so no well-behaved client should ever observe a denial in normal operation.
+    /// Not spec §13 text; hard-coded, adjust here only.</summary>
+    public const int ReadBurst = 30;
+
+    /// <summary>Sustained refill rate (tokens/second) for the <see cref="ReadBurst"/> bucket above.</summary>
+    public const int ReadRefillPerSecond = 5;
+
+    /// <summary>Quiescent-prune horizon for <see cref="FanOut.ReadRateLimiter"/> — mirrors
+    /// <see cref="FanOut.MessageRateLimiter"/>'s <see cref="AutoThrottleTierDecay"/>-anchored sweep, but this
+    /// limiter has no violation ladder to protect, only the single bucket's fullness. INVARIANT (pinned
+    /// by <c>ChatLimitsTests</c>): this MUST stay strictly greater than the bucket's own full-refill time
+    /// (<see cref="ReadBurst"/> / <see cref="ReadRefillPerSecond"/> seconds = 6s) — otherwise an entry
+    /// pruned at this horizon and silently recreated fresh (full capacity) would NOT be behaviour-
+    /// preserving relative to a live bucket that had only refilled for that same idle duration.</summary>
+    public static readonly TimeSpan ReadRateLimiterPruneHorizon = TimeSpan.FromMinutes(2);
 }

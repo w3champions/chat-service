@@ -53,6 +53,7 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
     private FanOutEngine _fanOutEngine;
@@ -91,6 +92,7 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _fanOutEngine = FanOutEngineTestFactory.CreateIgnored();
         _assembler = new SessionStateAssembler(
@@ -122,6 +124,7 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
@@ -442,6 +445,61 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
             "no usable relationship snapshot at all must fail closed rather than risk an unfiltered page");
         Assert.IsNull(page.Conversations);
         Assert.AreEqual(ChatLimits.RelationshipRetryAfterSeconds, page.RetryAfterSeconds);
+    }
+
+    // ---------------------------------------------------------------------
+    // 2026-08-05 PR36 feedback, Part 3: the shared ReadRateLimiter guards GetConversations FIRST THING —
+    // before the cursor validation, the clamp, the relationship-snapshot fetch, and every Mongo read.
+    // ---------------------------------------------------------------------
+
+    [Test]
+    public async Task GetConversations_OverReadLimit_ReturnsThrottled_WithRetryAfter()
+    {
+        var shell = await CreateDmShell($"{OtherPrefix}0#1", Now.AddMinutes(-5));
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        // Exhaust the shared per-battleTag read budget directly on the SAME limiter instance the hub
+        // was built with — this is the ordering unit-test style the brief allows when the hub harness
+        // has no Mongo-call mocking: the limiter denial must fire before the method does ANY other work.
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        var page = await hub.GetConversations(null, null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, page.Code, "over the shared read budget must be rejected");
+        Assert.IsNull(page.Conversations, "a Throttled reject must never carry a payload");
+        Assert.IsNotNull(page.RetryAfterSeconds);
+        Assert.Greater(page.RetryAfterSeconds.Value, 0);
+
+        // Proves the denial fired BEFORE any Mongo work: a successful call would have seeded the caller's
+        // OnlineMemberRegistry with the pre-existing shell (step 7 of the method) — it was never reached.
+        Assert.IsFalse(_onlineMemberRegistry.IsMember("conn-1", shell.Id),
+            "a denied call must never reach the registry-seeding step, proving no Mongo/membership work ran");
+    }
+
+    [Test]
+    public async Task GetConversations_ReadLimit_IsIndependentPerBattleTag()
+    {
+        await CreateDmShell($"{OtherPrefix}0#1", Now.AddMinutes(-5));
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+        var throttled = await hub.GetConversations(null, null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Throttled, throttled.Code, "BattleTag's own budget is spent");
+
+        // A different caller (own connection + own session) is completely unaffected.
+        const string OtherCaller = "wolf#456";
+        RegisterSession("conn-2", OtherCaller);
+        var otherHub = BuildHub("conn-2");
+        var unaffected = await otherHub.GetConversations(null, null, limit: 10);
+        Assert.AreEqual(ChatResultCode.Ok, unaffected.Code, "a distinct battleTag has its own independent read budget");
     }
 
     // ---------------------------------------------------------------------

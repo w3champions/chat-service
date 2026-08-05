@@ -61,6 +61,7 @@ public class ChatHubDmFocusTests : IntegrationTestBase
     private ChannelRepository _channelRepository;
     private MembershipRepository _membershipRepository;
     private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
     private ChannelCreationRateLimiter _channelCreationRateLimiter;
     private SessionStateAssembler _assembler;
 
@@ -90,6 +91,7 @@ public class ChatHubDmFocusTests : IntegrationTestBase
         _channelRepository = new ChannelRepository(MongoClient);
         _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
         _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
         _channelCreationRateLimiter = new ChannelCreationRateLimiter();
         _assembler = new SessionStateAssembler(
             _membershipRepository,
@@ -113,6 +115,7 @@ public class ChatHubDmFocusTests : IntegrationTestBase
             _focusRegistry,
             _onlineMemberRegistry,
             _messageRateLimiter,
+            _readRateLimiter,
             _time,
             _channelRepository,
             _membershipRepository,
