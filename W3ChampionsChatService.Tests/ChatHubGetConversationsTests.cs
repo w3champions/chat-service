@@ -480,6 +480,32 @@ public class ChatHubGetConversationsTests : IntegrationTestBase
             "a denied call must never reach the registry-seeding step, proving no Mongo/membership work ran");
     }
 
+    // Fix round 1, finding F2: the test above proves ordering relative to Mongo work, but a mutant that
+    // moved the limiter check past ONLY the cursor-pair validation (step 3, ChatHub.Dm.cs) — while still
+    // staying before every Mongo call — would slip through it undetected. This tripwire pins the limiter
+    // strictly before that validation too: a malformed one-half cursor from an over-budget caller would
+    // normally throw HubException at step 3; if the limiter runs FIRST THING as required, the denial
+    // fires before the cursor is ever inspected, so the call returns Throttled instead of throwing.
+    [Test]
+    public async Task GetConversations_OverReadLimit_WithMalformedCursor_ReturnsThrottled_NotHubException()
+    {
+        RegisterSession("conn-1", BattleTag);
+        var hub = BuildHub("conn-1");
+
+        for (var i = 0; i < ChatLimits.ReadBurst; i++)
+        {
+            Assert.IsTrue(_readRateLimiter.TryAcquire(BattleTag, Now).Allowed);
+        }
+
+        // Exactly one cursor half supplied — malformed, and normally a client-bug HubException (step 3).
+        // If the limiter ever slipped below that validation, this line throws and the test fails.
+        var page = await hub.GetConversations(cursorLastMessageAt: Now, cursorChannelId: null, limit: 10);
+
+        Assert.AreEqual(ChatResultCode.Throttled, page.Code,
+            "the read rate limit must run FIRST THING — strictly before the cursor-pair validation — so a " +
+            "malformed cursor from an over-budget caller returns Throttled rather than throwing HubException");
+    }
+
     [Test]
     public async Task GetConversations_ReadLimit_IsIndependentPerBattleTag()
     {
