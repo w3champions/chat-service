@@ -190,7 +190,9 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
     [Test]
     public async Task TryAdvanceAssertion_SameEpochEqualSeq_Rejects_AndLeavesStampUnchanged()
     {
-        // Pins the ModifiedCount vs MatchedCount subtlety: a same-(epoch, seq) replay must be a no-op.
+        // Pins equal-seq REJECTION (the observable boolean/stamp), not the ModifiedCount vs MatchedCount
+        // choice — the strict Lt and the ModifiedCount check mutually mask each other here; neither is
+        // independently distinguished by this test alone (see ChannelRepository.TryAdvanceAssertion).
         var repo = new ChannelRepository(MongoClient);
         var channel = await repo.FindOrCreateSystem(SystemChannelKind.Match, "match-1", "Match Chat", Now);
         await repo.TryAdvanceAssertion(channel.Id, "e1", 3);
@@ -283,6 +285,10 @@ public class ChannelRepositorySystemTests : IntegrationTestBase
         await repo.FindOrCreateSystem(SystemChannelKind.Clan, "clan-1", "Clan Chat", Now);
         await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Pub", NormalizedName = "pub" });
         await repo.Insert(new ChatChannel { Type = ChannelType.Dm, PairKey = "alice#1|bob#2" });
+        // Pins the Type == System clause (Task 1 review r1, mutation M8): SystemKind == Match alone
+        // would otherwise admit this non-System doc. The unique ux_systemKind_systemRef index is
+        // partial on Type == System, so a Public doc with a SystemKind cannot collide with it.
+        await repo.Insert(new ChatChannel { Type = ChannelType.Public, Name = "Impostor", NormalizedName = "impostor", SystemKind = SystemChannelKind.Match, SystemRef = "match-impostor" });
 
         var result = await repo.LoadNonDetachedMatchChannels();
 

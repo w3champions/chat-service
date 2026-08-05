@@ -274,6 +274,11 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             fb.Ne(c => c.AssertEpoch, epoch),
             fb.And(
                 fb.Eq(c => c.AssertEpoch, epoch),
+                // Strict Lt (not Lte) is REDUNDANT BY DESIGN with the ModifiedCount check below: either
+                // one alone already rejects an equal-seq replay (Lt excludes the doc from the filter;
+                // ModifiedCount==0 catches a no-op $set when the filter is relaxed to Lte). Only the
+                // COMBINATION is mutation-tested/pinned — do not relax one on the assumption the other
+                // is independently test-pinned (Task 1 review r1, mutations M1/M3).
                 fb.Or(fb.Exists(c => c.AssertSeq, false), fb.Lt(c => c.AssertSeq, seq))));
         var filter = fb.And(fb.Eq(c => c.Id, channelId), fb.Ne(c => c.Detached, true), admissible);
         var update = Builders<ChatChannel>.Update
@@ -281,6 +286,9 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
             .Set(c => c.AssertSeq, seq);
 
         var result = await Channels.UpdateOneAsync(filter, update);
+        // ModifiedCount (not MatchedCount) is REDUNDANT BY DESIGN with the strict Lt above — see the
+        // comment there. Do not switch to MatchedCount on the assumption "TryAdvanceAssertion always
+        // writes when it matches"; that assumption breaks the moment Lt is ever relaxed to Lte.
         return result.ModifiedCount == 1;
     }
 
