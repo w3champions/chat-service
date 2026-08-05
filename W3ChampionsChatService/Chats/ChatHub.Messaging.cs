@@ -212,10 +212,10 @@ public partial class ChatHub
 
         // 7. Persist (C1 amendment): allocate the per-channel seq (atomic $inc LastSeq + $set
         // LastMessageAt on the channel doc), then insert the durable message.
-        // TOCTOU guard: the channel existed at step 4, but a TTL-backed shell (System/Dm/GroupDm) could
+        // TOCTOU guard: the channel existed at step 5, but a TTL-backed shell (System/Dm/GroupDm) could
         // be reaped in the gap before AllocateSeq. AllocateSeq then throws (its $inc matched no doc, so
         // NO seq/LastMessageAt was burned) — map that vanished-channel race to the SAME typed NotFound
-        // as step 4 rather than letting an untyped exception escape as a generic SignalR error (the
+        // as step 5 rather than letting an untyped exception escape as a generic SignalR error (the
         // pipeline's "every rejection is a typed result" guardrail). A genuine Insert failure below is a
         // real infrastructure error and is deliberately left to propagate.
         // C5 D10 (shell-expiry maintenance, the C1-amendment gap): for Dm/GroupDm the SAME atomic
