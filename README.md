@@ -309,6 +309,8 @@ channel's own `POST` (create-on-demand, using the ref as a placeholder display n
 
 The **authoritative full-set membership assertion** — the replacement for the delta above. mm sends the
 lobby's complete member set; chat-service diffs it against stored membership and converges, idempotently.
+A user-initiated leave (`ChatHub.LeaveChannel`) on a live match channel is re-converged by the next
+assertion, by design (2026-08-05 reconciliation review, H4) — mm is authoritative for lobby membership.
 
 ```json
 { "epoch": "<opaque token>", "seq": 1, "members": ["Tag#1", "Tag#2"], "name": "My Lobby", "detached": false }
