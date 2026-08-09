@@ -145,7 +145,7 @@ public class ChatHubFriendPresenceTests : IntegrationTestBase
         // The engine shares the SAME SessionRegistry every hub registers into — PushFriendPresenceChanged
         // resolves each friend's live connection through it.
         _viewersAccumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
     }

@@ -104,7 +104,7 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
         // capture harness so ChannelAdded/ChannelRemoved pushes AND any stray ViewersChanged are observable.
         _harness = new HubPushCaptureHarness();
         _accumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
         _coalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry(), _accumulator, _time);
 

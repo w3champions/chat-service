@@ -54,7 +54,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         var harness = new HubPushCaptureHarness();
         var focus = new FocusRegistry();
         var accumulator = new ViewersAccumulator(
-            harness.HubContext, focus, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+            harness.HubContext, focus, ViewersAccumulatorTestFactory.EmptyViewerResolver());
         return (harness, focus, accumulator);
     }
 

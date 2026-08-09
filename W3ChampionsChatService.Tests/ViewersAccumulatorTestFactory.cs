@@ -20,7 +20,19 @@ internal static class ViewersAccumulatorTestFactory
         new ViewersAccumulator(
             new HubPushCaptureHarness().HubContext,
             new FocusRegistry(),
-            new W3ChampionsChatService.Chats.ViewerResolver(
-                new W3ChampionsChatService.Sessions.SessionRegistry(),
-                new W3ChampionsChatService.Chats.ConnectionMapping()));
+            EmptyViewerResolver());
+
+    /// <summary>
+    /// A <see cref="W3ChampionsChatService.Chats.ViewerResolver"/> over freshly-empty
+    /// <see cref="W3ChampionsChatService.Sessions.SessionRegistry"/>/<see cref="W3ChampionsChatService.Chats.ConnectionMapping"/>
+    /// instances — correct ONLY where the test asserts nothing about a resolved viewer's display name or
+    /// flair (every resolve degrades to <c>ChannelViewerDto(tag, tag, null)</c> regardless of which empty
+    /// registries back it, so no test outcome can depend on which instance this is). A test that DOES
+    /// assert on a joined viewer's name/flair must wire a resolver over the SAME registries its fixture
+    /// seeds instead.
+    /// </summary>
+    internal static W3ChampionsChatService.Chats.ViewerResolver EmptyViewerResolver() =>
+        new W3ChampionsChatService.Chats.ViewerResolver(
+            new W3ChampionsChatService.Sessions.SessionRegistry(),
+            new W3ChampionsChatService.Chats.ConnectionMapping());
 }

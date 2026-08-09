@@ -64,7 +64,7 @@ public class FanOutFlushServiceTests
         // --- Arm the accumulator: RecordChange BEFORE the Focus captures a not-viewing baseline; the Focus
         // makes it viewing, so a due FlushDue (>= T0+5s) emits a `joined` to the focused viewer.
         var focus = new FocusRegistry();
-        var accumulator = new ViewersAccumulator(harness.HubContext, focus, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+        var accumulator = new ViewersAccumulator(harness.HubContext, focus, ViewersAccumulatorTestFactory.EmptyViewerResolver());
         accumulator.RecordChange(ChannelId, ViewerTag, T0);
         focus.Focus(ViewerConn, ChannelId, ViewerTag);
 

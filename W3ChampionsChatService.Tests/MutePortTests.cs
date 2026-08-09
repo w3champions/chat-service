@@ -114,7 +114,7 @@ public class MutePortTests : IntegrationTestBase
 
         _pushHarness = new HubPushCaptureHarness();
         _accumulator = new ViewersAccumulator(
-            _pushHarness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+            _pushHarness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
     }
 
     // ── Hub construction ─────────────────────────────────────────────────────────

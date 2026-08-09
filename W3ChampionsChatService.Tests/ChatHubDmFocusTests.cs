@@ -71,14 +71,16 @@ public class ChatHubDmFocusTests : IntegrationTestBase
         _time = new FakeTimeProvider(new DateTimeOffset(T0, TimeSpan.Zero));
         _harness = new HubPushCaptureHarness();
         _focusRegistry = new FocusRegistry();
-        // The accumulator shares the SAME FocusRegistry the hubs mutate — its baseline capture
-        // (RecordChange) and current-state read (FlushDue) see the live roster the hubs produce.
-        _accumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
-
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _sessionRegistry = new SessionRegistry();
         _connectionMapping = new ConnectionMapping();
+        // The accumulator shares the SAME FocusRegistry the hubs mutate — its baseline capture
+        // (RecordChange) and current-state read (FlushDue) see the live roster the hubs produce. It also
+        // shares the SAME session/connection registries the hubs register into, so a joined entry's
+        // display name/flair reflect the live ChatUser each test seeds.
+        _accumulator = new ViewersAccumulator(
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
+
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;

@@ -121,7 +121,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
         // The engine shares the SAME presence-interest registry the hubs mutate — so RegisterFocus (hub)
         // and GetInterestedConnections (engine's PushPresenceChanged) see one consistent index.
         _viewersAccumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
     }

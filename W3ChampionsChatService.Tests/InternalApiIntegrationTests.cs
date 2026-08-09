@@ -139,9 +139,10 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         _sessionRegistry = new SessionRegistry();
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
+        _connectionMapping = new ConnectionMapping();
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         _viewersAccumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext,
             _focusRegistry,
@@ -174,7 +175,6 @@ public class InternalApiIntegrationTests : IntegrationTestBase
 
         // The offline half of acceptance 3 — a real SessionStateAssembler over the SAME repositories/registries.
         _muteRepository = new MuteRepository(MongoClient);
-        _connectionMapping = new ConnectionMapping();
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
         _sessionStateAssembler = new SessionStateAssembler(
             _membershipRepository,

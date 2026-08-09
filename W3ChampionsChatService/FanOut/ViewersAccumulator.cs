@@ -54,10 +54,18 @@ public class ViewersAccumulator(
     // when computing the delta (FlushDue). Reads happen under _lock; FocusRegistry never calls back into
     // this accumulator, and every path here acquires this lock BEFORE FocusRegistry's, so there is no
     // lock-ordering cycle.
+    //
+    // The same invariant extends to _viewerResolver below: FlushDue calls ViewerResolver.Resolve (for each
+    // joined battleTag) while still holding _lock, which nests SessionRegistry's and ConnectionMapping's
+    // own locks inside this one. That nesting is safe for the same reason as FocusRegistry — SessionRegistry
+    // holds no reference back to FanOut/this accumulator, and ConnectionMapping is a dependency-free leaf —
+    // so neither can call back in and there is no cycle.
     private readonly FocusRegistry _focusRegistry = focusRegistry;
 
     // Resolves a joined battleTag into a full roster entry (display name + flair). Shared with
-    // ChatHub.FocusChannel so a join delta and an initial roster can never render differently.
+    // ChatHub.FocusChannel so a join delta and an initial roster can never render differently. Invoked from
+    // FlushDue WHILE _lock is held (see the field comment above) — its own SessionRegistry/ConnectionMapping
+    // locks are always the innermost in the nesting, never the outermost.
     private readonly Chats.ViewerResolver _viewerResolver = viewerResolver;
 
     // channelId -> the channel's accumulation window. Mutated only under _lock.
