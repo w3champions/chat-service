@@ -1,0 +1,354 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Connections.Features;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.AspNetCore.SignalR;
+using Moq;
+using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
+using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.FanOut;
+using W3ChampionsChatService.Memberships;
+using W3ChampionsChatService.Mentions;
+using W3ChampionsChatService.Mutes;
+using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
+using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
+
+namespace W3ChampionsChatService.Tests;
+
+/// <summary>
+/// Clan-channel membership tests (2026-08-09 clan-channel regression). The chat revamp (#33) rebuilt
+/// channels as server-persisted membership rows but shipped no clan path at all, so the clan channel —
+/// which the PRE-revamp launcher fabricated client-side as an ephemeral <c>clan &lt;tag&gt;</c> SignalR
+/// group — silently vanished for every clan member.
+/// <para>
+/// These tests pin the replacement contract: the connect path reconciles a System+<see
+/// cref="SystemChannelKind.Clan"/> channel keyed by the clan id ALREADY resolved from wb's
+/// <c>clan-and-picture</c> (<see cref="ChatUser.ClanTag"/>), so the membership is durable and lands in
+/// the SAME <c>SessionState</c> the client renders. Removal of a stale clan membership is gated on
+/// <see cref="ChatUserResolution.FreshFromWb"/> — the NEVER-CLOBBER invariant already used by the
+/// directory upsert: a wb outage resolves ClanTag to null, and that must never rip a user out of their
+/// clan channel.
+/// </para>
+/// </summary>
+public class ChatHubClanChannelTests : IntegrationTestBase
+{
+    private const string BattleTag = "peter#123";
+    private const string ClanId = "EwOk";
+
+    private TicketStore _ticketStore;
+    private SessionRegistry _sessionRegistry;
+    private ConnectionMapping _connectionMapping;
+    private UserDirectoryRepository _userDirectory;
+    private MuteRepository _muteRepository;
+    private MuteReconciliationService _reconcileService;
+    private Mock<IChatAuthenticationService> _authService;
+
+    private ChannelRepository _channelRepository;
+    private MembershipRepository _membershipRepository;
+    private FocusRegistry _focusRegistry;
+    private OnlineMemberRegistry _onlineMemberRegistry;
+    private MessageRateLimiter _messageRateLimiter;
+    private ReadRateLimiter _readRateLimiter;
+    private ChannelCreationRateLimiter _channelCreationRateLimiter;
+    private SessionStateAssembler _assembler;
+    private FakeRelationshipSource _relationshipSource;
+    private IRelationshipProvider _relationshipProvider;
+
+    // Ordered capture of (target, method, payload) so a test can assert on the ACTUAL SessionState the
+    // client would render, not merely that some event fired.
+    private readonly List<(string Target, string Method, object[] Args)> _sends = new();
+
+    [SetUp]
+    public void SetupBeforeEach()
+    {
+        _ticketStore = new TicketStore();
+        _sessionRegistry = new SessionRegistry();
+        _connectionMapping = new ConnectionMapping();
+        _userDirectory = new UserDirectoryRepository(MongoClient);
+        _muteRepository = new MuteRepository(MongoClient);
+        _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
+        _sends.Clear();
+
+        _authService = new Mock<IChatAuthenticationService>();
+        SetupResolution(ClanId, freshFromWb: true);
+
+        _channelRepository = new ChannelRepository(MongoClient);
+        _membershipRepository = new MembershipRepository(MongoClient, _channelRepository);
+        _focusRegistry = new FocusRegistry();
+        _onlineMemberRegistry = new OnlineMemberRegistry();
+        _messageRateLimiter = new MessageRateLimiter();
+        _readRateLimiter = new ReadRateLimiter();
+        _channelCreationRateLimiter = new ChannelCreationRateLimiter();
+        _relationshipSource = new FakeRelationshipSource();
+        _relationshipProvider = new RelationshipProvider(_relationshipSource, TimeProvider.System);
+        _assembler = new SessionStateAssembler(
+            _membershipRepository,
+            _channelRepository,
+            new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
+            _muteRepository,
+            _onlineMemberRegistry,
+            _connectionMapping,
+            new MentionInboxRepository(MongoClient));
+    }
+
+    /// <summary>Points the flair resolver at a given clan id / freshness tier.</summary>
+    private void SetupResolution(string clanId, bool freshFromWb)
+    {
+        _authService.Setup(m => m.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync((W3CUserAuthentication id) =>
+                new ChatUserResolution(
+                    new ChatUser(id.BattleTag, id.IsAdmin, clanId, new ProfilePicture(), null, null),
+                    freshFromWb));
+    }
+
+    private static W3CUserAuthentication Identity(string battleTag = BattleTag, string name = "peter") =>
+        new() { BattleTag = battleTag, Name = name, IsAdmin = false };
+
+    private ChatHub BuildConnection(string connectionId, string accessToken)
+    {
+        var hub = new ChatHub(
+            _connectionMapping,
+            _reconcileService,
+            _ticketStore,
+            _sessionRegistry,
+            _userDirectory,
+            _assembler,
+            _focusRegistry,
+            _onlineMemberRegistry,
+            _messageRateLimiter,
+            _readRateLimiter,
+            TimeProvider.System,
+            _channelRepository,
+            _membershipRepository,
+            _channelCreationRateLimiter,
+            new W3ChampionsChatService.Messages.MessageRepository(MongoClient),
+            FanOutEngineTestFactory.CreateIgnored(),
+            ViewersAccumulatorTestFactory.CreateIgnored(),
+            new NoOpMentionInboxCleaner(),
+            _relationshipProvider,
+            new UserSettingsRepository(MongoClient),
+            new DmInitiationTracker(),
+            _authService.Object,
+            MentionFanOutTestFactory.CreateIgnored(MongoClient),
+            new PresenceInterestRegistry(),
+            new MentionInboxRepository(MongoClient),
+            new NotificationPreferenceRepository(MongoClient));
+
+        var clients = new Mock<IHubCallerClients>();
+        clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
+        clients.Setup(c => c.Group(It.IsAny<string>())).Returns(CapturingGroup());
+        clients.Setup(c => c.Client(It.IsAny<string>())).Returns<string>(CapturingSingle);
+        hub.Clients = clients.Object;
+
+        var context = new Mock<HubCallerContext>();
+        context.Setup(c => c.ConnectionId).Returns(connectionId);
+        context.Setup(c => c.Features).Returns(BuildFeatures(accessToken));
+        hub.Context = context.Object;
+        hub.Groups = new Mock<IGroupManager>().Object;
+
+        return hub;
+    }
+
+    private static IFeatureCollection BuildFeatures(string accessToken)
+    {
+        var features = new FeatureCollection();
+        var httpContext = new DefaultHttpContext();
+        if (accessToken != null)
+        {
+            httpContext.Request.QueryString = new QueryString($"?access_token={accessToken}");
+        }
+        var httpContextFeature = new Mock<IHttpContextFeature>();
+        httpContextFeature.Setup(f => f.HttpContext).Returns(httpContext);
+        features.Set<IHttpContextFeature>(httpContextFeature.Object);
+        return features;
+    }
+
+    private ISingleClientProxy CapturingSingle(string target)
+    {
+        var proxy = new Mock<ISingleClientProxy>();
+        proxy.Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) => _sends.Add((target, method, args)))
+            .Returns(Task.CompletedTask);
+        return proxy.Object;
+    }
+
+    private IClientProxy CapturingGroup()
+    {
+        var proxy = new Mock<IClientProxy>();
+        proxy.Setup(p => p.SendCoreAsync(It.IsAny<string>(), It.IsAny<object[]>(), It.IsAny<CancellationToken>()))
+            .Callback<string, object[], CancellationToken>((method, args, _) => _sends.Add(("group", method, args)))
+            .Returns(Task.CompletedTask);
+        return proxy.Object;
+    }
+
+    /// <summary>The SessionState pushed to the caller — the exact snapshot the launcher renders from.</summary>
+    private SessionStateDto CapturedSessionState() =>
+        (SessionStateDto)_sends.Single(s => s.Method == ChatEvents.SessionState).Args[0];
+
+    private async Task<ChatHub> Connect(string connectionId = "conn-1", string battleTag = BattleTag)
+    {
+        var ticket = _ticketStore.Mint(Identity(battleTag), DateTime.UtcNow);
+        var hub = BuildConnection(connectionId, ticket);
+        await hub.OnConnectedAsync();
+        return hub;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Auto-join
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Connect_WithClan_CreatesClanChannelAndJoinsIt()
+    {
+        await Connect();
+
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+        Assert.IsNotNull(channel, "A clan member's connect must find-or-create the System+Clan channel shell");
+        Assert.AreEqual(ChannelType.System, channel.Type);
+        Assert.AreEqual(ClanId, channel.SystemRef, "SystemRef is the clan id straight from wb's clan-and-picture");
+        Assert.IsNull(channel.ExpiresAt, "A clan shell is permanent — ExpiresAt must stay ABSENT (ExpiryCalculator)");
+
+        var membership = await _membershipRepository.Load(channel.Id, BattleTag);
+        Assert.IsNotNull(membership, "The connecting clan member must be auto-joined to their clan channel");
+    }
+
+    [Test]
+    public async Task Connect_WithClan_ClanChannelIsInTheSessionStateSnapshot()
+    {
+        await Connect();
+
+        var state = CapturedSessionState();
+        var clanEntry = state.Channels.SingleOrDefault(c =>
+            c.Channel.Type == ChannelType.System && c.Channel.SystemKind == SystemChannelKind.Clan);
+
+        Assert.IsNotNull(clanEntry,
+            "Reconciliation must run BEFORE AssembleAndSeed — otherwise the membership exists but the "
+            + "client never sees it until the NEXT connect, which is the user-visible bug.");
+        Assert.AreEqual(ClanId, clanEntry.Channel.SystemRef);
+    }
+
+    [Test]
+    public async Task Connect_WithoutClan_CreatesNoClanChannel()
+    {
+        SetupResolution(clanId: null, freshFromWb: true);
+
+        await Connect();
+
+        var state = CapturedSessionState();
+        Assert.IsFalse(
+            state.Channels.Any(c => c.Channel.SystemKind == SystemChannelKind.Clan),
+            "A clanless user must get no clan channel");
+    }
+
+    [Test]
+    public async Task Connect_Twice_IsIdempotent_OneChannelOneMembership()
+    {
+        await Connect("conn-1");
+        _sends.Clear();
+        await Connect("conn-2");
+
+        var channels = await _channelRepository.LoadAllOfType(ChannelType.System);
+        Assert.AreEqual(1, channels.Count(c => c.SystemKind == SystemChannelKind.Clan),
+            "Reconnecting must not create a second clan channel shell");
+
+        var memberships = await _membershipRepository.LoadForUser(BattleTag);
+        Assert.AreEqual(1, memberships.Count, "Reconnecting must not duplicate the clan membership");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Reconciliation on clan change
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Connect_AfterClanChange_DropsStaleClanMembershipAndJoinsTheNewOne()
+    {
+        await Connect("conn-1");
+        var oldChannel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        SetupResolution("s4s", freshFromWb: true);
+        _sends.Clear();
+        await Connect("conn-2");
+
+        Assert.IsNull(await _membershipRepository.Load(oldChannel.Id, BattleTag),
+            "Switching clans must drop the membership in the previous clan's channel");
+
+        var newChannel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, "s4s");
+        Assert.IsNotNull(await _membershipRepository.Load(newChannel.Id, BattleTag),
+            "Switching clans must join the new clan's channel");
+    }
+
+    [Test]
+    public async Task Connect_AfterLeavingClan_DropsTheClanMembership()
+    {
+        await Connect("conn-1");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        SetupResolution(clanId: null, freshFromWb: true);
+        _sends.Clear();
+        await Connect("conn-2");
+
+        Assert.IsNull(await _membershipRepository.Load(channel.Id, BattleTag),
+            "A FRESH wb read saying the user has no clan is authoritative — the membership must go");
+    }
+
+    [Test]
+    public async Task Connect_DuringWbOutage_NeverRemovesAnExistingClanMembership()
+    {
+        await Connect("conn-1");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        // A total wb + directory-cache miss resolves ClanTag to null with FreshFromWb: false
+        // (ChatAuthenticationService tier 3). That null is an ABSENCE OF DATA, not a clan departure.
+        SetupResolution(clanId: null, freshFromWb: false);
+        _sends.Clear();
+        await Connect("conn-2");
+
+        Assert.IsNotNull(await _membershipRepository.Load(channel.Id, BattleTag),
+            "NEVER-CLOBBER: a wb outage must not evict the user from their clan channel");
+
+        var state = CapturedSessionState();
+        Assert.IsTrue(
+            state.Channels.Any(c => c.Channel.SystemKind == SystemChannelKind.Clan),
+            "The clan channel must survive an outage connect in the rendered snapshot too");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Non-leavable
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task LeaveChannel_OnClanChannel_IsRejectedAndMembershipSurvives()
+    {
+        var hub = await Connect();
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        var result = await hub.LeaveChannel(channel.Id);
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code,
+            "A clan channel is not user-leavable (product decision 2026-08-09)");
+        Assert.IsNotNull(await _membershipRepository.Load(channel.Id, BattleTag),
+            "A rejected leave must not delete the membership row");
+    }
+
+    [Test]
+    public async Task LeaveChannel_OnANonClanChannel_StillWorks()
+    {
+        var hub = await Connect();
+        var join = await hub.JoinChannel("Some Room");
+
+        var result = await hub.LeaveChannel(join.Channel.Id);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code,
+            "The clan carve-out must not regress the type-agnostic escape hatch for every other kind (H4)");
+        Assert.IsNull(await _membershipRepository.Load(join.Channel.Id, BattleTag));
+    }
+}

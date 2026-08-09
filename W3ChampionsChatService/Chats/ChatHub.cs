@@ -223,6 +223,13 @@ public partial class ChatHub(
         // one round-trip per connect, not two. Still fire-and-forget and non-fatal.
         _ = PushFriendPresenceFromSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId, relationshipSnapshot);
 
+        // Clan-channel reconciliation (2026-08-09) — MUST run BEFORE AssembleAndSeed, which reads the
+        // membership rows this may write. Reuses the clan id already carried by `resolution` (the same wb
+        // round-trip hoisted above for flair), so it costs no extra network call. Self-contained and
+        // fail-soft — see ChatHub.Clan.cs for the full rationale, including why removal is gated on
+        // resolution.FreshFromWb.
+        await ReconcileClanMembership(identity, resolution, now);
+
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
         // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
         // snapshot to the CALLER only — it is that connection's private state rebuild (spec acceptance
