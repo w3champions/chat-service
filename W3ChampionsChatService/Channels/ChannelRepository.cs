@@ -303,6 +303,15 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
         Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Detached, true));
 
     /// <summary>
+    /// Marks the room a LADDER match — see <see cref="ChatChannel.Ladder"/> for why the flag exists and
+    /// why it is STICKY-TRUE. Idempotent, and deliberately WRITE-ONLY-TRUE: there is no clearing
+    /// counterpart, so no update can un-moderate a live ladder room. (Deleting the channel does drop the
+    /// flag with the rest of the document — see the Ladder doc for why that is left alone.)
+    /// </summary>
+    public virtual Task SetLadder(string channelId) =>
+        Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Ladder, true));
+
+    /// <summary>
     /// Every System+Match channel eligible for an epoch sync — NOT detached (a detached room is excluded
     /// from every sweep by design, so it is filtered out server-side and never even loaded) AND already
     /// stamped by the assertion protocol (<c>AssertEpoch</c> exists).

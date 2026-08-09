@@ -44,6 +44,23 @@ public class InternalChannelCreateRequest
     public string Epoch { get; set; }
     public long? Seq { get; set; }
     public bool? Detached { get; set; }
+
+    /// <summary>
+    /// Declares this ref a LADDER match rather than a custom-game lobby. Absent/false ⇒ custom lobby
+    /// (today's behavior, byte-for-byte). The ONLY consumer is the send-path mute scope
+    /// (<see cref="Channels.ChannelModeration.IsMuteEnforced"/>): a lounge-muted or shadow-banned
+    /// player must not be able to talk in a ladder game's in-game/post-game room, while a custom
+    /// lobby stays exempt.
+    /// <para>
+    /// Deliberately SEPARATE from <see cref="Detached"/> even though mm happens to send both together
+    /// on the ladder create path today. Detach means "membership is frozen, sweeps skip this"; it is
+    /// also set on every custom lobby at GAME_STARTED, so it does not — and must never be made to —
+    /// answer "is this ladder". Inferring one from the other would silently un-moderate ladder rooms
+    /// the day mm's detach timing changes.
+    /// </para>
+    /// STICKY-TRUE server-side: see <see cref="Channels.ChatChannel.Ladder"/>.
+    /// </summary>
+    public bool? Ladder { get; set; }
 }
 
 /// <summary>
@@ -72,6 +89,22 @@ public class InternalRosterAssertRequest
     public List<string> Members { get; set; }
     public string Name { get; set; }
     public bool? Detached { get; set; }
+
+    /// <summary>
+    /// Same meaning as <see cref="InternalChannelCreateRequest.Ladder"/>. Carried on this route too
+    /// because the roster endpoint is ALSO a channel-creating path: mm's ladder create has a
+    /// retry-on-failure fallback that converges through <c>PUT .../roster</c> instead, and that
+    /// assertion may well be the call that creates the channel on demand. Without the flag here, a
+    /// ladder room born on the fallback path would be indistinguishable from a custom lobby and would
+    /// silently escape the mute gate.
+    /// <para>
+    /// Applied BEFORE the detach-freeze and staleness gates, and independently of them: it is a
+    /// property assertion about the ref, not a membership mutation, so a stale/duplicate/frozen
+    /// assertion that legitimately discards its ROSTER must still be able to correct the room's
+    /// classification.
+    /// </para>
+    /// </summary>
+    public bool? Ladder { get; set; }
 }
 
 /// <summary>
@@ -112,8 +145,13 @@ public class InternalRelationshipChangeRequest
 /// 9) — System.Text.Json's default camelCase serialization matches the wire contract mm expects, so no
 /// custom naming policy is needed.
 /// </summary>
-public record InternalChannelDto(string Id, string Ref, string Name, DateTime? ExpiresAt)
+/// <para>
+/// <c>Ladder</c> is the STORED classification read back, not an echo of the request: because the flag
+/// is sticky-true, "what mm sent" and "what the channel now holds" diverge on exactly the calls worth
+/// diagnosing (a create omitting the flag against an already-ladder ref). Additive — mm may ignore it.
+/// </para>
+public record InternalChannelDto(string Id, string Ref, string Name, DateTime? ExpiresAt, bool Ladder)
 {
     public static InternalChannelDto FromChannel(ChatChannel channel) =>
-        new(channel.Id, channel.SystemRef, channel.Name, channel.ExpiresAt);
+        new(channel.Id, channel.SystemRef, channel.Name, channel.ExpiresAt, channel.Ladder);
 }

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
@@ -85,9 +86,14 @@ public partial class ChatHub
     /// <see cref="ChannelType.GroupDm"/> ONLY: block/consent/cap handling that may silently short-circuit
     /// with a fabricated <see cref="ChatResultCode.Ok"/> (<c>FakeSendAck</c>) or the one fail-closed
     /// <see cref="ChatResultCode.Throttled"/> — see <see cref="ApplyPrivateLaneGates"/>.</item>
-    /// <item>Mute gate — PUBLIC channels ONLY (guardrail: semiPublic/system/dm are exempt, preserving
-    /// the legacy mute-scope). Reads <see cref="ConnectionMapping.GetEffectiveMuteStatus"/> (cache-only,
-    /// zero DB): <see cref="MuteStatus.Full"/> → <see cref="ChatResultCode.Muted"/>;
+    /// <item>Mute gate — scoped by <see cref="Channels.ChannelModeration.IsMuteEnforced"/>: PUBLIC
+    /// channels and LADDER match rooms (<see cref="ChannelType.System"/> +
+    /// <see cref="SystemChannelKind.Match"/> + <see cref="Channels.ChatChannel.Ladder"/>). semiPublic /
+    /// dm / groupDm / System+Clan / System+Lobby AND custom-game match rooms are exempt — the legacy
+    /// mute scope, widened by exactly the ladder carve-in (a muted player must not be able to talk in a
+    /// ladder game's in-game/post-game room; a custom lobby is the host's own room and stays exempt).
+    /// Reads <see cref="ConnectionMapping.GetEffectiveMuteStatus"/> (cache-only, zero DB):
+    /// <see cref="MuteStatus.Full"/> → <see cref="ChatResultCode.Muted"/>;
     /// <see cref="MuteStatus.Shadow"/> → flag the message and persist (returns Ok — the illusion).</item>
     /// <item>Persist (C1 amendment, mandatory — else the TTL is inert):
     /// <see cref="Channels.ChannelRepository.AllocateSeq"/> atomically $inc LastSeq + $set LastMessageAt,
@@ -251,9 +257,11 @@ public partial class ChatHub
             }
         }
 
-        // 6. Mute gate — PUBLIC channels ONLY (guardrail: never gate semiPublic/system/dm).
+        // 6. Mute gate — the ChannelModeration.IsMuteEnforced scope: Public channels and LADDER match
+        // rooms (System+Match with Ladder=true). semiPublic / dm / groupDm / System+Clan / System+Lobby
+        // and CUSTOM-GAME match rooms stay exempt (the legacy mute scope, minus the ladder carve-in).
         var isShadow = false;
-        if (channel.Type == ChannelType.Public)
+        if (ChannelModeration.IsMuteEnforced(channel))
         {
             var muteStatus = _connections.GetEffectiveMuteStatus(connectionId, now);
             if (muteStatus == MuteStatus.Full)
@@ -503,12 +511,15 @@ public partial class ChatHub
         //
         // This branch does NOT re-apply the {Public, SemiPublic, System+Match} scope wall that
         // single-delete/purge/the REST endpoint enforce — it is safe only emergently, by construction
-        // of the write paths: a shadow==true row can exist ONLY in a Public channel (the shadow flag is
-        // set Public-only at send time), and a deleted!=null row can exist ONLY in a moderatable channel
-        // (both delete paths are themselves scope-walled). So in any DM/GroupDm/System+Clan/System+Lobby
-        // channel a moderator happens to be a member of, ForModerator is byte-identical to
-        // ForUserDelivery — no private content or flag leaks. This safety depends on those write-time
-        // invariants holding in the send path and delete paths; it is not re-verified here.
+        // of the write paths: a shadow==true row can exist ONLY where the send-path mute gate runs, i.e.
+        // ChannelModeration.IsMuteEnforced — Public or a LADDER System+Match room — and a deleted!=null
+        // row can exist ONLY in a moderatable channel (both delete paths are themselves scope-walled).
+        // BOTH of those sets are SUBSETS of IsModeratable, which is what makes this safe: in any
+        // DM/GroupDm/System+Clan/System+Lobby channel a moderator happens to be a member of,
+        // ForModerator is byte-identical to ForUserDelivery — no private content or flag leaks. (The
+        // ladder carve-in did not widen the exposure: System+Match was already inside IsModeratable, so
+        // a ladder room's shadow rows are legitimately moderator-visible.) This safety depends on those
+        // write-time invariants holding in the send path and delete paths; it is not re-verified here.
         if (session.HasPermission(EPermission.Moderation))
         {
             var moderatorPage = aroundSeq.HasValue

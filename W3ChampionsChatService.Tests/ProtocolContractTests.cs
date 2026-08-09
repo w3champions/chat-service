@@ -387,12 +387,15 @@ public class ProtocolContractTests
     {
         // D6: AssertEpoch/AssertSeq/Detached are mm<->chat reconciliation bookkeeping, never client
         // protocol — the raw entity rides ChannelAddedDto.Channel / ChannelDto.Channel to clients.
+        // Ladder joins them: it is the mm-declared ladder-vs-custom classification the send-path mute
+        // gate reads server-side, not something a client is told or could act on.
         var channel = new ChatChannel
         {
             Id = "c1",
             AssertEpoch = "e1",
             AssertSeq = 5,
             Detached = true,
+            Ladder = true,
         };
 
         var json = JsonSerializer.Serialize(channel);
@@ -403,6 +406,8 @@ public class ProtocolContractTests
         StringAssert.DoesNotContain("AssertSeq", json);
         StringAssert.DoesNotContain("detached", json);
         StringAssert.DoesNotContain("Detached", json);
+        StringAssert.DoesNotContain("ladder", json);
+        StringAssert.DoesNotContain("Ladder", json);
         // Positive control — proves the object really did serialize.
         StringAssert.Contains("Id", json);
     }
