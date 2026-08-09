@@ -89,7 +89,10 @@ public class MembershipRepository(MongoClient mongoClient, ChannelRepository cha
         return Memberships.Find(m => m.BattleTag == tag).Project(m => m.ChannelId).ToListAsync();
     }
 
-    public Task Delete(string channelId, string battleTag)
+    // Virtual: a test seam, mirroring DeleteOrphanedForUser's existing precedent in this class. PR40
+    // review (P1) made clan-membership REVOCATION fail-closed, and the only way to prove a failed delete
+    // fails the connect (rather than silently leaving the user in a former clan) is a throwing double.
+    public virtual Task Delete(string channelId, string battleTag)
     {
         var tag = NormalizeTag(battleTag);
         return Memberships.DeleteOneAsync(m => m.ChannelId == channelId && m.BattleTag == tag);
