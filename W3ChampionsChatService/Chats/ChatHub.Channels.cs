@@ -434,6 +434,22 @@ public partial class ChatHub
     /// exactly the case the escape hatch exists for. No behavior change; this codifies the decision to
     /// keep the exception as-is rather than adding a server-side no-op-for-live-match-channel guard.
     /// </para>
+    /// <para>
+    /// CLAN CARVE-OUT (2026-08-09 clan-channel regression) — product decision (Marco, 2026-08-09): H4's
+    /// type-agnostic rule now has EXACTLY ONE exception. A System+<see cref="SystemChannelKind.Clan"/>
+    /// channel is NOT user-leavable and is rejected below with <see cref="ChatResultCode.PermissionDenied"/>
+    /// before any mutation. Rationale: clan membership is owned by wb, not by the chat user, so "leaving"
+    /// a clan channel is not a state the user is entitled to author — and unlike a live match channel
+    /// there is no assertion stream to silently restore it, so an ungated leave would strand the user
+    /// outside their clan channel until their clan membership itself changed. The escape hatch is
+    /// deliberately narrowed rather than removed: EVERY other kind (Public, SemiPublic, Dm, GroupDm,
+    /// System+Match, System with no kind, and a vanished/unresolvable channel) keeps the unconditional
+    /// force-leave behaviour H4 exists to protect. The launcher correspondingly hides Leave for clan rows
+    /// (<c>launcher-e/src/components/chat/ChannelListRow.tsx</c>, <c>isClanChannel</c>), so this server
+    /// gate is the authoritative backstop for a stale/hand-rolled client rather than the primary UX.
+    /// Note the ASYMMETRY with the match case above: a clan leave is refused OUTRIGHT, whereas a live
+    /// match leave is permitted and then reverted by the next roster assertion.
+    /// </para>
     /// </summary>
     public async Task<ChannelOperationResult> LeaveChannel(string channelId)
     {
@@ -447,6 +463,15 @@ public partial class ChatHub
         // Load the channel BEFORE mutating so the departure can branch by type. A missing/vanished channel
         // stays a no-op Ok (treated as non-private-lane below) — LeaveChannel never returns NotFound.
         var channel = await _channelRepository.Load(channelId);
+
+        // Clan carve-out (see the doc comment above): the ONE type that is not user-leavable. Checked
+        // BEFORE any mutation so a rejected leave is a true no-op — no membership delete, no registry
+        // eviction, no viewer-roster delta. A null/vanished channel falls through to the ungated path, as
+        // it always has.
+        if (channel != null && channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Clan)
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
+        }
 
         await _membershipRepository.Delete(channelId, battleTag);
         _onlineMemberRegistry.Leave(channelId, Context.ConnectionId);
