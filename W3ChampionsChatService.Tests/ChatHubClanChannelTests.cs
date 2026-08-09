@@ -321,9 +321,152 @@ public class ChatHubClanChannelTests : IntegrationTestBase
             "The clan channel must survive an outage connect in the rendered snapshot too");
     }
 
+    [Test]
+    public async Task Connect_WhenClanShellCreationFails_StillConnects_WithoutTheClanChannel()
+    {
+        // PR41 review (P2): creating the channel shell is part of the GRANT, not the revocation, so it
+        // belongs on the fail-soft path. Creating a shell grants nobody access, and this call sits on the
+        // hot path every clan member takes on every connect — rejecting the connection over a transient
+        // channel-upsert fault would be an availability regression, and would contradict the stated
+        // policy that only revocation is fatal.
+        var throwingChannels = new Mock<ChannelRepository>(MongoClient) { CallBase = true };
+        throwingChannels
+            .Setup(c => c.FindOrCreateSystem(SystemChannelKind.Clan, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTime>()))
+            .ThrowsAsync(new TimeoutException("mongo hiccup"));
+        _channelRepository = throwingChannels.Object;
+
+        Assert.DoesNotThrowAsync(async () => await Connect(),
+            "a failed clan-shell creation must never cost the user their chat session");
+
+        var state = CapturedSessionState();
+        Assert.IsFalse(
+            state.Channels.Any(c => c.Channel.SystemKind == SystemChannelKind.Clan),
+            "the user simply connects without the clan channel and self-heals on the next connect");
+    }
+
+    [Test]
+    public async Task Connect_AfterLeavingClan_RevokesEvenWhenNoShellIsEverCreated()
+    {
+        // Guards the PR41 restructure: staleness is now derived from SystemRef, so departure revocation
+        // must work without a target shell existing at all (the clanRef == null path creates nothing).
+        await Connect("conn-1");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        SetupResolution(clanId: null, freshFromWb: true);
+        _sends.Clear();
+        await Connect("conn-2");
+
+        Assert.IsNull(await _membershipRepository.Load(channel.Id, BattleTag),
+            "a fresh 'no clan' read must still revoke, with no shell resolution involved");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PR40 review — displaced connects must not write clan state (P2)
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Reconcile_FromADisplacedConnection_WritesNothing()
+    {
+        // Two connects for the same battleTag overlap: registering conn-2 aborts conn-1's context but does
+        // NOT cancel its in-flight OnConnectedAsync, which still holds the clan snapshot IT captured. If
+        // the loser finished last it would re-add the old membership and delete the new one — durable
+        // state decided by scheduling order. Driven directly because the race is mid-connect by nature.
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var staleHub = BuildConnection("conn-1", ticket);
+        _sessionRegistry.Register("conn-1", Identity(), staleHub.Context);
+
+        // conn-2 arrives and displaces conn-1.
+        _sessionRegistry.Register("conn-2", Identity(), BuildConnection("conn-2", "t2").Context);
+
+        await staleHub.ReconcileClanMembership(
+            Identity(),
+            new ChatUserResolution(
+                new ChatUser(BattleTag, false, ClanId, new ProfilePicture(), null, null), true),
+            DateTime.UtcNow);
+
+        Assert.IsNull(await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId),
+            "a displaced connection must not write clan state — the winner's view is the one that counts");
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Non-leavable
     // ---------------------------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------------------------
+    // PR40 review — freshness as an access-control gate (P1)
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Connect_WithCachedClanFlairDuringOutage_DoesNotGrantClanAccess()
+    {
+        // The scenario the review identified: directory entries are retained forever, but
+        // CleanupJobs.PruneIdleMemberships deletes the membership rows of users idle > 1 year. A user who
+        // left their clan while inactive therefore returns with a cached ClanId naming a clan they are no
+        // longer in, and no membership row to contradict it. Granting access off that cached value would
+        // re-admit them to the clan channel AND its retained history.
+        SetupResolution(ClanId, freshFromWb: false);
+
+        await Connect();
+
+        Assert.IsNull(await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId),
+            "a non-fresh resolution must not even create the clan shell");
+
+        var state = CapturedSessionState();
+        Assert.IsFalse(
+            state.Channels.Any(c => c.Channel.SystemKind == SystemChannelKind.Clan),
+            "clan access must never be granted from unverifiable cached flair");
+    }
+
+    [Test]
+    public async Task Connect_DuringWbOutage_MakesNoClanWritesAtAll()
+    {
+        // Regression guard for the tightening: the earlier rule was "additive-only when not fresh", which
+        // still granted access. The rule is now "no writes at all" — an existing membership is preserved
+        // untouched (asserted below and in the outage test above), nothing is created.
+        await Connect("conn-1");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+        var before = await _membershipRepository.Load(channel.Id, BattleTag);
+
+        SetupResolution("s4s", freshFromWb: false);
+        _sends.Clear();
+        await Connect("conn-2");
+
+        Assert.IsNotNull(await _membershipRepository.Load(channel.Id, BattleTag),
+            "a non-fresh resolution must preserve the existing membership");
+        Assert.IsNull(await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, "s4s"),
+            "a non-fresh resolution must not act on its (unverifiable) new clan id either");
+        Assert.AreEqual(before.JoinedAt, (await _membershipRepository.Load(channel.Id, BattleTag)).JoinedAt,
+            "the preserved membership must be left byte-identical, not re-written");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // PR40 review — fail-closed revocation (P1)
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Connect_WhenStaleClanRemovalFails_FailsTheConnectRatherThanKeepingAccess()
+    {
+        await Connect("conn-1");
+        var oldChannel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        // A membership repository whose stale-row delete always fails. Swallowing this would leave the
+        // user readable/writable in their FORMER clan, which AssembleAndSeed would then seed.
+        var throwingMemberships = new Mock<MembershipRepository>(MongoClient, _channelRepository) { CallBase = true };
+        throwingMemberships
+            .Setup(m => m.Delete(oldChannel.Id, It.IsAny<string>()))
+            .ThrowsAsync(new TimeoutException("mongo hiccup"));
+        _membershipRepository = throwingMemberships.Object;
+
+        SetupResolution("s4s", freshFromWb: true);
+        _sends.Clear();
+
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var hub = BuildConnection("conn-2", ticket);
+
+        Assert.ThrowsAsync<TimeoutException>(
+            async () => await hub.OnConnectedAsync(),
+            "a failed revocation must fail the connect — never silently leave the user in their old clan");
+    }
 
     [Test]
     public async Task LeaveChannel_OnClanChannel_IsRejectedAndMembershipSurvives()

@@ -198,7 +198,10 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// omitting it, which the TTL convention documented on <see cref="Domain.ChatDomainIndexes"/>
     /// requires). Two concurrent calls for the SAME (kind, ref) resolve to exactly one document.
     /// </summary>
-    public async Task<ChatChannel> FindOrCreateSystem(SystemChannelKind kind, string systemRef, string name, DateTime now)
+    // Virtual: a test seam (same rationale as MembershipRepository.Delete / DeleteOrphanedForUser). PR41
+    // review (P2) moved this call onto the clan reconciler's FAIL-SOFT join path, and a throwing double is
+    // the only way to prove a shell-creation fault leaves the connect intact instead of rejecting it.
+    public virtual async Task<ChatChannel> FindOrCreateSystem(SystemChannelKind kind, string systemRef, string name, DateTime now)
     {
         var expiresAt = ExpiryCalculator.ForChannelShell(new ChatChannel { Type = ChannelType.System, SystemKind = kind }, now);
 

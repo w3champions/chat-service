@@ -225,9 +225,14 @@ public partial class ChatHub(
 
         // Clan-channel reconciliation (2026-08-09) — MUST run BEFORE AssembleAndSeed, which reads the
         // membership rows this may write. Reuses the clan id already carried by `resolution` (the same wb
-        // round-trip hoisted above for flair), so it costs no extra network call. Self-contained and
-        // fail-soft — see ChatHub.Clan.cs for the full rationale, including why removal is gated on
-        // resolution.FreshFromWb.
+        // round-trip hoisted above for flair), so it costs no extra network call.
+        //
+        // PARTIALLY FATAL (PR40 review P1) — deliberately NOT fully fail-soft. Revoking a stale clan
+        // membership (and the read that identifies one) throws on failure, because a swallowed failure
+        // would leave the user with live access to a former clan's channel that AssembleAndSeed seeds on
+        // the very next line. Joining is fail-soft internally. So this await can fail the connect for the
+        // same class of Mongo fault that AssembleAndSeed below already treats as fatal — see
+        // ChatHub.Clan.cs for the full rationale.
         await ReconcileClanMembership(identity, resolution, now);
 
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
