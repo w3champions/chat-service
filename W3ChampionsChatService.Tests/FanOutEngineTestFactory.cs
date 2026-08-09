@@ -1,4 +1,5 @@
 using System;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Sessions;
 
@@ -31,7 +32,7 @@ internal static class FanOutEngineTestFactory
             new ActivityCoalescer(harness.HubContext, members),
             new SessionRegistry(),
             new PresenceInterestRegistry(),
-            new ViewersAccumulator(harness.HubContext, focus),
+            new ViewersAccumulator(harness.HubContext, focus, new ViewerResolver(new SessionRegistry(), new ConnectionMapping())),
             TimeProvider.System);
     }
 }

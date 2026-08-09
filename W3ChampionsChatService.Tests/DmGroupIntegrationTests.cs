@@ -130,7 +130,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         // The three fan-out sinks ALL push through the ONE shared harness and read the SHARED registries
         // the hubs mutate, so every push lands in a single ordered capture.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _viewersAccumulator = new ViewersAccumulator(
+            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry(), _viewersAccumulator, _time);
 

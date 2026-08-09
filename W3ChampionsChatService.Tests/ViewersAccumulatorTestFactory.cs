@@ -17,5 +17,10 @@ namespace W3ChampionsChatService.Tests;
 internal static class ViewersAccumulatorTestFactory
 {
     internal static ViewersAccumulator CreateIgnored() =>
-        new ViewersAccumulator(new HubPushCaptureHarness().HubContext, new FocusRegistry());
+        new ViewersAccumulator(
+            new HubPushCaptureHarness().HubContext,
+            new FocusRegistry(),
+            new W3ChampionsChatService.Chats.ViewerResolver(
+                new W3ChampionsChatService.Sessions.SessionRegistry(),
+                new W3ChampionsChatService.Chats.ConnectionMapping()));
 }

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Messages;
@@ -72,7 +73,7 @@ public class ActivityCoalescerTests
         var focus = new FocusRegistry();
         var members = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus), TimeProvider.System);
+        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus, new ViewerResolver(new SessionRegistry(), new ConnectionMapping())), TimeProvider.System);
         return (harness, focus, members, engine);
     }
 
@@ -408,7 +409,7 @@ public class ActivityCoalescerTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, new FocusRegistry()), TimeProvider.System);
+        var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, new FocusRegistry(), new ViewerResolver(new SessionRegistry(), new ConnectionMapping())), TimeProvider.System);
 
         // A send routes an offer to the unfocused level-All member, creating coalescing state.
         await engine.OnMessagePersisted(Channel(), Message(seq: 5), AuthorConn, isShadow: false, T0);

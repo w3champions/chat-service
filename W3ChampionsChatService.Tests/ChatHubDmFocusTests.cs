@@ -73,7 +73,8 @@ public class ChatHubDmFocusTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         // The accumulator shares the SAME FocusRegistry the hubs mutate — its baseline capture
         // (RecordChange) and current-state read (FlushDue) see the live roster the hubs produce.
-        _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _accumulator = new ViewersAccumulator(
+            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
 
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _sessionRegistry = new SessionRegistry();

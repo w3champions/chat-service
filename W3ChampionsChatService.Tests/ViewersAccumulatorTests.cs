@@ -53,7 +53,8 @@ public class ViewersAccumulatorTests : IntegrationTestBase
     {
         var harness = new HubPushCaptureHarness();
         var focus = new FocusRegistry();
-        var accumulator = new ViewersAccumulator(harness.HubContext, focus);
+        var accumulator = new ViewersAccumulator(
+            harness.HubContext, focus, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
         return (harness, focus, accumulator);
     }
 
@@ -68,6 +69,9 @@ public class ViewersAccumulatorTests : IntegrationTestBase
 
     private static bool Contains(IEnumerable<string> tags, string battleTag) =>
         tags.Any(t => string.Equals(t, battleTag, StringComparison.OrdinalIgnoreCase));
+
+    private static bool Contains(IEnumerable<ChannelViewerDto> viewers, string battleTag) =>
+        viewers.Any(v => string.Equals(v.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase));
 
     // ---- PURE: accumulate / flush ------------------------------------------------------------------
 
@@ -121,7 +125,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         Assert.AreSame(payloadA, payloadD, "the SAME batch object must be sent to every focused viewer (no per-connection deltas)");
 
         var batch = (ViewersChangedDto)payloadA;
-        Assert.That(batch.Joined, Is.EquivalentTo(new[] { "alice#1", "bob#2", "dan#4" }), "the shared batch carries every joiner");
+        Assert.That(batch.Joined.Select(j => j.BattleTag), Is.EquivalentTo(new[] { "alice#1", "bob#2", "dan#4" }), "the shared batch carries every joiner");
         Assert.IsEmpty(batch.Left);
         Assert.AreEqual(1, harness.SignalCount("conn-a", ChatEvents.ViewersChanged), "each focused viewer receives the batch exactly once");
     }
@@ -263,15 +267,18 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         _time = new FakeTimeProvider(new DateTimeOffset(T0, TimeSpan.Zero));
         _harness = new HubPushCaptureHarness();
         _focusRegistry = new FocusRegistry();
-        // The accumulator shares the SAME FocusRegistry the hubs mutate — so its baseline capture (in
-        // RecordChange) and its current-state read (in FlushDue) see the live roster the hubs produce.
-        _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
 
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _sessionRegistry = new SessionRegistry();
         _messageRateLimiter = new MessageRateLimiter();
         _readRateLimiter = new ReadRateLimiter();
         _connectionMapping = new ConnectionMapping();
+        // The accumulator shares the SAME FocusRegistry the hubs mutate — so its baseline capture (in
+        // RecordChange) and its current-state read (in FlushDue) see the live roster the hubs produce.
+        // It also shares the SAME session/connection registries the hubs register into, so a joined
+        // entry's flair reflects the live ChatUser each test seeds.
+        _accumulator = new ViewersAccumulator(
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -509,5 +516,44 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         Assert.IsTrue(Contains(charlieBatches.Last().Left, BattleTagB),
             "an explicit LeaveChannel while staying connected MUST be reported as a leave");
         Assert.IsFalse(Contains(charlieBatches.Last().Joined, BattleTagB));
+    }
+
+    [Test]
+    public async Task FlushDue_JoinedEntries_CarryFlairAndDisplayName()
+    {
+        // This test needs SEEDED registries so the resolver has flair to find, so it builds its own
+        // accumulator rather than using NewAccumulator() (which wires empty ones).
+        var harness = new HubPushCaptureHarness();
+        var focus = new FocusRegistry();
+        var sessions = new SessionRegistry();
+        var connections = new ConnectionMapping();
+        var accumulator = new ViewersAccumulator(
+            harness.HubContext, focus, new ViewerResolver(sessions, connections));
+
+        const string joiner = "alice#1";
+
+        sessions.Register("conn-a", new W3CUserAuthentication { BattleTag = joiner, Name = "Alice" }, null);
+        connections.RegisterUser("conn-a", new ChatUser(
+            joiner,
+            false,
+            "W3C",
+            new ProfilePicture { Race = AvatarCategory.UD, PictureId = 4, IsClassic = false },
+            new ChatColor("chat_color_gold"),
+            [new ChatIcon("chat_icon_star")]));
+
+        accumulator.RecordChange(ChannelId, joiner, T0);
+        focus.Focus("conn-a", ChannelId, joiner);
+
+        await accumulator.FlushDue(T0 + Flush);
+
+        var batch = ViewersChangedFor(harness, "conn-a").Single();
+        var joined = batch.Joined.Single();
+
+        Assert.AreEqual(joiner, joined.BattleTag);
+        Assert.AreEqual("Alice", joined.Name, "A join must carry the display name, not just the battleTag");
+        Assert.IsNotNull(joined.Profile, "A join must carry flair so the roster never renders a default avatar");
+        Assert.AreEqual(AvatarCategory.UD, joined.Profile.ProfilePicture.Race);
+        Assert.AreEqual(4, joined.Profile.ProfilePicture.PictureId);
+        Assert.AreEqual("chat_color_gold", joined.Profile.ChatColor.ColorId);
     }
 }

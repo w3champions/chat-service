@@ -42,7 +42,10 @@ namespace W3ChampionsChatService.FanOut;
 /// <para>Singleton (registered in <see cref="Startup"/>). Task 15 drives <see cref="FlushDue"/> from the
 /// 1s-granularity hosted flush service.</para>
 /// </summary>
-public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry focusRegistry)
+public class ViewersAccumulator(
+    IHubContext<ChatHub> hubContext,
+    FocusRegistry focusRegistry,
+    Chats.ViewerResolver viewerResolver)
 {
     // The SignalR delivery channel — pushes the shared ViewersChanged batch to each focused connection.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
@@ -52,6 +55,10 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
     // this accumulator, and every path here acquires this lock BEFORE FocusRegistry's, so there is no
     // lock-ordering cycle.
     private readonly FocusRegistry _focusRegistry = focusRegistry;
+
+    // Resolves a joined battleTag into a full roster entry (display name + flair). Shared with
+    // ChatHub.FocusChannel so a join delta and an initial roster can never render differently.
+    private readonly Chats.ViewerResolver _viewerResolver = viewerResolver;
 
     // channelId -> the channel's accumulation window. Mutated only under _lock.
     private readonly Dictionary<string, ChannelWindow> _windows = new Dictionary<string, ChannelWindow>();
@@ -121,14 +128,14 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
                     continue;
                 }
 
-                var joined = new List<string>();
+                var joined = new List<ChannelViewerDto>();
                 var left = new List<string>();
                 foreach (var (battleTag, wasViewing) in window.Baseline)
                 {
                     var isViewing = IsCurrentlyViewingNoLock(channelId, battleTag);
                     if (isViewing && !wasViewing)
                     {
-                        joined.Add(battleTag);
+                        joined.Add(_viewerResolver.Resolve(battleTag));
                     }
                     else if (!isViewing && wasViewing)
                     {

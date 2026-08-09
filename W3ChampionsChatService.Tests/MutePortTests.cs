@@ -113,7 +113,8 @@ public class MutePortTests : IntegrationTestBase
         _assembler = NewAssembler(_muteRepository);
 
         _pushHarness = new HubPushCaptureHarness();
-        _accumulator = new ViewersAccumulator(_pushHarness.HubContext, _focusRegistry);
+        _accumulator = new ViewersAccumulator(
+            _pushHarness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
     }
 
     // ── Hub construction ─────────────────────────────────────────────────────────
@@ -320,6 +321,9 @@ public class MutePortTests : IntegrationTestBase
 
     private static bool ContainsTag(IEnumerable<string> tags, string battleTag) =>
         tags.Any(t => string.Equals(t, battleTag, StringComparison.OrdinalIgnoreCase));
+
+    private static bool ContainsTag(IEnumerable<ChannelViewerDto> viewers, string battleTag) =>
+        viewers.Any(v => string.Equals(v.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase));
 
     // ── Connect: full ban never aborts (G1) ──────────────────────────────────────
 

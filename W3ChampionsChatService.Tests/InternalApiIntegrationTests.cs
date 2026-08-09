@@ -140,7 +140,8 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _viewersAccumulator = new ViewersAccumulator(
+            _harness.HubContext, _focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext,
             _focusRegistry,

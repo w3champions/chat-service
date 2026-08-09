@@ -9,6 +9,7 @@ using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Internal;
@@ -58,7 +59,7 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var focusRegistry = new FocusRegistry();
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var activityCoalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        var viewersAccumulator = new ViewersAccumulator(harness.HubContext, focusRegistry);
+        var viewersAccumulator = new ViewersAccumulator(harness.HubContext, focusRegistry, new ViewerResolver(new SessionRegistry(), new ConnectionMapping()));
         var fanOutEngine = new FanOutEngine(
             harness.HubContext,
             focusRegistry,
