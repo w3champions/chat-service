@@ -64,6 +64,33 @@ message-history read (below). It is defined exactly once, in
 (`ChannelModeration.IsModeratable`), specifically so the hub and the REST surface can never drift apart
 on what a moderator is allowed to touch.
 
+### Mute scope — where a lounge mute actually bites
+
+There is a **second, narrower** scope wall, defined next to `IsModeratable` in the same file
+(`ChannelModeration.IsMuteEnforced`) and read by exactly one call site — step 6 of `ChatHub.SendMessage`.
+A lounge mute (full or shadow) is enforced on a send iff the channel is:
+
+- **Public**, or
+- a **ladder match room** — `System` + `SystemKind.Match` + `ChatChannel.Ladder`.
+
+Everything else is exempt: SemiPublic, DMs/group DMs, clan and lobby system channels, and — deliberately
+— **custom-game match rooms**. A muted player can still talk in the custom lobby that invited them; they
+cannot talk in a ladder game's in-game or post-game chat.
+
+The two walls are intentionally different sets and must not be collapsed. `IsModeratable` answers "may a
+moderator reach into this room after the fact" (delete/purge/history) and covers SemiPublic and *every*
+match room; `IsMuteEnforced` answers "is a muted user silenced while typing here", which is a product
+decision about competitive-integrity surface.
+
+**`ChatChannel.Ladder` is the only thing separating ladder from custom.** chat-service uses one
+`SystemKind.Match` for both; both refs are a bare `nanoid(10)`, both create through the same endpoint,
+and `detached` is set on *both* (at birth for ladder, at game start for a custom lobby), so `detached`
+cannot be — and must never be made to — answer "is this ladder". The flag is set only from mm's explicit
+`ladder: true` on the internal create/roster-assert calls (below), and is **sticky-true for the life of
+the channel document**: no update ever clears it, so an older mm, a partial rollout, or a retry built
+from a stale payload can never silently un-moderate a live ladder room. It does not survive teardown —
+if a ref is deleted and later recreated, the recreating call must send `ladder: true` again.
+
 ### Shadow-ban model
 
 A shadow-banned user's messages are stored normally (`ChannelMessage.Shadow = true`) but routed
@@ -292,6 +319,16 @@ Optional additive fields (absent ⇒ today's behavior, byte-for-byte):
   on create**: chat-service uses one channel kind for both custom lobbies and ladder matches, and ladder
   refs are never part of mm's live-lobby registry, so without birth-detach the first epoch sync after any
   mm restart would tear down every in-progress ladder game's chat.
+- `ladder` (bool) — declares this ref a **ladder match** rather than a custom-game lobby. Absent/false ⇒
+  custom lobby, today's behavior byte-for-byte. **Ladder matches must send `ladder: true`**: this flag is
+  the sole input to the mute scope described under [Mute scope](#mute-scope--where-a-lounge-mute-actually-bites),
+  so a ladder match created without it lets lounge-muted and shadow-banned players chat freely in its
+  in-game and post-game room. Sticky-true server-side — once set for a ref it is never cleared, so a
+  later call that omits it is a harmless no-op rather than a silent un-moderation.
+
+  It is deliberately **separate from `detached`**, even though mm happens to send both together on the
+  ladder create path. The two answer different questions and their sets are not the same: `detached` is
+  also set on every custom lobby at game start.
 
 ### `PUT /internal/channels/{ref}/roster`
 
@@ -301,7 +338,7 @@ A user-initiated leave (`ChatHub.LeaveChannel`) on a live match channel is re-co
 assertion, by design (2026-08-05 reconciliation review, H4) — mm is authoritative for lobby membership.
 
 ```json
-{ "epoch": "<opaque token>", "seq": 1, "members": ["Tag#1", "Tag#2"], "name": "My Lobby", "detached": false }
+{ "epoch": "<opaque token>", "seq": 1, "members": ["Tag#1", "Tag#2"], "name": "My Lobby", "detached": false, "ladder": false }
 ```
 
 - `epoch` — an **opaque string** (the same character class/length cap as `ref`), mm's authority
@@ -317,6 +354,11 @@ assertion, by design (2026-08-05 reconciliation review, H4) — mm is authoritat
   length/trim/charset validation of its own to a custom-game lobby name before sending it, and a field
   chat cannot store must never be able to reject the entire authoritative roster.
 - `detached` — see below.
+- `ladder` — same meaning as on the create call above. Carried here too because this route is *also* a
+  channel-creating path: mm's ladder create has a retry-on-failure fallback that converges through
+  `PUT .../roster`, and that assertion may be the call that creates the room on demand. Applied **before**
+  the detach-freeze and staleness gates, and independently of both — a discarded assertion discards its
+  *roster*, not the truth about what kind of room this is.
 
 **Staleness — `(epoch, seq)` admission table**, persisted per channel:
 
@@ -385,6 +427,13 @@ only trigger a pointless mm retry), and — unlike the roster assertion — this
 authoritative teardown mm chooses to send.
 
 ### Deploy order
+
+**`ladder` is inert until mm sends it.** The mute gate reads a flag only mm can set, so between this
+service's deploy and mm's, ladder match rooms stay exactly as unmoderated as they are today — this
+half of the change fixes nothing on its own and needs the matching mm release to take effect. It is
+additive and fail-open in that direction by construction: an absent flag reads as "custom lobby". Rooms
+created before mm's deploy are never retro-classified (the flag is only ever written by an incoming
+call), so the gate starts applying to matches created from mm's deploy onward, not to in-flight ones.
 
 **chat-service deploys before (or with) mm.** Until mm's own deploy lands, its still-running deployment
 keeps calling the old membership-delta endpoint this service no longer serves — those calls `404`

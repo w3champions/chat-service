@@ -271,7 +271,8 @@ public class MutePortTests : IntegrationTestBase
         _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.Mentions, 0, type));
     }
 
-    private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public, SystemChannelKind? systemKind = null)
+    private async Task<ChatChannel> CreateChannel(
+        string name, ChannelType type = ChannelType.Public, SystemChannelKind? systemKind = null, bool ladder = false)
     {
         var channel = new ChatChannel
         {
@@ -279,6 +280,7 @@ public class MutePortTests : IntegrationTestBase
             Name = name,
             NormalizedName = ChannelNames.Normalize(name),
             SystemKind = systemKind,
+            Ladder = ladder,
             SystemRef = type == ChannelType.System ? "sysref-" + name : null,
             // A real Dm always carries a pair-key + request state (FindOrCreateDm invariant) — C5's send-path
             // private-lane gates (step 5.5) resolve the counterpart from the pair-key. Stamp a realistic,
@@ -458,7 +460,7 @@ public class MutePortTests : IntegrationTestBase
         Assert.AreEqual(ChannelType.SemiPublic, created.Channel.Type);
     }
 
-    // ── Send mute-gate matrix (gate keys on ChannelType.Public ONLY) ──────────────
+    // ── Send mute-gate matrix (Public + LADDER System+Match; everything else exempt) ──────────────
 
     [Test]
     // LEGACY: ChatBanRoomScopeTests.SendMessage_CachedBan_Expired_InBannedRoom_Broadcasts @778aec9
@@ -511,26 +513,33 @@ public class MutePortTests : IntegrationTestBase
         Assert.IsNotNull(await _messageRepository.Load(result.MessageId), $"The {type} message must persist");
     }
 
-    [TestCase(ChannelType.Public, ChatResultCode.Muted)]
-    [TestCase(ChannelType.SemiPublic, ChatResultCode.Ok)]
-    [TestCase(ChannelType.System, ChatResultCode.Ok)]
-    [TestCase(ChannelType.Dm, ChatResultCode.Ok)]
-    [TestCase(ChannelType.GroupDm, ChatResultCode.Ok)]
+    // The mute scope is ChannelModeration.IsMuteEnforced: Public, plus a System+Match room that mm
+    // declared a LADDER match. A System+Match room WITHOUT that flag is a custom-game lobby and stays
+    // exempt, which is why `type` alone no longer determines the outcome here — the System row is
+    // parameterised over `ladder` and the two System cases must disagree.
+    [TestCase(ChannelType.Public, false, ChatResultCode.Muted)]
+    [TestCase(ChannelType.SemiPublic, false, ChatResultCode.Ok)]
+    [TestCase(ChannelType.System, true, ChatResultCode.Muted)]
+    [TestCase(ChannelType.System, false, ChatResultCode.Ok)]
+    [TestCase(ChannelType.Dm, false, ChatResultCode.Ok)]
+    [TestCase(ChannelType.GroupDm, false, ChatResultCode.Ok)]
     // LEGACY: ChatBanRoomScopeTests.IsPublicRoom_ClassifiesCorrectly (§16 string matrix → channel-TYPE gate matrix) @778aec9
-    public async Task Send_FullMuted_TypeMatrix_OnlyPublicGated(ChannelType type, ChatResultCode expected)
+    public async Task Send_FullMuted_TypeMatrix_PublicAndLadderMatchGated(ChannelType type, bool ladder, ChatResultCode expected)
     {
-        var channel = await CreateChannel($"chan-{type}", type, type == ChannelType.System ? SystemChannelKind.Match : null);
+        var channel = await CreateChannel(
+            $"chan-{type}-{ladder}", type, type == ChannelType.System ? SystemChannelKind.Match : null, ladder);
         SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Full, muteEnd: Now.AddDays(1), type: type);
         var hub = BuildHub("conn-1");
 
         var result = await hub.SendMessage(channel.Id, "let me talk");
 
         Assert.AreEqual(expected, result.Code,
-            $"The mute gate must key on ChannelType.Public ONLY — a full mute in a {type} channel must be {expected}");
+            $"The mute gate covers Public and LADDER System+Match rooms only — a full mute in a {type} " +
+            $"channel (ladder={ladder}) must be {expected}");
         var reloaded = await _channelRepository.Load(channel.Id);
         if (expected == ChatResultCode.Muted)
         {
-            Assert.AreEqual(0L, reloaded.LastSeq, "A muted send in a Public channel must not persist");
+            Assert.AreEqual(0L, reloaded.LastSeq, "A muted send in a gated channel must not persist");
         }
         else
         {

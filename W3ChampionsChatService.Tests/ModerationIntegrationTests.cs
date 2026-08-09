@@ -274,7 +274,8 @@ public class ModerationIntegrationTests : IntegrationTestBase
 
     // ---- Mongo seed helpers ------------------------------------------------------------------------
 
-    private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public, SystemChannelKind? systemKind = null)
+    private async Task<ChatChannel> CreateChannel(
+        string name, ChannelType type = ChannelType.Public, SystemChannelKind? systemKind = null, bool ladder = false)
     {
         var channel = new ChatChannel
         {
@@ -282,6 +283,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
             Name = name,
             NormalizedName = ChannelNames.Normalize(name),
             SystemKind = systemKind,
+            Ladder = ladder,
             SystemRef = type == ChannelType.System ? "sysref-" + name : null,
         };
         await _channelRepository.Insert(channel);
@@ -380,6 +382,85 @@ public class ModerationIntegrationTests : IntegrationTestBase
     }
 
     private static string EndDate(int daysFromNow) => DateTime.UtcNow.AddDays(daysFromNow).ToString("O");
+
+    // ============================================================================================
+    // Scenario 0 — the LADDER post-game room: the reported bug, end-to-end. A muted or shadow-banned
+    // player could previously type visibly in a ladder match's post-game chat, because the send-path
+    // mute gate keyed on ChannelType.Public alone and a match room is System+Match.
+    //
+    // This asserts the product outcome (what other players SEE), not just the persisted flag, and pairs
+    // each ladder assertion with the custom-lobby control that must stay exempt.
+    // ============================================================================================
+
+    [Test]
+    public async Task LadderPostGameRoom_MutedAndShadowBanned_CannotTypeVisibly_CustomLobbyStillCan()
+    {
+        const string FullTag = "muted#1";
+        const string ShadowTag = "shadow#2";
+        const string PeerTag = "peer#3";
+
+        var ladder = await CreateChannel("w3c-20-abc", ChannelType.System, SystemChannelKind.Match, ladder: true);
+        var custom = await CreateChannel("Bob's Lobby", ChannelType.System, SystemChannelKind.Match);
+        foreach (var channel in new[] { ladder, custom })
+        {
+            await SeedMembership(channel.Id, FullTag);
+            await SeedMembership(channel.Id, ShadowTag);
+            await SeedMembership(channel.Id, PeerTag);
+        }
+
+        // Both bans land through the REST path BEFORE connect, so the connect ceremony resolves them
+        // from Mongo exactly as it would in production.
+        foreach (var (tag, isShadow) in new[] { (FullTag, false), (ShadowTag, true) })
+        {
+            var ban = await _muteController.AddLoungeMute(new LoungeMuteRequest
+            {
+                battleTag = tag,
+                endDate = EndDate(1),
+                author = "moderator#9",
+                reason = "ladder post-game test",
+                isShadowBan = isShadow,
+            });
+            Assert.IsInstanceOf<OkObjectResult>(ban, $"the REST ban POST for {tag} must succeed");
+        }
+
+        var fullHub = await Connect("conn-full", FullTag);
+        var shadowHub = await Connect("conn-shadow", ShadowTag);
+        var peerHub = await Connect("conn-peer", PeerTag);
+        foreach (var (hub, channel) in new[]
+                 {
+                     (fullHub, ladder), (shadowHub, ladder), (peerHub, ladder),
+                     (fullHub, custom), (shadowHub, custom), (peerHub, custom),
+                 })
+        {
+            Assert.AreEqual(ChatResultCode.Ok, (await hub.FocusChannel(channel.Id)).Code);
+        }
+
+        // LADDER — the fix. A full mute is rejected outright; a shadow ban returns the Ok illusion but
+        // reaches nobody else.
+        Assert.AreEqual(ChatResultCode.Muted, (await fullHub.SendMessage(ladder.Id, "gg ez noobs")).Code,
+            "a full-muted player must NOT be able to send in a ladder post-game room");
+
+        var shadowSend = await shadowHub.SendMessage(ladder.Id, "still here though");
+        Assert.AreEqual(ChatResultCode.Ok, shadowSend.Code, "a shadow send still returns Ok (the illusion)");
+        Assert.IsTrue((await _messageRepository.Load(shadowSend.MessageId)).Shadow,
+            "and persists REAL-flagged");
+
+        // The whole point: the peer's client received nothing from either of them.
+        Assert.AreEqual(0, MessageReceivedFor("conn-peer").Count,
+            "a focused peer in the ladder room sees NEITHER the full-muted send (rejected) NOR the " +
+            "shadow send (withheld) — this is the reported bug's acceptance criterion");
+        Assert.AreEqual(1, MessageReceivedFor("conn-shadow").Count,
+            "the shadow author still gets their own echo, so the ban stays invisible to them");
+
+        // CUSTOM LOBBY — the control. Same channel shape, no ladder flag, still exempt.
+        Assert.AreEqual(ChatResultCode.Ok, (await fullHub.SendMessage(custom.Id, "hey")).Code,
+            "a custom-game lobby stays outside the mute scope (explicit product decision)");
+        var customShadowSend = await shadowHub.SendMessage(custom.Id, "hey too");
+        Assert.IsFalse((await _messageRepository.Load(customShadowSend.MessageId)).Shadow,
+            "and a shadow ban does not flag a custom-lobby message either");
+        Assert.AreEqual(2, MessageReceivedFor("conn-peer").Count,
+            "so the peer DOES receive both custom-lobby messages live");
+    }
 
     // ============================================================================================
     // Scenario 1 — brief acceptance 2 (coordinator check 2): the shadow ILLUSION end-to-end, across a

@@ -1425,4 +1425,105 @@ public class MatchChannelServiceTests : IntegrationTestBase
         Assert.That(_harness.AllSignals.Count - pushesBefore, Is.EqualTo(1),
             "a channel whose doc vanished between the scan and its turn is skipped, not torn down on stale data");
     }
+
+    // ============================================================================================
+    // LADDER classification — the send-path mute scope's sole discriminator
+    //
+    // chat-service uses ONE SystemKind.Match for both ladder matches and custom-game lobbies, so
+    // ChatChannel.Ladder is what tells ChannelModeration.IsMuteEnforced which is which. These pin the
+    // three properties the gate depends on: it is stamped on BOTH creating routes, it is sticky-true,
+    // and it is applied independently of the detach/staleness gates that guard MEMBERSHIP.
+    // ============================================================================================
+
+    [Test]
+    public async Task CreateOrGet_WithoutLadder_LeavesChannelUnmarked()
+    {
+        var channel = await _service.CreateOrGet("lobby-1", "My Lobby", Members("Alice#1"), focus: false);
+
+        Assert.That(channel.Ladder, Is.False, "a custom-game lobby is the default — the flag must be opt-in");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.Ladder, Is.False);
+    }
+
+    [Test]
+    public async Task CreateOrGet_WithLadderTrue_MarksChannelLadder()
+    {
+        var channel = await _service.CreateOrGet(
+            "ladder-1", "w3c-20-abc", Members("Alice#1"), focus: false, detached: true, ladder: true);
+
+        Assert.That(channel.Ladder, Is.True, "the returned entity reflects the stamp, not the pre-call read");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.Ladder, Is.True, "and it is durable");
+    }
+
+    [Test]
+    public async Task CreateOrGet_LadderIsStickyTrue_ALaterCallWithoutTheFlagNeverClearsIt()
+    {
+        var channel = await _service.CreateOrGet(
+            "ladder-1", "w3c-20-abc", Members("Alice#1"), focus: false, ladder: true);
+
+        // An older mm, a half-finished rollout, or a retry rebuilt from a stale payload.
+        await _service.CreateOrGet("ladder-1", "w3c-20-abc", Members("Alice#1"), focus: false);
+
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.Ladder, Is.True,
+            "ladder-ness is immutable for a ref — nothing may un-moderate a ladder room mid-game");
+    }
+
+    [Test]
+    public async Task Assert_WithLadderTrue_OnCreateOnDemand_MarksChannelLadder()
+    {
+        // mm's ladder create-failure fallback: the room is born on the ROSTER route, not the create route.
+        await _service.ApplyRosterAssertion(
+            "ladder-1", "e1", 1, Members("Alice#1"), name: "w3c-20-abc", detached: true, ladder: true);
+
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
+        Assert.That(channel.Ladder, Is.True,
+            "a ladder room created by the assertion fallback must still be inside the mute scope");
+    }
+
+    [Test]
+    public async Task Assert_LadderIsStickyTrue_ALaterAssertionWithoutTheFlagNeverClearsIt()
+    {
+        await _service.ApplyRosterAssertion(
+            "ladder-1", "e1", 1, Members("Alice#1"), name: null, detached: false, ladder: true);
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
+
+        await _service.ApplyRosterAssertion("ladder-1", "e1", 2, Members("Alice#1"), name: null, detached: false);
+
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.Ladder, Is.True,
+            "the roster route's stamp is a no-op on absence, never a clear — same rule as the create route");
+    }
+
+    [Test]
+    public async Task Assert_AgainstFrozenChannel_StillStampsLadder_EvenThoughTheRosterIsDiscarded()
+    {
+        var channel = await _service.CreateOrGet("ladder-1", "w3c-20-abc", Members("Alice#1"), focus: false, detached: true);
+
+        var outcome = await _service.ApplyRosterAssertion(
+            "ladder-1", "e1", 1, Members("Bob#2"), name: null, detached: false, ladder: true);
+
+        Assert.That(outcome, Is.EqualTo(RosterAssertionOutcome.DiscardedFrozen), "the roster is still discarded");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.Ladder, Is.True,
+            "but the classification lands anyway — a discarded assertion discards its ROSTER, not the truth " +
+            "about what kind of room this is");
+        Assert.That(await _membershipRepository.Load(channel.Id, "Bob#2"), Is.Null,
+            "and the freeze still holds for membership");
+    }
+
+    [Test]
+    public async Task Assert_StaleDuplicate_StillStampsLadder_EvenThoughTheRosterIsDiscarded()
+    {
+        await _service.ApplyRosterAssertion("ladder-1", "e1", 5, Members("Alice#1"), name: null, detached: false);
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
+
+        var outcome = await _service.ApplyRosterAssertion(
+            "ladder-1", "e1", 4, Members("Bob#2"), name: null, detached: false, ladder: true);
+
+        Assert.That(outcome, Is.EqualTo(RosterAssertionOutcome.DiscardedStale));
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.Ladder, Is.True, "the staleness gate guards membership, not classification");
+    }
 }

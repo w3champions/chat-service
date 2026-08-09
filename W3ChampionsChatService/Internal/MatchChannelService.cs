@@ -118,20 +118,26 @@ public class MatchChannelService(
     /// — they are never in mm's <c>liveLobbyRefs</c> (that registry only holds custom lobbies), so without
     /// birth-detach the FIRST epoch sync after any mm restart would tear down every in-progress ladder
     /// game's chat. Idempotent: a retried detached create with the same members changes nothing further.</item>
+    /// <item><paramref name="ladder"/>: mm's declaration that this ref is a LADDER match, not a
+    /// custom-game lobby — the sole discriminator between the two, and the sole input to the send-path
+    /// mute scope (<see cref="ChannelModeration.IsMuteEnforced"/>). Stamped FIRST, ahead of every gate
+    /// below, and sticky-true — see <c>StampLadder</c>. Deliberately independent of
+    /// <paramref name="detached"/> even though mm sends both on today's ladder create: detach is ALSO set
+    /// on every custom lobby at game start, so it cannot answer "is this ladder".</item>
     /// </list>
     /// </para>
     /// </summary>
     public async Task<ChatChannel> CreateOrGet(
         string systemRef, string name, IReadOnlyList<string> members, bool focus,
-        string epoch = null, long? seq = null, bool detached = false)
+        string epoch = null, long? seq = null, bool detached = false, bool ladder = false)
     {
         using var _ = await _refGate.AcquireAsync(systemRef);
-        return await CreateOrGetLocked(systemRef, name, members, focus, epoch, seq, detached);
+        return await CreateOrGetLocked(systemRef, name, members, focus, epoch, seq, detached, ladder);
     }
 
     private async Task<ChatChannel> CreateOrGetLocked(
         string systemRef, string name, IReadOnlyList<string> members, bool focus,
-        string epoch, long? seq, bool detached)
+        string epoch, long? seq, bool detached, bool ladder)
     {
         var now = timeProvider.GetUtcNow().UtcDateTime;
         // 2026-08-05 fix wave (final review C1): name is nullable — mirrors ApplyRosterAssertion's own
@@ -141,6 +147,13 @@ public class MatchChannelService(
         var trimmedName = string.IsNullOrWhiteSpace(name) ? systemRef : name.Trim();
 
         var channel = await channelRepository.FindOrCreateSystem(SystemChannelKind.Match, systemRef, trimmedName, now);
+
+        // LADDER classification — stamped FIRST, before every gate below (name backfill, the D10 stamp,
+        // the member-add gate, the detach latch). It is the one thing in this method that must land even
+        // when everything else about the call is skipped: a detached-and-therefore-add-skipping retry, or
+        // a create that races a newer assertion, must still be able to establish that this room is
+        // moderated. See StampLadder.
+        await StampLadder(channel, ladder);
 
         // Name backfill (§3.3). Only writes on a genuine difference (idempotent); mutating the in-memory copy
         // too keeps the returned channel — and every ChannelAdded emitted for a member below — carrying the
@@ -184,6 +197,35 @@ public class MatchChannelService(
         }
 
         return channel;
+    }
+
+    /// <summary>
+    /// Applies mm's LADDER declaration to <paramref name="channel"/>, mutating the in-memory copy too so
+    /// the returned entity (and anything derived from it downstream) reflects the stamp rather than the
+    /// pre-call read. Shared by <see cref="CreateOrGet"/> and <see cref="ApplyRosterAssertion"/>; both
+    /// call it IMMEDIATELY after find-or-create, ahead of every other gate.
+    /// <list type="bullet">
+    /// <item>STICKY-TRUE, one direction only: <c>ladder: false</c>/absent is a NO-OP, never a clear. An
+    /// older mm, a half-finished rollout, or a retry rebuilt from a stale payload must not be able to
+    /// un-moderate a ladder room mid-game. See <see cref="ChatChannel.Ladder"/>.</item>
+    /// <item>Only writes on a genuine transition (false → true), so the common paths — every custom
+    /// lobby, and every repeat call on an already-stamped ladder ref — pay ZERO extra Mongo writes.</item>
+    /// <item>NOT gated by <see cref="ChatChannel.Detached"/> or by the (epoch, seq) staleness rules,
+    /// deliberately. Those protect MEMBERSHIP from being rewound by late/duplicate deliveries; this is a
+    /// monotonic property assertion about the ref itself, where a late delivery carries exactly the same
+    /// truth as an early one. Gating it would mean a ladder room that first learns it is a ladder room
+    /// from a discarded assertion stays permanently unmoderated.</item>
+    /// </list>
+    /// </summary>
+    private async Task StampLadder(ChatChannel channel, bool ladder)
+    {
+        if (!ladder || channel.Ladder)
+        {
+            return;
+        }
+
+        await channelRepository.SetLadder(channel.Id);
+        channel.Ladder = true;
     }
 
     /// <summary>
@@ -320,6 +362,11 @@ public class MatchChannelService(
     /// <item>DETACH LAST: when <paramref name="detached"/>, the final member set is applied FIRST, then
     /// the channel is marked detached — so the freeze rule never has to special-case its own trigger.</item>
     /// </list>
+    /// <paramref name="ladder"/> is mm's LADDER declaration for this ref — applied BEFORE steps 3 and 4
+    /// above and independently of both, because a discarded assertion discards its ROSTER, not the truth
+    /// about what kind of room this is. This route carries the flag (not just <see cref="CreateOrGet"/>)
+    /// because mm's ladder create has a retry-on-failure fallback that converges through this endpoint,
+    /// where the assertion may itself be the create-on-demand. See <c>StampLadder</c>.
     /// <paramref name="name"/> is nullable (null ⇒ ref placeholder on create-on-demand). There is NO
     /// <c>focus</c> parameter — mm has never sent focus on any internal call, so adds pass
     /// <c>focus: false</c> to <see cref="AddMemberWithInvariant"/>, byte-identical to today's behavior.
@@ -333,7 +380,8 @@ public class MatchChannelService(
     /// </para>
     /// </summary>
     public async Task<RosterAssertionOutcome> ApplyRosterAssertion(
-        string systemRef, string epoch, long seq, IReadOnlyList<string> members, string name, bool detached)
+        string systemRef, string epoch, long seq, IReadOnlyList<string> members, string name, bool detached,
+        bool ladder = false)
     {
         using var _ = await _refGate.AcquireAsync(systemRef);
 
@@ -342,6 +390,12 @@ public class MatchChannelService(
 
         var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef)
             ?? await channelRepository.FindOrCreateSystem(SystemChannelKind.Match, systemRef, trimmedName, now);
+
+        // LADDER classification — stamped BEFORE the detach-freeze and staleness gates below, and
+        // independently of both: a discarded assertion discards its ROSTER, not the truth about what kind
+        // of room this is. This route matters for ladder specifically because it is mm's fallback when the
+        // ladder create call fails — the assertion may be the call that creates the room. See StampLadder.
+        await StampLadder(channel, ladder);
 
         if (channel.Detached)
         {

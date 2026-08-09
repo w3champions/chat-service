@@ -24,4 +24,27 @@ public static class ChannelModeration
         channel.Type == ChannelType.Public
         || channel.Type == ChannelType.SemiPublic
         || (channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match);
+
+    /// <summary>
+    /// The MUTE scope wall — the second, deliberately NARROWER wall (<c>ChatHub.SendMessage</c> step 6):
+    /// a lounge mute (full or shadow) is enforced on a send iff the channel is
+    /// <see cref="ChannelType.Public"/>, or it is a LADDER match room
+    /// (<see cref="ChannelType.System"/> + <see cref="SystemChannelKind.Match"/> +
+    /// <see cref="ChatChannel.Ladder"/>). Everything else — SemiPublic, DM/GroupDm, System+Clan,
+    /// System+Lobby, and a CUSTOM-GAME match room — is exempt, preserving the legacy mute scope.
+    /// <para>
+    /// WHY THIS IS NOT <see cref="IsModeratable"/>: the two walls answer different questions and are
+    /// intentionally not the same set. IsModeratable asks "may a moderator reach INTO this room after
+    /// the fact" (delete/purge/read history) and includes SemiPublic and EVERY match room. This asks
+    /// "is a muted user silenced while typing HERE", which is a product decision about where a mute
+    /// bites: ladder chat is competitive-integrity surface and is gated; a custom lobby is the host's
+    /// own room and is not (an explicit product call — a muted player can still talk to the friends
+    /// who invited them). Keeping them separate is the point; do not collapse them.
+    /// </para>
+    /// </summary>
+    public static bool IsMuteEnforced(ChatChannel channel) =>
+        channel.Type == ChannelType.Public
+        || (channel.Type == ChannelType.System
+            && channel.SystemKind == SystemChannelKind.Match
+            && channel.Ladder);
 }

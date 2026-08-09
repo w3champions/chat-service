@@ -110,11 +110,15 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         {
             var channel = await matchChannelService.CreateOrGet(
                 request.Ref, name, request.Members, request.Focus ?? false,
-                request.Epoch, request.Seq, request.Detached ?? false);
+                request.Epoch, request.Seq, request.Detached ?? false, request.Ladder ?? false);
 
+            // `ladder` is logged alongside `detached` because the two are easy to confuse and only one of
+            // them decides whether a muted player can talk in this room — an operator diagnosing "why
+            // could a banned user chat in that ladder game" needs to see which flag mm actually sent.
             Log.Information(
-                "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount} detached={Detached}",
-                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count, request.Detached ?? false);
+                "Internal channel create succeeded {Caller} {Verb} {Ref} memberCount={MemberCount} detached={Detached} ladder={Ladder}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", request.Ref, request.Members.Count,
+                request.Detached ?? false, request.Ladder ?? false);
 
             return Ok(InternalChannelDto.FromChannel(channel));
         }
@@ -179,7 +183,7 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         {
             var outcome = await matchChannelService.ApplyRosterAssertion(
                 @ref, request.Epoch, request.Seq, request.Members,
-                name, request.Detached ?? false);
+                name, request.Detached ?? false, request.Ladder ?? false);
 
             // 2026-08-05 fix wave (final review M2): the outcome REPLACES the old unconditional
             // "succeeded" wording — a discarded assertion (stale/duplicate or against a frozen channel)
@@ -187,9 +191,9 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
             // line, exactly on the storm paths (an mm retry storm, or mm asserting a frozen lobby) the
             // staleness/detach gates exist to absorb. One line, the real outcome.
             Log.Information(
-                "Internal channel roster-assert {Outcome} {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached}",
+                "Internal channel roster-assert {Outcome} {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached} ladder={Ladder}",
                 outcome, InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref,
-                request.Epoch, request.Seq, request.Members.Count, request.Detached ?? false);
+                request.Epoch, request.Seq, request.Members.Count, request.Detached ?? false, request.Ladder ?? false);
 
             // A DISCARDED (stale/detached) assertion is still a 200 — it is a successful no-op, not a
             // failure. mm must not retry a correctly-rejected stale assertion; the domain layer already

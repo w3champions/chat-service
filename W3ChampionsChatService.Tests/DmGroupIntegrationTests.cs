@@ -825,7 +825,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         // A FULL mute on the user's live connection (cache-only enforcement, the SendMessage mute gate seam).
         _connectionMapping.SetMute("conn-user", MuteStatus.Full, Now.AddDays(1));
 
-        // Public: gated → Muted (the control). DM + group: the mute gate is PUBLIC-ONLY, so both send Ok.
+        // Public: gated → Muted (the control). DM + group: the mute scope
+        // (ChannelModeration.IsMuteEnforced) covers only Public and LADDER match rooms, so both send Ok.
         Assert.That((await userHub.SendMessage(pub.Id, "public")).Code, Is.EqualTo(ChatResultCode.Muted), "a full mute gates a PUBLIC send");
         var dmSend = await userHub.SendMessage(dm.Channel.Id, "dm while muted");
         Assert.That(dmSend.Code, Is.EqualTo(ChatResultCode.Ok), "a full mute does NOT gate a DM send");
