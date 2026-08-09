@@ -4,7 +4,6 @@ using System.Linq;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
-using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Messages;

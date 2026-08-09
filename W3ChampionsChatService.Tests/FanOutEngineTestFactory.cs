@@ -1,5 +1,4 @@
 using System;
-using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Sessions;
 
