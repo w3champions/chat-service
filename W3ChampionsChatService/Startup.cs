@@ -51,7 +51,8 @@ public class Startup
             // ChatHub.Messaging.cs — defense-in-depth against a client sending an oversized frame to
             // force needless buffering/allocation ahead of the app-level validation.
             options.MaximumReceiveMessageSize = 16 * 1024;
-        });
+        })
+        .AddJsonProtocol(ChatJsonProtocol.Configure);
 
         // D9 (C6 Task 3): registers IHttpClientFactory — WebsiteBackendRepository is rebuilt on it,
         // killing the per-call `new HttpClient()` socket-exhaustion anti-pattern (a fresh HttpClient
