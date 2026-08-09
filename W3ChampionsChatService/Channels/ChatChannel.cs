@@ -84,6 +84,16 @@ public class ChatChannel
     [BsonIgnoreIfNull]
     public DateTime? LastMessageAt { get; set; }
 
+    /// <summary>
+    /// Dm (accepted) / GroupDm only — the newest user-visible message, denormalized for conversation-list
+    /// rendering at rest. Rides the raw <see cref="ChatChannel"/> in <c>ChannelDto</c>/<c>ChannelAddedDto</c>/
+    /// <c>GetConversations</c> like every other field here. Absent means "nothing to show yet" (a fresh or
+    /// pending shell, a channel whose only messages are shadow or deleted, or a doc written before this
+    /// field existed — see <see cref="ChannelLastMessage"/> for the full scope and shadow rules).
+    /// </summary>
+    [BsonIgnoreIfNull]
+    public ChannelLastMessage LastMessage { get; set; }
+
     /// <summary>Absolute expiry instant (TTL index, expireAfterSeconds 0). Absent = permanent.</summary>
     [BsonIgnoreIfNull]
     public DateTime? ExpiresAt { get; set; }

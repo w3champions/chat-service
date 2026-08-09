@@ -725,4 +725,163 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That((await _messageRepository.LoadForModerator(channel.Id)).Count, Is.EqualTo(1),
             "message 2 is NOT persisted — only message 1 remains stored");
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // ChannelLastMessage — the conversation-list projection maintained on the channel doc at send time
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task DmSend_AcceptedDm_ProjectsLastMessageOntoTheChannel()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "tinker goblin");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection, Is.Not.Null, "an accepted Dm send must leave the conversation-list projection on the channel doc");
+        Assert.That(projection.Seq, Is.EqualTo(result.Seq));
+        Assert.That(projection.SenderBattleTag, Is.EqualTo(Initiator));
+        Assert.That(projection.Excerpt, Is.EqualTo("tinker goblin"));
+        Assert.That(projection.SentAt, Is.EqualTo(Now), "SentAt must be the message's own server instant, so it stays comparable with LastMessageAt");
+    }
+
+    [Test]
+    public async Task DmSend_SecondMessage_AdvancesProjectionToTheNewerOne()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(channel.Id, "first");
+        var second = await hub.SendMessage(channel.Id, "second");
+
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection.Seq, Is.EqualTo(second.Seq));
+        Assert.That(projection.Excerpt, Is.EqualTo("second"), "the projection tracks the conversation's LAST message, not its first");
+    }
+
+    [Test]
+    public async Task DmSend_PendingDm_ProjectsNothing_ConsentWall()
+    {
+        // The recipient has not accepted yet. They can already see this shell in their tray (D4 dual
+        // listing), so projecting the initiator's text here would show a stranger's message before
+        // consent — the same wall that already suppresses the recipient's ChannelActivity.
+        var channel = await CreateDm(DmRequestState.Pending);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "hi, do you know me?");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(1L), "the message itself is persisted as usual");
+        Assert.That(reloaded.LastMessage, Is.Null, "a PENDING Dm must never carry a last-message projection");
+    }
+
+    [Test]
+    public async Task GroupDmSend_ProjectsLastMessage()
+    {
+        var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastSeq = 0, LastMessageAt = Now, ExpiresAt = Now.AddDays(365) };
+        await _channelRepository.Insert(group);
+        SeedMember(InitiatorConn, Initiator, group.Id, ChannelType.GroupDm);
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(group.Id, "all tinkers in one place");
+
+        var projection = (await _channelRepository.Load(group.Id)).LastMessage;
+        Assert.That(projection, Is.Not.Null, "groups list in the same tray as 1:1 conversations and carry the projection too");
+        Assert.That(projection.Excerpt, Is.EqualTo("all tinkers in one place"));
+    }
+
+    [Test]
+    public async Task PublicSend_ProjectsNothing_BecauseTheCatalogShipsToNonMembers()
+    {
+        // PublicCatalog ships the raw ChatChannel for rooms the caller has NOT joined, so a projection
+        // here would publish room content to non-members.
+        var channel = new ChatChannel { Type = ChannelType.Public, Name = "general", NormalizedName = ChannelNames.Normalize("general") };
+        await _channelRepository.Insert(channel);
+        SeedMember(InitiatorConn, Initiator, channel.Id, ChannelType.Public);
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(channel.Id, "hello lounge");
+
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(1L));
+        Assert.That(reloaded.LastMessage, Is.Null, "a public room must never carry a last-message projection");
+    }
+
+    [Test]
+    public async Task DmSend_LongContent_ProjectionExcerptMatchesTheLiveEventExcerpt()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+        var content = new string('x', ChatLimits.DmPreviewExcerptLength + 50);
+
+        await hub.SendMessage(channel.Id, content);
+
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection.Excerpt.Length, Is.EqualTo(ChatLimits.DmPreviewExcerptLength));
+        Assert.That(projection.Excerpt, Is.EqualTo(Excerpts.Bounded(content)),
+            "the projection and the live ChannelActivity preview must come from the SAME excerpt helper, or a "
+            + "client would see the same message's text differ between the snapshot and the live event");
+    }
+
+    // --- Invariants this projection silently depends on, pinned so that widening either scope fails loudly ---
+
+    [Test]
+    public void ProjectedChannels_AreDisjointFromModeratableChannels()
+    {
+        // WHY THIS MATTERS: there is no deletion invalidation for ChannelLastMessage, and none is needed
+        // ONLY because a projected channel can never have a message deleted — ChannelModeration.IsModeratable
+        // gates both ChatHub.DeleteMessage and ChatHub.PurgeMessagesFromUser. If moderation is ever widened
+        // to reach Dm/GroupDm, this projection starts serving soft-deleted text to every member of the
+        // conversation, forever: a moderation hole, not a cosmetic bug. Whoever widens it must also add the
+        // recompute-on-delete that this assertion is standing in for.
+        foreach (var channel in AllChannelShapes())
+        {
+            Assert.That(
+                ChatHub.CarriesLastMessageProjection(channel) && ChannelModeration.IsModeratable(channel),
+                Is.False,
+                $"{Describe(channel)} is BOTH projected and moderatable — deleted text would stay pinned in every member's conversation list");
+        }
+    }
+
+    [Test]
+    public void ProjectedChannels_AreDisjointFromMuteEnforcedChannels()
+    {
+        // The send path skips the projection for shadow messages, which today is defence in depth rather
+        // than a live code path: a shadow message can only be produced where a mute is enforced, and that
+        // set is disjoint from the projected set. If mute enforcement is ever widened to DMs/groups, that
+        // !isShadow guard silently becomes load-bearing — this pins the relationship so the guard is not
+        // "simplified away" as dead code first.
+        foreach (var channel in AllChannelShapes())
+        {
+            Assert.That(
+                ChatHub.CarriesLastMessageProjection(channel) && ChannelModeration.IsMuteEnforced(channel),
+                Is.False,
+                $"{Describe(channel)} is BOTH projected and mute-enforced — a shadow author's text could reach every member");
+        }
+    }
+
+    private static IEnumerable<ChatChannel> AllChannelShapes()
+    {
+        yield return new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted };
+        yield return new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Pending };
+        yield return new ChatChannel { Type = ChannelType.GroupDm };
+        yield return new ChatChannel { Type = ChannelType.Public };
+        yield return new ChatChannel { Type = ChannelType.SemiPublic };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, Ladder = true };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, Ladder = false };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Clan };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Lobby };
+    }
+
+    private static string Describe(ChatChannel channel) =>
+        channel.Type == ChannelType.System ? $"System+{channel.SystemKind}(ladder={channel.Ladder})"
+        : channel.Type == ChannelType.Dm ? $"Dm({channel.RequestState})"
+        : channel.Type.ToString();
 }

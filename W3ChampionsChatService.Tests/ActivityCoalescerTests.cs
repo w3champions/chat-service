@@ -418,4 +418,74 @@ public class ActivityCoalescerTests
         engine.OnConnectionClosed(MemberConn);
         Assert.AreEqual(0, coalescer.TrackedChannelCount(MemberConn), "OnConnectionClosed must evict the connection's coalescing state");
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // SentAt — the message timestamp that makes ChannelActivity usable as a conversation-list sort key
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Offer_CarriesSentAtOnTheImmediateEmit()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+        var sentAt = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview: null, sentAt: sentAt);
+
+        var dto = harness.PayloadFor(MemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.AreEqual(sentAt, dto.SentAt,
+            "without this the client has no live ordering signal at all — LastMessageAt only refreshes on a snapshot or a GetConversations page");
+    }
+
+    [Test]
+    public async Task Offer_WithoutSentAt_LeavesItNull()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0);
+
+        var dto = harness.PayloadFor(MemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.IsNull(dto.SentAt, "absence must stay distinguishable from a zero timestamp — a client reads it as 'no ordering information'");
+    }
+
+    [Test]
+    public async Task CoalescedBurst_FlushesTheLatestOfferedSentAt()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+        var first = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+        var latest = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
+
+        // Opens the window (emits immediately), then two more within it collapse into the pending.
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview: null, sentAt: first);
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview: null, sentAt: first.AddMinutes(1));
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 7, T0.AddSeconds(2), preview: null, sentAt: latest);
+
+        await coalescer.FlushDue(T0.AddSeconds(11));
+
+        var payloads = ActivityPayloads(harness, MemberConn);
+        Assert.AreEqual(2, payloads.Count, "one immediate emit plus one flushed pending");
+        Assert.AreEqual(first, payloads[0].SentAt);
+        Assert.AreEqual(latest, payloads[1].SentAt,
+            "the drained burst must carry the LATEST offered timestamp, mirroring the latest-offered-preview discipline beside it");
+        Assert.AreEqual(7, payloads[1].LastSeq);
+    }
+
+    [Test]
+    public async Task SentAt_TravelsWithItsOwnPreview()
+    {
+        // The pair describes ONE message. If they were written or drained independently a client could
+        // render one message's text against another message's timestamp.
+        var (harness, _, coalescer) = NewCoalescer();
+        var olderSentAt = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+        var newerSentAt = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
+        var older = new DmActivityPreviewDto("peter#123", "peter", "older text");
+        var newer = new DmActivityPreviewDto("peter#123", "peter", "newer text");
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, older, olderSentAt);
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), newer, newerSentAt);
+        await coalescer.FlushDue(T0.AddSeconds(11));
+
+        var flushed = ActivityPayloads(harness, MemberConn)[1];
+        Assert.AreEqual("newer text", ((DmActivityPreviewDto)flushed.Preview).Excerpt);
+        Assert.AreEqual(newerSentAt, flushed.SentAt, "the flushed timestamp must belong to the same message as the flushed preview");
+    }
 }

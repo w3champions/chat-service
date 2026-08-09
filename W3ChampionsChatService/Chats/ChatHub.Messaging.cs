@@ -318,6 +318,27 @@ public partial class ChatHub
         };
         await _messageRepository.Insert(message);
 
+        // 7.25 Conversation-list projection (ChannelLastMessage): denormalize this message onto the channel
+        // doc so SessionState/GetConversations/ChannelAdded can render "who said what, and when" without
+        // reading the message collection. Before it, that text only ever existed in a live event, so a
+        // client had nothing to render a conversation list from at rest and no way to recover one after a
+        // reconnect (w3champions/launcher-e#848).
+        //
+        // Runs post-insert (the projection describes a durable message, so it must never precede it) and
+        // pre-fan-out (a client that reacts to the event by calling GetConversations must not race a
+        // not-yet-written projection). Skipped entirely for shadow — a shadow author's text must never
+        // reach a non-author, and this projection is channel-global with no per-viewer filtering, so the
+        // ONLY safe treatment is to not write one. Scope (accepted Dm + GroupDm) is CarriesLastMessageProjection.
+        //
+        // The write is a compare-and-set on seq (TryAdvanceLastMessage), so concurrent same-channel sends
+        // that reach it out of order settle on the higher seq regardless of arrival order — the same
+        // monotonic discipline AllocateSeq gives the counter itself. A false return means a concurrent
+        // newer message already won, which is the correct outcome and not an error.
+        if (!isShadow && CarriesLastMessageProjection(channel))
+        {
+            await _channelRepository.TryAdvanceLastMessage(channelId, BuildLastMessageProjection(message));
+        }
+
         // 7.5 Dm recipient materialization + RequestReceived (C5 Task 4, D4) — post-persist, BEFORE fan-out.
         // Lazily creates the counterpart's membership on first delivery (seeding their registry via
         // PushChannelAdded(focus:false)) and fires the targeted RequestReceived consent transition for a
@@ -646,4 +667,38 @@ public partial class ChatHub
             Flair = ChatProfileMapper.FromChatUser(chatUser),
         };
     }
+
+    /// <summary>
+    /// Which channels carry the <see cref="ChannelLastMessage"/> conversation-list projection: GroupDm
+    /// always, Dm only once ACCEPTED, nothing else. See <see cref="ChannelLastMessage"/> for why the set is
+    /// this narrow — the pending-Dm exclusion is the consent wall (a recipient must not see a stranger's
+    /// text before accepting, the same rule that suppresses their <c>ChannelActivity</c>), and the
+    /// public/system exclusion keeps room content out of the <c>PublicCatalog</c> shells that ship to
+    /// NON-members.
+    /// <para>
+    /// A Dm accepted AFTER messages already exist is not backfilled: the projection appears with the
+    /// conversation's next message. Backfilling would mean reading the message collection on the accept
+    /// path to publish text the recipient has, until that moment, deliberately not been shown.
+    /// </para>
+    /// </summary>
+    internal static bool CarriesLastMessageProjection(ChatChannel channel) => channel.Type switch
+    {
+        ChannelType.GroupDm => true,
+        ChannelType.Dm => channel.RequestState == DmRequestState.Accepted,
+        _ => false,
+    };
+
+    /// <summary>
+    /// The single message→projection mapping. <see cref="Excerpts.Bounded"/> is the SAME helper that builds
+    /// <see cref="DmActivityPreviewDto.Excerpt"/>, so the excerpt a client renders from the live event and
+    /// the one it renders from the snapshot can never disagree about the same message.
+    /// </summary>
+    private static ChannelLastMessage BuildLastMessageProjection(ChannelMessage message) => new()
+    {
+        Seq = message.Seq,
+        SenderBattleTag = message.Sender.BattleTag,
+        SenderName = message.Sender.Name,
+        Excerpt = Excerpts.Bounded(message.Content),
+        SentAt = message.SentAt,
+    };
 }

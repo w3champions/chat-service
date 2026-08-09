@@ -318,4 +318,94 @@ public class ChannelRepositoryTests : IntegrationTestBase
             "LoadModeratableChannels' Mongo filter must select EXACTLY the channels ChannelModeration.IsModeratable " +
             "agrees are moderatable — the two scope-wall expressions must never drift apart");
     }
+
+    // ----------------------------------------------------------------------------------------------
+    // ChannelLastMessage — the conversation-list projection's compare-and-set write
+    // ----------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task TryAdvanceLastMessage_FirstWrite_SetsProjection()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted, LastSeq = 0 };
+        await repo.Insert(channel);
+
+        var advanced = await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 1, "hello"));
+
+        Assert.IsTrue(advanced, "the first projection write must land — a missing field matches the null leg of the filter");
+        var loaded = await repo.Load(channel.Id);
+        Assert.AreEqual(1L, loaded.LastMessage.Seq);
+        Assert.AreEqual("hello", loaded.LastMessage.Excerpt);
+        Assert.AreEqual("peter#123", loaded.LastMessage.SenderBattleTag);
+    }
+
+    [Test]
+    public async Task TryAdvanceLastMessage_LowerSeq_DoesNotRegressProjection()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted, LastSeq = 0 };
+        await repo.Insert(channel);
+        await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 7, "newest"));
+
+        // Concurrent same-channel sends reach this write serialized only by Mongo, so a lower seq can
+        // genuinely land after a higher one. It must lose.
+        var advanced = await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 6, "older"));
+
+        Assert.IsFalse(advanced, "an out-of-order lower seq must report that it did not advance the projection");
+        var loaded = await repo.Load(channel.Id);
+        Assert.AreEqual(7L, loaded.LastMessage.Seq, "the projection must never regress to an older message");
+        Assert.AreEqual("newest", loaded.LastMessage.Excerpt);
+    }
+
+    [Test]
+    public async Task TryAdvanceLastMessage_SameSeqTwice_IsIdempotent()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted, LastSeq = 0 };
+        await repo.Insert(channel);
+        await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 3, "first write"));
+
+        // A retried/duplicated fan-out for the SAME message must not rewrite the row (strictly-greater CAS).
+        var advanced = await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 3, "second write"));
+
+        Assert.IsFalse(advanced);
+        Assert.AreEqual("first write", (await repo.Load(channel.Id)).LastMessage.Excerpt);
+    }
+
+    [Test]
+    public async Task LastMessage_RoundTripsAndIsOmittedWhenAbsent()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var without = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Pending, LastSeq = 0 };
+        await repo.Insert(without);
+
+        var raw = await MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName)
+            .GetCollection<BsonDocument>(ChatCollections.Channels)
+            .Find(new BsonDocument("_id", without.Id)).FirstAsync();
+        Assert.IsFalse(raw.Contains("LastMessage"), "a channel with no projection must omit the field entirely, not store a null");
+
+        var sentAt = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+        await repo.TryAdvanceLastMessage(without.Id, new ChannelLastMessage
+        {
+            Seq = 4,
+            SenderBattleTag = "peter#123",
+            SenderName = "peter",
+            Excerpt = "round trip",
+            SentAt = sentAt,
+        });
+
+        var loaded = await repo.Load(without.Id);
+        Assert.AreEqual(4L, loaded.LastMessage.Seq);
+        Assert.AreEqual("peter", loaded.LastMessage.SenderName);
+        Assert.AreEqual(sentAt, loaded.LastMessage.SentAt, "SentAt must survive the Mongo round trip as the same UTC instant");
+    }
+
+    private static ChannelLastMessage NewProjection(long seq, string excerpt) => new()
+    {
+        Seq = seq,
+        SenderBattleTag = "peter#123",
+        SenderName = "peter",
+        Excerpt = excerpt,
+        SentAt = new DateTime(2026, 8, 9, 22, 0, 0, DateTimeKind.Utc),
+    };
 }
