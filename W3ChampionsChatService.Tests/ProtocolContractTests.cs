@@ -2,6 +2,7 @@ using System;
 using System.Text.Json;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
@@ -112,13 +113,24 @@ public class ProtocolContractTests
     [Test]
     public void FocusChannelResult_CarriesViewerRoster()
     {
-        var viewers = new[] { new ChannelViewerDto("Peter#123", "Peter") };
+        // Explicit Profile (Finding 3: ChannelViewerDto's Profile ctor arg no longer defaults to
+        // null — every construction site states its intent). Also asserts Profile itself rides the
+        // roster (Finding 4): a regression that stopped populating it would previously leave this
+        // wire-shape contract test green.
+        var profile = new ChatProfile
+        {
+            ProfilePicture = new ProfilePicture { Race = AvatarCategory.HU, PictureId = 3, IsClassic = true },
+        };
+        var viewers = new[] { new ChannelViewerDto("Peter#123", "Peter", profile) };
 
         var result = new FocusChannelResult(ChatResultCode.Ok, Viewers: viewers);
 
         Assert.AreEqual(1, result.Viewers.Count);
         Assert.AreEqual("Peter#123", result.Viewers[0].BattleTag);
         Assert.AreEqual("Peter", result.Viewers[0].Name);
+        Assert.AreSame(profile, result.Viewers[0].Profile);
+        Assert.AreEqual(AvatarCategory.HU, result.Viewers[0].Profile.ProfilePicture.Race);
+        Assert.AreEqual(3, result.Viewers[0].Profile.ProfilePicture.PictureId);
     }
 
     [Test]

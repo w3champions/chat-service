@@ -10,7 +10,8 @@ namespace W3ChampionsChatService.Protocol;
 /// <c>ChatHub.BuildSenderSnapshot</c> reads for message flair — so a user's roster avatar and their
 /// message avatar are the same value by construction, never merely by convention. NULL only for a
 /// viewer whose live session or connection entry vanished mid-call (a teardown race); clients render
-/// their default avatar for that case. Defaulted so existing 2-arg construction still compiles.
+/// their default avatar for that case. No default value — every construction site must decide
+/// explicitly whether the entry carries flair or is deliberately flairless (pass <c>null</c>).
 /// </para>
 /// </summary>
-public record ChannelViewerDto(string BattleTag, string Name, ChatProfile Profile = null);
+public record ChannelViewerDto(string BattleTag, string Name, ChatProfile Profile);
