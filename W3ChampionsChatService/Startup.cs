@@ -173,6 +173,9 @@ public class Startup
         services.AddSingleton<ChannelCreationRateLimiter>();
 
         services.AddSingleton<ConnectionMapping>();
+        // Singleton: holds only the singleton ConnectionMapping + ISessionRegistry. Consumed by
+        // ViewersAccumulator; ChatHub builds its own equivalent instance (see ChatHub.cs).
+        services.AddSingleton<ViewerResolver>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();

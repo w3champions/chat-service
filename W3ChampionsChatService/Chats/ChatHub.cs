@@ -107,6 +107,11 @@ public partial class ChatHub(
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly ITicketStore _ticketStore = ticketStore;
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
+    // Built from the primary-constructor params rather than injected, deliberately: adding a ctor
+    // parameter would force an edit to all 31 test files that construct a ChatHub. ViewerResolver is
+    // stateless (it holds only references to the two singletons above), so this instance and the
+    // DI-registered singleton the ViewersAccumulator receives are interchangeable.
+    private readonly ViewerResolver _viewerResolver = new(sessionRegistry, connections);
     private readonly UserDirectoryRepository _userDirectory = userDirectory;
     // C3 (Task 8): the SessionState snapshot assembler + the in-memory fan-out registries this hub
     // seeds on connect and tears down on disconnect. TimeProvider supplies the trusted server clock
