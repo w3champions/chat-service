@@ -169,49 +169,59 @@ public partial class ChatHub
         // the connect path (AssembleAndSeed calls it moments later), so this is a cheap repeat read
         // against the same BattleTag-prefixed index, not a new access pattern.
         var memberships = await _membershipRepository.LoadForUser(identity.BattleTag);
-        var existingClanChannelIds = memberships.Count == 0
-            ? Array.Empty<string>()
+        var existingClanChannels = memberships.Count == 0
+            ? Array.Empty<ChatChannel>()
             : (await _channelRepository.LoadByIds(memberships.Select(m => m.ChannelId)))
                 .Where(c => c.Type == ChannelType.System && c.SystemKind == SystemChannelKind.Clan)
-                .Select(c => c.Id)
                 .ToArray();
 
-        // Resolve the target shell BEFORE removing anything, so "stale" is computed against a known
-        // target. Creating an empty shell grants nobody access, so doing it first is safe; the actual
-        // access grant (the membership insert) is deliberately the LAST step.
-        string targetChannelId = null;
-        ChatChannel targetChannel = null;
-        if (clanRef != null)
-        {
-            targetChannel = await _channelRepository.FindOrCreateSystem(
-                SystemChannelKind.Clan, clanRef, ClanChannelName(clanRef), now);
-            targetChannelId = targetChannel.Id;
-        }
+        // PR41 review (P2): staleness is derived from SystemRef, NOT from the id of a freshly-created
+        // target shell. System channels are unique on (SystemKind, SystemRef) — the ux_systemKind_systemRef
+        // index — so the clan channel whose SystemRef equals clanRef IS the target; comparing refs is
+        // exactly equivalent to comparing ids, without needing the shell to exist yet. Ordinal comparison
+        // mirrors the exact-match semantics FindOrCreateSystem's Mongo filter uses. A null clanRef (a fresh
+        // wb read saying "no clan") makes EVERY held clan channel stale, which is the intended departure
+        // case. This decoupling is what lets shell creation move onto the fail-soft join path below.
+        var staleClanChannels = existingClanChannels
+            .Where(c => clanRef == null || !string.Equals(c.SystemRef, clanRef, StringComparison.Ordinal))
+            .ToArray();
 
         // Revocation before grant: if this throws, the connect fails having granted nothing new.
-        foreach (var staleChannelId in existingClanChannelIds.Where(id => id != targetChannelId))
+        foreach (var stale in staleClanChannels)
         {
-            await _membershipRepository.Delete(staleChannelId, identity.BattleTag);
+            await _membershipRepository.Delete(stale.Id, identity.BattleTag);
             Log.Information(
                 "Clan reconcile: removed {BattleTag} from stale clan channel {ChannelId}",
-                identity.BattleTag, staleChannelId);
+                identity.BattleTag, stale.Id);
         }
 
-        if (targetChannel == null || existingClanChannelIds.Contains(targetChannelId))
+        // Nothing to grant: either a fresh wb read says the user is in no clan (the revocations above were
+        // the whole job), or they already hold the right clan channel — the idempotent reconnect case.
+        var alreadyMember = clanRef != null
+            && existingClanChannels.Any(c => string.Equals(c.SystemRef, clanRef, StringComparison.Ordinal));
+        if (clanRef == null || alreadyMember)
         {
             return;
         }
 
-        // FAIL-SOFT JOIN — see the method doc. A miss here costs the user a channel, never wrong access.
+        // FAIL-SOFT JOIN — see the method doc. Covers BOTH steps of the grant: the shell find-or-create
+        // AND the membership insert. PR41 review (P2) moved the find-or-create in here: creating a shell
+        // grants nobody access, so there is no access-control reason to fail closed on it, and leaving it
+        // outside made a transient channel-upsert fault reject the whole connection on the hot path every
+        // clan member takes on every connect — an availability regression against the behaviour on master,
+        // and a contradiction of this method's own stated policy that only revocation is fatal.
         try
         {
+            var channel = await _channelRepository.FindOrCreateSystem(
+                SystemChannelKind.Clan, clanRef, ClanChannelName(clanRef), now);
+
             // NotificationLevel.All — a clan channel is a primary, non-leavable lane, so it gets the same
             // default as a match channel (MatchChannelService.AddMemberWithInvariant), NOT JoinChannel's
             // opt-in Mentions default for rooms a user picked themselves. InsertIfAbsent (not Insert) for
             // race-safety against ux_channelId_battleTag when two sockets reconcile concurrently.
             await _membershipRepository.InsertIfAbsent(new ChannelMembership
             {
-                ChannelId = targetChannelId,
+                ChannelId = channel.Id,
                 BattleTag = identity.BattleTag,
                 Role = MembershipRole.Member,
                 NotificationLevel = NotificationLevel.All,

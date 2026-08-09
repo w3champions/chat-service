@@ -321,6 +321,45 @@ public class ChatHubClanChannelTests : IntegrationTestBase
             "The clan channel must survive an outage connect in the rendered snapshot too");
     }
 
+    [Test]
+    public async Task Connect_WhenClanShellCreationFails_StillConnects_WithoutTheClanChannel()
+    {
+        // PR41 review (P2): creating the channel shell is part of the GRANT, not the revocation, so it
+        // belongs on the fail-soft path. Creating a shell grants nobody access, and this call sits on the
+        // hot path every clan member takes on every connect — rejecting the connection over a transient
+        // channel-upsert fault would be an availability regression, and would contradict the stated
+        // policy that only revocation is fatal.
+        var throwingChannels = new Mock<ChannelRepository>(MongoClient) { CallBase = true };
+        throwingChannels
+            .Setup(c => c.FindOrCreateSystem(SystemChannelKind.Clan, It.IsAny<string>(), It.IsAny<string>(), It.IsAny<DateTime>()))
+            .ThrowsAsync(new TimeoutException("mongo hiccup"));
+        _channelRepository = throwingChannels.Object;
+
+        Assert.DoesNotThrowAsync(async () => await Connect(),
+            "a failed clan-shell creation must never cost the user their chat session");
+
+        var state = CapturedSessionState();
+        Assert.IsFalse(
+            state.Channels.Any(c => c.Channel.SystemKind == SystemChannelKind.Clan),
+            "the user simply connects without the clan channel and self-heals on the next connect");
+    }
+
+    [Test]
+    public async Task Connect_AfterLeavingClan_RevokesEvenWhenNoShellIsEverCreated()
+    {
+        // Guards the PR41 restructure: staleness is now derived from SystemRef, so departure revocation
+        // must work without a target shell existing at all (the clanRef == null path creates nothing).
+        await Connect("conn-1");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Clan, ClanId);
+
+        SetupResolution(clanId: null, freshFromWb: true);
+        _sends.Clear();
+        await Connect("conn-2");
+
+        Assert.IsNull(await _membershipRepository.Load(channel.Id, BattleTag),
+            "a fresh 'no clan' read must still revoke, with no shell resolution involved");
+    }
+
     // ---------------------------------------------------------------------------------------------
     // PR40 review — displaced connects must not write clan state (P2)
     // ---------------------------------------------------------------------------------------------
