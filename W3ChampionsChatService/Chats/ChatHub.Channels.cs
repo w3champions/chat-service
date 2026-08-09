@@ -110,8 +110,9 @@ public partial class ChatHub
         }
 
         // Roster = the channel's ACTIVE viewers (online AND focused) from FocusRegistry — NEVER from
-        // membership. Each distinct battleTag is resolved to a display name via the live session; a
-        // roster entry with no live session (e.g. a teardown race) falls back to the battleTag itself
+        // membership. Each distinct battleTag is resolved to a display name via the live session; each
+        // entry also carries the viewer's flair (Profile), resolved in-memory via <see cref="ViewerResolver"/>.
+        // A roster entry with no live session (e.g. a teardown race) falls back to the battleTag itself
         // rather than dropping the entry or throwing.
         var viewers = _focusRegistry.GetRoster(channelId)
             .Select(_viewerResolver.Resolve)
