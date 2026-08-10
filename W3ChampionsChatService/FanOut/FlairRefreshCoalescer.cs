@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Serilog;
 using W3ChampionsChatService.Domain;
@@ -45,14 +46,21 @@ public class FlairRefreshCoalescer(IFlairRefresher refresher)
         }
     }
 
+    /// <summary>
+    /// Drains at most <see cref="ChatLimits.FlairRefreshPerTickBudget"/> pending battleTags, leaving any
+    /// remainder pending for a later call. Each refresh is a website-backend HTTP round trip plus Mongo
+    /// I/O plus per-connection sends — a bounded slice keeps one large burst (e.g. a bulk clan delete)
+    /// from monopolizing the shared flush tick this coalescer shares with the other, purely in-memory,
+    /// <see cref="FanOutFlushService"/> participants.
+    /// </summary>
     public async Task Flush()
     {
         List<string> due;
         lock (_lock)
         {
             if (_pending.Count == 0) return;
-            due = new List<string>(_pending);
-            _pending.Clear();
+            due = _pending.Take(ChatLimits.FlairRefreshPerTickBudget).ToList();
+            foreach (var battleTag in due) _pending.Remove(battleTag);
         }
 
         foreach (var battleTag in due)

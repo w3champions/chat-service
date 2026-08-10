@@ -262,4 +262,16 @@ public static class ChatLimits
     /// unbounded set would let a website-backend write storm consume memory here.
     /// </summary>
     public const int FlairRefreshPendingCap = 512;
+
+    /// <summary>
+    /// One flush tick's flair-refresh budget: <see cref="FanOut.FlairRefreshCoalescer.Flush"/> drains at
+    /// most this many pending battleTags per call, leaving any remainder pending for the next tick. Each
+    /// refresh is a website-backend HTTP round trip plus a Mongo load/upsert plus per-connection
+    /// SignalR sends — qualitatively heavier than the other two <see cref="FanOut.FanOutFlushService"/>
+    /// participants, which are pure in-memory work. Unbounded draining lets a large burst (e.g. a bulk
+    /// clan delete notifying every online former member) starve the coalescer's and accumulator's
+    /// flushes on the same shared 1s tick for as long as the burst takes to drain. This is safe to bound
+    /// because the coalescer's semantics already tolerate a tag being refreshed a tick later.
+    /// </summary>
+    public const int FlairRefreshPerTickBudget = 32;
 }

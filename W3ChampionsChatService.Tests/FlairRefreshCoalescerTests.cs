@@ -88,6 +88,28 @@ public class FlairRefreshCoalescerTests
     }
 
     [Test]
+    public async Task Flush_TakesOnlyThePerTickBudget_LeavingTheRemainderPendingForTheNextTick()
+    {
+        // One tick's worth plus a few more, so the first Flush must leave a genuine remainder rather
+        // than happening to drain everything anyway.
+        var total = ChatLimits.FlairRefreshPerTickBudget + 5;
+        for (var i = 0; i < total; i++) _coalescer.RecordChange($"player{i}#1");
+
+        await _coalescer.Flush();
+
+        Assert.That(_refresher.Refreshed, Has.Count.EqualTo(ChatLimits.FlairRefreshPerTickBudget),
+            "a single Flush must refresh no more than one tick's budget");
+        Assert.That(_coalescer.PendingCount, Is.EqualTo(5),
+            "the remainder beyond the budget must stay pending for the next tick");
+
+        await _coalescer.Flush();
+
+        Assert.That(_refresher.Refreshed, Has.Count.EqualTo(total),
+            "a second Flush must refresh the leftover remainder");
+        Assert.That(_coalescer.PendingCount, Is.EqualTo(0));
+    }
+
+    [Test]
     public void RecordChange_IgnoresBlankTags()
     {
         _coalescer.RecordChange(null);

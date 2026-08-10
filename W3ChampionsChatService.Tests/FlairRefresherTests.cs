@@ -119,6 +119,24 @@ public class FlairRefresherTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task Refresh_DoesNotEmitToAConnectionFocusedOnlyOnAnUnrelatedChannel()
+    {
+        // A connection focused only on a channel the changed player is not focused on must receive
+        // nothing — a regression to Clients.All would still pass every other test in this file.
+        const string BystanderTag = "bystander#789";
+        GoOnline("conn-peter", ChangedTag);
+        GoOnline("conn-bystander", BystanderTag);
+        _focus.Focus("conn-peter", "lounge", ChangedTag);
+        _focus.Focus("conn-bystander", "clan", BystanderTag);
+        ResolvesTo(UserWith(ChangedTag, AvatarCategory.NE, 7), true);
+
+        await _refresher.Refresh(ChangedTag);
+
+        Assert.That(_harness.SignalsFor("conn-bystander"), Is.Empty,
+            "a connection focused only on an unrelated channel must receive no FlairChanged signal");
+    }
+
+    [Test]
     public async Task Refresh_SendsOncePerConnection_EvenWhenSharingSeveralChannels()
     {
         GoOnline("conn-peter", ChangedTag);
