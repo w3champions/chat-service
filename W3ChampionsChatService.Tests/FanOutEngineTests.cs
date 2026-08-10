@@ -80,10 +80,20 @@ public class FanOutEngineTests
     // the OnlineMemberRegistry themselves (a different channel/member combination per test), but neither
     // existing NewEngine overload exposes the registry it builds — each constructs it as a private local.
     // This overload takes a CALLER-OWNED OnlineMemberRegistry instead of constructing one, so a test can
-    // seed it (via Join) both before and after this call returns.
+    // seed it (via Join) both before and after this call returns. It also diverges from the ISessionRegistry
+    // overload above in a second way: the ViewersAccumulator here is built with
+    // ViewersAccumulatorTestFactory.EmptyViewerResolver() rather than a real ViewerResolver over the passed
+    // SessionRegistry — safe because no test in this group asserts on viewers or flair, only on activity/preview.
     private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry, OnlineMemberRegistry onlineMemberRegistry) =>
         new FanOutEngine(
-            harness.HubContext, focusRegistry, onlineMemberRegistry, new ActivityCoalescer(harness.HubContext, onlineMemberRegistry), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
+            harness.HubContext,
+            focusRegistry,
+            onlineMemberRegistry,
+            new ActivityCoalescer(harness.HubContext, onlineMemberRegistry),
+            new SessionRegistry(),
+            new PresenceInterestRegistry(),
+            new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()),
+            TimeProvider.System);
 
     // A SessionRegistry seeded with the given (connection, battleTag, isModerator) entries. A moderator
     // entry mirrors ChatSession.HasPermission's conjunct exactly: IsAdmin AND Permissions⊇{Moderation}.
@@ -954,6 +964,7 @@ public class FanOutEngineTests
         var preview = activity.Preview as DmActivityPreviewDto;
         Assert.That(preview, Is.Not.Null,
             "post-game chat needs a preview so the client can raise its one-time nudge toast");
+        Assert.That(preview.SenderBattleTag, Is.EqualTo("Alice#1"), "the client routes the nudge toast by battleTag, not display name — SenderBattleTag must be populated from dto.Sender.BattleTag");
         Assert.That(preview.SenderName, Is.EqualTo("Alice"), "SenderName must reuse dto.Sender.Name from the same MessageDto built for focused delivery, not a fresh lookup");
         Assert.That(preview.Excerpt, Is.EqualTo("gg wp"), "Excerpt must be the message content bounded by Excerpts.Bounded, unchanged for content under the cap");
     }
@@ -1021,10 +1032,8 @@ public class FanOutEngineTests
             "System is not enough — only SystemKind.Match gets a preview, so System+Clan must stay preview-free");
     }
 
-    // Not `async Task`: Assert.DoesNotThrowAsync itself awaits the inner lambda, so the method body has
-    // no top-level await of its own — marking it async would trip CS1998 (lacks await operators).
     [Test]
-    public Task SystemMessageInMatchChannel_ProducesNoPreview_AndDoesNotThrow()
+    public void SystemMessageInMatchChannel_ProducesNoPreview_AndDoesNotThrow()
     {
         var harness = new HubPushCaptureHarness();
         var focusRegistry = new FocusRegistry();
@@ -1054,7 +1063,7 @@ public class FanOutEngineTests
             "a system message has a null Sender — the preview build must not dereference it");
 
         var activity = harness.PayloadFor("conn-bob", ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.That(activity, Is.Not.Null, "a system message still routes coalesced activity to an unfocused level-All member — only the preview is withheld");
         Assert.That(activity.Preview, Is.Null, "there is no sender to preview");
-        return Task.CompletedTask;
     }
 }

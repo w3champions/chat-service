@@ -201,8 +201,10 @@ public class FanOutEngine(
         // C5 (Task 9, D15) + post-game chat Plan A Task 6: the activity preview. Built ONCE per
         // persisted message (identical for every Offer call in the loop below). Two channel classes
         // get one:
-        //   - Dm (C5/OQ-7): the original scope. A pending Dm never reaches the Offer call below at all,
-        //     so this is only ever OFFERED for an accepted Dm.
+        //   - Dm (C5/OQ-7): the original scope. A pending Dm never reaches the Offer call below at all
+        //     (the suppression `continue` skips every recipient, and the initiator/sender is skipped just
+        //     after it), so this is only ever OFFERED for an accepted Dm — building it unconditionally for
+        //     any Dm channel is harmless (it is simply never read for a still-pending one).
         //   - System + Match (post-game chat): the client's ONE-TIME nudge toast after the score screen
         //     closes needs a sender and an excerpt; without a preview it has nothing to render, which is
         //     precisely why post-game messages were previously silent.
