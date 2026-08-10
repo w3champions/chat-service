@@ -255,4 +255,27 @@ public static class ChatLimits
     /// hits it" was unfalsifiable in production. A sustained-denial user must not spam the log on every
     /// call, so this bounds it to once per window. Not spec §13 text; hard-coded, adjust here only.</summary>
     public static readonly TimeSpan ReadRateLimiterDenyLogInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Maximum battleTags the flair-refresh coalescer will hold between flushes. At the cap it DROPS
+    /// new tags rather than growing: a dropped refresh degrades to the reconnect backstop, whereas an
+    /// unbounded set would let a website-backend write storm consume memory here.
+    /// </summary>
+    public const int FlairRefreshPendingCap = 512;
+
+    /// <summary>
+    /// One flush tick's flair-refresh budget: <see cref="FanOut.FlairRefreshCoalescer.Flush"/> drains at
+    /// most this many pending battleTags per call, leaving any remainder pending for the next tick.
+    /// <para>
+    /// Now that the drain runs on its own <see cref="FanOut.FlairRefreshFlushService"/> (fix round, P1) —
+    /// not the shared <see cref="FanOut.FanOutFlushService"/> loop — this budget no longer protects that
+    /// loop's cadence; an unbounded drain can no longer stall unrelated live-chat fan-out regardless of
+    /// burst size. What it still protects is website-backend itself: each refresh is an HTTP round trip
+    /// plus a Mongo load/upsert plus per-connection SignalR sends, so an unbounded drain would let a large
+    /// burst (e.g. a bulk clan delete notifying every online former member) fire dozens-to-hundreds of
+    /// concurrent-ish website-backend requests from a single tick. This is safe to bound because the
+    /// coalescer's semantics already tolerate a tag being refreshed a tick later.
+    /// </para>
+    /// </summary>
+    public const int FlairRefreshPerTickBudget = 32;
 }

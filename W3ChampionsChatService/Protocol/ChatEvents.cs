@@ -42,4 +42,9 @@ public static class ChatEvents
     /// replaces the wb <c>FriendOnlineStatus</c> push (C6-plan.md D13). Carries a
     /// <c>FriendPresenceChangedDto</c>.</summary>
     public const string FriendPresenceChanged = nameof(FriendPresenceChanged);
+
+    /// <summary>C7: pushed when a player's flair (portrait, chat colour, chat icons, clan) changes,
+    /// to every connection focused on a channel that player is also focused on, plus the player's own
+    /// connection. Carries a <c>FlairChangedDto</c>.</summary>
+    public const string FlairChanged = nameof(FlairChanged);
 }

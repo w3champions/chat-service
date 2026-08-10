@@ -141,6 +141,16 @@ public class InternalRelationshipChangeRequest
 }
 
 /// <summary>
+/// Body of <c>POST /internal/profile-changes</c>: the players whose flair website-backend believes
+/// may have changed. Capped at <see cref="Domain.ChatLimits.InternalMaxMembersPerCall"/>; the sender
+/// chunks larger sets into separate requests.
+/// </summary>
+public class InternalProfileChangeRequest
+{
+    public List<string> BattleTags { get; set; }
+}
+
+/// <summary>
 /// REST projection of a <see cref="ChatChannel"/> returned by <c>POST /internal/channels</c> (C7 Task
 /// 9) — System.Text.Json's default camelCase serialization matches the wire contract mm expects, so no
 /// custom naming policy is needed.

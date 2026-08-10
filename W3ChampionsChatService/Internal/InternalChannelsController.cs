@@ -292,15 +292,7 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         && members.Count <= ChatLimits.InternalMaxMembersPerCall
         && members.All(IsValidMemberEntry);
 
-    // 2026-08-05 fix wave (final review M5): mirrors InternalRelationshipChangesController's
-    // IsValidParticipant EXACTLY — non-blank AND control-char-free. Before this, a member entry was
-    // bounded only by the 64 KB body cap and landed as a lowercased Mongo BattleTag key with no
-    // per-entry length or control-char guard, asymmetric with the relationship-changes surface's
-    // identical-shaped field. char.IsControl catches an embedded '\n'/'\r'/'\t'/NUL (log-injection);
-    // U+2028/U+2029 are checked explicitly because they are category Zl/Zp, not Cc, so char.IsControl
-    // alone misses them.
-    private static bool IsValidMemberEntry(string value) =>
-        !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
+    private static bool IsValidMemberEntry(string value) => InternalValidation.IsValidBattleTag(value);
 
     private void LogUnexpected(Exception ex, string verb, string @ref) =>
         Log.Error(ex, "Internal channels endpoint failed {Caller} {Verb} {Ref}", InternalHmacAuthFilter.ResolveCaller(HttpContext), verb, @ref);
