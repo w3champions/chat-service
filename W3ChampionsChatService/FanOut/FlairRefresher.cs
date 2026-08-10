@@ -55,61 +55,44 @@ public class FlairRefresher(
 
         var resolution = await _chatAuthenticationService.GetUserFromIdentity(session.Identity);
 
-        // Fix round P2 (findings 2+3): re-validate AFTER the await, before any side effect. The awaited
-        // wb round-trip above is a window in which the player can disconnect, or reconnect under a new
-        // connection id. If the authoritative session for this battleTag is no longer THIS connection,
-        // every side effect below must be skipped:
-        //  - acting on the stale `session` would resurrect ConnectionMapping's entry for a connection
-        //    ChatHub.OnDisconnectedAsync already tore down (Remove runs in a `finally`, unconditionally,
-        //    then RegisterUser's unconditional `_users[connectionId] = user` would recreate it) —
-        //    disconnect fires once, so nothing would ever remove it again: an unbounded leak under
-        //    repeated connect/disconnect-during-refresh races.
-        //  - the send targets below would include a dead SignalR connection id (harmless — sends to a
-        //    dead connection are silent no-ops — but pointless).
+        // The awaited wb round-trip above is a window in which the player can disconnect, or reconnect
+        // under a new connection id. Re-validate against the authoritative session before touching any
+        // state: acting on the stale `session` would resurrect a ConnectionMapping entry that
+        // ChatHub.OnDisconnectedAsync's `finally` already tore down, and since disconnect fires exactly
+        // once, nothing would ever remove it again — an unbounded leak under repeated connect/disconnect
+        // races.
         var current = _sessionRegistry.GetByBattleTag(battleTag);
         if (current == null || current.ConnectionId != session.ConnectionId) return;
 
-        // THE RULE (spec §5). A wb blip degrades to a tier-3 profile with FreshFromWb false. Acting on
-        // it would replace a good cached ChatUser and broadcast the default avatar to every viewer —
-        // converting a transient upstream hiccup into a visible regression for the whole channel. Doing
-        // nothing costs nothing: the next successful ping, or the player's next connect, re-enriches.
+        // THE RULE. A wb blip degrades to a tier-3 profile with FreshFromWb false. Acting on it would
+        // replace a good cached ChatUser and broadcast the default avatar to every viewer — converting a
+        // transient upstream hiccup into a visible regression for the whole channel. Doing nothing costs
+        // nothing: the next successful ping, or the player's next connect, re-enriches.
         if (!resolution.FreshFromWb) return;
 
-        // Fix round P2 (finding 3): downstream uses the LIVE SESSION IDENTITY's casing, not the raw
-        // webhook-supplied `battleTag` parameter — matching the connect path (ChatHub.UpsertDirectory,
-        // which always passes identity.BattleTag). The webhook value comes from website-backend's
-        // PersonalSetting.Id / ClanMembership.BattleTag (storage casing) and nothing reconciles it
-        // against the session; DisplayBattleTag is the authoritative display casing read by mention
-        // search (ChatHub.Mentions.cs), so acting on the webhook casing here could overwrite a user's
-        // display casing with storage casing on every flair ping.
+        // Downstream uses the LIVE SESSION IDENTITY's casing, not the raw webhook-supplied `battleTag`
+        // parameter — matching the connect path (ChatHub.UpsertDirectory, which always passes
+        // identity.BattleTag). The webhook value comes from website-backend's storage casing and nothing
+        // reconciles it against the session; DisplayBattleTag is the authoritative display casing read by
+        // mention search, so acting on the webhook casing here could overwrite a user's display casing
+        // with storage casing on every flair ping.
         var liveBattleTag = current.Identity.BattleTag;
 
         _connections.RegisterUser(current.ConnectionId, resolution.User);
 
-        // Codex P2 follow-up: the pre-write revalidation above (lines 69-70) narrows the disconnect race
-        // but does not close it. It and the RegisterUser write immediately above are two separate,
-        // unsynchronized critical sections (SessionRegistry's lock, then ConnectionMapping's lock) with no
-        // await between them — so ChatHub.OnDisconnectedAsync's Unregister+Remove sequence can still land
-        // in that gap on another thread. If it does, RegisterUser just resurrected the _users entry that
-        // Remove already cleaned up, and since disconnect fires exactly once, nothing would ever remove it
-        // again: an unbounded leak under repeated connect/disconnect-during-refresh races.
-        //
-        // Close the loop with a POST-write validation instead of a cross-lock atomic write (which would
-        // require SessionRegistry and ConnectionMapping to share a lock — a bigger, riskier change for two
-        // registries that are deliberately independent). Re-read the authoritative session; if it no longer
-        // points at this connection, undo the write. ConnectionMapping.Remove is safe to call here:
-        //  - it is a no-op for an already-absent connectionId (Remove/TryGetValue-based, never throws), so
-        //    it is safe whether OnDisconnectedAsync's own Remove already ran or hasn't run yet;
-        //  - it is scoped to THIS connectionId only (room lookup, mute cache and _users are all keyed by
-        //    connectionId, which SignalR guarantees unique per connection), so it can never remove a
-        //    different, live connection's mapping — including another connection for the same battleTag.
-        //
-        // This only guards the ConnectionMapping write. The user-directory upsert and the fan-out send
-        // below don't need the same guard: the directory upsert is a keyed-by-battleTag, idempotent
-        // "latest known-good profile" write with no dangling state if the session is gone — harmless, and
-        // still correct for the player's next connect. The fan-out send targets a dead connection id at
-        // worst, which SignalR already treats as a silent no-op (see the catch below) — pointless, not
-        // leaky. Only ConnectionMapping accumulates unbounded, un-owned state if left unvalidated.
+        // The revalidation above narrows the disconnect race but does not close it: that read and this
+        // write are two separate, unsynchronized critical sections with no await between them, so
+        // ChatHub.OnDisconnectedAsync can still land in the gap on another thread and have its Remove
+        // undone by the RegisterUser call just above. Re-read the authoritative session once more; if it
+        // no longer points at this connection, someone else got there first — undo the write and stop.
+        // ConnectionMapping.Remove is safe here: it no-ops on an already-absent connectionId, and it is
+        // scoped to this connectionId only, so it can never remove a different, live connection's mapping
+        // (including another connection for the same battleTag). Returning here — rather than falling
+        // through into the directory upsert and fan-out below — matters: those two use this stale
+        // request's `resolution`, and a newer refresh for the same battleTag may already have written a
+        // fresher one. Idempotent, battleTag-keyed writes don't save you when two refreshes interleave —
+        // the older one finishing last still overwrites the newer profile and broadcasts outdated flair
+        // to live viewers, not just a dead connection.
         var postWriteSession = _sessionRegistry.GetByBattleTag(battleTag);
         if (postWriteSession == null || postWriteSession.ConnectionId != current.ConnectionId)
         {
