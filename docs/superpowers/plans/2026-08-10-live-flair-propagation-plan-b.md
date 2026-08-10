@@ -13,7 +13,7 @@
 - **Spec:** `docs/superpowers/specs/2026-08-09-roster-flair-enrichment-design.md`. This plan implements §3.2, §3.3 and the `FlairChangedDto` row of §4. §3.1 and the roster half of §4 shipped in Plan A (chat-service PR #44, launcher-e PR #850, both merged 2026-08-10).
 - **The `FreshFromWb` rule is the single most important behaviour in this plan.** On a refresh, if `GetUserFromIdentity` returns `FreshFromWb == false`, do **nothing at all** — no `RegisterUser`, no directory write, no `FlairChanged`. A website-backend blip would otherwise broadcast a degraded tier-3 profile (the sheep) to every viewer in the channel, turning a transient upstream hiccup into a visible regression for everyone. This is the one place this design could make things worse than today. It gets an explicit test.
 - **Never fail a caller's write.** A notifier fault must never surface to a settings save or clan operation. Notification fires only *after* the inner write succeeds, inside its own try/catch.
-- **Self-disabling.** Without `CHAT_INTERNAL_API_SECRET` the notifier is a silent no-op with one startup log line. This is what makes the feature deployable dark and enabled by configuration.
+- **Self-disabling.** Without `CHAT_INTERNAL_API_SECRET` the notifier is a silent no-op with one startup log line. **Correction (2026-08-10, from the final review):** this does *not* make the feature deployable dark. `ChatPingSettings` is keyed on the same `CHAT_INTERNAL_API_SECRET` the already-shipped `RelationshipChangeNotifier` uses, so in any environment where relationship pings work — production included — the flair notifier is enabled the moment website-backend deploys. There is no configuration state in which website-backend ships this dormant. The mitigation is deploy order, not configuration: see Rollout.
 - **Reuse, do not reinvent.** `IFlairChangeNotifier` clones the `RelationshipChangeNotifier` triad 1:1 — same `ChatInternalApiSigner` HMAC scheme and headers, same `ChatPingSettings`, same `Task.Run` fire-and-forget with 2 attempts and a 3 s per-attempt cap. The chat-service controller clones `InternalRelationshipChangesController`. The coalescer mirrors `ActivityCoalescer` / `ViewersAccumulator` discipline: mutate state under one lock, send outside it, fault-isolate per connection.
 - **Batch cap:** `ChatLimits.InternalMaxMembersPerCall` is **64**. The bulk clan-delete path can exceed that, so the notifier must chunk; the controller rejects any batch over the cap outright with no partial processing.
 - **launcher-e has no test runner.** Do not add one and do not write frontend tests. Verification there is `npm run type-check`, `npm run lint:prod`, `npm run dprint`, `npm run check:i18n`.
@@ -2167,7 +2167,11 @@ Report the two suite counts, the four launcher-e exit codes, the two grep result
 
 ## Rollout
 
-This plan is step 4 of the spec's §8 rollout, and steps 1-3 have already shipped. It is deployable **dark**: without `CHAT_INTERNAL_API_SECRET` the notifier self-disables and nothing changes. Deploy chat-service first (the endpoint is inert until something calls it), then website-backend, then set the secret to enable.
+This plan is step 4 of the spec's §8 rollout, and steps 1-3 have already shipped.
+
+**Deploy order is load-bearing: chat-service first, then website-backend.** `CHAT_INTERNAL_API_SECRET` is already set in production (it is shared with the relationship pings), so website-backend starts POSTing the moment it deploys. If the chat-service route does not exist yet, every settings save and clan write gets a 404, retries once, and logs `Flair change-ping rejected by chat-service`. No user-visible harm — the write has already committed and the notifier cannot fail it — but it is sustained log noise proportional to site write volume, and it is also the rollback story: reverting chat-service alone leaves website-backend warning on every write until it follows.
+
+The chat-service side is inert on its own: the endpoint exists but nothing calls it until website-backend ships.
 
 Unlike Plan A, nothing here is a breaking wire change. `FlairChanged` is a new event; a client that does not bind it simply ignores it, and the launcher change in Task 7 can ship on any schedule.
 
