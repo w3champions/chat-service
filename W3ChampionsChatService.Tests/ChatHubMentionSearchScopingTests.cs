@@ -96,6 +96,7 @@ public class ChatHubMentionSearchScopingTests : IntegrationTestBase
 
     private ChatHub BuildHub(string connectionId, MembershipRepository membershipRepository = null)
     {
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileHarness.Service,
@@ -122,7 +123,8 @@ public class ChatHubMentionSearchScopingTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             _mentionInboxRepository,
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

@@ -76,6 +76,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
     private ViewersAccumulator _viewersAccumulator;
+    private ViewerResolver _viewerResolver;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
@@ -131,8 +132,8 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         // registries the hubs mutate — so every push lands in a single ordered capture and the
         // coalescer/accumulator see the live roster/membership/read-state the hubs produce.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry(), _viewersAccumulator, _time);
     }
@@ -175,7 +176,8 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

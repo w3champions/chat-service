@@ -47,6 +47,7 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
     private FakeTimeProvider _time;
     private HubPushCaptureHarness _harness;
     private ViewersAccumulator _accumulator;
+    private ViewerResolver _viewerResolver;
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private SessionRegistry _sessionRegistry;
@@ -103,8 +104,8 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
         // A REAL FanOutEngine + a REAL ViewersAccumulator sharing the hubs' registries, both wired to one
         // capture harness so ChannelAdded/ChannelRemoved pushes AND any stray ViewersChanged are observable.
         _harness = new HubPushCaptureHarness();
-        _accumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _coalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         _fanOutEngine = new FanOutEngine(_harness.HubContext, _focusRegistry, _onlineMemberRegistry, _coalescer, _sessionRegistry, new PresenceInterestRegistry(), _accumulator, _time);
 
@@ -157,7 +158,8 @@ public class ChatHubGroupManagementTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(new Mock<ISingleClientProxy>().Object);

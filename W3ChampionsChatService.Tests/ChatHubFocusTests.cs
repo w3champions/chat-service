@@ -87,6 +87,7 @@ public class ChatHubFocusTests : IntegrationTestBase
 
     private ChatHub BuildHub(string connectionId)
     {
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileService,
@@ -113,7 +114,8 @@ public class ChatHubFocusTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

@@ -77,6 +77,7 @@ public class MutePortTests : IntegrationTestBase
     // SAME FocusRegistry the hubs mutate, and pushes through the capture harness (NOT the hub's Clients).
     private HubPushCaptureHarness _pushHarness;
     private ViewersAccumulator _accumulator;
+    private ViewerResolver _viewerResolver;
 
     // Connections that had Context.Abort() invoked (join/send no-abort pins). Connect-path sends/aborts
     // are captured separately in _connectSends (target, method | "ABORT").
@@ -113,8 +114,8 @@ public class MutePortTests : IntegrationTestBase
         _assembler = NewAssembler(_muteRepository);
 
         _pushHarness = new HubPushCaptureHarness();
-        _accumulator = new ViewersAccumulator(
-            _pushHarness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _accumulator = new ViewersAccumulator(_pushHarness.HubContext, _focusRegistry, _viewerResolver);
     }
 
     // ── Hub construction ─────────────────────────────────────────────────────────
@@ -123,8 +124,15 @@ public class MutePortTests : IntegrationTestBase
         new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _onlineMemberRegistry, _connectionMapping,
             new MentionInboxRepository(MongoClient));
 
+    // The ViewerResolver is deliberately paired with `viewers`, not always _viewerResolver: passing
+    // _viewerResolver alongside a throwaway ViewersAccumulatorTestFactory.CreateIgnored() would resolve a
+    // display name/flair from the SHARED real registries into a hub whose accumulator can never observe
+    // it — same-instance sharing only makes sense when `viewers` IS the real, shared _accumulator.
     private ChatHub NewHub(SessionStateAssembler assembler, ViewersAccumulator viewers, IHubCallerClients clients, HubCallerContext context)
     {
+        var viewerResolver = ReferenceEquals(viewers, _accumulator)
+            ? _viewerResolver
+            : ViewersAccumulatorTestFactory.EmptyViewerResolver();
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileHarness.Service,
@@ -151,7 +159,8 @@ public class MutePortTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient))
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver)
         {
             Clients = clients,
             Context = context,

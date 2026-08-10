@@ -88,6 +88,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _connectionMapping,
             new MentionInboxRepository(MongoClient));
 
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+
         _chatHub = new ChatHub(
             _connectionMapping,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
@@ -114,7 +116,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);

@@ -245,6 +245,7 @@ public class ViewersAccumulatorTests : IntegrationTestBase
     private FakeTimeProvider _time;
     private HubPushCaptureHarness _harness;
     private ViewersAccumulator _accumulator;
+    private ViewerResolver _viewerResolver;
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private SessionRegistry _sessionRegistry;
@@ -277,8 +278,8 @@ public class ViewersAccumulatorTests : IntegrationTestBase
         // RecordChange) and its current-state read (in FlushDue) see the live roster the hubs produce.
         // It also shares the SAME session/connection registries the hubs register into, so a joined
         // entry's flair reflects the live ChatUser each test seeds.
-        _accumulator = new ViewersAccumulator(
-            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, _connectionMapping));
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -330,7 +331,8 @@ public class ViewersAccumulatorTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
         var context = new Mock<HubCallerContext>();

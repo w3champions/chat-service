@@ -101,17 +101,20 @@ public partial class ChatHub(
     // PR36 follow-up (D2): the notification-preference carrier — JoinChannel's rejoin-seed path reads it,
     // SetNotificationLevel's write path (Public/SemiPublic only) writes it. Both live in
     // ChatHub.Channels.cs; this is the ONLY ctor change this task makes to ChatHub itself.
-    NotificationPreferenceRepository notificationPreferenceRepository) : Hub
+    NotificationPreferenceRepository notificationPreferenceRepository,
+    // PR44 review ("No shortcuts. Follow proper DI!"): resolves a roster battleTag into a
+    // ChannelViewerDto (display name + flair) for FocusChannel. This MUST be the SAME singleton
+    // ViewersAccumulator receives (registered in Startup.cs) — that shared instance is what
+    // guarantees an initial roster snapshot and a subsequent ViewersChanged join delta can never
+    // render the same viewer differently. Stateless — it holds only references to ISessionRegistry
+    // and ConnectionMapping (both already above), so injecting it costs nothing beyond the reference.
+    ViewerResolver viewerResolver) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly ITicketStore _ticketStore = ticketStore;
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
-    // Built from the primary-constructor params rather than injected, deliberately: adding a ctor
-    // parameter would force an edit to all 31 test files that construct a ChatHub. ViewerResolver is
-    // stateless (it holds only references to the two singletons above), so this instance and the
-    // DI-registered singleton the ViewersAccumulator receives are interchangeable.
-    private readonly ViewerResolver _viewerResolver = new(sessionRegistry, connections);
+    private readonly ViewerResolver _viewerResolver = viewerResolver;
     private readonly UserDirectoryRepository _userDirectory = userDirectory;
     // C3 (Task 8): the SessionState snapshot assembler + the in-memory fan-out registries this hub
     // seeds on connect and tears down on disconnect. TimeProvider supplies the trusted server clock
