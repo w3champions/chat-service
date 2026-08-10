@@ -179,6 +179,8 @@ public class Startup
         // guarantees an initial roster and a ViewersChanged join delta can never render a viewer
         // differently.
         services.AddSingleton<ViewerResolver>();
+        // Singleton: holds only singletons plus the hub context. Consumed by FlairRefreshCoalescer.
+        services.AddSingleton<IFlairRefresher, FlairRefresher>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();
