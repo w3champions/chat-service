@@ -334,9 +334,33 @@ public partial class ChatHub
         // that reach it out of order settle on the higher seq regardless of arrival order — the same
         // monotonic discipline AllocateSeq gives the counter itself. A false return means a concurrent
         // newer message already won, which is the correct outcome and not an error.
+        //
+        // BEST-EFFORT, exactly like the fan-out below it: the message is already durable by this point,
+        // so a failure here must never propagate and turn a completed send into an error — the caller
+        // would get no ack for a message that exists, and a client retry would persist a duplicate.
+        // Introducing a second post-persist Mongo write is only acceptable on that condition. The cost
+        // of swallowing it is bounded and self-healing: the conversation row renders the previous
+        // message until the next one in that channel advances the projection.
+        //
+        // The ACCEPTED half of the scope is re-decided inside TryAdvanceLastMessage, against the durable
+        // channel doc rather than this in-memory snapshot — `channel` was loaded before the send and a
+        // concurrent AcceptRequest can commit in between, which would otherwise skip the projection for
+        // a conversation that is accepted by the time this runs. Only the shape gate (Dm/GroupDm) and
+        // the shadow rule, neither of which any concurrent write can change, are decided here.
         if (!isShadow && CarriesLastMessageProjection(channel))
         {
-            await _channelRepository.TryAdvanceLastMessage(channelId, BuildLastMessageProjection(message));
+            try
+            {
+                await _channelRepository.TryAdvanceLastMessage(channelId, BuildLastMessageProjection(message));
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(
+                    ex,
+                    "Conversation-list projection failed for channel {ChannelId} seq {Seq} — message is persisted and delivery continues; the row stays on the previous message until the next send",
+                    channelId,
+                    message.Seq);
+            }
         }
 
         // 7.5 Dm recipient materialization + RequestReceived (C5 Task 4, D4) — post-persist, BEFORE fan-out.
@@ -669,24 +693,26 @@ public partial class ChatHub
     }
 
     /// <summary>
-    /// Which channels carry the <see cref="ChannelLastMessage"/> conversation-list projection: GroupDm
-    /// always, Dm only once ACCEPTED, nothing else. See <see cref="ChannelLastMessage"/> for why the set is
-    /// this narrow — the pending-Dm exclusion is the consent wall (a recipient must not see a stranger's
-    /// text before accepting, the same rule that suppresses their <c>ChannelActivity</c>), and the
-    /// public/system exclusion keeps room content out of the <c>PublicCatalog</c> shells that ship to
-    /// NON-members.
+    /// Which channels carry the <see cref="ChannelLastMessage"/> conversation-list projection: the two
+    /// conversation shapes, nothing else. See <see cref="ChannelLastMessage"/> for why the set is this
+    /// narrow — the public/system exclusion keeps room content out of the <c>PublicCatalog</c> shells that
+    /// ship to NON-members.
+    /// <para>
+    /// This is the TYPE half of the scope only. The consent wall — a pending Dm is not projected, so a
+    /// recipient never sees a stranger's text before accepting, the same rule that suppresses their
+    /// <c>ChannelActivity</c> — is enforced inside
+    /// <see cref="ChannelRepository.TryAdvanceLastMessage"/>'s own filter instead, because it is the half
+    /// a concurrent write can change between the send loading this channel and the projection landing.
+    /// A channel's TYPE is immutable, so deciding that here is safe by construction.
+    /// </para>
     /// <para>
     /// A Dm accepted AFTER messages already exist is not backfilled: the projection appears with the
     /// conversation's next message. Backfilling would mean reading the message collection on the accept
     /// path to publish text the recipient has, until that moment, deliberately not been shown.
     /// </para>
     /// </summary>
-    internal static bool CarriesLastMessageProjection(ChatChannel channel) => channel.Type switch
-    {
-        ChannelType.GroupDm => true,
-        ChannelType.Dm => channel.RequestState == DmRequestState.Accepted,
-        _ => false,
-    };
+    internal static bool CarriesLastMessageProjection(ChatChannel channel) =>
+        channel.Type is ChannelType.Dm or ChannelType.GroupDm;
 
     /// <summary>
     /// The single message→projection mapping. <see cref="Excerpts.Bounded"/> is the SAME helper that builds

@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Time.Testing;
+using MongoDB.Driver;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
@@ -129,7 +130,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
             new MentionInboxRepository(MongoClient));
     }
 
-    private ChatHub BuildHub(string connectionId)
+    private ChatHub BuildHub(string connectionId, ChannelRepository channelRepository = null)
     {
         var hub = new ChatHub(
             _connectionMapping,
@@ -143,7 +144,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
             _messageRateLimiter,
             _readRateLimiter,
             _time,
-            _channelRepository,
+            channelRepository ?? _channelRepository,
             _membershipRepository,
             _channelCreationRateLimiter,
             _messageRepository,
@@ -828,6 +829,66 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That(projection.Excerpt, Is.EqualTo(Excerpts.Bounded(content)),
             "the projection and the live ChannelActivity preview must come from the SAME excerpt helper, or a "
             + "client would see the same message's text differ between the snapshot and the live event");
+    }
+
+    [Test]
+    public async Task DmSend_ProjectionWriteThrows_SendStillAcksAndDelivers()
+    {
+        // The projection is a SECOND post-persist write. If it could propagate, a message that is already
+        // durable would come back as an error, the caller would get no ack, and a client retry would
+        // persist a duplicate. Best-effort is the only acceptable shape for post-persist work — the same
+        // rule the fan-out below it already follows.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn, new ThrowingLastMessageChannelRepository(MongoClient));
+
+        var result = await hub.SendMessage(channel.Id, "the projection write is about to fail");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "a failed projection must not turn a persisted send into an error");
+        Assert.That(result.Seq, Is.EqualTo(1L), "the ack still carries the allocated seq");
+        var stored = await _messageRepository.LoadForUser(channel.Id, Initiator);
+        Assert.That(stored.Count, Is.EqualTo(1), "the message is durable regardless");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastMessage, Is.Null, "and the row simply stays on the previous message until the next send");
+    }
+
+    [Test]
+    public async Task DmSend_AcceptedConcurrentlyWithTheSend_StillProjects()
+    {
+        // The send loads the channel BEFORE it writes. If the recipient accepts in that window, the
+        // in-memory snapshot still says Pending — deciding consent from it would skip the projection for a
+        // conversation that is accepted by the time the write lands, stranding the row until the next
+        // message. The decision belongs to the durable doc, so this send projects even though the hub's
+        // own copy of the channel says otherwise.
+        var channel = await CreateDm(DmRequestState.Pending);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn, new AcceptOnProjectionChannelRepository(MongoClient));
+
+        var result = await hub.SendMessage(channel.Id, "accepted while this was in flight");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection, Is.Not.Null, "the durable state was Accepted when the write ran, so the projection belongs there");
+        Assert.That(projection.Excerpt, Is.EqualTo("accepted while this was in flight"));
+    }
+
+    // Fails the conversation-list projection write and nothing else.
+    private sealed class ThrowingLastMessageChannelRepository(MongoClient client) : ChannelRepository(client)
+    {
+        public override Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage) =>
+            throw new MongoException("projection write failed");
+    }
+
+    // Commits the acceptance the instant the projection write runs — i.e. AFTER the send loaded the
+    // channel as Pending — reproducing the accept-races-send window from the durable side, through the
+    // same SetRequestAccepted transition AcceptRequest itself uses.
+    private sealed class AcceptOnProjectionChannelRepository(MongoClient client) : ChannelRepository(client)
+    {
+        public override async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+        {
+            await SetRequestAccepted(channelId, DateTime.UtcNow);
+            return await base.TryAdvanceLastMessage(channelId, lastMessage);
+        }
     }
 
     // --- Invariants this projection silently depends on, pinned so that widening either scope fails loudly ---

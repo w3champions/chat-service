@@ -100,13 +100,20 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 channels[channelId] = entry;
             }
 
-            // Latest-offered-preview: overwritten unconditionally on every Offer, regardless of which
-            // branch fires below — a coalesced burst's pending always reflects the MOST RECENT preview.
-            // SentAt rides the exact same latest-wins discipline: it describes the same offered message as
-            // the preview beside it, so the two must be written and drained together or a client would pair
-            // one message's text with another's timestamp.
-            entry.Preview = preview;
-            entry.SentAt = sentAt;
+            // Highest-offered-preview. (Preview, SentAt) describe ONE message and are written and drained
+            // together, or a client would pair one message's text with another's timestamp. They are kept
+            // for the HIGHEST seq offered rather than the most recently offered, because that is the seq
+            // the emit below selects: concurrent same-channel sends can reach this lock out of order, and
+            // a latest-arrival-wins rule would then emit the higher seq carrying the LOWER message's text
+            // and timestamp — a row showing the second-newest message, pinned at a seq the newest message
+            // can no longer replace. Coalescing a burst still keeps the newest of it, since a burst that
+            // arrives in order offers ascending seqs.
+            if (lastSeq >= entry.PreviewSeq)
+            {
+                entry.Preview = preview;
+                entry.SentAt = sentAt;
+                entry.PreviewSeq = lastSeq;
+            }
 
             if (now - entry.LastSentAt >= ChatLimits.ChannelActivityCoalesce)
             {
@@ -272,5 +279,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
         internal long LastEmittedSeq;
         internal object Preview;
         internal DateTime? SentAt;
+        /// <summary>The seq the current <see cref="Preview"/>/<see cref="SentAt"/> pair describes — keeps
+        /// them aligned with the highest offered seq when offers arrive out of order.</summary>
+        internal long PreviewSeq;
     }
 }

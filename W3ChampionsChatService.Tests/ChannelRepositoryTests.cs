@@ -373,10 +373,60 @@ public class ChannelRepositoryTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task TryAdvanceLastMessage_PendingDm_IsANoOp_ConsentWall()
+    {
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Pending, LastSeq = 0 };
+        await repo.Insert(channel);
+
+        var advanced = await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 1, "hi, do you know me?"));
+
+        Assert.IsFalse(advanced, "a pending Dm is outside the projected scope — the write must simply not match");
+        Assert.IsNull((await repo.Load(channel.Id)).LastMessage, "a recipient must not see a stranger's text before accepting");
+    }
+
+    [Test]
+    public async Task TryAdvanceLastMessage_ReadsConsentFromTheDurableDoc_NotTheCallersSnapshot()
+    {
+        // The send path decides scope from a channel it loaded BEFORE the write. If a concurrent
+        // AcceptRequest commits in that window, the durable doc is what must decide — otherwise the
+        // projection is skipped for a conversation that IS accepted, and the row stays stale until the
+        // next message. Same channel, same call, opposite outcome purely from the durable state.
+        var repo = new ChannelRepository(MongoClient);
+        var channel = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Pending, LastSeq = 0 };
+        await repo.Insert(channel);
+        Assert.IsFalse(await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 1, "before consent")));
+
+        await repo.SetRequestAccepted(channel.Id, DateTime.UtcNow);
+        var advanced = await repo.TryAdvanceLastMessage(channel.Id, NewProjection(seq: 2, "after consent"));
+
+        Assert.IsTrue(advanced, "once the durable doc says Accepted the very same write must land");
+        Assert.AreEqual("after consent", (await repo.Load(channel.Id)).LastMessage.Excerpt);
+    }
+
+    [Test]
+    public async Task TryAdvanceLastMessage_GroupDm_AdvancesWithoutAnyRequestState()
+    {
+        // A group has no consent machine at all — RequestState is null on the doc, so the accepted leg of
+        // the filter can never match it and the type leg is what admits it.
+        var repo = new ChannelRepository(MongoClient);
+        var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastSeq = 0 };
+        await repo.Insert(group);
+
+        var advanced = await repo.TryAdvanceLastMessage(group.Id, NewProjection(seq: 1, "all tinkers in one place"));
+
+        Assert.IsTrue(advanced);
+        Assert.AreEqual("all tinkers in one place", (await repo.Load(group.Id)).LastMessage.Excerpt);
+    }
+
+    [Test]
     public async Task LastMessage_RoundTripsAndIsOmittedWhenAbsent()
     {
         var repo = new ChannelRepository(MongoClient);
-        var without = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Pending, LastSeq = 0 };
+        // Accepted: this test is about SERIALIZATION, and a pending Dm is outside the projected scope
+        // entirely (TryAdvanceLastMessage_PendingDm_IsANoOp_ConsentWall covers that), so it would have
+        // nothing to round-trip.
+        var without = new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted, LastSeq = 0 };
         await repo.Insert(without);
 
         var raw = await MongoClient.GetDatabase(MongoDbRepositoryBase.DatabaseName)

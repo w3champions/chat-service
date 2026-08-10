@@ -470,6 +470,32 @@ public class ActivityCoalescerTests
     }
 
     [Test]
+    public async Task OutOfOrderOffer_DoesNotPairTheHigherSeqWithTheLowerMessagesTextAndTimestamp()
+    {
+        // Concurrent same-channel sends reach the lock in either order, and the emitted seq is the MAX of
+        // what was offered. If (Preview, SentAt) were kept latest-ARRIVED rather than highest-SEQ, a
+        // delayed lower offer would ride out under the higher seq — the row would show the second-newest
+        // message pinned at a seq the newest message can no longer replace (the client's projection merge
+        // is monotonic on exactly that seq).
+        var (harness, _, coalescer) = NewCoalescer();
+        var newerSentAt = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
+        var newer = new DmActivityPreviewDto("peter#123", "peter", "the newest message");
+        var older = new DmActivityPreviewDto("peter#123", "peter", "the delayed older message");
+
+        // seq 7 opens the window and emits; the delayed seq 6 then lands inside it.
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 7, T0, preview: newer, sentAt: newerSentAt);
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview: older, sentAt: newerSentAt.AddMinutes(-1));
+        await coalescer.FlushDue(T0.AddSeconds(11));
+
+        var payloads = ActivityPayloads(harness, MemberConn);
+        Assert.AreEqual(2, payloads.Count, "one immediate emit plus one flushed pending");
+        Assert.AreEqual(7, payloads[1].LastSeq, "the emitted seq stays at the max, as before");
+        Assert.AreEqual("the newest message", ((DmActivityPreviewDto)payloads[1].Preview).Excerpt,
+            "the text must belong to the seq being emitted, not to whichever offer arrived last");
+        Assert.AreEqual(newerSentAt, payloads[1].SentAt, "and so must the timestamp beside it");
+    }
+
+    [Test]
     public async Task SentAt_TravelsWithItsOwnPreview()
     {
         // The pair describes ONE message. If they were written or drained independently a client could

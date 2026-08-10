@@ -113,13 +113,24 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// exchange the seq allocator stays untouched and this write is monotonic by construction: two
     /// concurrent sends that reach it out of order settle on the higher seq no matter which lands last.
     /// </para>
+    /// <para>
+    /// The CONSENT half of the scope is enforced here rather than by the caller: a 1:1 Dm is projected only
+    /// once its request is <see cref="DmRequestState.Accepted"/>, and that is read from the durable doc in
+    /// the same command that writes. The caller decides scope from a channel it loaded BEFORE the send, and
+    /// a concurrent <c>AcceptRequest</c> can commit in between — deciding there would skip the projection
+    /// for a conversation that is accepted by the time the write runs, stranding the row on an older message
+    /// until the next send. A pending Dm is a no-op here, not an error: same shape as losing the seq CAS.
+    /// </para>
     /// Returns true iff this call actually advanced the field.
     /// </summary>
-    public async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+    public virtual async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
     {
         var filterBuilder = Builders<ChatChannel>.Filter;
         var filter = filterBuilder.And(
             filterBuilder.Eq(c => c.Id, channelId),
+            filterBuilder.Or(
+                filterBuilder.Eq(c => c.Type, ChannelType.GroupDm),
+                filterBuilder.Eq(c => c.RequestState, DmRequestState.Accepted)),
             filterBuilder.Or(
                 // A missing field matches Eq(..., null) in Mongo — this is the never-projected-yet case.
                 filterBuilder.Eq(c => c.LastMessage, null),
