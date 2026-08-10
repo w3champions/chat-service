@@ -62,7 +62,7 @@ public class FanOutFlushServiceTests
         // --- Arm the accumulator: RecordChange BEFORE the Focus captures a not-viewing baseline; the Focus
         // makes it viewing, so a due FlushDue (>= T0+5s) emits a `joined` to the focused viewer.
         var focus = new FocusRegistry();
-        var accumulator = new ViewersAccumulator(harness.HubContext, focus);
+        var accumulator = new ViewersAccumulator(harness.HubContext, focus, ViewersAccumulatorTestFactory.EmptyViewerResolver());
         accumulator.RecordChange(ChannelId, ViewerTag, T0);
         focus.Focus(ViewerConn, ChannelId, ViewerTag);
 
@@ -115,7 +115,7 @@ public class FanOutFlushServiceTests
         // The accumulator's join flushed via the same timer path.
         var batches = ViewersChangedFor(harness, ViewerConn);
         Assert.AreEqual(1, batches.Count, "the accumulated join must flush exactly once via the timer");
-        Assert.IsTrue(batches[0].Joined.Any(t => string.Equals(t, ViewerTag, StringComparison.OrdinalIgnoreCase)),
+        Assert.IsTrue(batches[0].Joined.Any(v => string.Equals(v.BattleTag, ViewerTag, StringComparison.OrdinalIgnoreCase)),
             "the timer-driven ViewersChanged batch must report the viewer as joined");
         Assert.IsEmpty(batches[0].Left);
     }

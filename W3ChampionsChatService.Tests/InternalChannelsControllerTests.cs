@@ -9,6 +9,7 @@ using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Internal;
@@ -58,7 +59,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var focusRegistry = new FocusRegistry();
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var activityCoalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        var viewersAccumulator = new ViewersAccumulator(harness.HubContext, focusRegistry);
+        // The accumulator's resolver shares the SAME sessionRegistry passed to the engine below (no test
+        // in this file ever registers a session or asserts on ViewersChanged content, so this is currently
+        // inert either way — wired for parity with the fixture's other real-registry sharing).
+        var viewersAccumulator = new ViewersAccumulator(harness.HubContext, focusRegistry, new ViewerResolver(sessionRegistry, new ConnectionMapping()));
         var fanOutEngine = new FanOutEngine(
             harness.HubContext,
             focusRegistry,

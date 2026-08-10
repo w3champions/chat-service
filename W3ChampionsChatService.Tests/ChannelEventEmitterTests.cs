@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Memberships;
@@ -46,7 +47,10 @@ public class ChannelEventEmitterTests
         var members = new OnlineMemberRegistry();
         var sessions = new SessionRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, sessions, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus), TimeProvider.System);
+        // The accumulator's resolver shares the SAME SessionRegistry seeded via RegisterOnline below, so a
+        // roster delta's display name matches what a real session would resolve to (no ConnectionMapping
+        // exists in this pure in-memory fixture, so flair is always null here — no test asserts on it).
+        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, sessions, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus, new ViewerResolver(sessions, new ConnectionMapping())), TimeProvider.System);
         return (harness, focus, members, sessions, engine);
     }
 

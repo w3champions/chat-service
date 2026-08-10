@@ -8,6 +8,7 @@ using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Internal;
@@ -55,7 +56,11 @@ public class MatchChannelServiceTests : IntegrationTestBase
         _focusRegistry = new FocusRegistry();
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        // The accumulator's resolver shares the SAME SessionRegistry RegisterOnline seeds below, so a
+        // roster delta's display name matches a real session's (no ConnectionMapping exists in this
+        // fixture — no hub ever connects — so flair is always null here; no test asserts on it).
+        _viewersAccumulator = new ViewersAccumulator(
+            _harness.HubContext, _focusRegistry, new ViewerResolver(_sessionRegistry, new ConnectionMapping()));
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext,
             _focusRegistry,

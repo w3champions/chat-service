@@ -62,6 +62,7 @@ public class MuteReconciliationTests : IntegrationTestBase
         _channelRepository = new ChannelRepository(MongoClient);
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _sessionRegistry = new SessionRegistry();
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         _chatHub = new ChatHub(
             _connectionMapping,
             _harness.Service,
@@ -95,7 +96,8 @@ public class MuteReconciliationTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         _clients = new Mock<IHubCallerClients>();
         _callerProxy = new Mock<ISingleClientProxy>();

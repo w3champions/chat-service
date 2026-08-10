@@ -77,6 +77,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
     private ViewersAccumulator _viewersAccumulator;
+    private ViewerResolver _viewerResolver;
     private PresenceInterestRegistry _presenceInterestRegistry; // the shared index under test
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
@@ -180,7 +181,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
         // SAME PresenceInterestRegistry the hubs mutate, so RegisterFocus (hub) and GetInterestedConnections
         // (engine's PushPresenceChanged) see one consistent index.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
     }
@@ -232,7 +234,8 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             _mentionFanOut,                     // REAL fan-out through the shared harness
             _presenceInterestRegistry,          // SHARED — same instance the engine reads
             _mentionInboxRepository,            // SHARED — the read/ack store
-            _notificationPreferenceRepository); // SHARED — same instance _mentionFanOut reads (fix round 1, F9)
+            _notificationPreferenceRepository,  // SHARED — same instance _mentionFanOut reads (fix round 1, F9)
+            _viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

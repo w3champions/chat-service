@@ -6,6 +6,7 @@ using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Messages;
@@ -69,7 +70,10 @@ public class FanOutEngineTests
     {
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+        // The accumulator's resolver shares the SAME sessionRegistry the caller passed in (SessionsWith(...)
+        // for the moderator-flagged tests, or a throwaway from the 2-arg overload) — no ConnectionMapping
+        // exists in this pure in-memory fixture, so flair is always null; no test here asserts on it.
+        return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, new ViewerResolver(sessionRegistry, new ConnectionMapping())), TimeProvider.System);
     }
 
     // A SessionRegistry seeded with the given (connection, battleTag, isModerator) entries. A moderator
@@ -118,7 +122,7 @@ public class FanOutEngineTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
         return (harness, engine);
     }
 
@@ -367,8 +371,10 @@ public class FanOutEngineTests
         // Explicit construction so we can seed the OnlineMemberRegistry the engine actually uses: an
         // UNFOCUSED level-All member who, for a NON-shadow message, WOULD receive a ChannelActivity.
         var members = new OnlineMemberRegistry();
+        // The accumulator's resolver shares the SAME sessions registry (SessionsWith(...) above) the engine
+        // itself uses.
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, new ViewerResolver(sessions, new ConnectionMapping())), TimeProvider.System);
 
         focusRegistry.Focus(AuthorConnection, ChannelId, AuthorBattleTag);
         focusRegistry.Focus(ModeratorConnection, ChannelId, ModeratorBattleTag);
@@ -554,7 +560,7 @@ public class FanOutEngineTests
         members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -576,7 +582,7 @@ public class FanOutEngineTests
         // An unfocused level-All recipient of an ACCEPTED Dm — suppression is lifted, so activity resumes.
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -594,7 +600,7 @@ public class FanOutEngineTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(), InitiatorConnection, isShadow: false, Now);
 
@@ -706,7 +712,7 @@ public class FanOutEngineTests
         var groupMembers = new OnlineMemberRegistry();
         groupMembers.Join(ChannelId, GroupMemberConn, new MemberState(GroupMemberTag, NotificationLevel.All, 0, ChannelType.GroupDm));
         var groupEngine = new FanOutEngine(
-            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(groupHarness.HubContext, groupFocus), TimeProvider.System);
+            groupHarness.HubContext, groupFocus, groupMembers, new ActivityCoalescer(groupHarness.HubContext, groupMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(groupHarness.HubContext, groupFocus, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
         var groupChannel = new ChatChannel { Id = ChannelId, Type = ChannelType.GroupDm };
 
         await groupEngine.OnMessagePersisted(groupChannel, Message(), AuthorConnection, isShadow: false, Now);
@@ -722,7 +728,7 @@ public class FanOutEngineTests
         var publicMembers = new OnlineMemberRegistry();
         publicMembers.Join(ChannelId, PublicMemberConn, new MemberState(PublicMemberTag, NotificationLevel.All, 0, ChannelType.Public));
         var publicEngine = new FanOutEngine(
-            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(publicHarness.HubContext, publicFocus), TimeProvider.System);
+            publicHarness.HubContext, publicFocus, publicMembers, new ActivityCoalescer(publicHarness.HubContext, publicMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(publicHarness.HubContext, publicFocus, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
 
         await publicEngine.OnMessagePersisted(Channel(), Message(), AuthorConnection, isShadow: false, Now);
 
@@ -741,7 +747,7 @@ public class FanOutEngineTests
         members.Join(ChannelId, InitiatorConnection, new MemberState(DmInitiator, NotificationLevel.All, 0, ChannelType.Dm));
         members.Join(ChannelId, RecipientConnection, new MemberState(DmRecipient, NotificationLevel.All, 0, ChannelType.Dm));
         var engine = new FanOutEngine(
-            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry), TimeProvider.System);
+            harness.HubContext, focusRegistry, members, new ActivityCoalescer(harness.HubContext, members), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Pending), Message(content: "a pending message"), InitiatorConnection, isShadow: false, Now);
 
@@ -782,7 +788,10 @@ public class FanOutEngineTests
         var focus = new FocusRegistry();
         var members = new OnlineMemberRegistry();
         var sessions = new SessionRegistry();
-        var accumulator = new ViewersAccumulator(harness.HubContext, focus);
+        // The comment above this fixture claims "real registries drive FlushDue directly" — the resolver
+        // must share this SAME sessions registry (seeded via Register just below) for that to hold, even
+        // though these forced-removal assertions only check Left/Joined battleTags, not display name/flair.
+        var accumulator = new ViewersAccumulator(harness.HubContext, focus, new ViewerResolver(sessions, new ConnectionMapping()));
         var time = new FakeTimeProvider(new DateTimeOffset(Now, TimeSpan.Zero));
         var engine = new FanOutEngine(
             harness.HubContext, focus, members, new ActivityCoalescer(harness.HubContext, members), sessions, new PresenceInterestRegistry(), accumulator, time);

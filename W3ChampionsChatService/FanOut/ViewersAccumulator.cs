@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
@@ -42,7 +43,10 @@ namespace W3ChampionsChatService.FanOut;
 /// <para>Singleton (registered in <see cref="Startup"/>). Task 15 drives <see cref="FlushDue"/> from the
 /// 1s-granularity hosted flush service.</para>
 /// </summary>
-public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry focusRegistry)
+public class ViewersAccumulator(
+    IHubContext<ChatHub> hubContext,
+    FocusRegistry focusRegistry,
+    Chats.ViewerResolver viewerResolver)
 {
     // The SignalR delivery channel — pushes the shared ViewersChanged batch to each focused connection.
     private readonly IHubContext<ChatHub> _hubContext = hubContext;
@@ -52,6 +56,15 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
     // this accumulator, and every path here acquires this lock BEFORE FocusRegistry's, so there is no
     // lock-ordering cycle.
     private readonly FocusRegistry _focusRegistry = focusRegistry;
+
+    // Resolves a joined battleTag into a full roster entry (display name + flair). Shared with
+    // ChatHub.FocusChannel so a join delta and an initial roster can never render differently. FlushDue
+    // collects the joined battleTags under _lock but calls Resolve AFTER releasing it (consistent with
+    // this component's existing send discipline — sends already run outside _lock) — nesting
+    // SessionRegistry's/ConnectionMapping's locks inside the single process-wide accumulator lock would be
+    // safe (neither calls back in), but is unnecessary hold-time on a lock every hub thread's RecordChange
+    // also contends for, so it is avoided rather than merely tolerated.
+    private readonly Chats.ViewerResolver _viewerResolver = viewerResolver;
 
     // channelId -> the channel's accumulation window. Mutated only under _lock.
     private readonly Dictionary<string, ChannelWindow> _windows = new Dictionary<string, ChannelWindow>();
@@ -101,7 +114,11 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
     /// </summary>
     public async Task FlushDue(DateTime now)
     {
-        List<(IReadOnlyCollection<string> Connections, ViewersChangedDto Payload)> toEmit = null;
+        // Per due channel: its target connections, its joined battleTags (NOT YET resolved — Resolve
+        // happens after _lock is released, below) and its left battleTags. Resolution is deferred so the
+        // single process-wide accumulator lock isn't held across the SessionRegistry/ConnectionMapping
+        // lookups ViewerResolver.Resolve makes — matching how the SignalR sends already run outside _lock.
+        List<(IReadOnlyCollection<string> Connections, string ChannelId, List<string> JoinedBattleTags, List<string> Left)> toEmit = null;
         List<string> toEvict = null;
 
         lock (_lock)
@@ -121,14 +138,14 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
                     continue;
                 }
 
-                var joined = new List<string>();
+                var joinedBattleTags = new List<string>();
                 var left = new List<string>();
                 foreach (var (battleTag, wasViewing) in window.Baseline)
                 {
                     var isViewing = IsCurrentlyViewingNoLock(channelId, battleTag);
                     if (isViewing && !wasViewing)
                     {
-                        joined.Add(battleTag);
+                        joinedBattleTags.Add(battleTag);
                     }
                     else if (!isViewing && wasViewing)
                     {
@@ -156,15 +173,13 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
                     continue;
                 }
 
-                if (joined.Count == 0 && left.Count == 0)
+                if (joinedBattleTags.Count == 0 && left.Count == 0)
                 {
                     continue;
                 }
 
-                // ONE payload object, sent to every current focused connection — no per-connection deltas.
-                var payload = new ViewersChangedDto(channelId, joined, left);
-                (toEmit ??= new List<(IReadOnlyCollection<string>, ViewersChangedDto)>())
-                    .Add((connections, payload));
+                (toEmit ??= new List<(IReadOnlyCollection<string>, string, List<string>, List<string>)>())
+                    .Add((connections, channelId, joinedBattleTags, left));
             }
 
             if (toEvict != null)
@@ -181,8 +196,15 @@ public class ViewersAccumulator(IHubContext<ChatHub> hubContext, FocusRegistry f
             return;
         }
 
-        foreach (var (connections, payload) in toEmit)
+        foreach (var (connections, channelId, joinedBattleTags, left) in toEmit)
         {
+            // Resolved OUTSIDE _lock (see the comment on toEmit's declaration above). Order is preserved —
+            // joinedBattleTags was built by the same in-order Baseline walk the old under-lock code used,
+            // only the Resolve() call itself moved.
+            var joined = joinedBattleTags.Select(_viewerResolver.Resolve).ToList();
+
+            // ONE payload object, sent to every current focused connection — no per-connection deltas.
+            var payload = new ViewersChangedDto(channelId, joined, left);
             foreach (var connectionId in connections)
             {
                 try

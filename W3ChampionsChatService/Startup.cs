@@ -51,7 +51,8 @@ public class Startup
             // ChatHub.Messaging.cs — defense-in-depth against a client sending an oversized frame to
             // force needless buffering/allocation ahead of the app-level validation.
             options.MaximumReceiveMessageSize = 16 * 1024;
-        });
+        })
+        .AddJsonProtocol(ChatJsonProtocol.Configure);
 
         // D9 (C6 Task 3): registers IHttpClientFactory — WebsiteBackendRepository is rebuilt on it,
         // killing the per-call `new HttpClient()` socket-exhaustion anti-pattern (a fresh HttpClient
@@ -173,6 +174,11 @@ public class Startup
         services.AddSingleton<ChannelCreationRateLimiter>();
 
         services.AddSingleton<ConnectionMapping>();
+        // Singleton: holds only the singleton ConnectionMapping + ISessionRegistry. Consumed by BOTH
+        // ViewersAccumulator and ChatHub (ctor-injected, PR44) — the SAME instance, which is what
+        // guarantees an initial roster and a ViewersChanged join delta can never render a viewer
+        // differently.
+        services.AddSingleton<ViewerResolver>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();

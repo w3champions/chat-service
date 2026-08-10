@@ -49,6 +49,7 @@ public class ChatHubDmFocusTests : IntegrationTestBase
     private FakeTimeProvider _time;
     private HubPushCaptureHarness _harness;
     private ViewersAccumulator _accumulator;
+    private ViewerResolver _viewerResolver;
     private FocusRegistry _focusRegistry;
     private OnlineMemberRegistry _onlineMemberRegistry;
     private SessionRegistry _sessionRegistry;
@@ -71,13 +72,16 @@ public class ChatHubDmFocusTests : IntegrationTestBase
         _time = new FakeTimeProvider(new DateTimeOffset(T0, TimeSpan.Zero));
         _harness = new HubPushCaptureHarness();
         _focusRegistry = new FocusRegistry();
-        // The accumulator shares the SAME FocusRegistry the hubs mutate — its baseline capture
-        // (RecordChange) and current-state read (FlushDue) see the live roster the hubs produce.
-        _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
-
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _sessionRegistry = new SessionRegistry();
         _connectionMapping = new ConnectionMapping();
+        // The accumulator shares the SAME FocusRegistry the hubs mutate — its baseline capture
+        // (RecordChange) and current-state read (FlushDue) see the live roster the hubs produce. It also
+        // shares the SAME session/connection registries the hubs register into, so a joined entry's
+        // display name/flair reflect the live ChatUser each test seeds.
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _accumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
+
         _userDirectory = new UserDirectoryRepository(MongoClient);
         _muteRepository = new MuteRepository(MongoClient);
         _reconcileService = new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service;
@@ -131,7 +135,8 @@ public class ChatHubDmFocusTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
         var context = new Mock<HubCallerContext>();

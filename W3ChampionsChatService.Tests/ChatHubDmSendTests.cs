@@ -131,6 +131,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
 
     private ChatHub BuildHub(string connectionId)
     {
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileHarness.Service,
@@ -157,7 +158,8 @@ public class ChatHubDmSendTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingProxy(connectionId));

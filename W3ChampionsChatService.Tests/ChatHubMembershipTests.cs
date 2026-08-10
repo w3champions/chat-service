@@ -95,6 +95,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
         NotificationPreferenceRepository notificationPreferenceRepository = null,
         ChannelRepository channelRepository = null)
     {
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileService,
@@ -121,7 +122,8 @@ public class ChatHubMembershipTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            notificationPreferenceRepository ?? _notificationPreferenceRepository);
+            notificationPreferenceRepository ?? _notificationPreferenceRepository,
+            viewerResolver);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 

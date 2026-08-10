@@ -31,7 +31,7 @@ internal static class FanOutEngineTestFactory
             new ActivityCoalescer(harness.HubContext, members),
             new SessionRegistry(),
             new PresenceInterestRegistry(),
-            new ViewersAccumulator(harness.HubContext, focus),
+            new ViewersAccumulator(harness.HubContext, focus, ViewersAccumulatorTestFactory.EmptyViewerResolver()),
             TimeProvider.System);
     }
 }
