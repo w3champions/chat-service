@@ -876,6 +876,44 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task SystemMessage_SerializesAgainstTeardownOnTheRefGate()
+    {
+        // The publish is TWO steps (look the channel up, then allocate a seq and insert) and teardown is
+        // two more (delete the channel's messages, then the channel doc). Ungated they interleave: the
+        // teardown drops the messages, this publish inserts, and only then does the channel doc go — an
+        // orphan row in a room that no longer exists, already swept past, kept until its own 30-day
+        // message TTL, and fanned out to a membership being removed in the same breath. The publisher's
+        // AllocateSeq mapping only covers a teardown that wins BEFORE the allocation, so the route has to
+        // take the same per-ref gate every other mutating match-channel path takes. Holding the gate here
+        // stands in for the in-flight teardown.
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-gate\",\"name\":\"Gated\",\"members\":[\"Alice#1\"]}";
+        Assert.That(await PostChannelsCreate(createBody, MmSecret, NowTimestamp()), Is.InstanceOf<OkObjectResult>(),
+            "precondition: the match channel must exist before the publish is exercised");
+
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match\"}";
+
+        var gate = await _matchChannelService.AcquireRefGate("match-sys-gate");
+        Task<IActionResult> publish;
+        try
+        {
+            publish = PostSystemMessage("match-sys-gate", messageBody, MmSecret, NowTimestamp());
+
+            // A generous grace period: the assertion is that the publish is BLOCKED, so this only ever
+            // gives it more chance to wrongly finish. Ungated it completes in well under this.
+            var raced = await Task.WhenAny(publish, Task.Delay(TimeSpan.FromSeconds(2)));
+            Assert.That(raced, Is.Not.SameAs(publish),
+                "the publish must not proceed while another operation holds this ref's gate");
+        }
+        finally
+        {
+            gate.Dispose();
+        }
+
+        Assert.That(await publish, Is.InstanceOf<OkResult>(),
+            "and it must complete normally once the gate is released — serialized, not dropped");
+    }
+
+    [Test]
     public async Task SystemMessage_UnknownRef_Is404_AndCreatesNothing()
     {
         var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"}";

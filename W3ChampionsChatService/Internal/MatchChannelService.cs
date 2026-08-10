@@ -85,6 +85,31 @@ public class MatchChannelService(
     private readonly MatchChannelRefGate _refGate = new();
 
     /// <summary>
+    /// Acquires the SAME per-ref gate every mutating method in this class takes, for a caller that
+    /// mutates a match channel from OUTSIDE this class. Wrap it exactly as the internal callers do:
+    /// <c>using var _ = await matchChannelService.AcquireRefGate(systemRef);</c>.
+    /// <para>
+    /// Today's only such caller is the internal system-message route (post-game chat), which looks the
+    /// channel up and hands it to <see cref="Messages.SystemMessagePublisher"/>. Without this the
+    /// teardown shared by <see cref="DeleteChannel"/> and <see cref="ApplyEpochSync"/> can interleave:
+    /// it deletes the channel's messages, the publish then allocates a seq and inserts, and the teardown
+    /// finally deletes the channel doc — leaving an orphan row in a room that no longer exists (kept
+    /// until its own 30-day message TTL, since the teardown that would have swept it has already run)
+    /// and fanning it out to a membership being dropped in the same breath. The publisher's own
+    /// <c>InvalidOperationException</c> mapping only covers a teardown that wins BEFORE the allocation;
+    /// this closes the window after it.
+    /// </para>
+    /// <para>
+    /// Exposed as a gate handle rather than by moving the publish into this class, because
+    /// <see cref="Messages.SystemMessagePublisher"/> would then have to become a constructor parameter —
+    /// and this gate is deliberately owned privately so that every existing
+    /// <c>new MatchChannelService(...)</c> call site stays unchanged (see the field's comment above).
+    /// No re-entrancy hazard: nothing on the publish path calls back into this class.
+    /// </para>
+    /// </summary>
+    public Task<IDisposable> AcquireRefGate(string systemRef) => _refGate.AcquireAsync(systemRef);
+
+    /// <summary>
     /// Idempotent create-or-get of the System+Match channel keyed by <paramref name="systemRef"/>, then adds
     /// every <paramref name="members"/> battleTag under the one-match-channel-per-user invariant. Safe to call
     /// repeatedly for the same match (a duplicate mm POST) — a re-get never resets the 24h creation-anchored

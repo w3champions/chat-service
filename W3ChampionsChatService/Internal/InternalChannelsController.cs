@@ -372,6 +372,15 @@ public class InternalChannelsController(
 
         try
         {
+            // Serialized against teardown on the SAME per-ref gate every mutating match-channel route
+            // takes. The lookup and the publish are two steps, and DeleteChannel/ApplyEpochSync delete a
+            // channel's messages and then the channel doc as two more: ungated, a teardown can drop the
+            // messages, let this publish allocate a seq and insert, and only then drop the channel —
+            // leaving an orphan row in a room that no longer exists, already swept past, and fanned out to
+            // a membership being removed in the same breath. Publish's own AllocateSeq mapping only covers
+            // a teardown that wins BEFORE the allocation, so the gate is what closes the rest of it.
+            using var _ = await matchChannelService.AcquireRefGate(systemRef);
+
             var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef);
             if (channel == null)
             {
