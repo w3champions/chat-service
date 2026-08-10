@@ -198,27 +198,39 @@ public class FanOutEngine(
             return;
         }
 
-        // C5 (Task 9, D15) + post-game chat Plan A Task 6: the activity preview. Built ONCE per
-        // persisted message (identical for every Offer call in the loop below). Two channel classes
-        // get one:
-        //   - Dm (C5/OQ-7): the original scope. A pending Dm never reaches the Offer call below at all
-        //     (the suppression `continue` skips every recipient, and the initiator/sender is skipped just
-        //     after it), so this is only ever OFFERED for an accepted Dm — building it unconditionally for
-        //     any Dm channel is harmless (it is simply never read for a still-pending one).
-        //   - System + Match (post-game chat): the client's ONE-TIME nudge toast after the score screen
-        //     closes needs a sender and an excerpt; without a preview it has nothing to render, which is
-        //     precisely why post-game messages were previously silent.
-        // GroupDm / Public / SemiPublic / System+Clan deliberately stay preview-free — a busy lounge or
-        // clan room keeps its badge-only treatment. Sender fields are REUSED from `dto.Sender` (the
-        // MessageDto already built above) rather than a fresh lookup — no extra Mongo read.
-        // The User conjunct is LOAD-BEARING, not defensive: SystemMessagePublisher calls this method on
-        // exactly a System+Match channel, and a system message's Sender is null — without it the
-        // dto.Sender dereference below is a guaranteed NullReferenceException on every published intro.
-        var wantsPreview = message.Kind == MessageKind.User
-            && (channel.Type == ChannelType.Dm
-                || (channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match));
-        object activityPreview = wantsPreview
+        // C5 (Task 9, D15) + post-game chat Plan A Task 6: the activity previews. Built ONCE per
+        // persisted message (identical for every Offer call in the loop below). TWO slots, because the
+        // deployed launcher routes its DM-grade toast/sound/OS-notification on the mere PRESENCE of
+        // `preview` and never reads the channel's type — see ChannelActivityDto's doc:
+        //   - `dmPreview` → ChannelActivityDto.Preview, the FROZEN LEGACY slot. Dm and ONLY Dm, forever.
+        //     Widening it would make every post-game message a DM-grade notification on clients already
+        //     in the wild — the exact flooding this feature exists to avoid. A pending Dm never reaches
+        //     the Offer call below at all (the suppression `continue` skips every recipient, and the
+        //     initiator/sender is skipped just after it), so this is only ever OFFERED for an accepted
+        //     Dm — building it unconditionally for any Dm channel is harmless.
+        //   - `activityPreview` → ChannelActivityDto.ActivityPreview, the superseding slot. EVERY
+        //     preview-eligible class, Dm included, each preview naming its own ChannelType/SystemKind so
+        //     a new client routes on the room's class instead of on a field's presence.
+        // Today's eligible set is Dm (C5/OQ-7) + System&Match (post-game chat: the client's ONE-TIME
+        // nudge toast after the score screen closes needs a sender and an excerpt; without a preview it
+        // has nothing to render, which is precisely why post-game messages were previously silent).
+        // GroupDm / Public / SemiPublic / System+Clan deliberately stay preview-free in BOTH slots — a
+        // busy lounge or clan room keeps its badge-only treatment. Sender fields are REUSED from
+        // `dto.Sender` (the MessageDto already built above) rather than a fresh lookup — no extra Mongo
+        // read. The User conjunct is LOAD-BEARING for both slots, not defensive: SystemMessagePublisher
+        // calls this method on exactly a System+Match channel, and a system message's Sender is null —
+        // without it the dto.Sender dereference below is a guaranteed NullReferenceException on every
+        // published intro.
+        var isDm = channel.Type == ChannelType.Dm;
+        var isMatch = channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match;
+        var wantsPreview = message.Kind == MessageKind.User && (isDm || isMatch);
+        object dmPreview = wantsPreview && isDm
             ? new DmActivityPreviewDto(dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content))
+            : null;
+        object activityPreview = wantsPreview
+            ? new ActivityPreviewDto(
+                dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content),
+                channel.Type, channel.SystemKind)
             : null;
 
         // Activity routing (fan-out decision 3): unfocused level-All members are offered the seq; the
@@ -262,7 +274,7 @@ public class FanOutEngine(
                 continue;
             }
 
-            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, activityPreview);
+            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, dmPreview, activityPreview);
         }
     }
 
