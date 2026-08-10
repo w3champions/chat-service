@@ -181,6 +181,10 @@ public class Startup
         services.AddSingleton<ViewerResolver>();
         // Singleton: holds only singletons plus the hub context. Consumed by FlairRefreshCoalescer.
         services.AddSingleton<IFlairRefresher, FlairRefresher>();
+        // Task 5 (live flair propagation): coalesces bursty flair-change notifications into one refresh
+        // per flush tick. Singleton — it holds the pending battleTag set that RecordChange (Task 6's
+        // endpoint) writes and FanOutFlushService drains; a transient would fragment that set.
+        services.AddSingleton<FlairRefreshCoalescer>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();

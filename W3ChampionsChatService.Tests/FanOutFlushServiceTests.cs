@@ -73,8 +73,13 @@ public class FanOutFlushServiceTests
         Assert.AreEqual(0, ViewersChangedFor(harness, ViewerConn).Count,
             "the accumulated join must not emit until the flush service ticks");
 
+        // --- Arm the flair-refresh coalescer: it has no cadence of its own (every pending tag is due on
+        // every flush), so it needs no arming beyond a no-op refresher — this test's acceptance is about
+        // the timer loop, not the coalescer's own collapsing behaviour (covered by FlairRefreshCoalescerTests).
+        var flairRefreshCoalescer = new FlairRefreshCoalescer(new NoOpFlairRefresher());
+
         var fakeTime = new FakeTimeProvider(new DateTimeOffset(T0, TimeSpan.Zero));
-        var service = new FanOutFlushService(coalescer, accumulator, fakeTime);
+        var service = new FanOutFlushService(coalescer, accumulator, flairRefreshCoalescer, fakeTime);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -135,5 +140,12 @@ public class FanOutFlushServiceTests
             await Task.Yield();
         }
         return condition();
+    }
+
+    // Arming filler for the third flush participant — this test's acceptance is the timer loop calling
+    // all three drains, not the flair coalescer's own behaviour (covered by FlairRefreshCoalescerTests).
+    private class NoOpFlairRefresher : IFlairRefresher
+    {
+        public Task Refresh(string battleTag) => Task.CompletedTask;
     }
 }

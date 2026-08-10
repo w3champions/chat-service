@@ -255,4 +255,11 @@ public static class ChatLimits
     /// hits it" was unfalsifiable in production. A sustained-denial user must not spam the log on every
     /// call, so this bounds it to once per window. Not spec §13 text; hard-coded, adjust here only.</summary>
     public static readonly TimeSpan ReadRateLimiterDenyLogInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>
+    /// Maximum battleTags the flair-refresh coalescer will hold between flushes. At the cap it DROPS
+    /// new tags rather than growing: a dropped refresh degrades to the reconnect backstop, whereas an
+    /// unbounded set would let a website-backend write storm consume memory here.
+    /// </summary>
+    public const int FlairRefreshPendingCap = 512;
 }
