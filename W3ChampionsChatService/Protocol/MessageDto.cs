@@ -1,4 +1,5 @@
 using System;
+using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Messages;
 
 namespace W3ChampionsChatService.Protocol;
@@ -10,7 +11,10 @@ namespace W3ChampionsChatService.Protocol;
 /// already carries no boundary-private fields. <see cref="Deleted"/>/<see cref="Shadow"/> are
 /// user-facing flag slots; both the pull and push paths build this record EXCLUSIVELY through
 /// <see cref="ForUserDelivery"/> below, which forces them false — see that factory's doc comment for
-/// why.
+/// why. <see cref="Kind"/> is the client's renderer discriminator: <see cref="Sender"/>/<see cref="Content"/>
+/// are populated and <see cref="SystemMessage"/> is null when <see cref="Kind"/> is
+/// <see cref="MessageKind.User"/>; <see cref="SystemMessage"/> is populated and <see cref="Sender"/>/
+/// <see cref="Content"/> are null when <see cref="Kind"/> is <see cref="MessageKind.System"/>.
 /// </summary>
 public record MessageDto(
     string Id,
@@ -20,7 +24,9 @@ public record MessageDto(
     string Content,
     DateTime SentAt,
     bool Deleted,
-    bool Shadow)
+    bool Shadow,
+    MessageKind Kind = MessageKind.User,
+    SystemMessageBody SystemMessage = null)
 {
     /// <summary>
     /// The ONE user-facing delivery projection, shared by BOTH the pull path
@@ -43,7 +49,9 @@ public record MessageDto(
             Content: message.Content,
             SentAt: message.SentAt,
             Deleted: false,
-            Shadow: false);
+            Shadow: false,
+            Kind: message.Kind,
+            SystemMessage: message.SystemMessage);
 
     /// <summary>
     /// C4 (D3) moderator-facing projection: unlike <see cref="ForUserDelivery"/>, this exposes the
@@ -60,5 +68,7 @@ public record MessageDto(
             Content: message.Content,
             SentAt: message.SentAt,
             Deleted: message.Deleted != null,
-            Shadow: message.Shadow);
+            Shadow: message.Shadow,
+            Kind: message.Kind,
+            SystemMessage: message.SystemMessage);
 }

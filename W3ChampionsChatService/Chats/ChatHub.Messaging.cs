@@ -743,15 +743,17 @@ public partial class ChatHub
 
     /// <summary>
     /// The single message→projection mapping. <see cref="Excerpts.Bounded"/> is the SAME helper that builds
-    /// <see cref="DmActivityPreviewDto.Excerpt"/>, so the excerpt a client renders from the live event and
-    /// the one it renders from the snapshot can never disagree about the same message.
+    /// <see cref="ActivityPreviewDto.Excerpt"/>, at the SAME <see cref="ChatLimits.DmPreviewExcerptLength"/>
+    /// cap, so the excerpt a client renders from the live event and the one it renders from the snapshot
+    /// can never disagree about the same message. The limit is passed explicitly because post-game chat
+    /// generalized this helper over three different caps and deliberately dropped its DM-shaped default.
     /// </summary>
     private static ChannelLastMessage BuildLastMessageProjection(ChannelMessage message) => new()
     {
         Seq = message.Seq,
         SenderBattleTag = message.Sender.BattleTag,
         SenderName = message.Sender.Name,
-        Excerpt = Excerpts.Bounded(message.Content),
+        Excerpt = Excerpts.Bounded(message.Content, ChatLimits.DmPreviewExcerptLength),
         SentAt = message.SentAt,
     };
 }

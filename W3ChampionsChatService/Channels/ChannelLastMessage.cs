@@ -15,7 +15,7 @@ namespace W3ChampionsChatService.Channels;
 /// made correct — see the launcher-e investigation in w3champions/launcher-e#848.
 /// </para>
 /// <para>
-/// SCOPE (deliberately narrow, mirroring <c>DmActivityPreviewDto</c>'s own scope rules):
+/// SCOPE (deliberately narrow, mirroring <c>ActivityPreviewDto</c>'s own scope rules):
 /// <list type="bullet">
 /// <item>Only <c>Dm</c> (once <see cref="Domain.DmRequestState.Accepted"/>) and <c>GroupDm</c> channels
 /// carry it. A PENDING Dm never does — the recipient must not see a stranger's message text before
@@ -64,7 +64,7 @@ public class ChannelLastMessage
     /// <summary>
     /// The message content bounded by <see cref="Protocol.Excerpts.Bounded"/> — the SAME helper (and so
     /// the same <see cref="Domain.ChatLimits.DmPreviewExcerptLength"/> cap and the same surrogate-pair
-    /// safety) that builds <c>DmActivityPreviewDto.Excerpt</c>, so a client that renders one from the
+    /// safety) that builds <c>ActivityPreviewDto.Excerpt</c>, so a client that renders one from the
     /// live event and one from the snapshot can never see the two disagree on the same message.
     /// </summary>
     public string Excerpt { get; set; }

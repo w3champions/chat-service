@@ -828,7 +828,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
 
         var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
         Assert.That(projection.Excerpt.Length, Is.EqualTo(ChatLimits.DmPreviewExcerptLength));
-        Assert.That(projection.Excerpt, Is.EqualTo(Excerpts.Bounded(content)),
+        Assert.That(projection.Excerpt, Is.EqualTo(Excerpts.Bounded(content, ChatLimits.DmPreviewExcerptLength)),
             "the projection and the live ChannelActivity preview must come from the SAME excerpt helper, or a "
             + "client would see the same message's text differ between the snapshot and the live event");
     }

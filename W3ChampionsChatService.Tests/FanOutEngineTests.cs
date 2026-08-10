@@ -76,6 +76,26 @@ public class FanOutEngineTests
         return new FanOutEngine(harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, sessionRegistry, new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focusRegistry, new ViewerResolver(sessionRegistry, new ConnectionMapping())), TimeProvider.System);
     }
 
+    // Post-game chat Plan A Task 6 overload: the match-channel preview tests need to Join members into
+    // the OnlineMemberRegistry themselves (a different channel/member combination per test), but neither
+    // existing NewEngine overload exposes the registry it builds — each constructs it as a private local.
+    // This overload takes a CALLER-OWNED OnlineMemberRegistry instead of constructing one, so a test can
+    // seed it (via Join) both before and after this call returns. It also diverges from the ISessionRegistry
+    // overload above in a second way: the ViewersAccumulator here is built with
+    // ViewersAccumulatorTestFactory.EmptyViewerResolver() rather than a real ViewerResolver over that
+    // overload's SessionRegistry — safe because no test in this group asserts on viewers or flair, only
+    // on activity/preview.
+    private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry, OnlineMemberRegistry onlineMemberRegistry) =>
+        new FanOutEngine(
+            harness.HubContext,
+            focusRegistry,
+            onlineMemberRegistry,
+            new ActivityCoalescer(harness.HubContext, onlineMemberRegistry),
+            new SessionRegistry(),
+            new PresenceInterestRegistry(),
+            new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()),
+            TimeProvider.System);
+
     // A SessionRegistry seeded with the given (connection, battleTag, isModerator) entries. A moderator
     // entry mirrors ChatSession.HasPermission's conjunct exactly: IsAdmin AND Permissions⊇{Moderation}.
     private static SessionRegistry SessionsWith(params (string ConnectionId, string BattleTag, bool IsModerator)[] entries)
@@ -609,12 +629,13 @@ public class FanOutEngineTests
     }
 
     // ---------------------------------------------------------------------------------------------
-    // C5 (Task 9, D15) DM activity preview. An accepted Dm message's routed ChannelActivity carries a
-    // DmActivityPreviewDto — sender battleTag/name REUSED from the same MessageDto the focused-delivery
-    // path already built (no extra lookup), plus a bounded excerpt. GroupDm/Public activity always
-    // carries Preview: null (OQ-7 strict Dm-only scope), and a pending Dm still produces ZERO activity
-    // at all (D4 wall re-asserted now that previews are in play — no activity means no preview can leak
-    // an unsurfaced request).
+    // C5 (Task 9, D15) DM activity preview. An accepted Dm message's routed ChannelActivity carries an
+    // ActivityPreviewDto — sender battleTag/name REUSED from the same MessageDto the focused-delivery
+    // path already built (no extra lookup), a bounded excerpt, and the channel's own class so the client
+    // routes on ChannelType rather than on the slot being present. GroupDm/Public activity always
+    // carries Preview: null (they are not preview-eligible), and a pending Dm still produces ZERO
+    // activity at all (D4 wall re-asserted now that previews are in play — no activity means no preview
+    // can leak an unsurfaced request).
     // ---------------------------------------------------------------------------------------------
 
     [Test]
@@ -626,11 +647,13 @@ public class FanOutEngineTests
 
         var dto = harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto;
         Assert.IsNotNull(dto, "an accepted Dm's unfocused level-All recipient must receive a ChannelActivity");
-        var preview = dto.Preview as DmActivityPreviewDto;
-        Assert.IsNotNull(preview, "an accepted Dm's ChannelActivity must carry a DmActivityPreviewDto, not a plain null");
+        var preview = dto.Preview as ActivityPreviewDto;
+        Assert.IsNotNull(preview, "an accepted Dm's ChannelActivity must carry an ActivityPreviewDto, not a plain null");
         Assert.AreEqual(AuthorBattleTag, preview.SenderBattleTag, "the preview must reuse the persisted message's sender, not re-derive one");
         Assert.AreEqual("Author", preview.SenderName);
         Assert.AreEqual("hey there", preview.Excerpt);
+        Assert.AreEqual(ChannelType.Dm, preview.ChannelType, "the preview must NAME its channel class so a client routes on the class, never on the slot's presence");
+        Assert.IsNull(preview.SystemKind, "a Dm has no SystemKind — it must not be invented");
     }
 
     [Test]
@@ -641,7 +664,7 @@ public class FanOutEngineTests
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: longContent), InitiatorConnection, isShadow: false, Now);
 
-        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as ActivityPreviewDto;
         Assert.IsNotNull(preview);
         Assert.AreEqual(ChatLimits.DmPreviewExcerptLength, preview.Excerpt.Length, "content over the cap must be truncated to exactly DmPreviewExcerptLength chars");
         Assert.AreEqual(longContent.Substring(0, ChatLimits.DmPreviewExcerptLength), preview.Excerpt, "the excerpt must be the first N chars — no word-boundary trimming");
@@ -649,7 +672,7 @@ public class FanOutEngineTests
         // Content AT/UNDER the cap passes through whole, with no padding.
         var (shortHarness, shortEngine) = NewDmPreviewFixture();
         await shortEngine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: "short"), InitiatorConnection, isShadow: false, Now);
-        var shortPreview = (shortHarness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        var shortPreview = (shortHarness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as ActivityPreviewDto;
         Assert.IsNotNull(shortPreview);
         Assert.AreEqual("short", shortPreview.Excerpt, "content at/under the cap must pass through unchanged, with no padding");
     }
@@ -665,7 +688,7 @@ public class FanOutEngineTests
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: content), InitiatorConnection, isShadow: false, Now);
 
-        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as ActivityPreviewDto;
         Assert.IsNotNull(preview);
         var excerpt = preview.Excerpt;
 
@@ -696,14 +719,14 @@ public class FanOutEngineTests
 
         await engine.OnMessagePersisted(DmChannel(DmRequestState.Accepted), Message(content: exactContent), InitiatorConnection, isShadow: false, Now);
 
-        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as DmActivityPreviewDto;
+        var preview = (harness.PayloadFor(RecipientConnection, ChatEvents.ChannelActivity) as ChannelActivityDto)?.Preview as ActivityPreviewDto;
         Assert.IsNotNull(preview);
         Assert.AreEqual(ChatLimits.DmPreviewExcerptLength, preview.Excerpt.Length, "content exactly at the cap must pass through whole, unchanged");
         Assert.AreEqual(exactContent, preview.Excerpt, "content exactly at the cap must equal the full content — the <= boundary must not truncate");
     }
 
     [Test]
-    public async Task GroupAndPublicActivity_PreviewNull()
+    public async Task GroupPublicAndSemiPublicActivity_CarryNoPreview()
     {
         const string GroupMemberConn = "conn-group-member";
         const string GroupMemberTag = "GroupMember#1";
@@ -719,7 +742,7 @@ public class FanOutEngineTests
 
         var groupDto = groupHarness.PayloadFor(GroupMemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
         Assert.IsNotNull(groupDto, "an unfocused level-All group member must still receive plain activity");
-        Assert.IsNull(groupDto.Preview, "GroupDm activity must never carry a preview (D15/OQ-7 strict Dm-only scope)");
+        Assert.IsNull(groupDto.Preview, "GroupDm is not preview-eligible — widening it is a deliberate future opt-in, not a default");
 
         const string PublicMemberConn = "conn-public-member";
         const string PublicMemberTag = "PublicMember#1";
@@ -734,7 +757,23 @@ public class FanOutEngineTests
 
         var publicDto = publicHarness.PayloadFor(PublicMemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
         Assert.IsNotNull(publicDto, "an unfocused level-All public member must still receive plain activity");
-        Assert.IsNull(publicDto.Preview, "Public activity must never carry a preview");
+        Assert.IsNull(publicDto.Preview, "a busy lounge must keep its badge-only treatment");
+
+        const string SemiPublicMemberConn = "conn-semipublic-member";
+        const string SemiPublicMemberTag = "SemiPublicMember#1";
+        var semiHarness = new HubPushCaptureHarness();
+        var semiFocus = new FocusRegistry();
+        var semiMembers = new OnlineMemberRegistry();
+        semiMembers.Join(ChannelId, SemiPublicMemberConn, new MemberState(SemiPublicMemberTag, NotificationLevel.All, 0, ChannelType.SemiPublic));
+        var semiEngine = new FanOutEngine(
+            semiHarness.HubContext, semiFocus, semiMembers, new ActivityCoalescer(semiHarness.HubContext, semiMembers), new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(semiHarness.HubContext, semiFocus, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
+        var semiChannel = new ChatChannel { Id = ChannelId, Type = ChannelType.SemiPublic };
+
+        await semiEngine.OnMessagePersisted(semiChannel, Message(), AuthorConnection, isShadow: false, Now);
+
+        var semiDto = semiHarness.PayloadFor(SemiPublicMemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.IsNotNull(semiDto, "an unfocused level-All semiPublic member must still receive plain activity");
+        Assert.IsNull(semiDto.Preview, "SemiPublic is not preview-eligible either");
     }
 
     [Test]
@@ -902,5 +941,261 @@ public class FanOutEngineTests
         // (not-viewing == not-viewing): removing a non-viewer changes no roster, so no ViewersChanged fires.
         Assert.IsFalse(harness.AllSignals.Any(s => s.Method == ChatEvents.ViewersChanged),
             "removing an unfocused member emits no ViewersChanged — it was never a viewer");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Post-game chat Plan A Task 6: match-channel activity preview. A player who closes the post-match
+    // score screen quickly needs a sender + excerpt on the coalesced ChannelActivity so the client's
+    // one-time nudge toast has something to render. The preview NAMES its channel class, which is what
+    // lets the client tell a post-game nudge from a DM toast — routing on the slot's mere presence is
+    // what broke while the payload was Dm-only, and these tests exist so nobody reintroduces it. Every
+    // other non-Dm class, INCLUDING System+Clan, stays preview-free.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task MatchChannelActivity_CarriesPreviewNamingSystemMatch()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var engine = NewEngine(harness, focusRegistry, onlineMemberRegistry);
+
+        var channel = new ChatChannel
+        {
+            Id = "chan-match",
+            Type = ChannelType.System,
+            SystemKind = SystemChannelKind.Match,
+        };
+        // An UNFOCUSED, level-All member is the only one who receives ChannelActivity.
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
+
+        var message = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = channel.Id,
+            Seq = 1,
+            Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" },
+            Content = "gg wp",
+            SentAt = Now,
+        };
+
+        await engine.OnMessagePersisted(channel, message, senderConnectionId: "conn-alice", isShadow: false, Now);
+
+        var activity = harness.PayloadFor("conn-bob", ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.That(activity, Is.Not.Null, "an unfocused level-All member receives coalesced activity");
+
+        var preview = activity.Preview as ActivityPreviewDto;
+        Assert.That(preview, Is.Not.Null,
+            "post-game chat needs a preview so the client can raise its one-time nudge toast");
+        Assert.That(preview.SenderBattleTag, Is.EqualTo("Alice#1"), "the client routes the nudge toast by battleTag, not display name — SenderBattleTag must be populated from dto.Sender.BattleTag");
+        Assert.That(preview.SenderName, Is.EqualTo("Alice"), "SenderName must reuse dto.Sender.Name from the same MessageDto built for focused delivery, not a fresh lookup");
+        Assert.That(preview.Excerpt, Is.EqualTo("gg wp"), "Excerpt must be the message content bounded by Excerpts.Bounded, unchanged for content under the cap");
+
+        // THE guard against the bug the kind-carrying shape exists to prevent: without these two fields
+        // a client can only infer "a preview is present, so this must be a DM" and raises a DM-grade
+        // toast + chat sound + OS notification for every post-game message. Every auto-joined match
+        // member is NotificationLevel.All, so that inference floods the entire lobby.
+        Assert.That(preview.ChannelType, Is.EqualTo(ChannelType.System), "the client routes the nudge on the room's class, so the class must ride the preview itself — never be inferred from its presence");
+        Assert.That(preview.SystemKind, Is.EqualTo(SystemChannelKind.Match), "System alone is ambiguous — SystemKind is what separates a match room from a clan room on the client");
+    }
+
+    [Test]
+    public async Task PublicChannelActivity_StillCarriesNoPreview()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var engine = NewEngine(harness, focusRegistry, onlineMemberRegistry);
+
+        var channel = new ChatChannel { Id = "chan-public", Type = ChannelType.Public };
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.Public));
+
+        var message = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = channel.Id,
+            Seq = 1,
+            Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" },
+            Content = "hello lounge",
+            SentAt = Now,
+        };
+
+        await engine.OnMessagePersisted(channel, message, senderConnectionId: "conn-alice", isShadow: false, Now);
+
+        var activity = harness.PayloadFor("conn-bob", ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.That(activity, Is.Not.Null, "an unfocused level-All public member still receives coalesced activity");
+        Assert.That(activity.Preview, Is.Null,
+            "the preview widening is scoped to match channels — a busy lounge must keep its badge-only treatment");
+    }
+
+    [Test]
+    public async Task ClanChannelActivity_CarriesNoPreview()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var engine = NewEngine(harness, focusRegistry, onlineMemberRegistry);
+
+        var channel = new ChatChannel
+        {
+            Id = "chan-clan",
+            Type = ChannelType.System,
+            SystemKind = SystemChannelKind.Clan,
+        };
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
+
+        var message = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = channel.Id,
+            Seq = 1,
+            Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" },
+            Content = "clan night",
+            SentAt = Now,
+        };
+
+        await engine.OnMessagePersisted(channel, message, senderConnectionId: "conn-alice", isShadow: false, Now);
+
+        var activity = harness.PayloadFor("conn-bob", ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.That(activity, Is.Not.Null, "an unfocused level-All clan-channel member still receives coalesced activity");
+        Assert.That(activity.Preview, Is.Null,
+            "the eligibility test is System AND SystemKind.Match — a clan room must not slip in on ChannelType alone");
+    }
+
+    [Test]
+    public void SystemMessageInMatchChannel_ProducesNoPreview_AndDoesNotThrow()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var engine = NewEngine(harness, focusRegistry, onlineMemberRegistry);
+
+        var channel = new ChatChannel
+        {
+            Id = "chan-match",
+            Type = ChannelType.System,
+            SystemKind = SystemChannelKind.Match,
+        };
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
+
+        var systemMessage = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = channel.Id,
+            Seq = 1,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" },
+            SentAt = Now,
+        };
+
+        Assert.DoesNotThrowAsync(async () =>
+            await engine.OnMessagePersisted(channel, systemMessage, senderConnectionId: null, isShadow: false, Now),
+            "a system message has a null Sender — the preview build must not dereference it");
+
+        var activity = harness.PayloadFor("conn-bob", ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.That(activity, Is.Not.Null, "a system message still routes coalesced activity to an unfocused level-All member — only the preview is withheld");
+        Assert.That(activity.Preview, Is.Null, "there is no sender to preview — the MessageKind.User conjunct is what stops the null Sender being dereferenced");
+    }
+
+    [Test]
+    public async Task SystemMessageAfterUserMessage_InsideCoalesceWindow_DoesNotClearPendingPreview()
+    {
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, new SessionRegistry(),
+            new PresenceInterestRegistry(),
+            new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()),
+            TimeProvider.System);
+
+        var channel = new ChatChannel { Id = "chan-match", Type = ChannelType.System, SystemKind = SystemChannelKind.Match };
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
+
+        // #1 opens the 10s coalescing window and emits immediately, carrying its own preview.
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m1", ChannelId = channel.Id, Seq = 1, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "opener", SentAt = Now },
+            senderConnectionId: "conn-alice", isShadow: false, Now);
+
+        // #2 lands INSIDE the window, so it coalesces into the pending and its preview is never sent.
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m2", ChannelId = channel.Id, Seq = 2, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "gg wp", SentAt = Now.AddSeconds(1) },
+            senderConnectionId: "conn-alice", isShadow: false, Now.AddSeconds(1));
+
+        // #3 lands 1s later, still inside the window, and offers a NULL preview (a system message has no
+        // sender). mm may publish one at any instant — Plan B names two triggers. Unconditional
+        // latest-wins would blank #2's still-unsent preview and the flush would emit a bare badge, so the
+        // post-game message goes unnoticed: the exact failure this feature exists to prevent. #2's
+        // preview has never been delivered, so it must survive #3 and ride out on the drain.
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m3", ChannelId = channel.Id, Seq = 3, Kind = MessageKind.System, SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" }, SentAt = Now.AddSeconds(2) },
+            senderConnectionId: null, isShadow: false, Now.AddSeconds(2));
+
+        await coalescer.FlushDue(Now + ChatLimits.ChannelActivityCoalesce);
+
+        var flushed = harness.AllSignals
+            .Where(s => s.ConnectionId == "conn-bob" && s.Method == ChatEvents.ChannelActivity)
+            .Select(s => s.Payload)
+            .OfType<ChannelActivityDto>()
+            .Last();
+        Assert.That(flushed.LastSeq, Is.EqualTo(3), "sanity: the flush is the coalesced burst's drain, carrying the latest seq");
+        var preview = flushed.Preview as ActivityPreviewDto;
+        Assert.That(preview, Is.Not.Null,
+            "a preview-free system message inside the window must not blank the user message's pending preview");
+        Assert.That(preview.Excerpt, Is.EqualTo("gg wp"), "the surviving preview must be the last one that actually HAD content");
+    }
+
+    [Test]
+    public async Task SystemMessageAfterADeliveredPreview_DoesNotResurrectIt()
+    {
+        // The mirror image of the test above, and the reason the coalescer tracks whether a preview has
+        // already ridden out. A preview is RETAINED after its emit (an out-of-order lower offer can leave
+        // the same seq pending, and the drain has to re-send that seq's caption rather than the delayed
+        // lower message's). Retention makes a stale preview reachable: without the delivered check, a
+        // system message arriving any time later — one second or one hour — would find the
+        // already-delivered sender/excerpt still sitting in the entry and re-emit it under its own, much
+        // higher seq. The client would show a duplicate post-game notification captioned with a message
+        // it was already told about, and would arm a nudge off an activity that is supposed to carry no
+        // preview at all.
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, new SessionRegistry(),
+            new PresenceInterestRegistry(),
+            new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()),
+            TimeProvider.System);
+
+        var channel = new ChatChannel { Id = "chan-match", Type = ChannelType.System, SystemKind = SystemChannelKind.Match };
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
+
+        // The user message opens the window and emits immediately — its preview is DELIVERED here.
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m1", ChannelId = channel.Id, Seq = 1, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "gg wp", SentAt = Now },
+            senderConnectionId: "conn-alice", isShadow: false, Now);
+
+        // A system message a full window later: its own emit, its own seq, and no preview of its own.
+        var later = Now + ChatLimits.ChannelActivityCoalesce + TimeSpan.FromSeconds(1);
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m2", ChannelId = channel.Id, Seq = 2, Kind = MessageKind.System, SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" }, SentAt = later },
+            senderConnectionId: null, isShadow: false, later);
+
+        var activities = harness.AllSignals
+            .Where(s => s.ConnectionId == "conn-bob" && s.Method == ChatEvents.ChannelActivity)
+            .Select(s => s.Payload)
+            .OfType<ChannelActivityDto>()
+            .ToList();
+        Assert.That(activities.Count, Is.EqualTo(2), "sanity: two emits, one per window");
+        Assert.That((activities[0].Preview as ActivityPreviewDto)?.Excerpt, Is.EqualTo("gg wp"),
+            "sanity: the user message's own emit carries its preview");
+        Assert.That(activities[1].Preview, Is.Null,
+            "the system message's activity must carry NO preview — the already-delivered one must not ride out again under its seq");
     }
 }

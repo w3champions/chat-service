@@ -141,6 +141,33 @@ public class InternalRelationshipChangeRequest
 }
 
 /// <summary>
+/// <c>POST /internal/channels/{ref}/system-message</c> request body — a server-authored message
+/// published into an EXISTING channel. Lookup-only: unlike the create/roster routes this one never
+/// creates a channel, so an unknown ref is a 404 rather than an implicit create.
+/// <para>
+/// <see cref="Key"/> and <see cref="FallbackText"/> are both REQUIRED: the key is what a client
+/// renders through its own locale catalogue, and the fallback is the only thing a client that does not
+/// know the key (or the moderation history endpoint, which has no catalogue at all) can display.
+/// <see cref="Key"/> is re-validated server-side against the same character class as <c>ref</c> —
+/// <c>\A[A-Za-z0-9_-]{1,64}\z</c>, where 64 is <see cref="Domain.ChatLimits.InternalRefMaxLength"/> —
+/// so a dotted or namespaced catalogue key (e.g. <c>match.intro</c> or <c>chat:match_intro</c>) is
+/// rejected 400; catalogue keys for this endpoint must stick to alphanumerics, <c>_</c>, and <c>-</c>.
+/// <see cref="DedupeKey"/> is optional but strongly recommended — mm retries on timeout, and without a
+/// key a retried publish posts twice. An ABSENT, EMPTY, or WHITESPACE-ONLY <see cref="DedupeKey"/> all
+/// mean the same thing — "no dedupe" — and the endpoint deliberately never rejects the call over it;
+/// only a non-empty key that fails the <see cref="Key"/> character class above is a 400.
+/// </para>
+/// </summary>
+public class InternalSystemMessageRequest
+{
+    public string Key { get; set; }
+    public Dictionary<string, string> Params { get; set; }
+    public Dictionary<string, List<string>> ListParams { get; set; }
+    public string FallbackText { get; set; }
+    public string DedupeKey { get; set; }
+}
+
+/// <summary>
 /// Body of <c>POST /internal/profile-changes</c>: the players whose flair website-backend believes
 /// may have changed. Capped at <see cref="Domain.ChatLimits.InternalMaxMembersPerCall"/>; the sender
 /// chunks larger sets into separate requests.

@@ -167,6 +167,29 @@ public class ChatJsonProtocolTests
     }
 
     [Test]
+    public void Configure_MatchChannelActivity_PreviewCarriesItsChannelClassOnTheWire()
+    {
+        // Post-game chat Plan A Task 6, asserted on the actual wire bytes rather than on the C# record.
+        // The preview is no longer Dm-only, so `preview` being present says nothing about which kind of
+        // room produced it — channelType/systemKind must ride WITH it or a client is back to inferring
+        // "a preview means a DM" and raising a DM-grade toast for every post-game message.
+        var activity = new ChannelActivityDto(
+            "chan-match",
+            LastSeq: 5,
+            Preview: new ActivityPreviewDto(
+                "Alice#1", "Alice", "gg wp", ChannelType.System, SystemChannelKind.Match));
+
+        var json = JsonSerializer.Serialize(activity, ConfiguredOptions());
+
+        Assert.That(json, Does.Contain("\"preview\""),
+            "a match channel's activity must carry a preview so the client has a sender + excerpt to render its nudge");
+        Assert.That(json, Does.Contain("\"channelType\""),
+            "the preview must name its channel class on the wire — a client must never infer it from the field's presence");
+        Assert.That(json, Does.Contain("\"systemKind\""),
+            "systemKind is what separates a match room from a clan room on the client");
+    }
+
+    [Test]
     public void Configure_SessionState_OmitsNullMuteState()
     {
         var ownProfile = new OwnProfileDto("Peter#123", "Peter", IsAdmin: false, Flair: new ChatProfile(), Permissions: Array.Empty<string>());

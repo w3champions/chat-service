@@ -484,6 +484,11 @@ public partial class ChatHub(
     /// no live session → <see cref="ChatResultCode.PermissionDenied"/> (there is no identity to attribute
     /// the delete to).</item>
     /// <item><see cref="Messages.MessageRepository.Load"/>; missing → <see cref="ChatResultCode.NotFound"/>.</item>
+    /// <item>Server-authored messages are not moderatable: a <see cref="MessageKind.System"/> message has
+    /// no <see cref="Messages.MessageSender"/>, so the author-exclusion fan-out at the tail of this method
+    /// would <c>NullReferenceException</c> on <c>message.Sender.BattleTag</c> — and there is no author to
+    /// moderate in any case. → <see cref="ChatResultCode.PermissionDenied"/>, BEFORE the durable
+    /// <see cref="Messages.MessageRepository.MarkDeleted"/>, so the whole method stays a no-op.</item>
     /// <item>Resolve the message's channel and enforce the SHARED moderation scope wall (spec §10 + plan
     /// D5): single-delete uses the EXACT SAME <see cref="ChannelModeration.IsModeratable"/> include-list as
     /// the cross-channel <see cref="PurgeMessagesFromUser"/> sweep (C4 Task 7: also shared with the REST
@@ -530,6 +535,15 @@ public partial class ChatHub(
         if (message == null)
         {
             return new ChannelOperationResult(ChatResultCode.NotFound);
+        }
+
+        // 2.5. Server-authored messages are not moderatable. A system message has no MessageSender, so
+        // the author-exclusion fan-out at the tail of this method (GetConnectionIdsForUser on
+        // message.Sender.BattleTag) would NullReferenceException — and there is no author to moderate
+        // in any case. Rejecting here, before the durable MarkDeleted, keeps the whole method a no-op.
+        if (message.Kind == MessageKind.System)
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }
 
         // 3. Moderation scope wall (spec §10 + plan D5): single-delete shares the SAME include-list as the

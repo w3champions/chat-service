@@ -253,6 +253,11 @@ public class Startup
         // stateless MongoClient wrappers with no per-call state of their own to leak across calls.
         services.AddSingleton<MatchChannelService>();
 
+        // Post-game chat Plan A Task 3: the server-authored message insert path. Singleton for the same
+        // reason as MatchChannelService — no per-call state; its MessageRepository/ChannelRepository deps
+        // are transient MongoClient wrappers, safe to capture.
+        services.AddSingleton<SystemMessagePublisher>();
+
         Log.Information("Services added");
     }
 

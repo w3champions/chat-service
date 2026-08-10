@@ -78,7 +78,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         _messageRepository = new MessageRepository(MongoClient);
         _matchChannelService = new MatchChannelService(_channelRepository, _membershipRepository, _messageRepository, fanOutEngine, _time);
 
-        _controller = new InternalChannelsController(_matchChannelService)
+        // Task 4 added a second, sibling constructor dependency for the system-message route — this
+        // file's SUT construction has to keep pace even though none of ITS tests exercise that route.
+        var systemMessagePublisher = new SystemMessagePublisher(_messageRepository, _channelRepository, fanOutEngine, _time);
+        _controller = new InternalChannelsController(_matchChannelService, _channelRepository, systemMessagePublisher)
         {
             ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() },
         };

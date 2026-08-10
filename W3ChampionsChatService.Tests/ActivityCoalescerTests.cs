@@ -265,9 +265,9 @@ public class ActivityCoalescerTests
     public async Task CoalescedBurst_EmitsLatestPreview()
     {
         var (harness, _, coalescer) = NewCoalescer();
-        var preview1 = new DmActivityPreviewDto(AuthorTag, "Author", "first message");
-        var preview2 = new DmActivityPreviewDto(AuthorTag, "Author", "second message");
-        var preview3 = new DmActivityPreviewDto(AuthorTag, "Author", "third message — latest");
+        var preview1 = new ActivityPreviewDto(AuthorTag, "Author", "first message", ChannelType.Dm, null);
+        var preview2 = new ActivityPreviewDto(AuthorTag, "Author", "second message", ChannelType.Dm, null);
+        var preview3 = new ActivityPreviewDto(AuthorTag, "Author", "third message — latest", ChannelType.Dm, null);
 
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview1);                // immediate emit — opens the window
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview2);   // within window — coalesce
@@ -479,8 +479,8 @@ public class ActivityCoalescerTests
         // is monotonic on exactly that seq).
         var (harness, _, coalescer) = NewCoalescer();
         var newerSentAt = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
-        var newer = new DmActivityPreviewDto("peter#123", "peter", "the newest message");
-        var older = new DmActivityPreviewDto("peter#123", "peter", "the delayed older message");
+        var newer = new ActivityPreviewDto("peter#123", "peter", "the newest message", ChannelType.Dm, null);
+        var older = new ActivityPreviewDto("peter#123", "peter", "the delayed older message", ChannelType.Dm, null);
 
         // seq 7 opens the window and emits; the delayed seq 6 then lands inside it.
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 7, T0, preview: newer, sentAt: newerSentAt);
@@ -490,7 +490,7 @@ public class ActivityCoalescerTests
         var payloads = ActivityPayloads(harness, MemberConn);
         Assert.AreEqual(2, payloads.Count, "one immediate emit plus one flushed pending");
         Assert.AreEqual(7, payloads[1].LastSeq, "the emitted seq stays at the max, as before");
-        Assert.AreEqual("the newest message", ((DmActivityPreviewDto)payloads[1].Preview).Excerpt,
+        Assert.AreEqual("the newest message", ((ActivityPreviewDto)payloads[1].Preview).Excerpt,
             "the text must belong to the seq being emitted, not to whichever offer arrived last");
         Assert.AreEqual(newerSentAt, payloads[1].SentAt, "and so must the timestamp beside it");
     }
@@ -503,15 +503,15 @@ public class ActivityCoalescerTests
         var (harness, _, coalescer) = NewCoalescer();
         var olderSentAt = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
         var newerSentAt = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
-        var older = new DmActivityPreviewDto("peter#123", "peter", "older text");
-        var newer = new DmActivityPreviewDto("peter#123", "peter", "newer text");
+        var older = new ActivityPreviewDto("peter#123", "peter", "older text", ChannelType.Dm, null);
+        var newer = new ActivityPreviewDto("peter#123", "peter", "newer text", ChannelType.Dm, null);
 
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, older, olderSentAt);
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), newer, newerSentAt);
         await coalescer.FlushDue(T0.AddSeconds(11));
 
         var flushed = ActivityPayloads(harness, MemberConn)[1];
-        Assert.AreEqual("newer text", ((DmActivityPreviewDto)flushed.Preview).Excerpt);
+        Assert.AreEqual("newer text", ((ActivityPreviewDto)flushed.Preview).Excerpt);
         Assert.AreEqual(newerSentAt, flushed.SentAt, "the flushed timestamp must belong to the same message as the flushed preview");
     }
 }

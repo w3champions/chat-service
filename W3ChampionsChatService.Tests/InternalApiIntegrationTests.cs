@@ -162,7 +162,10 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         // exact env-only seam Startup.cs builds in production.
         _secrets = new InternalCallerSecrets(MmSecret, WbSecret);
 
-        _channelsController = new InternalChannelsController(_matchChannelService)
+        // Task 4's SystemMessagePublisher is wired over the SAME repositories/registries as everything
+        // else in this suite — no mock, the real publish→persist→fan-out path.
+        var systemMessagePublisher = new SystemMessagePublisher(_messageRepository, _channelRepository, _fanOutEngine, _time);
+        _channelsController = new InternalChannelsController(_matchChannelService, _channelRepository, systemMessagePublisher)
         {
             ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() },
         };
@@ -314,6 +317,21 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         var dto = await JsonSerializer.DeserializeAsync<InternalEpochSyncRequest>(http.Request.Body, JsonOptions);
         _channelsController.ControllerContext.HttpContext = http;
         return await _channelsController.EpochSync(dto);
+    }
+
+    // Task 4 — the system-message publish route, same hand-signed-through-the-real-filter idiom as the
+    // create/roster/epoch-sync helpers above.
+    private async Task<IActionResult> PostSystemMessage(string @ref, string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
+    {
+        var (passed, http) = await ThroughFilter("POST", $"/internal/channels/{@ref}/system-message", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
+        if (!passed)
+        {
+            return new UnauthorizedResult();
+        }
+
+        var dto = await JsonSerializer.DeserializeAsync<InternalSystemMessageRequest>(http.Request.Body, JsonOptions);
+        _channelsController.ControllerContext.HttpContext = http;
+        return await _channelsController.PublishSystemMessage(@ref, dto);
     }
 
     private async Task<IActionResult> PostRelationshipChange(string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
@@ -816,5 +834,413 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         Assert.That(createDto.Id, Is.EqualTo(shell.Id), "the create resolves to the SAME shell channel");
         Assert.That(createDto.Name, Is.EqualTo("Real Match Name"), "the real create backfills the placeholder name");
         Assert.That(createDto.ExpiresAt, Is.EqualTo(shellExpiry), "the create does NOT reset the shell's own creation-anchored expiry");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // Task 4 — POST /internal/channels/{ref}/system-message: lookup-only publish into an EXISTING
+    // match channel, proved through the REAL HMAC filter + REAL controller + REAL SystemMessagePublisher.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+
+    [Test]
+    public async Task SystemMessage_PublishesIntoAnExistingMatchChannel()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-1\",\"name\":\"Sys Match\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the system-message publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        // `key` carries leading/trailing whitespace so this test also pins the controller's Trim() —
+        // the persisted Key below must be the TRIMMED value, never the raw wire string.
+        var messageBody = "{\"key\":\"  match_intro  \",\"params\":{\"map\":\"Amazonia\"},"
+            + "\"listParams\":{\"players\":[\"Grubby#2136\",\"Happy#2233\"]},"
+            + "\"fallbackText\":\"Match on Amazonia \\u2014 Grubby#2136, Happy#2233\",\"dedupeKey\":\"match_intro\"}";
+
+        var result = await PostSystemMessage("match-sys-1", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(), "a valid signed system-message publish into an existing channel returns a body-free 200");
+
+        // The endpoint's real contract is the DTO -> SystemMessageBody mapping, not the status code —
+        // load the persisted row and assert every field the controller is supposed to carry through, so
+        // dropping a field (or forwarding the untrimmed key) would fail this test even though the status
+        // code stays 200.
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        Assert.That(systemMessage.SystemMessage.Key, Is.EqualTo("match_intro"),
+            "Key must be trimmed before it is persisted");
+        Assert.That(systemMessage.SystemMessage.Params["map"], Is.EqualTo("Amazonia"),
+            "Params must be carried through the DTO -> SystemMessageBody mapping unchanged");
+        Assert.That(systemMessage.SystemMessage.ListParams["players"], Is.EqualTo(new List<string> { "Grubby#2136", "Happy#2233" }),
+            "ListParams must be carried through the DTO -> SystemMessageBody mapping unchanged, including BOTH entries");
+        Assert.That(systemMessage.SystemMessage.FallbackText, Is.EqualTo("Match on Amazonia — Grubby#2136, Happy#2233"),
+            "FallbackText must be carried through the DTO -> SystemMessageBody mapping unchanged");
+    }
+
+    [Test]
+    public async Task SystemMessage_SerializesAgainstTeardownOnTheRefGate()
+    {
+        // The publish is TWO steps (look the channel up, then allocate a seq and insert) and teardown is
+        // two more (delete the channel's messages, then the channel doc). Ungated they interleave: the
+        // teardown drops the messages, this publish inserts, and only then does the channel doc go — an
+        // orphan row in a room that no longer exists, already swept past, kept until its own 30-day
+        // message TTL, and fanned out to a membership being removed in the same breath. The publisher's
+        // AllocateSeq mapping only covers a teardown that wins BEFORE the allocation, so the route has to
+        // take the same per-ref gate every other mutating match-channel path takes. Holding the gate here
+        // stands in for the in-flight teardown.
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-gate\",\"name\":\"Gated\",\"members\":[\"Alice#1\"]}";
+        Assert.That(await PostChannelsCreate(createBody, MmSecret, NowTimestamp()), Is.InstanceOf<OkObjectResult>(),
+            "precondition: the match channel must exist before the publish is exercised");
+
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match\"}";
+
+        var gate = await _matchChannelService.AcquireRefGate("match-sys-gate");
+        Task<IActionResult> publish;
+        try
+        {
+            publish = PostSystemMessage("match-sys-gate", messageBody, MmSecret, NowTimestamp());
+
+            // A generous grace period: the assertion is that the publish is BLOCKED, so this only ever
+            // gives it more chance to wrongly finish. Ungated it completes in well under this.
+            var raced = await Task.WhenAny(publish, Task.Delay(TimeSpan.FromSeconds(2)));
+            Assert.That(raced, Is.Not.SameAs(publish),
+                "the publish must not proceed while another operation holds this ref's gate");
+        }
+        finally
+        {
+            gate.Dispose();
+        }
+
+        Assert.That(await publish, Is.InstanceOf<OkResult>(),
+            "and it must complete normally once the gate is released — serialized, not dropped");
+    }
+
+    [Test]
+    public async Task SystemMessage_UnknownRef_Is404_AndCreatesNothing()
+    {
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"}";
+
+        var result = await PostSystemMessage("never-existed", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<NotFoundObjectResult>(),
+            "the system-message route is lookup-only — an unknown ref is a 404, never an implicit create");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "never-existed"), Is.Null,
+            "the system-message route is lookup-only — it must NEVER create a channel on demand");
+    }
+
+    [Test]
+    public async Task SystemMessage_BlankKeyOrFallback_Is400()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-2\",\"name\":\"Sys Match 2\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>(), "precondition: the match channel must exist so the 400s below are genuinely validation failures, not masked 404s");
+
+        var blankKeyBody = "{\"key\":\"   \",\"fallbackText\":\"x\"}";
+        var blankKey = await PostSystemMessage("match-sys-2", blankKeyBody, MmSecret, NowTimestamp());
+
+        var blankFallbackBody = "{\"key\":\"match_intro\",\"fallbackText\":\"\"}";
+        var blankFallback = await PostSystemMessage("match-sys-2", blankFallbackBody, MmSecret, NowTimestamp());
+
+        Assert.That(blankKey, Is.InstanceOf<BadRequestObjectResult>(), "a whitespace-only key must never reach the publisher");
+        Assert.That(blankFallback, Is.InstanceOf<BadRequestObjectResult>(),
+            "fallbackText is the only thing a client that does not know the key can render — it is required");
+    }
+
+    [Test]
+    public async Task SystemMessage_RepeatedWithSameDedupeKey_Is200_AndPublishesOnce()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-3\",\"name\":\"Sys Match 3\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the repeated dedupeKey publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\",\"dedupeKey\":\"match_intro\"}";
+
+        var first = await PostSystemMessage("match-sys-3", messageBody, MmSecret, NowTimestamp());
+        var second = await PostSystemMessage("match-sys-3", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(first, Is.InstanceOf<OkResult>(), "the first publish of a fresh dedupeKey must succeed");
+        Assert.That(second, Is.InstanceOf<OkResult>(),
+            "mm retries on timeout — a duplicate publish is a success, never an error");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        Assert.That(messages.Count(m => m.Kind == MessageKind.System), Is.EqualTo(1),
+            "the retried publish shares the SAME dedupeKey — it must be published exactly once, not twice");
+    }
+
+    // Review finding 1 (human-ruled): an empty dedupeKey is optional-field noise, not a validation
+    // failure — mm has no per-status retry policy, so this must normalize to "no dedupe" (SAME as an
+    // absent dedupeKey) rather than 400. Proven both ways: the call itself is a 200, AND two calls with
+    // a blank dedupeKey are NOT deduped against each other (blank is not itself a shared dedupe value).
+    // Review finding 7 (second round): both the controller comment and the DedupeKey XML doc promise
+    // absent/empty/whitespace-only are all equivalent, but the original test only covered "". Table-driven
+    // over BOTH literal forms so the whitespace-only claim is pinned too, not merely inferred from "".
+    [TestCase("")]
+    [TestCase("   ")]
+    public async Task SystemMessage_BlankDedupeKey_Is200_AndDoesNotDedupe(string dedupeKey)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-4\",\"name\":\"Sys Match 4\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the blank-dedupeKey publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\",\"dedupeKey\":\"" + dedupeKey + "\"}";
+
+        var first = await PostSystemMessage("match-sys-4", messageBody, MmSecret, NowTimestamp());
+        var second = await PostSystemMessage("match-sys-4", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(first, Is.InstanceOf<OkResult>(),
+            "a blank dedupeKey must normalize to \"no dedupe\" and never trigger a 400 — an optional field must never reject the whole call");
+        Assert.That(second, Is.InstanceOf<OkResult>(),
+            "a second call with a blank dedupeKey must also succeed — blank is not treated as a shared dedupe value between the two calls");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        Assert.That(messages.Count(m => m.Kind == MessageKind.System), Is.EqualTo(2),
+            "blank dedupeKey means NO dedupe (unlike a genuine shared key) — both calls must persist as DISTINCT messages");
+    }
+
+    // Review finding 4: three DISTINCT rejection decisions, each with its own rationale comment in the
+    // controller, none previously pinned by a test. Table-driven so all three close together; the
+    // InvalidSystemRef case is the one that matters most to get right — it MUST be 400 (a malformed
+    // ref never reaches the LoadBySystemRef lookup that produces a 404), never masquerading as the
+    // lookup-miss branch.
+    public enum SystemMessageRejectionScenario
+    {
+        KeyContainsNewline,
+        DedupeKeyContainsHash,
+        InvalidSystemRef,
+    }
+
+    [TestCase(SystemMessageRejectionScenario.KeyContainsNewline)]
+    [TestCase(SystemMessageRejectionScenario.DedupeKeyContainsHash)]
+    [TestCase(SystemMessageRejectionScenario.InvalidSystemRef)]
+    public async Task SystemMessage_RejectionScenarios_All400NotSomethingElse(SystemMessageRejectionScenario scenario)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-5\",\"name\":\"Sys Match 5\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>(),
+            "precondition: the match channel must exist so a 400 below is genuinely a validation failure, not a masked 404");
+
+        var (systemRef, body) = scenario switch
+        {
+            SystemMessageRejectionScenario.KeyContainsNewline =>
+                ("match-sys-5", "{\"key\":\"bad\\nkey\",\"fallbackText\":\"x\"}"),
+            SystemMessageRejectionScenario.DedupeKeyContainsHash =>
+                ("match-sys-5", "{\"key\":\"match_intro\",\"fallbackText\":\"x\",\"dedupeKey\":\"bad#key\"}"),
+            // A ref containing a space fails the SAME IsValidRef character class as `key`/`dedupeKey`
+            // above — deliberately targeting an EXISTING channel's ref shape rather than "never-existed",
+            // so a wrongly-implemented lookup-first ordering would surface this as a 404 instead.
+            SystemMessageRejectionScenario.InvalidSystemRef =>
+                ("bad ref", "{\"key\":\"match_intro\",\"fallbackText\":\"x\"}"),
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+
+        var result = await PostSystemMessage(systemRef, body, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<BadRequestObjectResult>(),
+            $"{scenario} must be a 400 — distinguishing a validation failure from a lookup miss (404) is the entire point of the invalid-systemRef case");
+    }
+
+    // Review finding 1 (second round): the fallbackText truncation is this commit's ONLY runtime
+    // behaviour change — everything else in the endpoint is validate-then-delegate — so it needs its
+    // own pin, not just implicit coverage from the happy-path test's short fallbackText.
+    [Test]
+    public async Task SystemMessage_OverlongFallbackText_Is200_AndTruncatedToMaxMessageLength()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-6\",\"name\":\"Sys Match 6\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the overlong-fallbackText publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var overlongFallback = new string('x', 600);
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"" + overlongFallback + "\"}";
+
+        var result = await PostSystemMessage("match-sys-6", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            "an overlong fallbackText must be TRUNCATED, never rejected — the truncate-don't-reject decision is the whole point of this test");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        Assert.That(systemMessage.SystemMessage.FallbackText.Length, Is.EqualTo(ChatLimits.MaxMessageLength),
+            "the persisted fallbackText must be truncated to exactly ChatLimits.MaxMessageLength — pins the boundary, not just \"shorter than before\"");
+    }
+
+    // Review finding 2 (second round): a naive fallbackText[..ChatLimits.MaxMessageLength] slice can
+    // land inside a UTF-16 surrogate pair, leaving a lone high surrogate that is unsafe to BSON-persist
+    // and fan out. Positioned so the naive slice WOULD split it: 511 'a's (indices 0..510) followed by
+    // an astral emoji (U+1F600, encoded as the surrogate pair 😀 at indices 511/512) — slicing
+    // at index 512 takes indices 0..511, i.e. the 511 'a's plus exactly the emoji's high surrogate and
+    // nothing else, which is precisely the split this test guards against.
+    [Test]
+    public async Task SystemMessage_OverlongFallbackTextWithSurrogatePairAtTruncationBoundary_DropsThePairWhole()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-7\",\"name\":\"Sys Match 7\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the surrogate-pair-boundary publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var prefix = new string('a', 511);
+        var fallbackWithBoundaryEmoji = prefix + "😀" + "tail";
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"" + fallbackWithBoundaryEmoji + "\"}";
+
+        var result = await PostSystemMessage("match-sys-7", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            "a boundary-straddling emoji must still be truncated, never rejected — the surrogate-pair guard is a persistence-safety fix, not a new validation rule");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        var persisted = systemMessage.SystemMessage.FallbackText;
+        Assert.That(char.IsHighSurrogate(persisted[^1]), Is.False,
+            "truncation must never leave a lone trailing high surrogate — that is invalid UTF-16 and unsafe to BSON-persist and fan out to every channel member");
+        Assert.That(persisted, Is.EqualTo(prefix),
+            "the boundary-straddling emoji must be dropped WHOLE once the naive slice would have cut it in half, not left half-persisted");
+    }
+
+    // Final review, finding 10: the two `name` truncations on the create and roster-assert routes were
+    // NAIVE name[..limit] slices that predate this branch, and both now route through the generalized
+    // Excerpts.Bounded. Same construction as the fallbackText case above, at the name cap: 99 'a's
+    // (indices 0..98) then an astral emoji at indices 99/100, so a naive slice at 100 would keep exactly
+    // the emoji's high surrogate and nothing else.
+    [Test]
+    public async Task ChannelCreate_OverlongNameWithSurrogatePairAtTruncationBoundary_DropsThePairWhole()
+    {
+        var prefix = new string('a', ChatLimits.InternalChannelNameMaxLength - 1);
+        var nameWithBoundaryEmoji = prefix + "😀" + "tail";
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-name-1\",\"name\":\"" + nameWithBoundaryEmoji + "\",\"members\":[\"Alice#1\"]}";
+
+        var result = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkObjectResult>(),
+            "an overlong name must still be truncated, never rejected — a cosmetic field can never block a create");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-name-1");
+        Assert.That(char.IsHighSurrogate(channel.Name[^1]), Is.False,
+            "the name truncation must never leave a lone trailing high surrogate — invalid UTF-16 that is unsafe to BSON-persist");
+        Assert.That(channel.Name, Is.EqualTo(prefix),
+            "the boundary-straddling emoji must be dropped WHOLE, exactly like the fallbackText cap — one surrogate-safe implementation, three call sites");
+    }
+
+    // Final review, finding 7: `params`/`listParams` used to reach Mongo with NO per-element guard at
+    // all. Keys become BSON element names + client catalogue placeholders (identifier class, the same
+    // IsValidRef `key`/`dedupeKey` get); values and list items are free display text that persists and
+    // fans out (control-char/U+2028/U+2029-free). Final review M3 (human-ruled): unlike a `members`
+    // entry, a param value is NOT required to be non-blank — `fallbackText` already covers rendering
+    // for a client that does not recognise `key`, so a blank/null value is display text with a safe
+    // fallback, not a permanent 400 mm cannot retry its way out of. See
+    // SystemMessage_BlankOrNullParamValue_Is200_AndPersistsAsIs below for that acceptance case.
+    public enum SystemMessageParamRejectionScenario
+    {
+        DottedParamKey,
+        DollarPrefixedParamKey,
+        ParamValueWithNewline,
+        DottedListParamKey,
+        ListItemWithLineSeparator,
+    }
+
+    [TestCase(SystemMessageParamRejectionScenario.DottedParamKey)]
+    [TestCase(SystemMessageParamRejectionScenario.DollarPrefixedParamKey)]
+    [TestCase(SystemMessageParamRejectionScenario.ParamValueWithNewline)]
+    [TestCase(SystemMessageParamRejectionScenario.DottedListParamKey)]
+    [TestCase(SystemMessageParamRejectionScenario.ListItemWithLineSeparator)]
+    public async Task SystemMessage_InvalidParams_Is400_AndPersistsNothing(SystemMessageParamRejectionScenario scenario)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-8\",\"name\":\"Sys Match 8\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null,
+            "precondition: the match channel must exist so a 400 below is genuinely a validation failure, not a masked 404");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var paramsJson = scenario switch
+        {
+            // A dotted or $-prefixed BSON element name is at best awkward to query once persisted.
+            SystemMessageParamRejectionScenario.DottedParamKey => "\"params\":{\"match.map\":\"Amazonia\"}",
+            SystemMessageParamRejectionScenario.DollarPrefixedParamKey => "\"params\":{\"$map\":\"Amazonia\"}",
+            // \n in a value that persists and fans out to every member as rendered display text — the
+            // control-char case IsValidDisplayText exists for (never a log-injection concern here: no
+            // Log.* call in this file or SystemMessagePublisher writes a param value).
+            SystemMessageParamRejectionScenario.ParamValueWithNewline => "\"params\":{\"map\":\"Ama\\nzonia\"}",
+            SystemMessageParamRejectionScenario.DottedListParamKey => "\"listParams\":{\"a.b\":[\"Grubby#2136\"]}",
+            // U+2028 is category Zl, not Cc, so char.IsControl alone misses it — the explicit conjunct.
+            SystemMessageParamRejectionScenario.ListItemWithLineSeparator => "\"listParams\":{\"players\":[\"Grub\\u2028by\"]}",
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"," + paramsJson + "}";
+
+        var result = await PostSystemMessage("match-sys-8", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<BadRequestObjectResult>(),
+            $"{scenario} must be rejected at the boundary — params reach Mongo as element names and fan out as display text");
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        Assert.That(messages.Any(m => m.Kind == MessageKind.System), Is.False,
+            "a rejected publish must persist nothing — validation runs before the lookup and the insert");
+    }
+
+    // Final review M3 (human-ruled): a param value / list item is display text `fallbackText` already
+    // covers, not an identity like a `members` entry — so a blank or null value is accepted and stored
+    // AS-IS rather than a permanent 400 mm cannot retry its way out of. This is the acceptance
+    // counterpart to SystemMessage_InvalidParams_Is400_AndPersistsNothing above, which no longer covers
+    // a blank param value now that the rule diverged from `members`.
+    public enum SystemMessageBlankParamAcceptanceScenario
+    {
+        BlankParamValue,
+        NullParamValue,
+        BlankListItem,
+    }
+
+    [TestCase(SystemMessageBlankParamAcceptanceScenario.BlankParamValue)]
+    [TestCase(SystemMessageBlankParamAcceptanceScenario.NullParamValue)]
+    [TestCase(SystemMessageBlankParamAcceptanceScenario.BlankListItem)]
+    public async Task SystemMessage_BlankOrNullParamValue_Is200_AndPersistsAsIs(SystemMessageBlankParamAcceptanceScenario scenario)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-10\",\"name\":\"Sys Match 10\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null,
+            "precondition: the match channel must exist before the blank-param-value publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var paramsJson = scenario switch
+        {
+            SystemMessageBlankParamAcceptanceScenario.BlankParamValue => "\"params\":{\"map\":\"   \"}",
+            SystemMessageBlankParamAcceptanceScenario.NullParamValue => "\"params\":{\"map\":null}",
+            SystemMessageBlankParamAcceptanceScenario.BlankListItem => "\"listParams\":{\"players\":[\"   \"]}",
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"," + paramsJson + "}";
+
+        var result = await PostSystemMessage("match-sys-10", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            $"{scenario} must be a 200 — a param value/list item is display text fallbackText already covers, not an identity like a members entry");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        switch (scenario)
+        {
+            case SystemMessageBlankParamAcceptanceScenario.BlankParamValue:
+                Assert.That(systemMessage.SystemMessage.Params["map"], Is.EqualTo("   "),
+                    "a blank param value must persist AS-IS, not be trimmed or normalized to null");
+                break;
+            case SystemMessageBlankParamAcceptanceScenario.NullParamValue:
+                Assert.That(systemMessage.SystemMessage.Params["map"], Is.Null,
+                    "a null param value must persist as null, not be rejected or coerced to empty string");
+                break;
+            case SystemMessageBlankParamAcceptanceScenario.BlankListItem:
+                Assert.That(systemMessage.SystemMessage.ListParams["players"], Is.EqualTo(new List<string> { "   " }),
+                    "a blank list item must persist AS-IS, not be trimmed, dropped, or normalized to null");
+                break;
+        }
+    }
+
+    [Test]
+    public async Task SystemMessage_AbsentParams_Is200()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-9\",\"name\":\"Sys Match 9\",\"members\":[\"Alice#1\"]}";
+        Assert.That(await PostChannelsCreate(createBody, MmSecret, NowTimestamp()), Is.InstanceOf<OkObjectResult>(),
+            "precondition: the match channel must exist");
+
+        var result = await PostSystemMessage(
+            "match-sys-9", "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"}", MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            "params/listParams are OPTIONAL — a null dictionary means \"no params\" and must never be turned into a 400 by the new element validation");
     }
 }

@@ -426,7 +426,70 @@ only trigger a pointless mm retry), and — unlike the roster assertion — this
 **already-frozen** channel: detach guards the automated paths (assertions, sweeps), not an explicit
 authoritative teardown mm chooses to send.
 
+### `POST /internal/channels/{ref}/system-message`
+
+Publishes a **server-authored** message into an existing match channel — a message with no sender and no
+free-form content, carrying a structured body a client renders against its own i18n catalogue:
+
+```json
+{
+  "key": "match_intro",
+  "params": { "map": "Amazonia" },
+  "listParams": { "players": ["Grubby#2136", "Happy#2233"] },
+  "fallbackText": "Match on Amazonia — Grubby#2136, Happy#2233",
+  "dedupeKey": "match_intro"
+}
+```
+
+**Lookup-only** — deliberately unlike `POST /internal/channels`, which find-or-creates. An unknown `ref`
+is a **`404`**, never an implicit create: a system message is meaningless without the room it narrates,
+and creating one here would leave a memberless channel nobody can ever see. The same `404` also covers
+the race where the channel is torn down (by `DELETE`, or by its 24h TTL) between the lookup and the
+write — mm should treat it as "this room is gone, stop retrying", not as a transient failure.
+
+- `key` — **required**, the client's catalogue lookup token. Trimmed, then validated against **the same
+  character class as `ref`**: `[A-Za-z0-9_-]`, 1-64 chars. **`match.intro` is a `400`** — dots are not in
+  the class, and dotted keys are the dominant i18n convention, so this is the mistake to expect. Use
+  `match_intro`. Empty-after-trim is a `400`.
+- `fallbackText` — **required**, the server-rendered English a client that does not recognise `key`
+  displays, and the only rendering the moderation history has. Trimmed; empty-after-trim is a `400`.
+  **Normalized, never rejected for length**: clamped to 512 chars (the same cap a user message body
+  gets), on a UTF-16-safe boundary so a truncated emoji is dropped whole rather than half-persisted.
+- `params` (`{string: string}`) / `listParams` (`{string: string[]}`) — both **optional**; absent means
+  "no params". When present, every **key** is validated against the same `[A-Za-z0-9_-]` class as `key`
+  (keys become BSON element names as well as client placeholders, so a dotted or `$`-prefixed key is
+  a `400`). Every **value** / list item must be free of control characters and U+2028/U+2029 (they
+  persist and fan out to every channel member as rendered display text), but — unlike a `members`
+  entry — **blank or `null` is accepted and stored as-is, never a `400`**: a param value is display text
+  `fallbackText` already covers for a client that does not recognise `key`, not an identity a caller
+  could usefully retry its way out of rejecting. Neither is length-capped beyond the 64 KB signed-body
+  cap.
+- `dedupeKey` — **optional**. When supplied, the publish is at-most-once per `(channel, dedupeKey)`:
+  a retry returns `200` and re-publishes nothing (mm retries on timeout, and an intro must never
+  double-post). Validated against the same `[A-Za-z0-9_-]` class when non-empty, since it becomes a
+  Mongo index key. **Absent, empty, and whitespace-only are all equivalent and all mean "no dedupe"** —
+  never a `400`, and never deduped against each other, so two blank-key calls persist as two distinct
+  messages.
+
+Success is a body-free `200`. Retention is unchanged: the message follows the normal 30d channel-message
+TTL and the publish never re-stamps the channel shell's own 24h creation-anchored expiry.
+
 ### Deploy order
+
+**Post-game chat ships as one release: chat-service, matchmaking-service and the launcher together.**
+The system-message route is the reason, and it is the one route on this surface that is **not
+fail-open** — unlike `ladder` (inert until mm sends it) or the old delta endpoint (a harmless `404`),
+calling it against a client that does not understand it actively breaks something. A launcher without
+system-message support declares `sender` and `content` required and non-nullable on its message type,
+and `appendMessage` calls `lastMessageFromMessage` unconditionally — before any kind check — which
+dereferences `message.sender.battleTag` and parses `message.content`. This service omits nulls on the
+wire, so both arrive **absent** and that throws inside the client's store action: the message never
+lands, the rest of the receive handler never runs, and `GetMessages` replays the same poisoned row on
+every reconnect. It **breaks the channel for the session** rather than degrading, which is why the
+launcher cannot lag the publisher.
+
+Deploying this service on its own is still safe in the meantime — it publishes nothing by itself; every
+system message originates in an mm call.
 
 **`ladder` is inert until mm sends it.** The mute gate reads a flag only mm can set, so between this
 service's deploy and mm's, ladder match rooms stay exactly as unmoderated as they are today — this

@@ -64,6 +64,21 @@ public class ModerationHistoryControllerTests : IntegrationTestBase
         return message;
     }
 
+    private async Task<ChannelMessage> SeedSystemMessage(string channelId, string fallbackText)
+    {
+        var seq = await _channelRepository.AllocateSeq(channelId, DateTime.UtcNow);
+        var message = new ChannelMessage
+        {
+            ChannelId = channelId,
+            Seq = seq,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = fallbackText },
+            SentAt = DateTime.UtcNow,
+        };
+        await _messageRepository.Insert(message);
+        return message;
+    }
+
     private static void AssertForbidden(IActionResult result)
     {
         Assert.IsInstanceOf<StatusCodeResult>(result, "an ineligible channel type must reject with a plain 403, not a body");
@@ -160,6 +175,27 @@ public class ModerationHistoryControllerTests : IntegrationTestBase
         Assert.IsTrue(dto.Deleted);
         Assert.AreEqual("mod#1", dto.DeletedBy);
         Assert.AreEqual(deletedAt, dto.DeletedAt);
+    }
+
+    [Test]
+    public async Task Messages_SystemMessageRow_NullSenderAndFallbackContent()
+    {
+        var channel = await InsertChannel(ChannelType.System, SystemChannelKind.Match);
+        var userMessage = await SeedMessage(channel.Id, "author#1", "gg");
+        var systemMessage = await SeedSystemMessage(channel.Id, "Match on Amazonia");
+
+        var page = await _controller.GetChannelMessages(channel.Id, beforeSeq: null, limit: 50) as OkObjectResult;
+        var dto = page.Value as ModerationMessagePageDto;
+
+        Assert.IsNotNull(dto, "a channel with a system message must still page successfully, not 500");
+        var systemRow = dto.Messages.SingleOrDefault(m => m.Id == systemMessage.Id);
+        Assert.IsNotNull(systemRow, "the system message row must be present in moderator history alongside the user row");
+        Assert.IsNull(systemRow.SenderBattleTag, "a system message has no author — the sender fields must be null, not throw");
+        Assert.IsNull(systemRow.SenderName, "a system message has no author — the sender fields must be null, not throw");
+        Assert.AreEqual("Match on Amazonia", systemRow.Content, "Content must fall back to the system body's FallbackText, the only English rendering the moderator can read");
+
+        var userRow = dto.Messages.Single(m => m.Id == userMessage.Id);
+        Assert.AreEqual("author#1", userRow.SenderBattleTag, "an ordinary user row must still project its real sender");
     }
 
     [Test]

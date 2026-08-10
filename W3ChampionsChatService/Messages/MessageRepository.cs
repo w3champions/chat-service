@@ -29,6 +29,18 @@ public class MessageRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     public Task<ChannelMessage> Load(string id) => Messages.Find(m => m.Id == id).FirstOrDefaultAsync();
 
     /// <summary>
+    /// The idempotency lookup for server-authored messages (post-game chat Plan A Task 3): the single
+    /// message in <paramref name="channelId"/> carrying <paramref name="dedupeKey"/>, or null. Served by
+    /// the partial unique index <c>ux_channelId_dedupeKey</c>, so at most one row can ever match.
+    /// Virtual: a test seam (the TryAdvanceAssertion idiom) so a subclass can force a single miss,
+    /// driving <see cref="SystemMessagePublisher.Publish"/> past the pre-check and into its
+    /// duplicate-key catch — the only way to prove that branch resolves to the concurrent winner's
+    /// message rather than letting the write exception escape.
+    /// </summary>
+    public virtual Task<ChannelMessage> LoadByDedupeKey(string channelId, string dedupeKey) =>
+        Messages.Find(m => m.ChannelId == channelId && m.DedupeKey == dedupeKey).FirstOrDefaultAsync();
+
+    /// <summary>
     /// User-facing visibility: soft-deleted messages excluded; shadow messages visible
     /// only to their author. ({Deleted: null} also matches documents without the field.)
     /// </summary>

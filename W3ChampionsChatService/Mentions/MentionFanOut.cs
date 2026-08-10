@@ -341,7 +341,7 @@ public class MentionFanOut(
             Seq = message.Seq,
             AuthorBattleTag = message.Sender.BattleTag,
             AuthorName = message.Sender.Name,
-            Excerpt = Excerpts.Bounded(message.Content),
+            Excerpt = Excerpts.Bounded(message.Content, ChatLimits.DmPreviewExcerptLength),
             CreatedAt = now,
             ExpiresAt = ExpiryCalculator.ForMentionInboxEntry(now),
         };
