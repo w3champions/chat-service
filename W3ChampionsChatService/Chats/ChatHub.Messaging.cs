@@ -351,7 +351,18 @@ public partial class ChatHub
         {
             try
             {
-                await _channelRepository.TryAdvanceLastMessage(channelId, BuildLastMessageProjection(message));
+                var projection = BuildLastMessageProjection(message);
+                if (await _channelRepository.TryAdvanceLastMessage(channelId, projection))
+                {
+                    // Mirror the successful write onto the in-memory channel: step 7.5 below re-announces
+                    // this same instance via ChannelAdded (MaterializeDmRecipientAndNotify), and a recipient
+                    // whose notification level is Mentions/None — or whose activity is unread-suppressed —
+                    // has no second chance to learn the projection. Announcing the copy we just wrote is
+                    // free; re-reading the doc would be another round-trip. A false return means a
+                    // concurrent newer message won the CAS, and the announcement carries the older
+                    // projection until the next send — the same self-healing staleness as a lost CAS.
+                    channel.LastMessage = projection;
+                }
             }
             catch (Exception ex)
             {
@@ -422,7 +433,9 @@ public partial class ChatHub
         }
 
         // 9. Typed ack.
-        return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq);
+        // SentAt: the sender is skipped by BOTH fan-out paths for their own message, so this ack is the
+        // only place the server's timestamp reaches them — see SendMessageResult for why that matters.
+        return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq, SentAt: message.SentAt);
     }
 
     /// <summary>

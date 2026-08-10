@@ -891,6 +891,74 @@ public class ChatHubDmSendTests : IntegrationTestBase
         }
     }
 
+    [Test]
+    public async Task DmSend_AckCarriesTheServerSentAt()
+    {
+        // The sender is the one participant BOTH fan-out paths skip for their own message: no activity
+        // ping (senderConnectionId is skipped explicitly), and MessageReceived only if they happen to be
+        // focused on the channel — which SendMessage does not require. So the ack is the only carrier of
+        // the server's timestamp for their own send, and without it a client would have to stamp the
+        // optimistic echo from the local clock, which is exactly what conversation ordering (and the
+        // keyset paging coordinate derived from it) must never be built on.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "no fan-out will tell me when this happened");
+
+        Assert.That(result.SentAt, Is.Not.Null, "an Ok ack must carry the send instant");
+        var persisted = (await _messageRepository.LoadForUser(channel.Id, Initiator)).Single();
+        Assert.That(result.SentAt, Is.EqualTo(persisted.SentAt),
+            "and it must be the SAME instant the message was stamped with, not a second reading of the clock");
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(result.SentAt, Is.EqualTo(projection.SentAt),
+            "so the sender's own row sorts on exactly the value everyone else's does");
+    }
+
+    [Test]
+    public async Task BlockedDmSend_FakeAckCarriesASentAtToo_SilentDropUniformity()
+    {
+        // The silent-drop ack must stay byte-shaped like a real one — a null SentAt where a real send has
+        // one would leak the block just as surely as a null MessageId would.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        SetBlocked(Recipient, Initiator);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "they blocked me and must not learn that I know");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.SentAt, Is.Not.Null, "a fabricated ack must carry a fabricated instant, same shape as a real one");
+        Assert.That((await _channelRepository.Load(channel.Id)).LastMessage, Is.Null, "while nothing is actually persisted or projected");
+    }
+
+    [Test]
+    public async Task DmSend_ReAnnouncedShell_CarriesTheProjectionItJustWrote()
+    {
+        // A snapshot-excluded shell is re-announced by MaterializeDmRecipientAndNotify using the SAME
+        // in-memory channel the send loaded. The projection write only touches Mongo, so unless it is
+        // mirrored back the recipient is handed a conversation row with no text — and a recipient on
+        // Mentions/None, or one whose activity is unread-suppressed, gets no second chance at it.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        RegisterSession(RecipientConn, Recipient);   // online but NOT registry-seeded → triggers the re-announce
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(channel.Id, "are you still there?");
+
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null);
+        Assert.That(added.Channel.LastMessage, Is.Not.Null, "the re-announced shell must carry the projection this very send wrote");
+        Assert.That(added.Channel.LastMessage.Excerpt, Is.EqualTo("are you still there?"));
+    }
+
     // --- Invariants this projection silently depends on, pinned so that widening either scope fails loudly ---
 
     [Test]

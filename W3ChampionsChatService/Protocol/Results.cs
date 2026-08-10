@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Memberships;
@@ -16,11 +17,23 @@ namespace W3ChampionsChatService.Protocol;
 /// <see cref="ChatChannel"/>/<see cref="ChannelMembership"/> directly instead of inventing parallel
 /// DTOs.
 /// </summary>
+/// <summary>
+/// <paramref name="SentAt"/> is the sender's own copy of the SERVER instant the message was stamped
+/// with — the same value every other recipient learns from <c>MessageReceived.SentAt</c> or
+/// <c>ChannelActivity.SentAt</c>. It is here because the sender is the one participant the fan-out
+/// deliberately skips: they receive no activity ping for their own message, and no
+/// <c>MessageReceived</c> either unless they happen to be focused on the channel they sent to (which
+/// <c>SendMessage</c> does not require). Without it a sender's own conversation could not take its new
+/// sort position from a server clock, and a client would have to invent one from the local clock —
+/// the one thing conversation ordering must never be built on, since it is also the keyset paging
+/// coordinate. Non-Ok results leave it null, exactly like MessageId/Seq.
+/// </summary>
 public record SendMessageResult(
     ChatResultCode Code,
     double? RetryAfterSeconds = null,
     string MessageId = null,
-    long? Seq = null);
+    long? Seq = null,
+    DateTime? SentAt = null);
 
 public record JoinChannelResult(
     ChatResultCode Code,
