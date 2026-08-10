@@ -57,6 +57,14 @@ public class InternalChannelsController(
     private const string MatchKind = "match";
     private const string GenericValidationError = "Invalid request.";
 
+    // Same generic-message TEXT as GenericValidationError, deliberately duplicated under a distinct
+    // name rather than reused — the class doc above scopes GenericValidationError to failures returned
+    // "via a plain 400"; a lookup miss (or the Publish defense-in-depth branch below) is a 404, and a
+    // separately-named constant keeps a future reader from wondering why a "validation error" backs a
+    // 404. The message policy (never echo which rule failed / what's missing) is intentionally the same
+    // string for both — only the name tracks which status code owns it.
+    private const string GenericNotFoundError = "Invalid request.";
+
     // \A/\z (absolute start/end), NOT ^/$ — .NET's `$` also matches immediately before a single
     // trailing '\n' when RegexOptions.Multiline is NOT set, so "abc123\n" would otherwise pass this
     // character-class check despite containing a newline (log-injection + distinct Mongo key risk).
@@ -294,7 +302,7 @@ public class InternalChannelsController(
     /// <paramref name="systemRef"/>. LOOKUP-ONLY — deliberately unlike <c>POST /internal/channels</c>:
     /// a system message is meaningless without the room it narrates, so an unknown ref is a 404 rather
     /// than an implicit create (which would leave a memberless channel nobody can ever see).
-    /// Idempotent when the caller supplies a dedupeKey — a retry returns 200 with the original message.
+    /// Idempotent when the caller supplies a dedupeKey — a retry returns 200 and re-publishes nothing.
     /// </summary>
     [HttpPost("{systemRef}/system-message")]
     public async Task<IActionResult> PublishSystemMessage(string systemRef, [FromBody] InternalSystemMessageRequest request)
@@ -318,8 +326,28 @@ public class InternalChannelsController(
             return BadRequest(new ErrorResult(GenericValidationError));
         }
 
+        // Defense-in-depth against a signed-but-malformed payload: fallbackText is bounded only by the
+        // 64 KB HMAC body cap otherwise, and it persists + fans out to every channel member. TRUNCATED,
+        // never rejected — same convention as `name` above (a signed field the caller cannot usefully
+        // retry its way out of a 400 on). Capped to ChatLimits.MaxMessageLength: this is server-rendered
+        // display text a client shows directly, the same shape as a user message body, so it reuses that
+        // cap rather than inventing a new number.
+        if (fallbackText.Length > ChatLimits.MaxMessageLength)
+        {
+            fallbackText = fallbackText[..ChatLimits.MaxMessageLength];
+        }
+
+        // DedupeKey is OPTIONAL — absent, empty, or whitespace-only ALL mean "no dedupe" and are never a
+        // 400 (mirrors SystemMessagePublisher.Publish's own dedupeKey normalization): mm has no
+        // per-status retry policy, so an optional field must never reject the whole call and get retried
+        // forever with the same rejected body. Only a NON-empty key that fails the ref character class
+        // is rejected — it would otherwise become a Mongo dedupe-index key.
         var dedupeKey = request.DedupeKey?.Trim();
-        if (dedupeKey != null && (dedupeKey.Length == 0 || !IsValidRef(dedupeKey)))
+        if (string.IsNullOrEmpty(dedupeKey))
+        {
+            dedupeKey = null; // ⇒ Publish's "no dedupe" path
+        }
+        else if (!IsValidRef(dedupeKey))
         {
             return BadRequest(new ErrorResult(GenericValidationError));
         }
@@ -329,7 +357,7 @@ public class InternalChannelsController(
             var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef);
             if (channel == null)
             {
-                return NotFound(new ErrorResult(GenericValidationError));
+                return NotFound(new ErrorResult(GenericNotFoundError));
             }
 
             var body = new SystemMessageBody
@@ -340,10 +368,14 @@ public class InternalChannelsController(
                 FallbackText = fallbackText,
             };
 
+            // Unreachable BY CONSTRUCTION today: Publish returns non-Ok only when its `channel` argument
+            // is null, and `channel` is already confirmed non-null immediately above. Kept anyway as
+            // defense-in-depth against a future Publish regression — a future reader should not go
+            // hunting for the live case that trips this branch; as of this writing there isn't one.
             var result = await systemMessagePublisher.Publish(channel, body, dedupeKey);
             if (result.Code != ChatResultCode.Ok)
             {
-                return NotFound(new ErrorResult(GenericValidationError));
+                return NotFound(new ErrorResult(GenericNotFoundError));
             }
 
             Log.Information(

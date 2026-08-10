@@ -845,16 +845,34 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     public async Task SystemMessage_PublishesIntoAnExistingMatchChannel()
     {
         var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-1\",\"name\":\"Sys Match\",\"members\":[\"Alice#1\"]}";
-        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
-        Assert.That(createResult, Is.InstanceOf<OkObjectResult>(), "precondition: the match channel must exist before the system-message publish is exercised");
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the system-message publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
 
-        var messageBody = "{\"key\":\"match_intro\",\"params\":{\"map\":\"Amazonia\"},"
+        // `key` carries leading/trailing whitespace so this test also pins the controller's Trim() —
+        // the persisted Key below must be the TRIMMED value, never the raw wire string.
+        var messageBody = "{\"key\":\"  match_intro  \",\"params\":{\"map\":\"Amazonia\"},"
             + "\"listParams\":{\"players\":[\"Grubby#2136\",\"Happy#2233\"]},"
             + "\"fallbackText\":\"Match on Amazonia \\u2014 Grubby#2136, Happy#2233\",\"dedupeKey\":\"match_intro\"}";
 
         var result = await PostSystemMessage("match-sys-1", messageBody, MmSecret, NowTimestamp());
 
         Assert.That(result, Is.InstanceOf<OkResult>(), "a valid signed system-message publish into an existing channel returns a body-free 200");
+
+        // The endpoint's real contract is the DTO -> SystemMessageBody mapping, not the status code —
+        // load the persisted row and assert every field the controller is supposed to carry through, so
+        // dropping a field (or forwarding the untrimmed key) would fail this test even though the status
+        // code stays 200.
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        Assert.That(systemMessage.SystemMessage.Key, Is.EqualTo("match_intro"),
+            "Key must be trimmed before it is persisted");
+        Assert.That(systemMessage.SystemMessage.Params["map"], Is.EqualTo("Amazonia"),
+            "Params must be carried through the DTO -> SystemMessageBody mapping unchanged");
+        Assert.That(systemMessage.SystemMessage.ListParams["players"], Is.EqualTo(new List<string> { "Grubby#2136", "Happy#2233" }),
+            "ListParams must be carried through the DTO -> SystemMessageBody mapping unchanged, including BOTH entries");
+        Assert.That(systemMessage.SystemMessage.FallbackText, Is.EqualTo("Match on Amazonia — Grubby#2136, Happy#2233"),
+            "FallbackText must be carried through the DTO -> SystemMessageBody mapping unchanged");
     }
 
     [Test]
@@ -908,5 +926,74 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         var messages = await _messageRepository.LoadForModerator(channelDto.Id);
         Assert.That(messages.Count(m => m.Kind == MessageKind.System), Is.EqualTo(1),
             "the retried publish shares the SAME dedupeKey — it must be published exactly once, not twice");
+    }
+
+    // Review finding 1 (human-ruled): an empty dedupeKey is optional-field noise, not a validation
+    // failure — mm has no per-status retry policy, so this must normalize to "no dedupe" (SAME as an
+    // absent dedupeKey) rather than 400. Proven both ways: the call itself is a 200, AND two calls with
+    // an empty dedupeKey are NOT deduped against each other (empty is not itself a shared dedupe value).
+    [Test]
+    public async Task SystemMessage_EmptyDedupeKey_Is200_AndDoesNotDedupe()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-4\",\"name\":\"Sys Match 4\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the empty-dedupeKey publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\",\"dedupeKey\":\"\"}";
+
+        var first = await PostSystemMessage("match-sys-4", messageBody, MmSecret, NowTimestamp());
+        var second = await PostSystemMessage("match-sys-4", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(first, Is.InstanceOf<OkResult>(),
+            "an empty dedupeKey must normalize to \"no dedupe\" and never trigger a 400 — an optional field must never reject the whole call");
+        Assert.That(second, Is.InstanceOf<OkResult>(),
+            "a second call with an empty dedupeKey must also succeed — empty is not treated as a shared dedupe value between the two calls");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        Assert.That(messages.Count(m => m.Kind == MessageKind.System), Is.EqualTo(2),
+            "empty dedupeKey means NO dedupe (unlike a genuine shared key) — both calls must persist as DISTINCT messages");
+    }
+
+    // Review finding 4: three DISTINCT rejection decisions, each with its own rationale comment in the
+    // controller, none previously pinned by a test. Table-driven so all three close together; the
+    // InvalidSystemRef case is the one that matters most to get right — it MUST be 400 (a malformed
+    // ref never reaches the LoadBySystemRef lookup that produces a 404), never masquerading as the
+    // lookup-miss branch.
+    public enum SystemMessageRejectionScenario
+    {
+        KeyContainsNewline,
+        DedupeKeyContainsHash,
+        InvalidSystemRef,
+    }
+
+    [TestCase(SystemMessageRejectionScenario.KeyContainsNewline)]
+    [TestCase(SystemMessageRejectionScenario.DedupeKeyContainsHash)]
+    [TestCase(SystemMessageRejectionScenario.InvalidSystemRef)]
+    public async Task SystemMessage_RejectionScenarios_All400NotSomethingElse(SystemMessageRejectionScenario scenario)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-5\",\"name\":\"Sys Match 5\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>(),
+            "precondition: the match channel must exist so a 400 below is genuinely a validation failure, not a masked 404");
+
+        var (systemRef, body) = scenario switch
+        {
+            SystemMessageRejectionScenario.KeyContainsNewline =>
+                ("match-sys-5", "{\"key\":\"bad\\nkey\",\"fallbackText\":\"x\"}"),
+            SystemMessageRejectionScenario.DedupeKeyContainsHash =>
+                ("match-sys-5", "{\"key\":\"match_intro\",\"fallbackText\":\"x\",\"dedupeKey\":\"bad#key\"}"),
+            // A ref containing a space fails the SAME IsValidRef character class as `key`/`dedupeKey`
+            // above — deliberately targeting an EXISTING channel's ref shape rather than "never-existed",
+            // so a wrongly-implemented lookup-first ordering would surface this as a 404 instead.
+            SystemMessageRejectionScenario.InvalidSystemRef =>
+                ("bad ref", "{\"key\":\"match_intro\",\"fallbackText\":\"x\"}"),
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+
+        var result = await PostSystemMessage(systemRef, body, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<BadRequestObjectResult>(),
+            $"{scenario} must be a 400 — distinguishing a validation failure from a lookup miss (404) is the entire point of the invalid-systemRef case");
     }
 }
