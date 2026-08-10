@@ -57,12 +57,8 @@ public class InternalChannelsController(
     private const string MatchKind = "match";
     private const string GenericValidationError = "Invalid request.";
 
-    // Deliberately the SAME string as GenericValidationError, under a distinct name — the class doc
-    // above scopes GenericValidationError to failures returned "via a plain 400"; a lookup miss (or the
-    // Publish defense-in-depth branch below) is a 404, and a separately-named constant keeps a future
-    // reader from wondering why a "validation error" backs a 404. Aliasing (rather than a second string
-    // literal) makes the "same text, different status code" policy a compiler-enforced fact instead of
-    // two literals that could silently drift apart.
+    // Same text as GenericValidationError, aliased under a 404-shaped name so a reader is not left
+    // wondering why a "validation error" backs a lookup miss.
     private const string GenericNotFoundError = GenericValidationError;
 
     // \A/\z (absolute start/end), NOT ^/$ — .NET's `$` also matches immediately before a single
@@ -95,9 +91,11 @@ public class InternalChannelsController(
         {
             name = null;
         }
-        else if (name.Length > ChatLimits.InternalChannelNameMaxLength)
+        else
         {
-            name = name[..ChatLimits.InternalChannelNameMaxLength];
+            // Excerpts.Bounded, not a naive name[..limit] slice: a lobby name is emoji-capable and a raw
+            // cut can land mid-surrogate-pair, persisting a lone code unit (final review, finding 10).
+            name = Excerpts.Bounded(name, ChatLimits.InternalChannelNameMaxLength);
         }
 
         if (!IsValidMembers(request.Members))
@@ -191,9 +189,10 @@ public class InternalChannelsController(
         {
             name = null; // ⇒ ApplyRosterAssertion falls back to the ref placeholder
         }
-        else if (name.Length > ChatLimits.InternalChannelNameMaxLength)
+        else
         {
-            name = name[..ChatLimits.InternalChannelNameMaxLength];
+            // Surrogate-safe truncation, same helper and same reason as the create route above.
+            name = Excerpts.Bounded(name, ChatLimits.InternalChannelNameMaxLength);
         }
 
         try
@@ -328,32 +327,31 @@ public class InternalChannelsController(
 
         // Defense-in-depth against a signed-but-malformed payload: fallbackText is bounded only by the
         // 64 KB HMAC body cap otherwise, and it persists + fans out to every channel member. TRUNCATED,
-        // never rejected — same convention as `name` above (a signed field the caller cannot usefully
-        // retry its way out of a 400 on). Capped to ChatLimits.MaxMessageLength: this is server-rendered
-        // display text a client shows directly, the same shape as a user message body, so it reuses that
-        // cap rather than inventing a new number.
-        //
-        // `Params`/`ListParams` are deliberately left UNCAPPED here, unlike `fallbackText`: they are a
-        // `Dictionary<string,string>`/`Dictionary<string,List<string>>`, and capping a dictionary needs
-        // genuinely NEW policy this file has no precedent for (a per-key length limit? an entry-count
-        // limit? a per-list-item length limit? some combination?) — there is no single existing
-        // convention to mirror the way `name`'s scalar-string truncation is mirrored here. The 64 KB
-        // HMAC body cap (InternalHmacAuthFilter) already bounds their worst case; a bespoke dictionary
-        // cap is a real design decision, not a one-line follow of an existing pattern, and is left for a
-        // future change that actually needs it.
-        if (fallbackText.Length > ChatLimits.MaxMessageLength)
-        {
-            fallbackText = fallbackText[..ChatLimits.MaxMessageLength];
+        // never rejected — same convention (and, since final-review finding 10, the same surrogate-safe
+        // helper) as `name` above: a signed field the caller cannot usefully retry its way out of a 400
+        // on. Capped to ChatLimits.MaxMessageLength: this is server-rendered display text a client shows
+        // directly, the same shape as a user message body, so it reuses that cap rather than inventing a
+        // new number.
+        fallbackText = Excerpts.Bounded(fallbackText, ChatLimits.MaxMessageLength);
 
-            // A naive slice can land mid-surrogate-pair (e.g. an emoji straddling the cut index),
-            // leaving a lone trailing high surrogate. That is not valid UTF-16 text: BSON-encoding it
-            // for the Mongo persist below is undefined at best (a replacement character) and a throw at
-            // worst, and it then fans out to every channel member. Drop the dangling high surrogate
-            // rather than persist a broken code unit.
-            if (char.IsHighSurrogate(fallbackText[^1]))
-            {
-                fallbackText = fallbackText[..^1];
-            }
+        // `Params`/`ListParams` get the file's EXISTING per-element convention rather than a bespoke
+        // dictionary policy (final review, finding 7 — the earlier "no precedent for this" note was
+        // wrong; IsValidMembers/IsValidTextEntry below is exactly that precedent, applied for exactly
+        // these reasons). Split by what each half actually becomes:
+        //   - KEYS become BSON element names on the persisted SystemMessageBody, and are catalogue
+        //     placeholder identifiers on the client. They get IsValidRef — the SAME identifier class
+        //     `key`/`dedupeKey` get two blocks up, which is also the only guard that keeps a
+        //     `$`-prefixed or dotted element name (awkward-to-impossible to query) out of Mongo.
+        //   - VALUES (and every list item) are free display text that persists and fans out to every
+        //     member, so they get IsValidTextEntry — non-blank, control-char-free, U+2028/U+2029-free:
+        //     byte-for-byte the guard every `members` entry already gets, for the same log-injection
+        //     reason.
+        // NOT length-capped, deliberately: the 64 KB HMAC body cap (InternalHmacAuthFilter) already
+        // bounds the worst case, so there is no DoS to defend and no existing per-entry length cap to
+        // mirror. A null dictionary means "no params" and is always legal.
+        if (!IsValidParams(request.Params) || !IsValidListParams(request.ListParams))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
         }
 
         // DedupeKey is OPTIONAL — absent, empty, or whitespace-only ALL mean "no dedupe" and are never a
@@ -390,11 +388,13 @@ public class InternalChannelsController(
             var result = await systemMessagePublisher.Publish(channel, body, dedupeKey);
             if (result.Code != ChatResultCode.Ok)
             {
-                // Unreachable BY CONSTRUCTION today: Publish returns non-Ok only when its `channel`
-                // argument is null, and `channel` is already confirmed non-null immediately above. Kept
-                // anyway as defense-in-depth against a future Publish regression — a future reader should
-                // not go hunting for the live case that trips this branch; as of this writing there isn't
-                // one.
+                // GENUINELY REACHABLE — this is no longer defense-in-depth. Publish maps a channel that
+                // VANISHES between the lookup above and its own AllocateSeq to NotFound (match channels
+                // are TTL-backed shells and mm can tear one down via DELETE /internal/channels/{ref}),
+                // so a real race lands here. A 404 is the right answer for it: the room this message
+                // narrates is gone, and mm must stop retrying rather than hammer a call that can never
+                // succeed. Publish's OTHER non-Ok code (TooLong, for a null/blank body) stays unreachable
+                // from here, since `key`/`fallbackText` are already validated non-blank above.
                 return NotFound(new ErrorResult(GenericNotFoundError));
             }
 
@@ -421,7 +421,7 @@ public class InternalChannelsController(
     private static bool IsValidMembers(List<string> members) =>
         members != null
         && members.Count <= ChatLimits.InternalMaxMembersPerCall
-        && members.All(IsValidMemberEntry);
+        && members.All(IsValidTextEntry);
 
     // 2026-08-05 fix wave (final review M5): mirrors InternalRelationshipChangesController's
     // IsValidParticipant EXACTLY — non-blank AND control-char-free. Before this, a member entry was
@@ -429,9 +429,22 @@ public class InternalChannelsController(
     // per-entry length or control-char guard, asymmetric with the relationship-changes surface's
     // identical-shaped field. char.IsControl catches an embedded '\n'/'\r'/'\t'/NUL (log-injection);
     // U+2028/U+2029 are checked explicitly because they are category Zl/Zp, not Cc, so char.IsControl
-    // alone misses them.
-    private static bool IsValidMemberEntry(string value) =>
+    // alone misses them. Named for the SHAPE of what it guards (a free-text entry), not for `members`:
+    // the system-message route's param values and list items get the identical guard for the identical
+    // reason (final review, finding 7).
+    private static bool IsValidTextEntry(string value) =>
         !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
+
+    // System-message params. A null dictionary means "no params" and is always legal. Keys get the
+    // identifier class (they become BSON element names on the persisted body AND client catalogue
+    // placeholders); values get the free-text entry guard. Full rationale at the call site.
+    private static bool IsValidParams(Dictionary<string, string> parameters) =>
+        parameters == null
+        || parameters.All(p => IsValidRef(p.Key) && IsValidTextEntry(p.Value));
+
+    private static bool IsValidListParams(Dictionary<string, List<string>> parameters) =>
+        parameters == null
+        || parameters.All(p => IsValidRef(p.Key) && p.Value != null && p.Value.All(IsValidTextEntry));
 
     private void LogUnexpected(Exception ex, string verb, string @ref) =>
         Log.Error(ex, "Internal channels endpoint failed {Caller} {Verb} {Ref}", InternalHmacAuthFilter.ResolveCaller(HttpContext), verb, @ref);

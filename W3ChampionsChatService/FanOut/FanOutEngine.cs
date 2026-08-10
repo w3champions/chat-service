@@ -225,11 +225,11 @@ public class FanOutEngine(
         var isMatch = channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match;
         var wantsPreview = message.Kind == MessageKind.User && (isDm || isMatch);
         object dmPreview = wantsPreview && isDm
-            ? new DmActivityPreviewDto(dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content))
+            ? new DmActivityPreviewDto(dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content, ChatLimits.DmPreviewExcerptLength))
             : null;
         object activityPreview = wantsPreview
             ? new ActivityPreviewDto(
-                dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content),
+                dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content, ChatLimits.DmPreviewExcerptLength),
                 channel.Type, channel.SystemKind)
             : null;
 

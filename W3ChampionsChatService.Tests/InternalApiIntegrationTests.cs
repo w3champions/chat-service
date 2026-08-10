@@ -1057,4 +1057,93 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         Assert.That(persisted, Is.EqualTo(prefix),
             "the boundary-straddling emoji must be dropped WHOLE once the naive slice would have cut it in half, not left half-persisted");
     }
+
+    // Final review, finding 10: the two `name` truncations on the create and roster-assert routes were
+    // NAIVE name[..limit] slices that predate this branch, and both now route through the generalized
+    // Excerpts.Bounded. Same construction as the fallbackText case above, at the name cap: 99 'a's
+    // (indices 0..98) then an astral emoji at indices 99/100, so a naive slice at 100 would keep exactly
+    // the emoji's high surrogate and nothing else.
+    [Test]
+    public async Task ChannelCreate_OverlongNameWithSurrogatePairAtTruncationBoundary_DropsThePairWhole()
+    {
+        var prefix = new string('a', ChatLimits.InternalChannelNameMaxLength - 1);
+        var nameWithBoundaryEmoji = prefix + "😀" + "tail";
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-name-1\",\"name\":\"" + nameWithBoundaryEmoji + "\",\"members\":[\"Alice#1\"]}";
+
+        var result = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkObjectResult>(),
+            "an overlong name must still be truncated, never rejected — a cosmetic field can never block a create");
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-name-1");
+        Assert.That(char.IsHighSurrogate(channel.Name[^1]), Is.False,
+            "the name truncation must never leave a lone trailing high surrogate — invalid UTF-16 that is unsafe to BSON-persist");
+        Assert.That(channel.Name, Is.EqualTo(prefix),
+            "the boundary-straddling emoji must be dropped WHOLE, exactly like the fallbackText cap — one surrogate-safe implementation, three call sites");
+    }
+
+    // Final review, finding 7: `params`/`listParams` used to reach Mongo with NO per-element guard at
+    // all. Keys become BSON element names + client catalogue placeholders (identifier class, the same
+    // IsValidRef `key`/`dedupeKey` get); values and list items are free display text that persists and
+    // fans out (the same non-blank/control-char guard every `members` entry gets).
+    public enum SystemMessageParamRejectionScenario
+    {
+        DottedParamKey,
+        DollarPrefixedParamKey,
+        ParamValueWithNewline,
+        BlankParamValue,
+        DottedListParamKey,
+        ListItemWithLineSeparator,
+    }
+
+    [TestCase(SystemMessageParamRejectionScenario.DottedParamKey)]
+    [TestCase(SystemMessageParamRejectionScenario.DollarPrefixedParamKey)]
+    [TestCase(SystemMessageParamRejectionScenario.ParamValueWithNewline)]
+    [TestCase(SystemMessageParamRejectionScenario.BlankParamValue)]
+    [TestCase(SystemMessageParamRejectionScenario.DottedListParamKey)]
+    [TestCase(SystemMessageParamRejectionScenario.ListItemWithLineSeparator)]
+    public async Task SystemMessage_InvalidParams_Is400_AndPersistsNothing(SystemMessageParamRejectionScenario scenario)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-8\",\"name\":\"Sys Match 8\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null,
+            "precondition: the match channel must exist so a 400 below is genuinely a validation failure, not a masked 404");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var paramsJson = scenario switch
+        {
+            // A dotted or $-prefixed BSON element name is at best awkward to query once persisted.
+            SystemMessageParamRejectionScenario.DottedParamKey => "\"params\":{\"match.map\":\"Amazonia\"}",
+            SystemMessageParamRejectionScenario.DollarPrefixedParamKey => "\"params\":{\"$map\":\"Amazonia\"}",
+            // \n in a value that is logged and fanned out — the log-injection case IsValidTextEntry exists for.
+            SystemMessageParamRejectionScenario.ParamValueWithNewline => "\"params\":{\"map\":\"Ama\\nzonia\"}",
+            SystemMessageParamRejectionScenario.BlankParamValue => "\"params\":{\"map\":\"   \"}",
+            SystemMessageParamRejectionScenario.DottedListParamKey => "\"listParams\":{\"a.b\":[\"Grubby#2136\"]}",
+            // U+2028 is category Zl, not Cc, so char.IsControl alone misses it — the explicit conjunct.
+            SystemMessageParamRejectionScenario.ListItemWithLineSeparator => "\"listParams\":{\"players\":[\"Grub\\u2028by\"]}",
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"," + paramsJson + "}";
+
+        var result = await PostSystemMessage("match-sys-8", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<BadRequestObjectResult>(),
+            $"{scenario} must be rejected at the boundary — params reach Mongo as element names and fan out as display text");
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        Assert.That(messages.Any(m => m.Kind == MessageKind.System), Is.False,
+            "a rejected publish must persist nothing — validation runs before the lookup and the insert");
+    }
+
+    [Test]
+    public async Task SystemMessage_AbsentParams_Is200()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-9\",\"name\":\"Sys Match 9\",\"members\":[\"Alice#1\"]}";
+        Assert.That(await PostChannelsCreate(createBody, MmSecret, NowTimestamp()), Is.InstanceOf<OkObjectResult>(),
+            "precondition: the match channel must exist");
+
+        var result = await PostSystemMessage(
+            "match-sys-9", "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"}", MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            "params/listParams are OPTIONAL — a null dictionary means \"no params\" and must never be turned into a 400 by the new element validation");
+    }
 }
