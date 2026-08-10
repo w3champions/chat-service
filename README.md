@@ -473,17 +473,20 @@ TTL and the publish never re-stamps the channel shell's own 24h creation-anchore
 
 ### Deploy order
 
-**The system-message route is NOT fail-open — do not publish before the launcher understands it.** This
-is the one route on this surface where calling it too early actively breaks something, unlike `ladder`
-(inert until mm sends it) or the old delta endpoint (a harmless `404`). A launcher that predates the
-system-message release declares `sender` and `content` required and non-nullable on its message type, and
-`appendMessage` calls `lastMessageFromMessage` unconditionally — before any kind check — which
+**Post-game chat ships as one release: chat-service, matchmaking-service and the launcher together.**
+The system-message route is the reason, and it is the one route on this surface that is **not
+fail-open** — unlike `ladder` (inert until mm sends it) or the old delta endpoint (a harmless `404`),
+calling it against a client that does not understand it actively breaks something. A launcher without
+system-message support declares `sender` and `content` required and non-nullable on its message type,
+and `appendMessage` calls `lastMessageFromMessage` unconditionally — before any kind check — which
 dereferences `message.sender.battleTag` and parses `message.content`. This service omits nulls on the
 wire, so both arrive **absent** and that throws inside the client's store action: the message never
-lands, the rest of the receive handler never runs, and history replays the same row on every reconnect.
-It **breaks the channel for the session** rather than degrading. mm must therefore not start publishing
-until a launcher that understands `kind: "system"` is the deployed floor. Deploying this service alone is
-safe — nothing publishes on its own.
+lands, the rest of the receive handler never runs, and `GetMessages` replays the same poisoned row on
+every reconnect. It **breaks the channel for the session** rather than degrading, which is why the
+launcher cannot lag the publisher.
+
+Deploying this service on its own is still safe in the meantime — it publishes nothing by itself; every
+system message originates in an mm call.
 
 **`ladder` is inert until mm sends it.** The mute gate reads a flag only mm can set, so between this
 service's deploy and mm's, ladder match rooms stay exactly as unmoderated as they are today — this

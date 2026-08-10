@@ -73,21 +73,18 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// observes.
     /// </para>
     /// <para>
-    /// C5 (Task 9, D15) + post-game chat Plan A Task 6: TWO preview slots ride through unchanged —
-    /// <paramref name="preview"/> is the FROZEN LEGACY Dm-only slot (a <c>DmActivityPreviewDto</c> for an
-    /// accepted Dm message, else null) and <paramref name="activityPreview"/> is the superseding
-    /// <c>ActivityPreviewDto</c> carried for every preview-eligible class. <see cref="FanOutEngine"/>
-    /// decides both; this coalescer only stores and forwards them. The entry keeps the LATEST NON-NULL
-    /// offer per slot (see the assignment below for why null must not overwrite) so a coalesced burst
-    /// emits the most recent message's preview, mirroring the latest-seq-only coalescing.
+    /// C5 (Task 9, D15) + post-game chat Plan A Task 6: <paramref name="preview"/> is the activity-preview
+    /// slot — an <c>ActivityPreviewDto</c> for a user message in a preview-eligible channel, else null;
+    /// <see cref="FanOutEngine"/> decides, this coalescer only stores and forwards it. The entry keeps the
+    /// LATEST NON-NULL offer (see the assignment below for why a null must not overwrite) so a coalesced
+    /// burst emits the most recent message's preview, mirroring the latest-seq-only coalescing.
     /// </para>
     /// </summary>
-    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null, object activityPreview = null)
+    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null)
     {
         bool emit;
         long emitSeq = 0;
         object emitPreview = null;
-        object emitActivityPreview = null;
 
         lock (_lock)
         {
@@ -102,23 +99,19 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 channels[channelId] = entry;
             }
 
-            // Latest NON-NULL offered preview, per slot, regardless of which branch fires below — a
-            // coalesced burst's pending reflects the MOST RECENT message that HAD a preview.
+            // Latest NON-NULL offered preview, regardless of which branch fires below — a coalesced
+            // burst's pending reflects the MOST RECENT message that HAD a preview.
             // The null guard is load-bearing, not tidiness: since post-game chat Plan A Task 6 a
             // preview-eligible channel also carries preview-FREE traffic (a server-authored system
-            // message has no sender, so FanOutEngine offers null for both slots). Unconditional
-            // latest-wins would let such a message, landing inside the 10s window AFTER a real user
-            // message, blank that message's pending preview — the client would then get a bare badge
-            // and the post-game message would go unnoticed, the exact failure this feature exists to
-            // prevent. Non-behaviour-changing for every pre-existing path: a Dm always offers non-null,
-            // and a preview-free channel only ever offers null onto an already-null entry.
+            // message has no sender, so FanOutEngine offers null). Unconditional latest-wins would let
+            // such a message, landing inside the 10s window AFTER a real user message, blank that
+            // message's pending preview — the client would then get a bare badge and the post-game
+            // message would go unnoticed, the exact failure this feature exists to prevent.
+            // Non-behaviour-changing for every pre-existing path: a Dm always offers non-null, and a
+            // preview-free channel only ever offers null onto an already-null entry.
             if (preview != null)
             {
                 entry.Preview = preview;
-            }
-            if (activityPreview != null)
-            {
-                entry.ActivityPreview = activityPreview;
             }
 
             if (now - entry.LastSentAt >= ChatLimits.ChannelActivityCoalesce)
@@ -134,7 +127,6 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 entry.PendingLastSeq = 0;
                 entry.LastEmittedSeq = emitSeq;
                 emitPreview = entry.Preview;
-                emitActivityPreview = entry.ActivityPreview;
                 emit = true;
             }
             else
@@ -150,7 +142,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
 
         if (emit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview, emitActivityPreview);
+            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview);
         }
     }
 
@@ -159,14 +151,13 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// <paramref name="now"/>: emits the pending's latest seq (subject to emit-time suppression), resets
     /// the window, and clears the pending. Driven by Task 15's 1s-granularity flush service; because it
     /// only emits when ≥10s has elapsed since the last emit, the per-(conn,channel) spacing floor holds.
-    /// C5 (Task 9, D15) + Plan A Task 6: the flush carries whatever BOTH preview slots
-    /// (<see cref="Entry.Preview"/>, <see cref="Entry.ActivityPreview"/>) hold at drain time — the latest
-    /// NON-NULL one <see cref="Offer"/> recorded per slot for the burst, mirroring the latest-seq-only
-    /// coalescing.
+    /// C5 (Task 9, D15) + Plan A Task 6: the flush carries whatever <see cref="Entry.Preview"/> holds at
+    /// drain time — the latest NON-NULL one <see cref="Offer"/> recorded for the burst, mirroring the
+    /// latest-seq-only coalescing.
     /// </summary>
     public async Task FlushDue(DateTime now)
     {
-        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview, object ActivityPreview)> toEmit = null;
+        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview)> toEmit = null;
 
         lock (_lock)
         {
@@ -184,8 +175,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                         entry.PendingLastSeq = 0;
                         entry.LastEmittedSeq = seq;
 
-                        (toEmit ??= new List<(string, string, long, object, object)>())
-                            .Add((connectionId, channelId, seq, entry.Preview, entry.ActivityPreview));
+                        (toEmit ??= new List<(string, string, long, object)>())
+                            .Add((connectionId, channelId, seq, entry.Preview));
                     }
                 }
             }
@@ -196,9 +187,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        foreach (var (connectionId, channelId, lastSeq, preview, activityPreview) in toEmit)
+        foreach (var (connectionId, channelId, lastSeq, preview) in toEmit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview, activityPreview);
+            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview);
         }
     }
 
@@ -236,13 +227,11 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// threshold. Suppression is purely seq-based (no <c>now</c> needed here — the time-based window
     /// decision was already made by the caller under the lock). Runs OUTSIDE <see cref="_lock"/> and
     /// never lets a single failed send escape — mirroring <see cref="FanOutEngine"/>'s best-effort,
-    /// fault-isolated delivery. Both preview slots ride straight onto the payload:
-    /// <paramref name="preview"/> (C5, Task 9/D15 — the frozen legacy Dm-only slot) is null for every
-    /// non-Dm channel and for C3-era callers that never pass one, and
-    /// <paramref name="activityPreview"/> (Plan A Task 6) is null for every channel class that is not
-    /// preview-eligible.
+    /// fault-isolated delivery. <paramref name="preview"/> (C5 Task 9/D15, widened by Plan A Task 6)
+    /// rides straight onto the payload — null for every channel class that is not preview-eligible, and
+    /// for C3-era callers that never pass one.
     /// </summary>
-    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null, object activityPreview = null)
+    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null)
     {
         // A connection with no live membership entry for the channel (left/disconnected between offer
         // and emit) is not a valid recipient — skip. The window was already advanced by the caller.
@@ -258,7 +247,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        var payload = new ChannelActivityDto(channelId, lastSeq, preview, activityPreview);
+        var payload = new ChannelActivityDto(channelId, lastSeq, preview);
 
         try
         {
@@ -278,10 +267,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// "window elapsed" and fires immediately. <see cref="LastEmittedSeq"/> is the running high-water
     /// mark of every seq this (connection, channel) has emitted or pended — both <see cref="Offer"/> and
     /// <see cref="FlushDue"/> take the MAX against it so an out-of-order lower offer can never regress
-    /// the seq a client observes. <see cref="Preview"/> (C5, Task 9/D15 — the frozen legacy Dm-only slot)
-    /// and <see cref="ActivityPreview"/> (Plan A Task 6 — the superseding slot) mirror that latest-wins
-    /// discipline, except that <see cref="Offer"/> only overwrites a slot with a NON-NULL offer, so a
-    /// preview-free message in a preview-eligible channel cannot blank a pending preview.
+    /// the seq a client observes. <see cref="Preview"/> (C5 Task 9/D15, widened by Plan A Task 6) mirrors
+    /// that latest-wins discipline, except that <see cref="Offer"/> only overwrites it with a NON-NULL
+    /// offer, so a preview-free message in a preview-eligible channel cannot blank a pending preview.
     /// </summary>
     private sealed class Entry
     {
@@ -290,6 +278,5 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
         internal long PendingLastSeq;
         internal long LastEmittedSeq;
         internal object Preview;
-        internal object ActivityPreview;
     }
 }

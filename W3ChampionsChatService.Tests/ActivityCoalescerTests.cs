@@ -265,9 +265,9 @@ public class ActivityCoalescerTests
     public async Task CoalescedBurst_EmitsLatestPreview()
     {
         var (harness, _, coalescer) = NewCoalescer();
-        var preview1 = new DmActivityPreviewDto(AuthorTag, "Author", "first message");
-        var preview2 = new DmActivityPreviewDto(AuthorTag, "Author", "second message");
-        var preview3 = new DmActivityPreviewDto(AuthorTag, "Author", "third message — latest");
+        var preview1 = new ActivityPreviewDto(AuthorTag, "Author", "first message", ChannelType.Dm, null);
+        var preview2 = new ActivityPreviewDto(AuthorTag, "Author", "second message", ChannelType.Dm, null);
+        var preview3 = new ActivityPreviewDto(AuthorTag, "Author", "third message — latest", ChannelType.Dm, null);
 
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview1);                // immediate emit — opens the window
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview2);   // within window — coalesce

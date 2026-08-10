@@ -7,40 +7,26 @@ namespace W3ChampionsChatService.Protocol;
 /// channel and the latest sequence, so coalescing a burst into one push is lossless (a later push
 /// with the newest <see cref="LastSeq"/> supersedes any it replaced).
 /// <para>
-/// TWO preview slots, deliberately. The deployed launcher routes its DM-style toast + chat sound + OS
-/// notification on the mere PRESENCE of <see cref="Preview"/> (<c>chat-messages.ts</c>'s
-/// <c>ingestChannelActivity</c> early-returns on <c>if (!activity.preview) return;</c> and never reads
-/// the channel's type), so widening <see cref="Preview"/> beyond Dm would silently turn every post-game
-/// message into a DM-grade notification on clients already in the wild.
-/// </para>
-/// <list type="bullet">
-/// <item><see cref="Preview"/> — FROZEN LEGACY. Carries a <see cref="DmActivityPreviewDto"/> for an
-/// accepted <c>Dm</c> channel's user message and NOTHING else: <c>GroupDm</c>/<c>Public</c>/
-/// <c>SemiPublic</c>/<c>System</c> (match and clan alike) leave it null (OQ-7's original strict Dm-only
-/// scope). Never widen it — that scope is exactly what makes a match channel's activity ship DARK to an
-/// old client. DELETABLE once a launcher that reads <see cref="ActivityPreview"/> is the deployed floor
-/// (post-game chat Plan C); until then it is the only preview an old client can see.</item>
-/// <item><see cref="ActivityPreview"/> — the SUPERSEDING slot. Carries an
-/// <see cref="ActivityPreviewDto"/> for EVERY preview-eligible channel class, <c>Dm</c> included, and
-/// the preview itself names its <c>ChannelType</c>/<c>SystemKind</c>. A new client reads only this slot
-/// and routes on those fields, never on presence — so the next class that opts in (GroupDm, clan, …) is
-/// a one-line condition change in <c>FanOutEngine</c> rather than a third field and a third client
-/// gate.</item>
-/// </list>
-/// <para>
-/// A <c>Dm</c> therefore carries BOTH (old clients keep their toast, new clients read the typed slot);
-/// a match channel carries ONLY <see cref="ActivityPreview"/>; every other class carries neither. A
-/// SYSTEM message (null sender, no content) carries neither in any channel.
+/// <see cref="Preview"/> carries an <see cref="ActivityPreviewDto"/> — sender snapshot, bounded excerpt,
+/// and the channel's own <c>ChannelType</c>/<c>SystemKind</c> — for every PREVIEW-ELIGIBLE channel
+/// class, and null for every other. Today's eligible set is <c>Dm</c> (C5/OQ-7) plus
+/// <c>System</c>+<c>Match</c> (post-game chat's one-time nudge); <c>GroupDm</c>/<c>Public</c>/
+/// <c>SemiPublic</c>/<c>System</c>+<c>Clan</c> get plain badge-only activity. A SYSTEM message (null
+/// sender, no content) produces no preview in any channel.
 /// </para>
 /// <para>
-/// Both slots are typed <c>object</c> deliberately: the wire contract does not commit to a single
-/// preview shape, and a null serializes identically regardless of the declared type.
-/// <see cref="ActivityPreview"/> is a TRAILING defaulted parameter so every existing positional
-/// construction site keeps compiling unchanged.
+/// A CLIENT MUST ROUTE ON THE PREVIEW'S <c>channelType</c>/<c>systemKind</c>, NEVER ON THE FIELD'S
+/// PRESENCE. That is not style advice — it is the bug this shape exists to prevent. While the slot was
+/// Dm-only, the launcher used "a preview is present" as a proxy for "this is a DM" and raised a DM-grade
+/// toast + chat sound + OS notification without ever reading the channel's type; the moment match
+/// channels became preview-eligible, every player who closed the score screen would have been flooded
+/// with DM-grade notifications for every post-game message. The preview now names its own class
+/// precisely so the next class that opts in (GroupDm, clan, …) is a one-line condition change in
+/// <see cref="FanOut.FanOutEngine"/> rather than a new field and a new client gate.
+/// </para>
+/// <para>
+/// Typed <c>object</c> deliberately: the wire contract does not commit to a single preview shape, and a
+/// null serializes identically regardless of the declared type.
 /// </para>
 /// </summary>
-public record ChannelActivityDto(
-    string ChannelId,
-    long LastSeq,
-    object Preview = null,
-    object ActivityPreview = null);
+public record ChannelActivityDto(string ChannelId, long LastSeq, object Preview = null);

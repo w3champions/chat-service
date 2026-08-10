@@ -164,33 +164,27 @@ public class ChatJsonProtocolTests
         // `if (activity.preview) { ... }` / `if (!activity.preview) return;` — truthy checks, so an
         // absent key and an explicit null are indistinguishable to every reader there.
         Assert.That(json, Does.Not.Contain("preview"));
-        Assert.That(json, Does.Not.Contain("activityPreview"));
     }
 
     [Test]
-    public void Configure_MatchChannelActivity_OmitsLegacyPreviewButEmitsActivityPreview()
+    public void Configure_MatchChannelActivity_PreviewCarriesItsChannelClassOnTheWire()
     {
-        // Post-game chat Plan A Task 6 — the SHIP-DARK guard, asserted on the actual wire bytes rather
-        // than on the C# record. The deployed launcher's ingestChannelActivity early-returns on
-        // `if (!activity.preview) return;` and never inspects the channel's type, so as long as a match
-        // channel's activity carries NO `preview` key, an old client routes no notification for it at
-        // all. The new `activityPreview` key carries the payload a Plan-C client reads, keyed by its own
-        // channelType/systemKind rather than by presence.
+        // Post-game chat Plan A Task 6, asserted on the actual wire bytes rather than on the C# record.
+        // The preview is no longer Dm-only, so `preview` being present says nothing about which kind of
+        // room produced it — channelType/systemKind must ride WITH it or a client is back to inferring
+        // "a preview means a DM" and raising a DM-grade toast for every post-game message.
         var activity = new ChannelActivityDto(
             "chan-match",
             LastSeq: 5,
-            Preview: null,
-            ActivityPreview: new ActivityPreviewDto(
+            Preview: new ActivityPreviewDto(
                 "Alice#1", "Alice", "gg wp", ChannelType.System, SystemChannelKind.Match));
 
         var json = JsonSerializer.Serialize(activity, ConfiguredOptions());
 
-        Assert.That(json, Does.Not.Contain("\"preview\""),
-            "a match channel must emit NO legacy preview key — that absence is what keeps an old launcher silent");
-        Assert.That(json, Does.Contain("\"activityPreview\""),
-            "the superseding slot must ride the wire so a Plan-C client has a sender + excerpt to render");
+        Assert.That(json, Does.Contain("\"preview\""),
+            "a match channel's activity must carry a preview so the client has a sender + excerpt to render its nudge");
         Assert.That(json, Does.Contain("\"channelType\""),
-            "the preview must name its channel class on the wire — a client must never infer it from the slot's presence");
+            "the preview must name its channel class on the wire — a client must never infer it from the field's presence");
         Assert.That(json, Does.Contain("\"systemKind\""),
             "systemKind is what separates a match room from a clan room on the client");
     }
