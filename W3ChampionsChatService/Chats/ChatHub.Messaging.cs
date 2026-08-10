@@ -358,10 +358,24 @@ public partial class ChatHub
                     // this same instance via ChannelAdded (MaterializeDmRecipientAndNotify), and a recipient
                     // whose notification level is Mentions/None — or whose activity is unread-suppressed —
                     // has no second chance to learn the projection. Announcing the copy we just wrote is
-                    // free; re-reading the doc would be another round-trip. A false return means a
-                    // concurrent newer message won the CAS, and the announcement carries the older
-                    // projection until the next send — the same self-healing staleness as a lost CAS.
+                    // free; re-reading the doc would be another round-trip.
                     channel.LastMessage = projection;
+                }
+                else if (channel.Type == ChannelType.Dm)
+                {
+                    // Lost the CAS: a concurrent same-channel send already wrote a HIGHER seq, and this
+                    // instance still holds whatever it was loaded with. Normally that costs nothing — but
+                    // THIS send may still be the one that materializes the recipient below, while the send
+                    // that won the CAS finds the registry already seeded and re-announces nothing. So the
+                    // one announcement that will ever be made would carry a stale or absent projection.
+                    // Re-read for the winner. Scoped to Dm because that is the only type step 7.5 re-
+                    // announces, and to the lost-CAS branch, which requires genuinely concurrent sends in
+                    // one conversation — this is not a per-message read.
+                    var winner = await _channelRepository.Load(channelId);
+                    if (winner?.LastMessage != null)
+                    {
+                        channel.LastMessage = winner.LastMessage;
+                    }
                 }
             }
             catch (Exception ex)

@@ -959,6 +959,51 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That(added.Channel.LastMessage.Excerpt, Is.EqualTo("are you still there?"));
     }
 
+    [Test]
+    public async Task DmSend_ThatLosesTheProjectionCas_StillReAnnouncesTheWinningProjection()
+    {
+        // A concurrent same-channel send can write a HIGHER seq before this one reaches the CAS. This
+        // send may nonetheless be the one that materializes the recipient — the send that WON the CAS
+        // finds the registry already seeded and re-announces nothing — so the single ChannelAdded that
+        // will ever be sent must still carry the winning projection, not this send's stale copy.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        RegisterSession(RecipientConn, Recipient);   // online but NOT registry-seeded → triggers the re-announce
+        var hub = BuildHub(InitiatorConn, new ConcurrentWinnerChannelRepository(MongoClient));
+
+        await hub.SendMessage(channel.Id, "mine loses the race");
+
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null);
+        Assert.That(added.Channel.LastMessage, Is.Not.Null, "a lost CAS must not leave the announcement without a projection");
+        Assert.That(added.Channel.LastMessage.Excerpt, Is.EqualTo("the concurrent winner"),
+            "and it must carry the message that actually won, not this send's own");
+    }
+
+    // Simulates a concurrent send that wrote a strictly higher seq first, so this send's CAS loses.
+    private sealed class ConcurrentWinnerChannelRepository(MongoClient client) : ChannelRepository(client)
+    {
+        public override async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+        {
+            await base.TryAdvanceLastMessage(channelId, new ChannelLastMessage
+            {
+                Seq = lastMessage.Seq + 1,
+                SenderBattleTag = "someone#9999",
+                SenderName = "someone",
+                Excerpt = "the concurrent winner",
+                SentAt = lastMessage.SentAt.AddSeconds(1),
+            });
+            return await base.TryAdvanceLastMessage(channelId, lastMessage);
+        }
+    }
+
     // --- Invariants this projection silently depends on, pinned so that widening either scope fails loudly ---
 
     [Test]
