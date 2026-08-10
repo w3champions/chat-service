@@ -370,11 +370,22 @@ the pre-existing 49% overhead noted above.
 
 ## 8. Rollout
 
-Ship in this order so the user-visible fix lands before the propagation machinery:
+Ship in this order. The wire change is breaking, not inert: `ViewersChangedDto.Joined` moves from
+`string[]` to an array of objects, and chat-service has no server-side client-version gate (verified
+by grep — no `minVersion`/`clientVersion`/`forceUpdate` check exists). An un-updated launcher's
+`ingestViewersChanged` keys its viewer Map on an object and then throws on
+`v.battleTag.toLowerCase()` in `ChatUserListPanel`, killing the user-list panel. The
+`MentionInboxEntryDto.ReadAt` pin matters to old clients too. So the launcher's force-update floor
+must be bumped and rolled out *before* chat-service deploys — nothing on the server does that
+gating for us:
 
-1. **chat-service roster enrichment + null omission** — inert until the client reads it.
-2. **launcher-e client** — consumes the roster flair; the reported bug is fixed at this point.
-3. **website-backend notifier + chat-service internal endpoint** — self-disables without
+1. **launcher-e force-update floor bump** — raised past the last pre-change build, and given time to
+   reach clients, before the next step.
+2. **chat-service roster enrichment + null omission** — safe now that no client below the new floor
+   can connect.
+3. **launcher-e client** — consumes the roster flair; the reported bug is fixed at this point.
+4. **website-backend notifier + chat-service internal endpoint** — self-disables without
    `CHAT_INTERNAL_API_SECRET`, so it can be deployed dark and enabled by configuration.
 
-Each step degrades to current behaviour if the next never ships.
+Steps 2-4 degrade to current behaviour if the next never ships; step 1 is a hard prerequisite for
+step 2, not a degrade-gracefully step.

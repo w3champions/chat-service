@@ -22,6 +22,17 @@ public static class ChatJsonProtocol
     /// <c>chat-protocol.types.ts</c> and every client read path uses optional chaining with a
     /// fallback, so an absent key and an explicit null are indistinguishable there.
     /// </para>
+    /// <para>
+    /// Rule for new nullable wire fields: because this omits null properties, a <c>null</c> reaching
+    /// the launcher is indistinguishable from an absent key. If a field's null value is meaningful
+    /// (not just "no value"), either pin it with
+    /// <c>[property: JsonIgnore(Condition = JsonIgnoreCondition.Never)]</c> — as
+    /// <see cref="MentionInboxEntryDto.ReadAt"/> is pinned, since null there means "unread" — or make
+    /// sure the client reads it with a truthy/nullish check rather than a strict <c>=== null</c>.
+    /// This is not a hypothetical: <c>MentionInboxEntryDto.ReadAt</c> shipped unpinned once and the
+    /// launcher's strict <c>=== null</c> checks silently broke the unread badge and mention
+    /// acknowledgement.
+    /// </para>
     /// </summary>
     public static void Configure(JsonHubProtocolOptions options)
     {

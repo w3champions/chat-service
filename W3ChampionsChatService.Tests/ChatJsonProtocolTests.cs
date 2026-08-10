@@ -137,33 +137,37 @@ public class ChatJsonProtocolTests
     }
 
     [Test]
-    public void Configure_PresenceDetails_OmitsNullLastSeenAt_SafeBecauseClientUsesNullishCoalescing()
+    public void Configure_PresenceDetails_OmitsNullLastSeenAt()
     {
         var detail = new PresenceDetailsDto("Peter#123", Online: true, LastSeenAt: null);
 
         var json = JsonSerializer.Serialize(detail, ConfiguredOptions());
 
-        // Safe: presence-source.ts reads `detail?.lastSeenAt ?? null` and ManageFriends.tsx guards with
-        // `lastSeenAt && (...)` — both treat an absent key and an explicit null identically, so omitting
-        // a null lastSeenAt changes nothing observable.
+        // This assertion only pins that omission happens — it does NOT guarantee client safety, and
+        // would keep passing even if a client reader regressed to a strict `=== null` check. Safety
+        // today rests entirely on the client: presence-source.ts reads `detail?.lastSeenAt ?? null`
+        // and ManageFriends.tsx guards with `lastSeenAt && (...)` — both treat an absent key and an
+        // explicit null identically, so omitting a null lastSeenAt changes nothing observable there.
         Assert.That(json, Does.Not.Contain("lastSeenAt"));
     }
 
     [Test]
-    public void Configure_ChannelActivity_OmitsNullPreview_SafeBecauseClientUsesTruthyCheck()
+    public void Configure_ChannelActivity_OmitsNullPreview()
     {
         var activity = new ChannelActivityDto("chan1", LastSeq: 5, Preview: null);
 
         var json = JsonSerializer.Serialize(activity, ConfiguredOptions());
 
-        // Safe: chat-messages.ts gates every read with `if (activity.preview) { ... }` /
-        // `if (!activity.preview) return;` — truthy checks, so an absent key and an explicit null are
-        // indistinguishable to every reader.
+        // This assertion only pins that omission happens — it does NOT guarantee client safety, and
+        // would keep passing even if a client reader regressed to a strict `=== null` check. Safety
+        // today rests entirely on the client: chat-messages.ts gates every read with
+        // `if (activity.preview) { ... }` / `if (!activity.preview) return;` — truthy checks, so an
+        // absent key and an explicit null are indistinguishable to every reader there.
         Assert.That(json, Does.Not.Contain("preview"));
     }
 
     [Test]
-    public void Configure_SessionState_OmitsNullMuteState_SafeBecauseClientUsesTruthyCheck()
+    public void Configure_SessionState_OmitsNullMuteState()
     {
         var ownProfile = new OwnProfileDto("Peter#123", "Peter", IsAdmin: false, Flair: new ChatProfile(), Permissions: Array.Empty<string>());
         var session = new SessionStateDto(
@@ -176,8 +180,11 @@ public class ChatJsonProtocolTests
 
         var json = JsonSerializer.Serialize(session, ConfiguredOptions());
 
-        // Safe: chat-core.ts's applySessionState guards with `if (snapshot.muteState) { ... }` — a
-        // truthy check, so an absent key and an explicit null behave identically there.
+        // This assertion only pins that omission happens — it does NOT guarantee client safety, and
+        // would keep passing even if a client reader regressed to a strict `=== null` check. Safety
+        // today rests entirely on the client: chat-core.ts's applySessionState guards with
+        // `if (snapshot.muteState) { ... }` — a truthy check, so an absent key and an explicit null
+        // behave identically there.
         Assert.That(json, Does.Not.Contain("muteState"));
     }
 }
