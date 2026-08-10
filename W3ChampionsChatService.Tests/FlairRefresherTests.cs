@@ -245,6 +245,43 @@ public class FlairRefresherTests : IntegrationTestBase
             "the stale pre-await session must not be used to push a FlairChanged");
     }
 
+    // Codex P2 follow-up: the pre-write revalidation (the test above) closes the "disconnect during the
+    // await" race, but ChatHub.OnDisconnectedAsync's Unregister+Remove sequence can still land in the
+    // narrow, unsynchronized gap between that revalidation and the ConnectionMapping.RegisterUser write —
+    // two separate lock sections with no await in between. Real thread preemption would only hit this
+    // non-deterministically, so a mocked ISessionRegistry is used to force the exact interleaving: the
+    // session is present for the first two reads (the initial lookup and the pre-write revalidation) and
+    // gone by the THIRD read — the post-write validation this fix adds. A real ConnectionMapping is used
+    // so the assertion exercises the actual Remove/RegisterUser interplay, not a mock.
+    [Test]
+    public async Task Refresh_WhenDisconnectRacesTheConnectionMappingWrite_LeavesNoOrphanMappingEntry()
+    {
+        var connections = new ConnectionMapping();
+        connections.RegisterUser("conn-peter", UserWith(ChangedTag, AvatarCategory.HU, 1));
+
+        var identity = new W3CUserAuthentication { BattleTag = ChangedTag, Name = "peter" };
+        var liveSession = new ChatSession { ConnectionId = "conn-peter", Identity = identity, Context = null };
+
+        var sessions = new Mock<ISessionRegistry>();
+        sessions.SetupSequence(s => s.GetByBattleTag(ChangedTag))
+            .Returns(liveSession)      // initial lookup (Refresh's first read)
+            .Returns(liveSession)      // pre-write revalidation (after the GetUserFromIdentity await)
+            .Returns((ChatSession)null); // post-write validation: disconnect landed in the gap
+
+        var auth = new Mock<IChatAuthenticationService>();
+        auth.Setup(a => a.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync(new ChatUserResolution(UserWith(ChangedTag, AvatarCategory.NE, 7), true));
+
+        var refresher = new FlairRefresher(
+            sessions.Object, auth.Object, connections, _userDirectory, _focus,
+            _harness.HubContext, new FakeTimeProvider());
+
+        await refresher.Refresh(ChangedTag);
+
+        Assert.That(connections.GetUser("conn-peter"), Is.Null,
+            "the post-write validation must remove the entry RegisterUser resurrected once the authoritative session is gone");
+    }
+
     // Finding 3 (P2): the webhook-supplied battleTag can carry website-backend's storage casing, while
     // the live session identity carries the authoritative display casing. DisplayBattleTag must always
     // win with the identity's casing — matching the connect path (ChatHub.UpsertDirectory).

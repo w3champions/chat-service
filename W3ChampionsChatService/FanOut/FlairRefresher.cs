@@ -86,6 +86,36 @@ public class FlairRefresher(
 
         _connections.RegisterUser(current.ConnectionId, resolution.User);
 
+        // Codex P2 follow-up: the pre-write revalidation above (lines 69-70) narrows the disconnect race
+        // but does not close it. It and the RegisterUser write immediately above are two separate,
+        // unsynchronized critical sections (SessionRegistry's lock, then ConnectionMapping's lock) with no
+        // await between them — so ChatHub.OnDisconnectedAsync's Unregister+Remove sequence can still land
+        // in that gap on another thread. If it does, RegisterUser just resurrected the _users entry that
+        // Remove already cleaned up, and since disconnect fires exactly once, nothing would ever remove it
+        // again: an unbounded leak under repeated connect/disconnect-during-refresh races.
+        //
+        // Close the loop with a POST-write validation instead of a cross-lock atomic write (which would
+        // require SessionRegistry and ConnectionMapping to share a lock — a bigger, riskier change for two
+        // registries that are deliberately independent). Re-read the authoritative session; if it no longer
+        // points at this connection, undo the write. ConnectionMapping.Remove is safe to call here:
+        //  - it is a no-op for an already-absent connectionId (Remove/TryGetValue-based, never throws), so
+        //    it is safe whether OnDisconnectedAsync's own Remove already ran or hasn't run yet;
+        //  - it is scoped to THIS connectionId only (room lookup, mute cache and _users are all keyed by
+        //    connectionId, which SignalR guarantees unique per connection), so it can never remove a
+        //    different, live connection's mapping — including another connection for the same battleTag.
+        //
+        // This only guards the ConnectionMapping write. The user-directory upsert and the fan-out send
+        // below don't need the same guard: the directory upsert is a keyed-by-battleTag, idempotent
+        // "latest known-good profile" write with no dangling state if the session is gone — harmless, and
+        // still correct for the player's next connect. The fan-out send targets a dead connection id at
+        // worst, which SignalR already treats as a silent no-op (see the catch below) — pointless, not
+        // leaky. Only ConnectionMapping accumulates unbounded, un-owned state if left unvalidated.
+        var postWriteSession = _sessionRegistry.GetByBattleTag(battleTag);
+        if (postWriteSession == null || postWriteSession.ConnectionId != current.ConnectionId)
+        {
+            _connections.Remove(current.ConnectionId);
+        }
+
         await UserDirectoryUpsert.Apply(
             _userDirectory, liveBattleTag, resolution, _timeProvider.GetUtcNow().UtcDateTime);
 
