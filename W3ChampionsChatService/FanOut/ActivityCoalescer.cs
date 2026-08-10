@@ -80,11 +80,12 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// message's preview, exactly mirroring the latest-seq-only coalescing.
     /// </para>
     /// </summary>
-    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null)
+    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null, DateTime? sentAt = null)
     {
         bool emit;
         long emitSeq = 0;
         object emitPreview = null;
+        DateTime? emitSentAt = null;
 
         lock (_lock)
         {
@@ -99,9 +100,20 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 channels[channelId] = entry;
             }
 
-            // Latest-offered-preview: overwritten unconditionally on every Offer, regardless of which
-            // branch fires below — a coalesced burst's pending always reflects the MOST RECENT preview.
-            entry.Preview = preview;
+            // Highest-offered-preview. (Preview, SentAt) describe ONE message and are written and drained
+            // together, or a client would pair one message's text with another's timestamp. They are kept
+            // for the HIGHEST seq offered rather than the most recently offered, because that is the seq
+            // the emit below selects: concurrent same-channel sends can reach this lock out of order, and
+            // a latest-arrival-wins rule would then emit the higher seq carrying the LOWER message's text
+            // and timestamp — a row showing the second-newest message, pinned at a seq the newest message
+            // can no longer replace. Coalescing a burst still keeps the newest of it, since a burst that
+            // arrives in order offers ascending seqs.
+            if (lastSeq >= entry.PreviewSeq)
+            {
+                entry.Preview = preview;
+                entry.SentAt = sentAt;
+                entry.PreviewSeq = lastSeq;
+            }
 
             if (now - entry.LastSentAt >= ChatLimits.ChannelActivityCoalesce)
             {
@@ -116,6 +128,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 entry.PendingLastSeq = 0;
                 entry.LastEmittedSeq = emitSeq;
                 emitPreview = entry.Preview;
+                emitSentAt = entry.SentAt;
                 emit = true;
             }
             else
@@ -131,7 +144,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
 
         if (emit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview);
+            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview, emitSentAt);
         }
     }
 
@@ -146,7 +159,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// </summary>
     public async Task FlushDue(DateTime now)
     {
-        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview)> toEmit = null;
+        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview, DateTime? SentAt)> toEmit = null;
 
         lock (_lock)
         {
@@ -164,8 +177,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                         entry.PendingLastSeq = 0;
                         entry.LastEmittedSeq = seq;
 
-                        (toEmit ??= new List<(string, string, long, object)>())
-                            .Add((connectionId, channelId, seq, entry.Preview));
+                        (toEmit ??= new List<(string, string, long, object, DateTime?)>())
+                            .Add((connectionId, channelId, seq, entry.Preview, entry.SentAt));
                     }
                 }
             }
@@ -176,9 +189,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        foreach (var (connectionId, channelId, lastSeq, preview) in toEmit)
+        foreach (var (connectionId, channelId, lastSeq, preview, sentAt) in toEmit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview);
+            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview, sentAt);
         }
     }
 
@@ -219,7 +232,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// fault-isolated delivery. <paramref name="preview"/> (C5, Task 9/D15) rides straight onto the
     /// payload — null for every non-Dm channel and for C3-era callers that never pass one.
     /// </summary>
-    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null)
+    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null, DateTime? sentAt = null)
     {
         // A connection with no live membership entry for the channel (left/disconnected between offer
         // and emit) is not a valid recipient — skip. The window was already advanced by the caller.
@@ -235,7 +248,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        var payload = new ChannelActivityDto(channelId, lastSeq, preview);
+        var payload = new ChannelActivityDto(channelId, lastSeq, preview, sentAt);
 
         try
         {
@@ -265,5 +278,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
         internal long PendingLastSeq;
         internal long LastEmittedSeq;
         internal object Preview;
+        internal DateTime? SentAt;
+        /// <summary>The seq the current <see cref="Preview"/>/<see cref="SentAt"/> pair describes — keeps
+        /// them aligned with the highest offered seq when offers arrive out of order.</summary>
+        internal long PreviewSeq;
     }
 }

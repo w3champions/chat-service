@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.Time.Testing;
+using MongoDB.Driver;
 using Moq;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
@@ -129,7 +130,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
             new MentionInboxRepository(MongoClient));
     }
 
-    private ChatHub BuildHub(string connectionId)
+    private ChatHub BuildHub(string connectionId, ChannelRepository channelRepository = null)
     {
         var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
@@ -144,7 +145,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
             _messageRateLimiter,
             _readRateLimiter,
             _time,
-            _channelRepository,
+            channelRepository ?? _channelRepository,
             _membershipRepository,
             _channelCreationRateLimiter,
             _messageRepository,
@@ -727,4 +728,336 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That((await _messageRepository.LoadForModerator(channel.Id)).Count, Is.EqualTo(1),
             "message 2 is NOT persisted — only message 1 remains stored");
     }
+
+    // ------------------------------------------------------------------------------------------------
+    // ChannelLastMessage — the conversation-list projection maintained on the channel doc at send time
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task DmSend_AcceptedDm_ProjectsLastMessageOntoTheChannel()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "tinker goblin");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection, Is.Not.Null, "an accepted Dm send must leave the conversation-list projection on the channel doc");
+        Assert.That(projection.Seq, Is.EqualTo(result.Seq));
+        Assert.That(projection.SenderBattleTag, Is.EqualTo(Initiator));
+        Assert.That(projection.Excerpt, Is.EqualTo("tinker goblin"));
+        Assert.That(projection.SentAt, Is.EqualTo(Now), "SentAt must be the message's own server instant, so it stays comparable with LastMessageAt");
+    }
+
+    [Test]
+    public async Task DmSend_SecondMessage_AdvancesProjectionToTheNewerOne()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(channel.Id, "first");
+        var second = await hub.SendMessage(channel.Id, "second");
+
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection.Seq, Is.EqualTo(second.Seq));
+        Assert.That(projection.Excerpt, Is.EqualTo("second"), "the projection tracks the conversation's LAST message, not its first");
+    }
+
+    [Test]
+    public async Task DmSend_PendingDm_ProjectsNothing_ConsentWall()
+    {
+        // The recipient has not accepted yet. They can already see this shell in their tray (D4 dual
+        // listing), so projecting the initiator's text here would show a stranger's message before
+        // consent — the same wall that already suppresses the recipient's ChannelActivity.
+        var channel = await CreateDm(DmRequestState.Pending);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "hi, do you know me?");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(1L), "the message itself is persisted as usual");
+        Assert.That(reloaded.LastMessage, Is.Null, "a PENDING Dm must never carry a last-message projection");
+    }
+
+    [Test]
+    public async Task GroupDmSend_ProjectsLastMessage()
+    {
+        var group = new ChatChannel { Type = ChannelType.GroupDm, Name = "squad", LastSeq = 0, LastMessageAt = Now, ExpiresAt = Now.AddDays(365) };
+        await _channelRepository.Insert(group);
+        SeedMember(InitiatorConn, Initiator, group.Id, ChannelType.GroupDm);
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(group.Id, "all tinkers in one place");
+
+        var projection = (await _channelRepository.Load(group.Id)).LastMessage;
+        Assert.That(projection, Is.Not.Null, "groups list in the same tray as 1:1 conversations and carry the projection too");
+        Assert.That(projection.Excerpt, Is.EqualTo("all tinkers in one place"));
+    }
+
+    [Test]
+    public async Task PublicSend_ProjectsNothing_BecauseTheCatalogShipsToNonMembers()
+    {
+        // PublicCatalog ships the raw ChatChannel for rooms the caller has NOT joined, so a projection
+        // here would publish room content to non-members.
+        var channel = new ChatChannel { Type = ChannelType.Public, Name = "general", NormalizedName = ChannelNames.Normalize("general") };
+        await _channelRepository.Insert(channel);
+        SeedMember(InitiatorConn, Initiator, channel.Id, ChannelType.Public);
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(channel.Id, "hello lounge");
+
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(1L));
+        Assert.That(reloaded.LastMessage, Is.Null, "a public room must never carry a last-message projection");
+    }
+
+    [Test]
+    public async Task DmSend_LongContent_ProjectionExcerptMatchesTheLiveEventExcerpt()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+        var content = new string('x', ChatLimits.DmPreviewExcerptLength + 50);
+
+        await hub.SendMessage(channel.Id, content);
+
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection.Excerpt.Length, Is.EqualTo(ChatLimits.DmPreviewExcerptLength));
+        Assert.That(projection.Excerpt, Is.EqualTo(Excerpts.Bounded(content)),
+            "the projection and the live ChannelActivity preview must come from the SAME excerpt helper, or a "
+            + "client would see the same message's text differ between the snapshot and the live event");
+    }
+
+    [Test]
+    public async Task DmSend_ProjectionWriteThrows_SendStillAcksAndDelivers()
+    {
+        // The projection is a SECOND post-persist write. If it could propagate, a message that is already
+        // durable would come back as an error, the caller would get no ack, and a client retry would
+        // persist a duplicate. Best-effort is the only acceptable shape for post-persist work — the same
+        // rule the fan-out below it already follows.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn, new ThrowingLastMessageChannelRepository(MongoClient));
+
+        var result = await hub.SendMessage(channel.Id, "the projection write is about to fail");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "a failed projection must not turn a persisted send into an error");
+        Assert.That(result.Seq, Is.EqualTo(1L), "the ack still carries the allocated seq");
+        var stored = await _messageRepository.LoadForUser(channel.Id, Initiator);
+        Assert.That(stored.Count, Is.EqualTo(1), "the message is durable regardless");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastMessage, Is.Null, "and the row simply stays on the previous message until the next send");
+    }
+
+    [Test]
+    public async Task DmSend_AcceptedConcurrentlyWithTheSend_StillProjects()
+    {
+        // The send loads the channel BEFORE it writes. If the recipient accepts in that window, the
+        // in-memory snapshot still says Pending — deciding consent from it would skip the projection for a
+        // conversation that is accepted by the time the write lands, stranding the row until the next
+        // message. The decision belongs to the durable doc, so this send projects even though the hub's
+        // own copy of the channel says otherwise.
+        var channel = await CreateDm(DmRequestState.Pending);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn, new AcceptOnProjectionChannelRepository(MongoClient));
+
+        var result = await hub.SendMessage(channel.Id, "accepted while this was in flight");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(projection, Is.Not.Null, "the durable state was Accepted when the write ran, so the projection belongs there");
+        Assert.That(projection.Excerpt, Is.EqualTo("accepted while this was in flight"));
+    }
+
+    // Fails the conversation-list projection write and nothing else.
+    private sealed class ThrowingLastMessageChannelRepository(MongoClient client) : ChannelRepository(client)
+    {
+        public override Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage) =>
+            throw new MongoException("projection write failed");
+    }
+
+    // Commits the acceptance the instant the projection write runs — i.e. AFTER the send loaded the
+    // channel as Pending — reproducing the accept-races-send window from the durable side, through the
+    // same SetRequestAccepted transition AcceptRequest itself uses.
+    private sealed class AcceptOnProjectionChannelRepository(MongoClient client) : ChannelRepository(client)
+    {
+        public override async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+        {
+            await SetRequestAccepted(channelId, DateTime.UtcNow);
+            return await base.TryAdvanceLastMessage(channelId, lastMessage);
+        }
+    }
+
+    [Test]
+    public async Task DmSend_AckCarriesTheServerSentAt()
+    {
+        // The sender is the one participant BOTH fan-out paths skip for their own message: no activity
+        // ping (senderConnectionId is skipped explicitly), and MessageReceived only if they happen to be
+        // focused on the channel — which SendMessage does not require. So the ack is the only carrier of
+        // the server's timestamp for their own send, and without it a client would have to stamp the
+        // optimistic echo from the local clock, which is exactly what conversation ordering (and the
+        // keyset paging coordinate derived from it) must never be built on.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "no fan-out will tell me when this happened");
+
+        Assert.That(result.SentAt, Is.Not.Null, "an Ok ack must carry the send instant");
+        var persisted = (await _messageRepository.LoadForUser(channel.Id, Initiator)).Single();
+        Assert.That(result.SentAt, Is.EqualTo(persisted.SentAt),
+            "and it must be the SAME instant the message was stamped with, not a second reading of the clock");
+        var projection = (await _channelRepository.Load(channel.Id)).LastMessage;
+        Assert.That(result.SentAt, Is.EqualTo(projection.SentAt),
+            "so the sender's own row sorts on exactly the value everyone else's does");
+    }
+
+    [Test]
+    public async Task BlockedDmSend_FakeAckCarriesASentAtToo_SilentDropUniformity()
+    {
+        // The silent-drop ack must stay byte-shaped like a real one — a null SentAt where a real send has
+        // one would leak the block just as surely as a null MessageId would.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        SetBlocked(Recipient, Initiator);
+        var hub = BuildHub(InitiatorConn);
+
+        var result = await hub.SendMessage(channel.Id, "they blocked me and must not learn that I know");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.SentAt, Is.Not.Null, "a fabricated ack must carry a fabricated instant, same shape as a real one");
+        Assert.That((await _channelRepository.Load(channel.Id)).LastMessage, Is.Null, "while nothing is actually persisted or projected");
+    }
+
+    [Test]
+    public async Task DmSend_ReAnnouncedShell_CarriesTheProjectionItJustWrote()
+    {
+        // A snapshot-excluded shell is re-announced by MaterializeDmRecipientAndNotify using the SAME
+        // in-memory channel the send loaded. The projection write only touches Mongo, so unless it is
+        // mirrored back the recipient is handed a conversation row with no text — and a recipient on
+        // Mentions/None, or one whose activity is unread-suppressed, gets no second chance at it.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        RegisterSession(RecipientConn, Recipient);   // online but NOT registry-seeded → triggers the re-announce
+        var hub = BuildHub(InitiatorConn);
+
+        await hub.SendMessage(channel.Id, "are you still there?");
+
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null);
+        Assert.That(added.Channel.LastMessage, Is.Not.Null, "the re-announced shell must carry the projection this very send wrote");
+        Assert.That(added.Channel.LastMessage.Excerpt, Is.EqualTo("are you still there?"));
+    }
+
+    [Test]
+    public async Task DmSend_ThatLosesTheProjectionCas_StillReAnnouncesTheWinningProjection()
+    {
+        // A concurrent same-channel send can write a HIGHER seq before this one reaches the CAS. This
+        // send may nonetheless be the one that materializes the recipient — the send that WON the CAS
+        // finds the registry already seeded and re-announces nothing — so the single ChannelAdded that
+        // will ever be sent must still carry the winning projection, not this send's stale copy.
+        var channel = await CreateDm(DmRequestState.Accepted);
+        await _membershipRepository.Insert(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Recipient,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        RegisterSession(RecipientConn, Recipient);   // online but NOT registry-seeded → triggers the re-announce
+        var hub = BuildHub(InitiatorConn, new ConcurrentWinnerChannelRepository(MongoClient));
+
+        await hub.SendMessage(channel.Id, "mine loses the race");
+
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null);
+        Assert.That(added.Channel.LastMessage, Is.Not.Null, "a lost CAS must not leave the announcement without a projection");
+        Assert.That(added.Channel.LastMessage.Excerpt, Is.EqualTo("the concurrent winner"),
+            "and it must carry the message that actually won, not this send's own");
+    }
+
+    // Simulates a concurrent send that wrote a strictly higher seq first, so this send's CAS loses.
+    private sealed class ConcurrentWinnerChannelRepository(MongoClient client) : ChannelRepository(client)
+    {
+        public override async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+        {
+            await base.TryAdvanceLastMessage(channelId, new ChannelLastMessage
+            {
+                Seq = lastMessage.Seq + 1,
+                SenderBattleTag = "someone#9999",
+                SenderName = "someone",
+                Excerpt = "the concurrent winner",
+                SentAt = lastMessage.SentAt.AddSeconds(1),
+            });
+            return await base.TryAdvanceLastMessage(channelId, lastMessage);
+        }
+    }
+
+    // --- Invariants this projection silently depends on, pinned so that widening either scope fails loudly ---
+
+    [Test]
+    public void ProjectedChannels_AreDisjointFromModeratableChannels()
+    {
+        // WHY THIS MATTERS: there is no deletion invalidation for ChannelLastMessage, and none is needed
+        // ONLY because a projected channel can never have a message deleted — ChannelModeration.IsModeratable
+        // gates both ChatHub.DeleteMessage and ChatHub.PurgeMessagesFromUser. If moderation is ever widened
+        // to reach Dm/GroupDm, this projection starts serving soft-deleted text to every member of the
+        // conversation, forever: a moderation hole, not a cosmetic bug. Whoever widens it must also add the
+        // recompute-on-delete that this assertion is standing in for.
+        foreach (var channel in AllChannelShapes())
+        {
+            Assert.That(
+                ChatHub.CarriesLastMessageProjection(channel) && ChannelModeration.IsModeratable(channel),
+                Is.False,
+                $"{Describe(channel)} is BOTH projected and moderatable — deleted text would stay pinned in every member's conversation list");
+        }
+    }
+
+    [Test]
+    public void ProjectedChannels_AreDisjointFromMuteEnforcedChannels()
+    {
+        // The send path skips the projection for shadow messages, which today is defence in depth rather
+        // than a live code path: a shadow message can only be produced where a mute is enforced, and that
+        // set is disjoint from the projected set. If mute enforcement is ever widened to DMs/groups, that
+        // !isShadow guard silently becomes load-bearing — this pins the relationship so the guard is not
+        // "simplified away" as dead code first.
+        foreach (var channel in AllChannelShapes())
+        {
+            Assert.That(
+                ChatHub.CarriesLastMessageProjection(channel) && ChannelModeration.IsMuteEnforced(channel),
+                Is.False,
+                $"{Describe(channel)} is BOTH projected and mute-enforced — a shadow author's text could reach every member");
+        }
+    }
+
+    private static IEnumerable<ChatChannel> AllChannelShapes()
+    {
+        yield return new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Accepted };
+        yield return new ChatChannel { Type = ChannelType.Dm, RequestState = DmRequestState.Pending };
+        yield return new ChatChannel { Type = ChannelType.GroupDm };
+        yield return new ChatChannel { Type = ChannelType.Public };
+        yield return new ChatChannel { Type = ChannelType.SemiPublic };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, Ladder = true };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Match, Ladder = false };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Clan };
+        yield return new ChatChannel { Type = ChannelType.System, SystemKind = SystemChannelKind.Lobby };
+    }
+
+    private static string Describe(ChatChannel channel) =>
+        channel.Type == ChannelType.System ? $"System+{channel.SystemKind}(ladder={channel.Ladder})"
+        : channel.Type == ChannelType.Dm ? $"Dm({channel.RequestState})"
+        : channel.Type.ToString();
 }

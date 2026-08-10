@@ -102,6 +102,45 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
+    /// Advances <see cref="ChatChannel.LastMessage"/> to <paramref name="lastMessage"/>, but ONLY if it is
+    /// strictly newer than whatever is stored — a compare-and-set on <see cref="ChannelLastMessage.Seq"/>.
+    /// <para>
+    /// WHY a second write instead of folding this into <see cref="AllocateSeq"/>'s atomic $inc: the
+    /// projection needs the seq that call allocates, so setting it there would mean rewriting the service's
+    /// most concurrency-critical write as an aggregation-pipeline update. The seq is also not the only
+    /// reason — the projection must be skipped for shadow messages, which <see cref="AllocateSeq"/> has no
+    /// business knowing about. This costs one extra by-_id update per non-shadow Dm/GroupDm message, and in
+    /// exchange the seq allocator stays untouched and this write is monotonic by construction: two
+    /// concurrent sends that reach it out of order settle on the higher seq no matter which lands last.
+    /// </para>
+    /// <para>
+    /// The CONSENT half of the scope is enforced here rather than by the caller: a 1:1 Dm is projected only
+    /// once its request is <see cref="DmRequestState.Accepted"/>, and that is read from the durable doc in
+    /// the same command that writes. The caller decides scope from a channel it loaded BEFORE the send, and
+    /// a concurrent <c>AcceptRequest</c> can commit in between — deciding there would skip the projection
+    /// for a conversation that is accepted by the time the write runs, stranding the row on an older message
+    /// until the next send. A pending Dm is a no-op here, not an error: same shape as losing the seq CAS.
+    /// </para>
+    /// Returns true iff this call actually advanced the field.
+    /// </summary>
+    public virtual async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+    {
+        var filterBuilder = Builders<ChatChannel>.Filter;
+        var filter = filterBuilder.And(
+            filterBuilder.Eq(c => c.Id, channelId),
+            filterBuilder.Or(
+                filterBuilder.Eq(c => c.Type, ChannelType.GroupDm),
+                filterBuilder.Eq(c => c.RequestState, DmRequestState.Accepted)),
+            filterBuilder.Or(
+                // A missing field matches Eq(..., null) in Mongo — this is the never-projected-yet case.
+                filterBuilder.Eq(c => c.LastMessage, null),
+                filterBuilder.Lt(c => c.LastMessage.Seq, lastMessage.Seq)));
+
+        var result = await Channels.UpdateOneAsync(filter, Builders<ChatChannel>.Update.Set(c => c.LastMessage, lastMessage));
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>
     /// Implicit find-or-create for semiPublic channels (join resolution — acceptance 9a):
     /// $setOnInsert upsert keyed (Type=SemiPublic, NormalizedName), mirroring
     /// PublicChannelSeeder's idempotent pattern. Backed by the unique partial index

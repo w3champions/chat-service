@@ -251,7 +251,13 @@ public class FanOutEngine(
                 continue;
             }
 
-            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, dmPreview);
+            // `message.SentAt`, not `now`: they are the same instant on the send path today, but the
+            // client uses this to ORDER conversations against `LastMessageAt`/`ChannelLastMessage.SentAt`,
+            // both of which are stamped from the message itself. Passing the message's own timestamp keeps
+            // all three the same value for the same message by construction rather than by coincidence.
+            // Offered for EVERY channel type (unlike `dmPreview`, which is Dm-only): a group conversation
+            // needs its sort position updated just as much as a 1:1 one, and a timestamp carries no content.
+            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, dmPreview, message.SentAt);
         }
     }
 
