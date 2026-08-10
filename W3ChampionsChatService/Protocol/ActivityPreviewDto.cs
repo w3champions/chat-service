@@ -33,6 +33,15 @@ namespace W3ChampionsChatService.Protocol;
 /// (<see cref="ChatLimits.DmPreviewExcerptLength"/> chars, surrogate-safe). A SYSTEM message has no
 /// sender and no content, so it produces no preview in either slot.
 /// </para>
+/// <para>
+/// Final review M4, discharging <c>ChatJsonProtocol</c>'s rule for new nullable wire fields:
+/// <see cref="SystemKind"/> is OMITTED (not sent as an explicit <c>null</c>) for a non-<c>System</c>
+/// channel (<c>Dm</c> today, the only other preview-eligible class). This is safe without pinning
+/// because <see cref="ChannelType"/> alone fully disambiguates — a client never needs to test
+/// <c>systemKind === null</c> to tell a DM from a match room, so an absent key and an explicit null are
+/// indistinguishable there and both are equally correct. A client MUST switch on <c>channelType</c>,
+/// never on <c>systemKind === null</c>.
+/// </para>
 /// </summary>
 public record ActivityPreviewDto(
     string SenderBattleTag,

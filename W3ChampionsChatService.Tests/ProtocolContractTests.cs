@@ -553,6 +553,40 @@ public class ProtocolContractTests
         Assert.That(userJson, Does.Not.Contain("systemMessage"), "a user message's null system body must not occupy wire bytes");
     }
 
+    // ── Final review M2 — ChannelType/SystemChannelKind ordinals are a notification-routing
+    // discriminator, not just a wire curiosity ──────────────────────────────────────────────────
+
+    [Test]
+    public void ChannelType_HasExactPinnedNumericValues()
+    {
+        // ActivityPreviewDto rides ChannelType as its ORDINAL, deliberately (see that DTO's own doc
+        // comment) so a client can compare activityPreview.channelType directly against a channel's
+        // own `type` — post-game chat's one-time nudge gate is decided by that comparison. The existing
+        // wire test (ChatJsonProtocolTests.Configure_MatchChannelActivity_PreviewCarriesItsChannelClassOnTheWire)
+        // only asserts the KEY is present, not its value, so reordering this enum would silently reroute
+        // every client's notification routing with a fully green suite. Pin every member's NUMERIC
+        // VALUE — not just ChatResultCode_HasExactPinnedMembers's name-only check above — and every
+        // member, not only System/Dm which the nudge reads today, since a reorder anywhere shifts every
+        // value after it.
+        Assert.AreEqual(5, Enum.GetValues(typeof(ChannelType)).Length);
+        Assert.AreEqual(0, (int)ChannelType.Public);
+        Assert.AreEqual(1, (int)ChannelType.SemiPublic);
+        Assert.AreEqual(2, (int)ChannelType.System);
+        Assert.AreEqual(3, (int)ChannelType.Dm);
+        Assert.AreEqual(4, (int)ChannelType.GroupDm);
+    }
+
+    [Test]
+    public void SystemChannelKind_HasExactPinnedNumericValues()
+    {
+        // Same load-bearing reason as ChannelType_HasExactPinnedNumericValues above — SystemChannelKind
+        // is the OTHER half of the ordinal pair ActivityPreviewDto rides on the wire.
+        Assert.AreEqual(3, Enum.GetValues(typeof(SystemChannelKind)).Length);
+        Assert.AreEqual(0, (int)SystemChannelKind.Lobby);
+        Assert.AreEqual(1, (int)SystemChannelKind.Match);
+        Assert.AreEqual(2, (int)SystemChannelKind.Clan);
+    }
+
     // The hub's REAL payload serializer options, so a wire-shape assertion above pins what a client
     // actually receives rather than System.Text.Json's defaults (which would emit nulls).
     private static JsonSerializerOptions ConfiguredHubOptions()

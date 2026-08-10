@@ -1084,13 +1084,16 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     // Final review, finding 7: `params`/`listParams` used to reach Mongo with NO per-element guard at
     // all. Keys become BSON element names + client catalogue placeholders (identifier class, the same
     // IsValidRef `key`/`dedupeKey` get); values and list items are free display text that persists and
-    // fans out (the same non-blank/control-char guard every `members` entry gets).
+    // fans out (control-char/U+2028/U+2029-free). Final review M3 (human-ruled): unlike a `members`
+    // entry, a param value is NOT required to be non-blank — `fallbackText` already covers rendering
+    // for a client that does not recognise `key`, so a blank/null value is display text with a safe
+    // fallback, not a permanent 400 mm cannot retry its way out of. See
+    // SystemMessage_BlankOrNullParamValue_Is200_AndPersistsAsIs below for that acceptance case.
     public enum SystemMessageParamRejectionScenario
     {
         DottedParamKey,
         DollarPrefixedParamKey,
         ParamValueWithNewline,
-        BlankParamValue,
         DottedListParamKey,
         ListItemWithLineSeparator,
     }
@@ -1098,7 +1101,6 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     [TestCase(SystemMessageParamRejectionScenario.DottedParamKey)]
     [TestCase(SystemMessageParamRejectionScenario.DollarPrefixedParamKey)]
     [TestCase(SystemMessageParamRejectionScenario.ParamValueWithNewline)]
-    [TestCase(SystemMessageParamRejectionScenario.BlankParamValue)]
     [TestCase(SystemMessageParamRejectionScenario.DottedListParamKey)]
     [TestCase(SystemMessageParamRejectionScenario.ListItemWithLineSeparator)]
     public async Task SystemMessage_InvalidParams_Is400_AndPersistsNothing(SystemMessageParamRejectionScenario scenario)
@@ -1114,9 +1116,10 @@ public class InternalApiIntegrationTests : IntegrationTestBase
             // A dotted or $-prefixed BSON element name is at best awkward to query once persisted.
             SystemMessageParamRejectionScenario.DottedParamKey => "\"params\":{\"match.map\":\"Amazonia\"}",
             SystemMessageParamRejectionScenario.DollarPrefixedParamKey => "\"params\":{\"$map\":\"Amazonia\"}",
-            // \n in a value that is logged and fanned out — the log-injection case IsValidTextEntry exists for.
+            // \n in a value that persists and fans out to every member as rendered display text — the
+            // control-char case IsValidDisplayText exists for (never a log-injection concern here: no
+            // Log.* call in this file or SystemMessagePublisher writes a param value).
             SystemMessageParamRejectionScenario.ParamValueWithNewline => "\"params\":{\"map\":\"Ama\\nzonia\"}",
-            SystemMessageParamRejectionScenario.BlankParamValue => "\"params\":{\"map\":\"   \"}",
             SystemMessageParamRejectionScenario.DottedListParamKey => "\"listParams\":{\"a.b\":[\"Grubby#2136\"]}",
             // U+2028 is category Zl, not Cc, so char.IsControl alone misses it — the explicit conjunct.
             SystemMessageParamRejectionScenario.ListItemWithLineSeparator => "\"listParams\":{\"players\":[\"Grub\\u2028by\"]}",
@@ -1131,6 +1134,62 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         var messages = await _messageRepository.LoadForModerator(channelDto.Id);
         Assert.That(messages.Any(m => m.Kind == MessageKind.System), Is.False,
             "a rejected publish must persist nothing — validation runs before the lookup and the insert");
+    }
+
+    // Final review M3 (human-ruled): a param value / list item is display text `fallbackText` already
+    // covers, not an identity like a `members` entry — so a blank or null value is accepted and stored
+    // AS-IS rather than a permanent 400 mm cannot retry its way out of. This is the acceptance
+    // counterpart to SystemMessage_InvalidParams_Is400_AndPersistsNothing above, which no longer covers
+    // a blank param value now that the rule diverged from `members`.
+    public enum SystemMessageBlankParamAcceptanceScenario
+    {
+        BlankParamValue,
+        NullParamValue,
+        BlankListItem,
+    }
+
+    [TestCase(SystemMessageBlankParamAcceptanceScenario.BlankParamValue)]
+    [TestCase(SystemMessageBlankParamAcceptanceScenario.NullParamValue)]
+    [TestCase(SystemMessageBlankParamAcceptanceScenario.BlankListItem)]
+    public async Task SystemMessage_BlankOrNullParamValue_Is200_AndPersistsAsIs(SystemMessageBlankParamAcceptanceScenario scenario)
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-10\",\"name\":\"Sys Match 10\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null,
+            "precondition: the match channel must exist before the blank-param-value publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var paramsJson = scenario switch
+        {
+            SystemMessageBlankParamAcceptanceScenario.BlankParamValue => "\"params\":{\"map\":\"   \"}",
+            SystemMessageBlankParamAcceptanceScenario.NullParamValue => "\"params\":{\"map\":null}",
+            SystemMessageBlankParamAcceptanceScenario.BlankListItem => "\"listParams\":{\"players\":[\"   \"]}",
+            _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
+        };
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"," + paramsJson + "}";
+
+        var result = await PostSystemMessage("match-sys-10", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            $"{scenario} must be a 200 — a param value/list item is display text fallbackText already covers, not an identity like a members entry");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        switch (scenario)
+        {
+            case SystemMessageBlankParamAcceptanceScenario.BlankParamValue:
+                Assert.That(systemMessage.SystemMessage.Params["map"], Is.EqualTo("   "),
+                    "a blank param value must persist AS-IS, not be trimmed or normalized to null");
+                break;
+            case SystemMessageBlankParamAcceptanceScenario.NullParamValue:
+                Assert.That(systemMessage.SystemMessage.Params["map"], Is.Null,
+                    "a null param value must persist as null, not be rejected or coerced to empty string");
+                break;
+            case SystemMessageBlankParamAcceptanceScenario.BlankListItem:
+                Assert.That(systemMessage.SystemMessage.ListParams["players"], Is.EqualTo(new List<string> { "   " }),
+                    "a blank list item must persist AS-IS, not be trimmed, dropped, or normalized to null");
+                break;
+        }
     }
 
     [Test]

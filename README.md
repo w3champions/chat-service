@@ -458,9 +458,12 @@ write — mm should treat it as "this room is gone, stop retrying", not as a tra
 - `params` (`{string: string}`) / `listParams` (`{string: string[]}`) — both **optional**; absent means
   "no params". When present, every **key** is validated against the same `[A-Za-z0-9_-]` class as `key`
   (keys become BSON element names as well as client placeholders, so a dotted or `$`-prefixed key is
-  a `400`), and every **value** / list item must be non-blank and free of control characters and
-  U+2028/U+2029 — the same guard `members` entries get, for the same log-injection reason. Neither is
-  length-capped beyond the 64 KB signed-body cap.
+  a `400`). Every **value** / list item must be free of control characters and U+2028/U+2029 (they
+  persist and fan out to every channel member as rendered display text), but — unlike a `members`
+  entry — **blank or `null` is accepted and stored as-is, never a `400`**: a param value is display text
+  `fallbackText` already covers for a client that does not recognise `key`, not an identity a caller
+  could usefully retry its way out of rejecting. Neither is length-capped beyond the 64 KB signed-body
+  cap.
 - `dedupeKey` — **optional**. When supplied, the publish is at-most-once per `(channel, dedupeKey)`:
   a retry returns `200` and re-publishes nothing (mm retries on timeout, and an intro must never
   double-post). Validated against the same `[A-Za-z0-9_-]` class when non-empty, since it becomes a

@@ -334,18 +334,19 @@ public class InternalChannelsController(
         // new number.
         fallbackText = Excerpts.Bounded(fallbackText, ChatLimits.MaxMessageLength);
 
-        // `Params`/`ListParams` get the file's EXISTING per-element convention rather than a bespoke
-        // dictionary policy (final review, finding 7 — the earlier "no precedent for this" note was
-        // wrong; IsValidMembers/IsValidTextEntry below is exactly that precedent, applied for exactly
-        // these reasons). Split by what each half actually becomes:
+        // `Params`/`ListParams` validation, applied per-element. Split by what each half actually
+        // becomes — and, since final review M3, validated by TWO DIFFERENT rules, not one shared one:
         //   - KEYS become BSON element names on the persisted SystemMessageBody, and are catalogue
         //     placeholder identifiers on the client. They get IsValidRef — the SAME identifier class
         //     `key`/`dedupeKey` get two blocks up, which is also the only guard that keeps a
         //     `$`-prefixed or dotted element name (awkward-to-impossible to query) out of Mongo.
-        //   - VALUES (and every list item) are free display text that persists and fans out to every
-        //     member, so they get IsValidTextEntry — non-blank, control-char-free, U+2028/U+2029-free:
-        //     byte-for-byte the guard every `members` entry already gets, for the same log-injection
-        //     reason.
+        //   - VALUES (and every list item) are free DISPLAY TEXT that persists and fans out to every
+        //     channel member as rendered text — that is the justification, not log injection: no
+        //     `Log.*` call in this file or in SystemMessagePublisher ever writes a param value. They get
+        //     IsValidDisplayText — control-char- and U+2028/U+2029-free, but (final review M3)
+        //     deliberately NOT non-blank: unlike a `members` entry, which is an identity mm cannot
+        //     normalize its way out of, a param value is display text `fallbackText` already covers for
+        //     rendering, so blank or absent is accepted and stored as-is rather than a permanent 400.
         // NOT length-capped, deliberately: the 64 KB HMAC body cap (InternalHmacAuthFilter) already
         // bounds the worst case, so there is no DoS to defend and no existing per-entry length cap to
         // mirror. A null dictionary means "no params" and is always legal.
@@ -421,30 +422,45 @@ public class InternalChannelsController(
     private static bool IsValidMembers(List<string> members) =>
         members != null
         && members.Count <= ChatLimits.InternalMaxMembersPerCall
-        && members.All(IsValidTextEntry);
+        && members.All(IsValidIdentityText);
 
     // 2026-08-05 fix wave (final review M5): mirrors InternalRelationshipChangesController's
     // IsValidParticipant EXACTLY — non-blank AND control-char-free. Before this, a member entry was
     // bounded only by the 64 KB body cap and landed as a lowercased Mongo BattleTag key with no
     // per-entry length or control-char guard, asymmetric with the relationship-changes surface's
-    // identical-shaped field. char.IsControl catches an embedded '\n'/'\r'/'\t'/NUL (log-injection);
-    // U+2028/U+2029 are checked explicitly because they are category Zl/Zp, not Cc, so char.IsControl
-    // alone misses them. Named for the SHAPE of what it guards (a free-text entry), not for `members`:
-    // the system-message route's param values and list items get the identical guard for the identical
-    // reason (final review, finding 7).
-    private static bool IsValidTextEntry(string value) =>
+    // identical-shaped field. char.IsControl catches an embedded '\n'/'\r'/'\t'/NUL; U+2028/U+2029 are
+    // checked explicitly because they are category Zl/Zp, not Cc, so char.IsControl alone misses them.
+    // Named for the SHAPE of what it guards — an IDENTITY entry, non-blank because a blank battleTag is
+    // a missing identity with nothing to normalize it into — not for `members`, its only caller today.
+    // Final review M3: deliberately NOT shared with the system-message param/list-item guard below
+    // (IsValidDisplayText) — that guard had to become MORE permissive (blank/null allowed) once a
+    // param value turned out to be display text `fallbackText` already covers, not an identity like
+    // this one. Split rather than weakened, so `members` keeps its non-blank guarantee unchanged.
+    private static bool IsValidIdentityText(string value) =>
         !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
 
     // System-message params. A null dictionary means "no params" and is always legal. Keys get the
     // identifier class (they become BSON element names on the persisted body AND client catalogue
-    // placeholders); values get the free-text entry guard. Full rationale at the call site.
+    // placeholders); values get IsValidDisplayText. Full rationale at the call site.
     private static bool IsValidParams(Dictionary<string, string> parameters) =>
         parameters == null
-        || parameters.All(p => IsValidRef(p.Key) && IsValidTextEntry(p.Value));
+        || parameters.All(p => IsValidRef(p.Key) && IsValidDisplayText(p.Value));
 
     private static bool IsValidListParams(Dictionary<string, List<string>> parameters) =>
         parameters == null
-        || parameters.All(p => IsValidRef(p.Key) && p.Value != null && p.Value.All(IsValidTextEntry));
+        || parameters.All(p => IsValidRef(p.Key) && p.Value != null && p.Value.All(IsValidDisplayText));
+
+    // Final review M3 (human-ruled): a param value / list item is free DISPLAY TEXT that persists and
+    // fans out to every channel member as rendered text — it is NOT an identity like a `members` entry,
+    // and `fallbackText` already renders for a client that does not recognise `key`. So unlike
+    // IsValidIdentityText above, blank or null is ACCEPTED and stored as-is rather than a permanent 400
+    // mm cannot usefully retry its way out of (the same reasoning the endpoint already applies to
+    // `fallbackText` itself and to a blank `dedupeKey`). Still control-char- and U+2028/U+2029-free:
+    // persistence plus fan-out to every member is reason enough to keep that half of the guard, even
+    // though it is never logged. `value == null` is valid here (a JSON `null` param value / list item),
+    // unlike IsValidRef/IsValidIdentityText, which treat null as invalid.
+    private static bool IsValidDisplayText(string value) =>
+        value == null || !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
 
     private void LogUnexpected(Exception ex, string verb, string @ref) =>
         Log.Error(ex, "Internal channels endpoint failed {Caller} {Verb} {Ref}", InternalHmacAuthFilter.ResolveCaller(HttpContext), verb, @ref);
