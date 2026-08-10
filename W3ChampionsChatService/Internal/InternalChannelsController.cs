@@ -57,13 +57,13 @@ public class InternalChannelsController(
     private const string MatchKind = "match";
     private const string GenericValidationError = "Invalid request.";
 
-    // Same generic-message TEXT as GenericValidationError, deliberately duplicated under a distinct
-    // name rather than reused — the class doc above scopes GenericValidationError to failures returned
-    // "via a plain 400"; a lookup miss (or the Publish defense-in-depth branch below) is a 404, and a
-    // separately-named constant keeps a future reader from wondering why a "validation error" backs a
-    // 404. The message policy (never echo which rule failed / what's missing) is intentionally the same
-    // string for both — only the name tracks which status code owns it.
-    private const string GenericNotFoundError = "Invalid request.";
+    // Deliberately the SAME string as GenericValidationError, under a distinct name — the class doc
+    // above scopes GenericValidationError to failures returned "via a plain 400"; a lookup miss (or the
+    // Publish defense-in-depth branch below) is a 404, and a separately-named constant keeps a future
+    // reader from wondering why a "validation error" backs a 404. Aliasing (rather than a second string
+    // literal) makes the "same text, different status code" policy a compiler-enforced fact instead of
+    // two literals that could silently drift apart.
+    private const string GenericNotFoundError = GenericValidationError;
 
     // \A/\z (absolute start/end), NOT ^/$ — .NET's `$` also matches immediately before a single
     // trailing '\n' when RegexOptions.Multiline is NOT set, so "abc123\n" would otherwise pass this
@@ -332,9 +332,28 @@ public class InternalChannelsController(
         // retry its way out of a 400 on). Capped to ChatLimits.MaxMessageLength: this is server-rendered
         // display text a client shows directly, the same shape as a user message body, so it reuses that
         // cap rather than inventing a new number.
+        //
+        // `Params`/`ListParams` are deliberately left UNCAPPED here, unlike `fallbackText`: they are a
+        // `Dictionary<string,string>`/`Dictionary<string,List<string>>`, and capping a dictionary needs
+        // genuinely NEW policy this file has no precedent for (a per-key length limit? an entry-count
+        // limit? a per-list-item length limit? some combination?) — there is no single existing
+        // convention to mirror the way `name`'s scalar-string truncation is mirrored here. The 64 KB
+        // HMAC body cap (InternalHmacAuthFilter) already bounds their worst case; a bespoke dictionary
+        // cap is a real design decision, not a one-line follow of an existing pattern, and is left for a
+        // future change that actually needs it.
         if (fallbackText.Length > ChatLimits.MaxMessageLength)
         {
             fallbackText = fallbackText[..ChatLimits.MaxMessageLength];
+
+            // A naive slice can land mid-surrogate-pair (e.g. an emoji straddling the cut index),
+            // leaving a lone trailing high surrogate. That is not valid UTF-16 text: BSON-encoding it
+            // for the Mongo persist below is undefined at best (a replacement character) and a throw at
+            // worst, and it then fans out to every channel member. Drop the dangling high surrogate
+            // rather than persist a broken code unit.
+            if (char.IsHighSurrogate(fallbackText[^1]))
+            {
+                fallbackText = fallbackText[..^1];
+            }
         }
 
         // DedupeKey is OPTIONAL — absent, empty, or whitespace-only ALL mean "no dedupe" and are never a
@@ -368,13 +387,14 @@ public class InternalChannelsController(
                 FallbackText = fallbackText,
             };
 
-            // Unreachable BY CONSTRUCTION today: Publish returns non-Ok only when its `channel` argument
-            // is null, and `channel` is already confirmed non-null immediately above. Kept anyway as
-            // defense-in-depth against a future Publish regression — a future reader should not go
-            // hunting for the live case that trips this branch; as of this writing there isn't one.
             var result = await systemMessagePublisher.Publish(channel, body, dedupeKey);
             if (result.Code != ChatResultCode.Ok)
             {
+                // Unreachable BY CONSTRUCTION today: Publish returns non-Ok only when its `channel`
+                // argument is null, and `channel` is already confirmed non-null immediately above. Kept
+                // anyway as defense-in-depth against a future Publish regression — a future reader should
+                // not go hunting for the live case that trips this branch; as of this writing there isn't
+                // one.
                 return NotFound(new ErrorResult(GenericNotFoundError));
             }
 

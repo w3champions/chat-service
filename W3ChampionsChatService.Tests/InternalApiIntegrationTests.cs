@@ -931,28 +931,32 @@ public class InternalApiIntegrationTests : IntegrationTestBase
     // Review finding 1 (human-ruled): an empty dedupeKey is optional-field noise, not a validation
     // failure — mm has no per-status retry policy, so this must normalize to "no dedupe" (SAME as an
     // absent dedupeKey) rather than 400. Proven both ways: the call itself is a 200, AND two calls with
-    // an empty dedupeKey are NOT deduped against each other (empty is not itself a shared dedupe value).
-    [Test]
-    public async Task SystemMessage_EmptyDedupeKey_Is200_AndDoesNotDedupe()
+    // a blank dedupeKey are NOT deduped against each other (blank is not itself a shared dedupe value).
+    // Review finding 7 (second round): both the controller comment and the DedupeKey XML doc promise
+    // absent/empty/whitespace-only are all equivalent, but the original test only covered "". Table-driven
+    // over BOTH literal forms so the whitespace-only claim is pinned too, not merely inferred from "".
+    [TestCase("")]
+    [TestCase("   ")]
+    public async Task SystemMessage_BlankDedupeKey_Is200_AndDoesNotDedupe(string dedupeKey)
     {
         var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-4\",\"name\":\"Sys Match 4\",\"members\":[\"Alice#1\"]}";
         var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
-        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the empty-dedupeKey publish is exercised");
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the blank-dedupeKey publish is exercised");
         var channelDto = createResult.Value as InternalChannelDto;
 
-        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\",\"dedupeKey\":\"\"}";
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\",\"dedupeKey\":\"" + dedupeKey + "\"}";
 
         var first = await PostSystemMessage("match-sys-4", messageBody, MmSecret, NowTimestamp());
         var second = await PostSystemMessage("match-sys-4", messageBody, MmSecret, NowTimestamp());
 
         Assert.That(first, Is.InstanceOf<OkResult>(),
-            "an empty dedupeKey must normalize to \"no dedupe\" and never trigger a 400 — an optional field must never reject the whole call");
+            "a blank dedupeKey must normalize to \"no dedupe\" and never trigger a 400 — an optional field must never reject the whole call");
         Assert.That(second, Is.InstanceOf<OkResult>(),
-            "a second call with an empty dedupeKey must also succeed — empty is not treated as a shared dedupe value between the two calls");
+            "a second call with a blank dedupeKey must also succeed — blank is not treated as a shared dedupe value between the two calls");
 
         var messages = await _messageRepository.LoadForModerator(channelDto.Id);
         Assert.That(messages.Count(m => m.Kind == MessageKind.System), Is.EqualTo(2),
-            "empty dedupeKey means NO dedupe (unlike a genuine shared key) — both calls must persist as DISTINCT messages");
+            "blank dedupeKey means NO dedupe (unlike a genuine shared key) — both calls must persist as DISTINCT messages");
     }
 
     // Review finding 4: three DISTINCT rejection decisions, each with its own rationale comment in the
@@ -995,5 +999,62 @@ public class InternalApiIntegrationTests : IntegrationTestBase
 
         Assert.That(result, Is.InstanceOf<BadRequestObjectResult>(),
             $"{scenario} must be a 400 — distinguishing a validation failure from a lookup miss (404) is the entire point of the invalid-systemRef case");
+    }
+
+    // Review finding 1 (second round): the fallbackText truncation is this commit's ONLY runtime
+    // behaviour change — everything else in the endpoint is validate-then-delegate — so it needs its
+    // own pin, not just implicit coverage from the happy-path test's short fallbackText.
+    [Test]
+    public async Task SystemMessage_OverlongFallbackText_Is200_AndTruncatedToMaxMessageLength()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-6\",\"name\":\"Sys Match 6\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the overlong-fallbackText publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var overlongFallback = new string('x', 600);
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"" + overlongFallback + "\"}";
+
+        var result = await PostSystemMessage("match-sys-6", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            "an overlong fallbackText must be TRUNCATED, never rejected — the truncate-don't-reject decision is the whole point of this test");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        Assert.That(systemMessage.SystemMessage.FallbackText.Length, Is.EqualTo(ChatLimits.MaxMessageLength),
+            "the persisted fallbackText must be truncated to exactly ChatLimits.MaxMessageLength — pins the boundary, not just \"shorter than before\"");
+    }
+
+    // Review finding 2 (second round): a naive fallbackText[..ChatLimits.MaxMessageLength] slice can
+    // land inside a UTF-16 surrogate pair, leaving a lone high surrogate that is unsafe to BSON-persist
+    // and fan out. Positioned so the naive slice WOULD split it: 511 'a's (indices 0..510) followed by
+    // an astral emoji (U+1F600, encoded as the surrogate pair 😀 at indices 511/512) — slicing
+    // at index 512 takes indices 0..511, i.e. the 511 'a's plus exactly the emoji's high surrogate and
+    // nothing else, which is precisely the split this test guards against.
+    [Test]
+    public async Task SystemMessage_OverlongFallbackTextWithSurrogatePairAtTruncationBoundary_DropsThePairWhole()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-7\",\"name\":\"Sys Match 7\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the surrogate-pair-boundary publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var prefix = new string('a', 511);
+        var fallbackWithBoundaryEmoji = prefix + "😀" + "tail";
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"" + fallbackWithBoundaryEmoji + "\"}";
+
+        var result = await PostSystemMessage("match-sys-7", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(),
+            "a boundary-straddling emoji must still be truncated, never rejected — the surrogate-pair guard is a persistence-safety fix, not a new validation rule");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        var systemMessage = messages.Single(m => m.Kind == MessageKind.System);
+        var persisted = systemMessage.SystemMessage.FallbackText;
+        Assert.That(char.IsHighSurrogate(persisted[^1]), Is.False,
+            "truncation must never leave a lone trailing high surrogate — that is invalid UTF-16 and unsafe to BSON-persist and fan out to every channel member");
+        Assert.That(persisted, Is.EqualTo(prefix),
+            "the boundary-straddling emoji must be dropped WHOLE once the naive slice would have cut it in half, not left half-persisted");
     }
 }
