@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Text.Json;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
@@ -422,5 +423,73 @@ public class ProtocolContractTests
         StringAssert.DoesNotContain("Ladder", json);
         // Positive control — proves the object really did serialize.
         StringAssert.Contains("Id", json);
+    }
+
+    // ── Post-game chat Plan A Task 2 — MessageDto projects the system-message fields ────────
+
+    [Test]
+    public void ForUserDelivery_CarriesSystemKindAndBody()
+    {
+        var systemMessage = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = "chan1",
+            Seq = 3,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody
+            {
+                Key = "match_intro",
+                Params = new Dictionary<string, string> { ["map"] = "Amazonia" },
+                FallbackText = "Match on Amazonia",
+            },
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = MessageDto.ForUserDelivery("chan1", systemMessage);
+
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.System), "the client needs the discriminator to pick a renderer");
+        Assert.That(dto.SystemMessage.Key, Is.EqualTo("match_intro"), "key is the client's catalogue lookup token");
+        Assert.That(dto.SystemMessage.FallbackText, Is.EqualTo("Match on Amazonia"), "fallback text must survive the projection");
+        Assert.That(dto.Sender, Is.Null, "a system message has no sender snapshot on the wire either");
+        Assert.That(dto.Content, Is.Null, "a system message carries no free-form content on the wire either");
+    }
+
+    [Test]
+    public void ForModerator_CarriesSystemKindAndBody()
+    {
+        var systemMessage = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = "chan1",
+            Seq = 3,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" },
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = MessageDto.ForModerator("chan1", systemMessage);
+
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.System), "the moderator projection needs the discriminator too");
+        Assert.That(dto.SystemMessage.FallbackText, Is.EqualTo("Match on Amazonia"),
+            "moderation history renders fallbackText — it has no i18n catalogue");
+    }
+
+    [Test]
+    public void UserMessageProjection_DefaultsToUserKindWithNoSystemBody()
+    {
+        var userMessage = new ChannelMessage
+        {
+            Id = "m2",
+            ChannelId = "chan1",
+            Seq = 4,
+            Sender = new MessageSender { BattleTag = "A#1", Name = "A" },
+            Content = "gg",
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = MessageDto.ForUserDelivery("chan1", userMessage);
+
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.User), "an ordinary user message projects as Kind.User");
+        Assert.That(dto.SystemMessage, Is.Null, "an ordinary user message carries no system body");
     }
 }
