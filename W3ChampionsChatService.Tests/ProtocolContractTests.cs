@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Text.Json;
+using Microsoft.AspNetCore.SignalR;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Chats;
@@ -33,6 +34,17 @@ public class ProtocolContractTests
         var json = JsonSerializer.Serialize(ChatResultCode.NotMember);
 
         Assert.AreEqual("\"NotMember\"", json);
+    }
+
+    [Test]
+    public void MessageKind_SerializesAsStringName()
+    {
+        // Same property, same reason, as ChatResultCode above: there is no global
+        // JsonStringEnumConverter (ChatJsonProtocol.Configure only sets DefaultIgnoreCondition), so
+        // without MessageKind's own [JsonConverter] the discriminator rides as an undocumented ordinal
+        // and a client ends up writing `if (msg.kind === 1)`.
+        Assert.AreEqual("\"System\"", JsonSerializer.Serialize(MessageKind.System));
+        Assert.AreEqual("\"User\"", JsonSerializer.Serialize(MessageKind.User));
     }
 
     [Test]
@@ -491,5 +503,62 @@ public class ProtocolContractTests
 
         Assert.That(dto.Kind, Is.EqualTo(MessageKind.User), "the client needs the discriminator to pick the ordinary-message renderer, not the system one");
         Assert.That(dto.SystemMessage, Is.Null, "a populated body here would make the client try to render system content for a normal chat line");
+    }
+
+    [Test]
+    public void MessageDto_WireShape_KindAlwaysEmittedAsString_SystemBodyOmittedWhenAbsent()
+    {
+        // The three cases above assert on the C# record's PROPERTIES; this one asserts on the bytes a
+        // client actually receives, through the hub's real serializer options (the same
+        // ChatJsonProtocol.Configure that ChatJsonProtocolTests pins). Without it the wire shape of
+        // `kind` and `systemMessage` — the two fields Plan C's renderer branches on — is unpinned.
+        var options = ConfiguredHubOptions();
+
+        var systemJson = JsonSerializer.Serialize(
+            MessageDto.ForUserDelivery("chan1", new ChannelMessage
+            {
+                Id = "m1",
+                ChannelId = "chan1",
+                Seq = 3,
+                Kind = MessageKind.System,
+                SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" },
+                SentAt = DateTime.UtcNow,
+            }),
+            options);
+
+        Assert.That(systemJson, Does.Contain("\"kind\":\"System\""),
+            "the discriminator must ride as a self-describing string, never as an ordinal a client has to guess");
+        Assert.That(systemJson, Does.Contain("\"systemMessage\""), "the structured body is the only thing a system message has to render");
+        Assert.That(systemJson, Does.Contain("\"fallbackText\":\"Match on Amazonia\""), "a client that does not know the key renders fallbackText");
+        Assert.That(systemJson, Does.Not.Contain("\"sender\""), "a system message has no sender — the null must be omitted, not sent as an explicit null");
+        Assert.That(systemJson, Does.Not.Contain("\"content\""), "a system message has no free-form content");
+
+        var userJson = JsonSerializer.Serialize(
+            MessageDto.ForUserDelivery("chan1", new ChannelMessage
+            {
+                Id = "m2",
+                ChannelId = "chan1",
+                Seq = 4,
+                Sender = new MessageSender { BattleTag = "A#1", Name = "A" },
+                Content = "gg",
+                SentAt = DateTime.UtcNow,
+            }),
+            options);
+
+        // Deliberately NOT shrunk with WhenWritingDefault: a discriminator that vanishes on the common
+        // case invites `msg.kind === undefined` bugs in the client, and ChatResultCode sets the
+        // always-emit precedent. See MessageKind's own doc comment.
+        Assert.That(userJson, Does.Contain("\"kind\":\"User\""),
+            "kind must be emitted on ORDINARY messages too — a discriminator present only sometimes is one a client cannot branch on");
+        Assert.That(userJson, Does.Not.Contain("systemMessage"), "a user message's null system body must not occupy wire bytes");
+    }
+
+    // The hub's REAL payload serializer options, so a wire-shape assertion above pins what a client
+    // actually receives rather than System.Text.Json's defaults (which would emit nulls).
+    private static JsonSerializerOptions ConfiguredHubOptions()
+    {
+        var options = new JsonHubProtocolOptions();
+        ChatJsonProtocol.Configure(options);
+        return options.PayloadSerializerOptions;
     }
 }
