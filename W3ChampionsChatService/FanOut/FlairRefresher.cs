@@ -55,24 +55,47 @@ public class FlairRefresher(
 
         var resolution = await _chatAuthenticationService.GetUserFromIdentity(session.Identity);
 
+        // Fix round P2 (findings 2+3): re-validate AFTER the await, before any side effect. The awaited
+        // wb round-trip above is a window in which the player can disconnect, or reconnect under a new
+        // connection id. If the authoritative session for this battleTag is no longer THIS connection,
+        // every side effect below must be skipped:
+        //  - acting on the stale `session` would resurrect ConnectionMapping's entry for a connection
+        //    ChatHub.OnDisconnectedAsync already tore down (Remove runs in a `finally`, unconditionally,
+        //    then RegisterUser's unconditional `_users[connectionId] = user` would recreate it) —
+        //    disconnect fires once, so nothing would ever remove it again: an unbounded leak under
+        //    repeated connect/disconnect-during-refresh races.
+        //  - the send targets below would include a dead SignalR connection id (harmless — sends to a
+        //    dead connection are silent no-ops — but pointless).
+        var current = _sessionRegistry.GetByBattleTag(battleTag);
+        if (current == null || current.ConnectionId != session.ConnectionId) return;
+
         // THE RULE (spec §5). A wb blip degrades to a tier-3 profile with FreshFromWb false. Acting on
         // it would replace a good cached ChatUser and broadcast the default avatar to every viewer —
         // converting a transient upstream hiccup into a visible regression for the whole channel. Doing
         // nothing costs nothing: the next successful ping, or the player's next connect, re-enriches.
         if (!resolution.FreshFromWb) return;
 
-        _connections.RegisterUser(session.ConnectionId, resolution.User);
+        // Fix round P2 (finding 3): downstream uses the LIVE SESSION IDENTITY's casing, not the raw
+        // webhook-supplied `battleTag` parameter — matching the connect path (ChatHub.UpsertDirectory,
+        // which always passes identity.BattleTag). The webhook value comes from website-backend's
+        // PersonalSetting.Id / ClanMembership.BattleTag (storage casing) and nothing reconciles it
+        // against the session; DisplayBattleTag is the authoritative display casing read by mention
+        // search (ChatHub.Mentions.cs), so acting on the webhook casing here could overwrite a user's
+        // display casing with storage casing on every flair ping.
+        var liveBattleTag = current.Identity.BattleTag;
+
+        _connections.RegisterUser(current.ConnectionId, resolution.User);
 
         await UserDirectoryUpsert.Apply(
-            _userDirectory, battleTag, resolution, _timeProvider.GetUtcNow().UtcDateTime);
+            _userDirectory, liveBattleTag, resolution, _timeProvider.GetUtcNow().UtcDateTime);
 
-        var payload = new FlairChangedDto(battleTag, ChatProfileMapper.FromChatUser(resolution.User));
+        var payload = new FlairChangedDto(liveBattleTag, ChatProfileMapper.FromChatUser(resolution.User));
 
         // Flair is user-scoped, not channel-scoped: the audience is every connection focused on any
         // channel this player is focused on, deduped, plus their own connection unconditionally so a
         // player focused on nothing still sees their own avatar update.
-        var targets = new HashSet<string>(StringComparer.Ordinal) { session.ConnectionId };
-        foreach (var channelId in _focusRegistry.GetFocusedChannels(session.ConnectionId))
+        var targets = new HashSet<string>(StringComparer.Ordinal) { current.ConnectionId };
+        foreach (var channelId in _focusRegistry.GetFocusedChannels(current.ConnectionId))
         {
             foreach (var connectionId in _focusRegistry.GetFocusedConnections(channelId))
             {

@@ -191,4 +191,84 @@ public class FlairRefresherTests : IntegrationTestBase
         Assert.That(entry, Is.Not.Null);
         Assert.That(entry.Profile.ProfilePicture.PictureId, Is.EqualTo(7));
     }
+
+    // Finding 2 (P2): a player can disconnect WHILE GetUserFromIdentity is in flight. Every side effect
+    // after that await must be skipped, or ConnectionMapping.RegisterUser resurrects an entry that
+    // ChatHub.OnDisconnectedAsync's `finally` already removed — and since disconnect only fires once,
+    // nothing would ever remove it again (an unbounded leak under repeated races).
+    [Test]
+    public async Task Refresh_WhenTheSessionDisconnectsDuringTheAwait_SkipsEverySideEffect()
+    {
+        GoOnline("conn-peter", ChangedTag);
+        _auth.Setup(a => a.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .Returns(async () =>
+            {
+                // Simulate ChatHub.OnDisconnectedAsync's `finally` block running while this call is
+                // in flight: Unregister the session, then remove the connection→user mapping — exactly
+                // what the hub does, in the same order.
+                _sessions.Unregister("conn-peter");
+                _connections.Remove("conn-peter");
+                await Task.Yield();
+                return new ChatUserResolution(UserWith(ChangedTag, AvatarCategory.NE, 7), true);
+            });
+
+        await _refresher.Refresh(ChangedTag);
+
+        Assert.That(_connections.GetUser("conn-peter"), Is.Null,
+            "RegisterUser must not resurrect an entry ChatHub.OnDisconnectedAsync already removed");
+        Assert.That(_harness.AllSignals, Is.Empty,
+            "no FlairChanged may be sent to a connection that disconnected mid-refresh");
+        var entry = await _userDirectory.Load(ChangedTag);
+        Assert.That(entry, Is.Null, "no directory write may happen for a session that is no longer live");
+    }
+
+    // Finding 2 (P2), reconnect variant: the player disconnects AND reconnects under a NEW connection id
+    // while GetUserFromIdentity is in flight. The stale `session` captured before the await must not be
+    // acted on even though a session for the battleTag exists again — it is not the SAME connection.
+    [Test]
+    public async Task Refresh_WhenTheSessionReconnectsUnderANewConnectionDuringTheAwait_SkipsEverySideEffect()
+    {
+        GoOnline("conn-peter-old", ChangedTag);
+        _auth.Setup(a => a.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .Returns(async () =>
+            {
+                _sessions.Unregister("conn-peter-old");
+                _connections.Remove("conn-peter-old");
+                GoOnline("conn-peter-new", ChangedTag);
+                await Task.Yield();
+                return new ChatUserResolution(UserWith(ChangedTag, AvatarCategory.NE, 7), true);
+            });
+
+        await _refresher.Refresh(ChangedTag);
+
+        Assert.That(_connections.GetUser("conn-peter-old"), Is.Null,
+            "the OLD connection's mapping must not be resurrected");
+        Assert.That(_harness.AllSignals, Is.Empty,
+            "the stale pre-await session must not be used to push a FlairChanged");
+    }
+
+    // Finding 3 (P2): the webhook-supplied battleTag can carry website-backend's storage casing, while
+    // the live session identity carries the authoritative display casing. DisplayBattleTag must always
+    // win with the identity's casing — matching the connect path (ChatHub.UpsertDirectory).
+    [Test]
+    public async Task Refresh_UsesTheSessionIdentitysCasing_NotTheWebhookSuppliedCasing()
+    {
+        const string IdentityCasedTag = "Peter#123";
+        const string WebhookCasedTag = "peter#123";
+        GoOnline("conn-peter", IdentityCasedTag);
+        ResolvesTo(UserWith(IdentityCasedTag, AvatarCategory.NE, 7), true);
+
+        await _refresher.Refresh(WebhookCasedTag);
+
+        var entry = await _userDirectory.Load(IdentityCasedTag);
+        Assert.That(entry, Is.Not.Null);
+        Assert.That(entry.DisplayBattleTag, Is.EqualTo(IdentityCasedTag),
+            "the session identity's display casing must win over the webhook-supplied casing");
+
+        var signals = _harness.SignalsFor("conn-peter").Where(s => s.Method == ChatEvents.FlairChanged).ToList();
+        Assert.That(signals, Has.Count.EqualTo(1));
+        var payload = (FlairChangedDto)signals.Single().Payload;
+        Assert.That(payload.BattleTag, Is.EqualTo(IdentityCasedTag),
+            "the pushed FlairChangedDto must also carry the identity's casing, matching the directory write");
+    }
 }
