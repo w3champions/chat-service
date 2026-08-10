@@ -14,15 +14,18 @@ namespace W3ChampionsChatService.Tests;
 /// <summary>
 /// C3 (Task 15) test for the <see cref="FanOutFlushService"/> — the single production
 /// <c>BackgroundService</c> whose 1s <see cref="System.Threading.PeriodicTimer"/> drains the Task 13
-/// <see cref="ActivityCoalescer"/>, Task 14 <see cref="ViewersAccumulator"/>, and the live-flair
-/// <see cref="FlairRefreshCoalescer"/>. The pure aggregator tests
-/// (<see cref="ActivityCoalescerTests"/>/<see cref="ViewersAccumulatorTests"/>/
-/// <see cref="FlairRefreshCoalescerTests"/>) already prove each one's own coalescing/batching decisions;
-/// THIS test proves the OTHER half of acceptance — that the timer loop actually invokes all three drains
-/// in production, not just in unit tests. It drives the REAL participants over the REAL
-/// <see cref="PeriodicTimer"/> path using a <see cref="FakeTimeProvider"/>, so there is NO wall-clock
-/// sleep: advancing the fake clock past every cadence (10s) must produce a coalesced
-/// <c>ChannelActivity</c>, a batched <c>ViewersChanged</c>, AND an observed flair refresh.
+/// <see cref="ActivityCoalescer"/> and Task 14 <see cref="ViewersAccumulator"/>. The pure aggregator
+/// tests (<see cref="ActivityCoalescerTests"/>/<see cref="ViewersAccumulatorTests"/>) already prove each
+/// one's own coalescing/batching decisions; THIS test proves the OTHER half of acceptance — that the
+/// timer loop actually invokes both drains in production, not just in unit tests. It drives the REAL
+/// participants over the REAL <see cref="PeriodicTimer"/> path using a <see cref="FakeTimeProvider"/>, so
+/// there is NO wall-clock sleep: advancing the fake clock past every cadence (10s) must produce a
+/// coalesced <c>ChannelActivity</c> AND a batched <c>ViewersChanged</c>.
+/// <para>
+/// The live-flair <see cref="FlairRefreshCoalescer"/>'s drain coverage lives in
+/// <see cref="FlairRefreshFlushServiceTests"/> — it moved off this service's own dedicated
+/// <see cref="FlairRefreshFlushService"/> (fix round, P1), so it is no longer this service's concern.
+/// </para>
 /// </summary>
 public class FanOutFlushServiceTests
 {
@@ -35,10 +38,6 @@ public class FanOutFlushServiceTests
     // Accumulator arming: a focused viewer whose baseline-not-viewing → now-viewing flush emits a join.
     private const string ViewerConn = "conn-viewer";
     private const string ViewerTag = "Viewer#2";
-
-    // Flair coalescer arming: a battleTag recorded before the service starts, so the timer loop's third
-    // drain must be the thing that gets it refreshed — never invoked directly by the test.
-    private const string FlairTag = "Flair#3";
 
     private static readonly DateTime T0 = new DateTime(2026, 7, 3, 12, 0, 0, DateTimeKind.Utc);
 
@@ -79,16 +78,8 @@ public class FanOutFlushServiceTests
         Assert.AreEqual(0, ViewersChangedFor(harness, ViewerConn).Count,
             "the accumulated join must not emit until the flush service ticks");
 
-        // --- Arm the flair-refresh coalescer: it has no cadence of its own (every pending tag is due on
-        // every flush), so RecordChange before the service even starts is enough to make it due on the
-        // very first tick. The refresher RECORDS what it was asked to refresh, so this test can assert
-        // the timer loop's third drain actually ran — not just that it was constructed.
-        var flairRefresher = new RecordingFlairRefresher();
-        var flairRefreshCoalescer = new FlairRefreshCoalescer(flairRefresher);
-        flairRefreshCoalescer.RecordChange(FlairTag);
-
         var fakeTime = new FakeTimeProvider(new DateTimeOffset(T0, TimeSpan.Zero));
-        var service = new FanOutFlushService(coalescer, accumulator, flairRefreshCoalescer, fakeTime);
+        var service = new FanOutFlushService(coalescer, accumulator, fakeTime);
 
         await service.StartAsync(CancellationToken.None);
         try
@@ -107,12 +98,11 @@ public class FanOutFlushServiceTests
             // never fires the FlushDue calls.
             var flushed = await SpinUntil(() =>
                 harness.SignalCount(MemberConn, ChatEvents.ChannelActivity) >= 2 &&
-                ViewersChangedFor(harness, ViewerConn).Count >= 1 &&
-                flairRefresher.Refreshed.Contains(FlairTag));
+                ViewersChangedFor(harness, ViewerConn).Count >= 1);
 
             Assert.IsTrue(flushed,
-                "the 1s PeriodicTimer loop must invoke all three drains so the pending activity, the " +
-                "accumulated join, and the pending flair refresh all emit");
+                "the 1s PeriodicTimer loop must invoke both drains so the pending activity and the " +
+                "accumulated join both emit");
         }
         finally
         {
@@ -134,12 +124,6 @@ public class FanOutFlushServiceTests
         Assert.IsTrue(batches[0].Joined.Any(v => string.Equals(v.BattleTag, ViewerTag, StringComparison.OrdinalIgnoreCase)),
             "the timer-driven ViewersChanged batch must report the viewer as joined");
         Assert.IsEmpty(batches[0].Left);
-
-        // The flair coalescer's pending tag, recorded before the service even started, flushed via the
-        // same timer path. This is the crux of this test's fix: deleting the flair drain from
-        // FanOutFlushService.ExecuteAsync must make this assertion fail.
-        Assert.That(flairRefresher.Refreshed, Is.EqualTo(new[] { FlairTag }),
-            "the pending flair refresh must be drained exactly once via the timer");
     }
 
     // Bounded, wall-clock-free spin: yields to the scheduler up to maxSpins times, returning true as soon
@@ -157,19 +141,5 @@ public class FanOutFlushServiceTests
             await Task.Yield();
         }
         return condition();
-    }
-
-    // Records what it was asked to refresh, so this test can assert the timer loop's third drain
-    // genuinely ran — the coalescer's own collapsing/budget behaviour is covered by
-    // FlairRefreshCoalescerTests, this class exists only to make the drain OBSERVABLE here.
-    private class RecordingFlairRefresher : IFlairRefresher
-    {
-        public List<string> Refreshed { get; } = new();
-
-        public Task Refresh(string battleTag)
-        {
-            Refreshed.Add(battleTag);
-            return Task.CompletedTask;
-        }
     }
 }

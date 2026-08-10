@@ -166,6 +166,11 @@ public class Startup
         // (10s) and the accumulator (5s) on the injected TimeProvider clock. Without it the pure,
         // deterministic-time sinks above would never fire outside tests.
         services.AddHostedService<FanOutFlushService>();
+        // Fix round (P1): the live-flair drain's OWN hosted service, deliberately separate from
+        // FanOutFlushService above — a website-backend outage during FlairRefreshCoalescer.Flush must
+        // never stall the unrelated ActivityCoalescer/ViewersAccumulator fan-out on a shared loop. See
+        // FlairRefreshFlushService's doc comment.
+        services.AddHostedService<FlairRefreshFlushService>();
 
         // Task 10: JoinChannel's implicit-semiPublic-creation throttle. Singleton — a transient
         // registration would fragment each battleTag's per-hour creation counter across hub
@@ -183,7 +188,7 @@ public class Startup
         services.AddSingleton<IFlairRefresher, FlairRefresher>();
         // Task 5 (live flair propagation): coalesces bursty flair-change notifications into one refresh
         // per flush tick. Singleton — it holds the pending battleTag set that RecordChange (Task 6's
-        // endpoint) writes and FanOutFlushService drains; a transient would fragment that set.
+        // endpoint) writes and FlairRefreshFlushService drains; a transient would fragment that set.
         services.AddSingleton<FlairRefreshCoalescer>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
