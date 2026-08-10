@@ -1,8 +1,10 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using NUnit.Framework;
+using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Internal;
@@ -84,5 +86,27 @@ public class InternalProfileChangesControllerTests
         // No partial processing: one bad entry rejects the batch, and nothing is enqueued.
         Assert.That(_controller.Post(Request("peter#123", invalid)), Is.InstanceOf<BadRequestObjectResult>());
         Assert.That(_coalescer.PendingCount, Is.EqualTo(0));
+    }
+
+    // ── H1 realm-disjointness (Wb-only pin) ──────────────────────────────────────────────────────
+
+    [Test]
+    public void Controller_DeclaresHmacAttribute_WbOnly_NoUserHasPermission()
+    {
+        var type = typeof(InternalProfileChangesController);
+
+        var hmac = type.GetCustomAttribute<InternalHmacAuthAttribute>();
+        Assert.That(hmac, Is.Not.Null,
+            "the profile-changes controller must be HMAC-gated at class level (H1)");
+        Assert.That(hmac.AllowedCallers, Is.EqualTo(new[] { InternalCaller.Wb }),
+            "InternalProfileChangesController must allow EXACTLY Wb (least privilege) — flair refreshes are website-backend's to trigger");
+
+        Assert.That(type.GetCustomAttribute<UserHasPermissionAttribute>(), Is.Null,
+            "internal/* controllers live in the HMAC realm, never the JWT/permission realm");
+        foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+        {
+            Assert.That(method.GetCustomAttribute<UserHasPermissionAttribute>(), Is.Null,
+                $"{type.Name}.{method.Name} must not carry [UserHasPermission] — the two auth realms must stay disjoint");
+        }
     }
 }

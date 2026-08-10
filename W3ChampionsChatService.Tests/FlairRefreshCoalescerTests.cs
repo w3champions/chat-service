@@ -97,14 +97,13 @@ public class FlairRefreshCoalescerTests
     }
 
     [Test]
-    public async Task Flush_WhenOneRefreshThrows_StillRefreshesTheRest()
+    public void Flush_WhenOneRefreshThrows_StillRefreshesTheRest()
     {
         _refresher.Throw = true;
         _coalescer.RecordChange("peter#123");
         _coalescer.RecordChange("alice#456");
 
         Assert.DoesNotThrowAsync(() => _coalescer.Flush());
-        await Task.CompletedTask;
 
         Assert.That(_refresher.Refreshed, Has.Count.EqualTo(2),
             "one player's failed refresh must not cancel everyone else's");
