@@ -82,8 +82,9 @@ public class FanOutEngineTests
     // This overload takes a CALLER-OWNED OnlineMemberRegistry instead of constructing one, so a test can
     // seed it (via Join) both before and after this call returns. It also diverges from the ISessionRegistry
     // overload above in a second way: the ViewersAccumulator here is built with
-    // ViewersAccumulatorTestFactory.EmptyViewerResolver() rather than a real ViewerResolver over the passed
-    // SessionRegistry — safe because no test in this group asserts on viewers or flair, only on activity/preview.
+    // ViewersAccumulatorTestFactory.EmptyViewerResolver() rather than a real ViewerResolver over that
+    // overload's SessionRegistry — safe because no test in this group asserts on viewers or flair, only
+    // on activity/preview.
     private static FanOutEngine NewEngine(HubPushCaptureHarness harness, FocusRegistry focusRegistry, OnlineMemberRegistry onlineMemberRegistry) =>
         new FanOutEngine(
             harness.HubContext,
