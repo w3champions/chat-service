@@ -489,7 +489,7 @@ public class ProtocolContractTests
 
         var dto = MessageDto.ForUserDelivery("chan1", userMessage);
 
-        Assert.That(dto.Kind, Is.EqualTo(MessageKind.User), "an ordinary user message projects as Kind.User");
-        Assert.That(dto.SystemMessage, Is.Null, "an ordinary user message carries no system body");
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.User), "the client needs the discriminator to pick the ordinary-message renderer, not the system one");
+        Assert.That(dto.SystemMessage, Is.Null, "a populated body here would make the client try to render system content for a normal chat line");
     }
 }
