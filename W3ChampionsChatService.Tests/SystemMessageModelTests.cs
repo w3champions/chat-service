@@ -43,14 +43,14 @@ public class SystemMessageModelTests : IntegrationTestBase
 
         var read = await _messages.Load(written.Id);
 
-        Assert.That(read, Is.Not.Null, "persisted system message loads successfully");
+        Assert.That(read, Is.Not.Null, "read failure invalidates all following assertions");
         Assert.That(read.Kind, Is.EqualTo(MessageKind.System), "Kind survives the round-trip");
         Assert.That(read.Sender, Is.Null, "a system message has no sender snapshot");
         Assert.That(read.Content, Is.Null, "a system message carries no free-form content");
-        Assert.That(read.SystemMessage.Key, Is.EqualTo("match_intro"), "system message key survives bson round-trip");
-        Assert.That(read.SystemMessage.Params["map"], Is.EqualTo("Amazonia"), "string params dictionary survives bson round-trip");
+        Assert.That(read.SystemMessage.Key, Is.EqualTo("match_intro"), "key is clients' stable catalogue lookup token");
+        Assert.That(read.SystemMessage.Params["map"], Is.EqualTo("Amazonia"), "scalar params populate the template");
         Assert.That(read.SystemMessage.ListParams["players"], Is.EqualTo(new[] { "Grubby#2136", "Happy#2233" }), "nested list params survive bson round-trip without custom serializer");
-        Assert.That(read.SystemMessage.FallbackText, Does.Contain("Amazonia"), "fallback text survives bson round-trip");
+        Assert.That(read.SystemMessage.FallbackText, Does.Contain("Amazonia"), "fallback text handles unrecognised keys");
     }
 
     [Test]
