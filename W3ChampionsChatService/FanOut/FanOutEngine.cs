@@ -198,15 +198,24 @@ public class FanOutEngine(
             return;
         }
 
-        // C5 (Task 9, D15): DM activity preview. Built ONCE per persisted message (identical for every
-        // Offer call in the loop below) — OQ-7 pins this to `Dm` channels only; GroupDm/Public/System
-        // activity always carries a null Preview. A pending Dm never reaches the Offer call below at all
-        // (the suppression `continue` skips every recipient, and the initiator/sender is skipped just
-        // after it), so this is only ever OFFERED for an accepted Dm — building it unconditionally for
-        // any Dm channel is harmless (it is simply never read for a still-pending one). Sender fields are
-        // REUSED from `dto.Sender` (the same MessageDto already built above for focused delivery) rather
-        // than a fresh lookup — no extra Mongo read.
-        object dmPreview = channel.Type == ChannelType.Dm
+        // C5 (Task 9, D15) + post-game chat Plan A Task 6: the activity preview. Built ONCE per
+        // persisted message (identical for every Offer call in the loop below). Two channel classes
+        // get one:
+        //   - Dm (C5/OQ-7): the original scope. A pending Dm never reaches the Offer call below at all,
+        //     so this is only ever OFFERED for an accepted Dm.
+        //   - System + Match (post-game chat): the client's ONE-TIME nudge toast after the score screen
+        //     closes needs a sender and an excerpt; without a preview it has nothing to render, which is
+        //     precisely why post-game messages were previously silent.
+        // GroupDm / Public / SemiPublic / System+Clan deliberately stay preview-free — a busy lounge or
+        // clan room keeps its badge-only treatment. Sender fields are REUSED from `dto.Sender` (the
+        // MessageDto already built above) rather than a fresh lookup — no extra Mongo read.
+        // The User conjunct is LOAD-BEARING, not defensive: SystemMessagePublisher calls this method on
+        // exactly a System+Match channel, and a system message's Sender is null — without it the
+        // dto.Sender dereference below is a guaranteed NullReferenceException on every published intro.
+        var wantsPreview = message.Kind == MessageKind.User
+            && (channel.Type == ChannelType.Dm
+                || (channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match));
+        object activityPreview = wantsPreview
             ? new DmActivityPreviewDto(dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content))
             : null;
 
@@ -251,7 +260,7 @@ public class FanOutEngine(
                 continue;
             }
 
-            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, dmPreview);
+            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, activityPreview);
         }
     }
 
