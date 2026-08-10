@@ -15,12 +15,17 @@ namespace W3ChampionsChatService.Tests;
 /// C3 (Task 15) test for the <see cref="FanOutFlushService"/> — the single production
 /// <c>BackgroundService</c> whose 1s <see cref="System.Threading.PeriodicTimer"/> drains the Task 13
 /// <see cref="ActivityCoalescer"/> and Task 14 <see cref="ViewersAccumulator"/>. The pure aggregator
-/// tests (<see cref="ActivityCoalescerTests"/>/<see cref="ViewersAccumulatorTests"/>) already prove the
-/// coalescing/batching decisions against explicit <c>now</c> values; THIS test proves the OTHER half of
-/// acceptance — that the timer loop actually invokes <c>FlushDue(now)</c> in production, not just in
-/// unit tests. It drives the REAL aggregators over the REAL <see cref="PeriodicTimer"/> path using a
-/// <see cref="FakeTimeProvider"/>, so there is NO wall-clock sleep: advancing the fake clock past both
-/// cadences (10s) must produce BOTH a coalesced <c>ChannelActivity</c> and a batched <c>ViewersChanged</c>.
+/// tests (<see cref="ActivityCoalescerTests"/>/<see cref="ViewersAccumulatorTests"/>) already prove each
+/// one's own coalescing/batching decisions; THIS test proves the OTHER half of acceptance — that the
+/// timer loop actually invokes both drains in production, not just in unit tests. It drives the REAL
+/// participants over the REAL <see cref="PeriodicTimer"/> path using a <see cref="FakeTimeProvider"/>, so
+/// there is NO wall-clock sleep: advancing the fake clock past every cadence (10s) must produce a
+/// coalesced <c>ChannelActivity</c> AND a batched <c>ViewersChanged</c>.
+/// <para>
+/// The live-flair <see cref="FlairRefreshCoalescer"/>'s drain coverage lives in
+/// <see cref="FlairRefreshFlushServiceTests"/> — it moved off this service's own dedicated
+/// <see cref="FlairRefreshFlushService"/> (fix round, P1), so it is no longer this service's concern.
+/// </para>
 /// </summary>
 public class FanOutFlushServiceTests
 {
@@ -96,7 +101,8 @@ public class FanOutFlushServiceTests
                 ViewersChangedFor(harness, ViewerConn).Count >= 1);
 
             Assert.IsTrue(flushed,
-                "the 1s PeriodicTimer loop must invoke BOTH FlushDue methods so the pending activity and the accumulated join emit");
+                "the 1s PeriodicTimer loop must invoke both drains so the pending activity and the " +
+                "accumulated join both emit");
         }
         finally
         {

@@ -422,22 +422,16 @@ public class InternalChannelsController(
     private static bool IsValidMembers(List<string> members) =>
         members != null
         && members.Count <= ChatLimits.InternalMaxMembersPerCall
-        && members.All(IsValidIdentityText);
+        && members.All(IsValidMemberEntry);
 
-    // 2026-08-05 fix wave (final review M5): mirrors InternalRelationshipChangesController's
-    // IsValidParticipant EXACTLY — non-blank AND control-char-free. Before this, a member entry was
-    // bounded only by the 64 KB body cap and landed as a lowercased Mongo BattleTag key with no
-    // per-entry length or control-char guard, asymmetric with the relationship-changes surface's
-    // identical-shaped field. char.IsControl catches an embedded '\n'/'\r'/'\t'/NUL; U+2028/U+2029 are
-    // checked explicitly because they are category Zl/Zp, not Cc, so char.IsControl alone misses them.
-    // Named for the SHAPE of what it guards — an IDENTITY entry, non-blank because a blank battleTag is
-    // a missing identity with nothing to normalize it into — not for `members`, its only caller today.
-    // Final review M3: deliberately NOT shared with the system-message param/list-item guard below
-    // (IsValidDisplayText) — that guard had to become MORE permissive (blank/null allowed) once a
-    // param value turned out to be display text `fallbackText` already covers, not an identity like
-    // this one. Split rather than weakened, so `members` keeps its non-blank guarantee unchanged.
-    private static bool IsValidIdentityText(string value) =>
-        !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
+    // A member entry is an IDENTITY: non-blank (a blank battleTag is a missing identity with nothing to
+    // normalize it into) and control-char-free -- the rule InternalValidation owns for every internal/*
+    // surface, deduplicated there by the live-flair change. Post-game chat final review M3: it is
+    // deliberately NOT shared with the system-message param/list-item guard below (IsValidDisplayText).
+    // That guard had to become MORE permissive (blank/null accepted) once a param value turned out to be
+    // display text `fallbackText` already covers, not an identity like this one. Split rather than
+    // weakened, so `members` keeps its non-blank guarantee unchanged.
+    private static bool IsValidMemberEntry(string value) => InternalValidation.IsValidBattleTag(value);
 
     // System-message params. A null dictionary means "no params" and is always legal. Keys get the
     // identifier class (they become BSON element names on the persisted body AND client catalogue

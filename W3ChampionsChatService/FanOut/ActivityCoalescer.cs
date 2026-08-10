@@ -80,11 +80,12 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// burst emits the most recent message's preview, mirroring the latest-seq-only coalescing.
     /// </para>
     /// </summary>
-    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null)
+    public async Task Offer(string connectionId, string channelId, long lastSeq, DateTime now, object preview = null, DateTime? sentAt = null)
     {
         bool emit;
         long emitSeq = 0;
         object emitPreview = null;
+        DateTime? emitSentAt = null;
 
         lock (_lock)
         {
@@ -99,19 +100,45 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 channels[channelId] = entry;
             }
 
-            // Latest NON-NULL offered preview, regardless of which branch fires below — a coalesced
-            // burst's pending reflects the MOST RECENT message that HAD a preview.
-            // The null guard is load-bearing, not tidiness: since post-game chat Plan A Task 6 a
-            // preview-eligible channel also carries preview-FREE traffic (a server-authored system
-            // message has no sender, so FanOutEngine offers null). Unconditional latest-wins would let
-            // such a message, landing inside the 10s window AFTER a real user message, blank that
-            // message's pending preview — the client would then get a bare badge and the post-game
-            // message would go unnoticed, the exact failure this feature exists to prevent.
-            // Non-behaviour-changing for every pre-existing path: a Dm always offers non-null, and a
-            // preview-free channel only ever offers null onto an already-null entry.
-            if (preview != null)
+            // Highest-offered NON-NULL preview. Two independent rules are in force, and both are
+            // load-bearing.
+            //
+            // HIGHEST-SEQ, NOT LATEST-ARRIVAL: (Preview, SentAt) describe ONE message and are written
+            // and drained together, or a client would pair one message's text with another's timestamp.
+            // They are kept for the HIGHEST seq offered rather than the most recently offered, because
+            // that is the seq the emit below selects: concurrent same-channel sends can reach this lock
+            // out of order, and a latest-arrival-wins rule would then emit the higher seq carrying the
+            // LOWER message's text and timestamp — a row showing the second-newest message, pinned at a
+            // seq the newest message can no longer replace. Coalescing a burst still keeps the newest of
+            // it, since a burst that arrives in order offers ascending seqs.
+            //
+            // NULL NEVER WINS: since post-game chat Plan A Task 6 a preview-eligible channel also
+            // carries preview-FREE traffic (a server-authored system message has no sender, so
+            // FanOutEngine offers null). Letting a null through the seq comparison would blank a real
+            // user message's pending preview whenever the system message landed inside the same 10s
+            // window — the client would get a bare badge and the post-game message would go unnoticed,
+            // the exact failure this feature exists to prevent. A null offer therefore records NOTHING,
+            // and in particular does not advance PreviewSeq: the pair and the seq it is aligned to have
+            // to stay consistent with each other. Non-behaviour-changing for every pre-existing path —
+            // a Dm always offers non-null, and a preview-free channel only ever offers null onto an
+            // already-null entry.
+            // SentAt is tracked SEPARATELY from Preview, each against its own seq, because the two have
+            // different eligibility: every message carries a timestamp (the client's live ordering signal
+            // for EVERY channel type — a lounge or group conversation needs its sort position updated just
+            // as much as a 1:1 one), while only some carry a preview. Folding them into one write would
+            // force a choice between dropping the timestamp of a preview-free message and letting that
+            // message blank a pending preview; splitting them costs one long and owes nothing.
+            if (lastSeq >= entry.SentAtSeq)
+            {
+                entry.SentAt = sentAt;
+                entry.SentAtSeq = lastSeq;
+            }
+
+            if (preview != null && lastSeq >= entry.PreviewSeq)
             {
                 entry.Preview = preview;
+                entry.PreviewSeq = lastSeq;
+                entry.PreviewDelivered = false;
             }
 
             if (now - entry.LastSentAt >= ChatLimits.ChannelActivityCoalesce)
@@ -126,7 +153,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                 entry.HasPending = false;
                 entry.PendingLastSeq = 0;
                 entry.LastEmittedSeq = emitSeq;
-                emitPreview = entry.Preview;
+                emitPreview = TakePreview(entry, emitSeq);
+                emitSentAt = entry.SentAt;
                 emit = true;
             }
             else
@@ -142,7 +170,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
 
         if (emit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview);
+            await EmitIfNotSuppressed(connectionId, channelId, emitSeq, emitPreview, emitSentAt);
         }
     }
 
@@ -152,12 +180,13 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// the window, and clears the pending. Driven by Task 15's 1s-granularity flush service; because it
     /// only emits when ≥10s has elapsed since the last emit, the per-(conn,channel) spacing floor holds.
     /// C5 (Task 9, D15) + Plan A Task 6: the flush carries whatever <see cref="Entry.Preview"/> holds at
-    /// drain time — the latest NON-NULL one <see cref="Offer"/> recorded for the burst, mirroring the
-    /// latest-seq-only coalescing.
+    /// drain time — the HIGHEST-seq non-null one <see cref="Offer"/> recorded for the burst, mirroring
+    /// the latest-seq-only coalescing — and then <see cref="ClearPreview"/>s the entry, so the preview is
+    /// delivered exactly once and cannot resurface against a later, unrelated seq.
     /// </summary>
     public async Task FlushDue(DateTime now)
     {
-        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview)> toEmit = null;
+        List<(string ConnectionId, string ChannelId, long LastSeq, object Preview, DateTime? SentAt)> toEmit = null;
 
         lock (_lock)
         {
@@ -175,8 +204,8 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
                         entry.PendingLastSeq = 0;
                         entry.LastEmittedSeq = seq;
 
-                        (toEmit ??= new List<(string, string, long, object)>())
-                            .Add((connectionId, channelId, seq, entry.Preview));
+                        (toEmit ??= new List<(string, string, long, object, DateTime?)>())
+                            .Add((connectionId, channelId, seq, TakePreview(entry, seq), entry.SentAt));
                     }
                 }
             }
@@ -187,9 +216,9 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        foreach (var (connectionId, channelId, lastSeq, preview) in toEmit)
+        foreach (var (connectionId, channelId, lastSeq, preview, sentAt) in toEmit)
         {
-            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview);
+            await EmitIfNotSuppressed(connectionId, channelId, lastSeq, preview, sentAt);
         }
     }
 
@@ -231,7 +260,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// rides straight onto the payload — null for every channel class that is not preview-eligible, and
     /// for C3-era callers that never pass one.
     /// </summary>
-    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null)
+    private async Task EmitIfNotSuppressed(string connectionId, string channelId, long lastSeq, object preview = null, DateTime? sentAt = null)
     {
         // A connection with no live membership entry for the channel (left/disconnected between offer
         // and emit) is not a valid recipient — skip. The window was already advanced by the caller.
@@ -247,7 +276,7 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
             return;
         }
 
-        var payload = new ChannelActivityDto(channelId, lastSeq, preview);
+        var payload = new ChannelActivityDto(channelId, lastSeq, preview, sentAt);
 
         try
         {
@@ -271,6 +300,47 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
     /// that latest-wins discipline, except that <see cref="Offer"/> only overwrites it with a NON-NULL
     /// offer, so a preview-free message in a preview-eligible channel cannot blank a pending preview.
     /// </summary>
+    /// <summary>
+    /// The preview to put on the activity emitting <paramref name="emitSeq"/>, and the bookkeeping that
+    /// goes with handing it out. Called by BOTH emit paths, under <see cref="_lock"/>.
+    /// <para>
+    /// The entry RETAINS its preview after an emit rather than clearing it, because the emitted seq is a
+    /// running max: an out-of-order lower offer can leave the same seq pending, and the flush that
+    /// drains it has to re-send the caption belonging to that seq rather than the delayed lower
+    /// message's. That retention is what makes a stale preview reachable, and it is why this is a method
+    /// and not a field read.
+    /// </para>
+    /// <para>
+    /// A retained preview is handed out again ONLY while it still describes the newest thing the client is
+    /// being told about — <c>PreviewSeq >= emitSeq</c>. Once it has been delivered and the channel has
+    /// moved on to a HIGHER seq that brought no preview of its own, it is withheld. That case is not
+    /// hypothetical since post-game chat Plan A Task 6: a preview-eligible channel now also carries
+    /// preview-FREE traffic (a server-authored system message has no sender, so <see cref="FanOutEngine"/>
+    /// offers null), and without this a system message arriving any time later — one second or one hour —
+    /// would re-emit the already-delivered sender/excerpt against its own much higher seq. The client
+    /// would show a duplicate post-game notification captioned with a message it was already told about,
+    /// and, worse, would arm a nudge off an activity that was supposed to carry no preview at all.
+    /// </para>
+    /// <para>
+    /// The <c>!PreviewDelivered</c> disjunct is what keeps that withholding from swallowing a preview
+    /// that has never been sent: a user message sitting PENDING inside the window, followed by a system
+    /// message that bumps the pending seq past it, must still emit the user message's caption — a bare
+    /// badge there is precisely the "post-game message goes unnoticed" failure this feature exists to
+    /// prevent. Pending-and-undelivered therefore always wins; only an already-delivered pair is subject
+    /// to the seq test.
+    /// </para>
+    /// </summary>
+    private static object TakePreview(Entry entry, long emitSeq)
+    {
+        if (entry.Preview == null || (entry.PreviewDelivered && entry.PreviewSeq < emitSeq))
+        {
+            return null;
+        }
+
+        entry.PreviewDelivered = true;
+        return entry.Preview;
+    }
+
     private sealed class Entry
     {
         internal DateTime LastSentAt;
@@ -278,5 +348,17 @@ public class ActivityCoalescer(IHubContext<ChatHub> hubContext, OnlineMemberRegi
         internal long PendingLastSeq;
         internal long LastEmittedSeq;
         internal object Preview;
+        internal DateTime? SentAt;
+        /// <summary>The seq <see cref="SentAt"/> came from. Tracked apart from <see cref="PreviewSeq"/>
+        /// because every message offers a timestamp but only some offer a preview.</summary>
+        internal long SentAtSeq;
+        /// <summary>The seq the current <see cref="Preview"/>/<see cref="SentAt"/> pair describes — keeps
+        /// them aligned with the highest offered seq when offers arrive out of order.</summary>
+        internal long PreviewSeq;
+        /// <summary>Whether the current pair has already ridden out on an emit. Reset every time a new
+        /// non-null preview replaces it. Read only by <see cref="TakePreview"/>, which uses it to tell a
+        /// never-sent pending caption (always emitted) from an already-delivered one (withheld once a
+        /// higher, preview-free seq supersedes it).</summary>
+        internal bool PreviewDelivered;
     }
 }

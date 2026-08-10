@@ -1113,21 +1113,27 @@ public class FanOutEngineTests
         var channel = new ChatChannel { Id = "chan-match", Type = ChannelType.System, SystemKind = SystemChannelKind.Match };
         onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
 
-        // #1 opens the 10s coalescing window and emits immediately.
+        // #1 opens the 10s coalescing window and emits immediately, carrying its own preview.
         await engine.OnMessagePersisted(
             channel,
-            new ChannelMessage { Id = "m1", ChannelId = channel.Id, Seq = 1, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "gg wp", SentAt = Now },
+            new ChannelMessage { Id = "m1", ChannelId = channel.Id, Seq = 1, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "opener", SentAt = Now },
             senderConnectionId: "conn-alice", isShadow: false, Now);
 
-        // #2 lands 1s later — INSIDE the window, so it coalesces into the pending rather than emitting.
-        // mm may publish a system message at any instant (Plan B already names a second trigger), and a
-        // system message offers a null preview. Unconditional latest-wins would blank the user message's
-        // pending preview and the flush would emit a bare badge — the post-game message goes unnoticed,
-        // the exact failure this feature exists to prevent.
+        // #2 lands INSIDE the window, so it coalesces into the pending and its preview is never sent.
         await engine.OnMessagePersisted(
             channel,
-            new ChannelMessage { Id = "m2", ChannelId = channel.Id, Seq = 2, Kind = MessageKind.System, SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" }, SentAt = Now.AddSeconds(1) },
-            senderConnectionId: null, isShadow: false, Now.AddSeconds(1));
+            new ChannelMessage { Id = "m2", ChannelId = channel.Id, Seq = 2, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "gg wp", SentAt = Now.AddSeconds(1) },
+            senderConnectionId: "conn-alice", isShadow: false, Now.AddSeconds(1));
+
+        // #3 lands 1s later, still inside the window, and offers a NULL preview (a system message has no
+        // sender). mm may publish one at any instant — Plan B names two triggers. Unconditional
+        // latest-wins would blank #2's still-unsent preview and the flush would emit a bare badge, so the
+        // post-game message goes unnoticed: the exact failure this feature exists to prevent. #2's
+        // preview has never been delivered, so it must survive #3 and ride out on the drain.
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m3", ChannelId = channel.Id, Seq = 3, Kind = MessageKind.System, SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" }, SentAt = Now.AddSeconds(2) },
+            senderConnectionId: null, isShadow: false, Now.AddSeconds(2));
 
         await coalescer.FlushDue(Now + ChatLimits.ChannelActivityCoalesce);
 
@@ -1136,10 +1142,60 @@ public class FanOutEngineTests
             .Select(s => s.Payload)
             .OfType<ChannelActivityDto>()
             .Last();
-        Assert.That(flushed.LastSeq, Is.EqualTo(2), "sanity: the flush is the coalesced burst's drain, carrying the latest seq");
+        Assert.That(flushed.LastSeq, Is.EqualTo(3), "sanity: the flush is the coalesced burst's drain, carrying the latest seq");
         var preview = flushed.Preview as ActivityPreviewDto;
         Assert.That(preview, Is.Not.Null,
             "a preview-free system message inside the window must not blank the user message's pending preview");
         Assert.That(preview.Excerpt, Is.EqualTo("gg wp"), "the surviving preview must be the last one that actually HAD content");
+    }
+
+    [Test]
+    public async Task SystemMessageAfterADeliveredPreview_DoesNotResurrectIt()
+    {
+        // The mirror image of the test above, and the reason the coalescer tracks whether a preview has
+        // already ridden out. A preview is RETAINED after its emit (an out-of-order lower offer can leave
+        // the same seq pending, and the drain has to re-send that seq's caption rather than the delayed
+        // lower message's). Retention makes a stale preview reachable: without the delivered check, a
+        // system message arriving any time later — one second or one hour — would find the
+        // already-delivered sender/excerpt still sitting in the entry and re-emit it under its own, much
+        // higher seq. The client would show a duplicate post-game notification captioned with a message
+        // it was already told about, and would arm a nudge off an activity that is supposed to carry no
+        // preview at all.
+        var harness = new HubPushCaptureHarness();
+        var focusRegistry = new FocusRegistry();
+        var onlineMemberRegistry = new OnlineMemberRegistry();
+        var coalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
+        var engine = new FanOutEngine(
+            harness.HubContext, focusRegistry, onlineMemberRegistry, coalescer, new SessionRegistry(),
+            new PresenceInterestRegistry(),
+            new ViewersAccumulator(harness.HubContext, focusRegistry, ViewersAccumulatorTestFactory.EmptyViewerResolver()),
+            TimeProvider.System);
+
+        var channel = new ChatChannel { Id = "chan-match", Type = ChannelType.System, SystemKind = SystemChannelKind.Match };
+        onlineMemberRegistry.Join(channel.Id, "conn-bob", new MemberState("Bob#1", NotificationLevel.All, 0, ChannelType.System));
+
+        // The user message opens the window and emits immediately — its preview is DELIVERED here.
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m1", ChannelId = channel.Id, Seq = 1, Sender = new MessageSender { BattleTag = "Alice#1", Name = "Alice" }, Content = "gg wp", SentAt = Now },
+            senderConnectionId: "conn-alice", isShadow: false, Now);
+
+        // A system message a full window later: its own emit, its own seq, and no preview of its own.
+        var later = Now + ChatLimits.ChannelActivityCoalesce + TimeSpan.FromSeconds(1);
+        await engine.OnMessagePersisted(
+            channel,
+            new ChannelMessage { Id = "m2", ChannelId = channel.Id, Seq = 2, Kind = MessageKind.System, SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" }, SentAt = later },
+            senderConnectionId: null, isShadow: false, later);
+
+        var activities = harness.AllSignals
+            .Where(s => s.ConnectionId == "conn-bob" && s.Method == ChatEvents.ChannelActivity)
+            .Select(s => s.Payload)
+            .OfType<ChannelActivityDto>()
+            .ToList();
+        Assert.That(activities.Count, Is.EqualTo(2), "sanity: two emits, one per window");
+        Assert.That((activities[0].Preview as ActivityPreviewDto)?.Excerpt, Is.EqualTo("gg wp"),
+            "sanity: the user message's own emit carries its preview");
+        Assert.That(activities[1].Preview, Is.Null,
+            "the system message's activity must carry NO preview — the already-delivered one must not ride out again under its seq");
     }
 }

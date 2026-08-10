@@ -284,26 +284,8 @@ public partial class ChatHub(
     // ChatUser's flair. Non-fatal: a directory write must never fail a connect. `now` is the caller's
     // single injected-clock read (OnConnectedAsync) — routed through, not read again here, so this
     // stays on the SAME TimeProvider clock as the rest of the connect path.
-    private async Task UpsertDirectory(W3CUserAuthentication identity, ChatUserResolution resolution, DateTime now)
-    {
-        try
-        {
-            var entry = await _userDirectory.Load(identity.BattleTag)
-                ?? new UserDirectoryEntry { BattleTag = identity.BattleTag };
-            entry.DisplayBattleTag = identity.BattleTag;
-            entry.NormalizedName = identity.BattleTag?.Trim().ToLowerInvariant();
-            entry.LastSeenAt = now;
-            if (resolution.FreshFromWb)
-            {
-                entry.Profile = ChatProfileMapper.FromChatUser(resolution.User);
-            }
-            await _userDirectory.Upsert(entry);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "Failed to upsert user_directory entry for {BattleTag}", identity.BattleTag);
-        }
-    }
+    private Task UpsertDirectory(W3CUserAuthentication identity, ChatUserResolution resolution, DateTime now) =>
+        UserDirectoryUpsert.Apply(_userDirectory, identity.BattleTag, resolution, now);
 
     // C5 (Task 1): best-effort connect-time friend-presence push. Deliberately fire-and-forget — the
     // caller does NOT await it, so a slow/unreachable wb read never adds latency to (or fails) a connect.
