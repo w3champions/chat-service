@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Time.Testing;
+using MongoDB.Driver;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
@@ -70,10 +72,15 @@ public class SystemMessagePublisherTests : IntegrationTestBase
     public async Task Publish_PersistsSystemMessage_AllocatesSeq_AdvancesLastMessageAt()
     {
         var channel = await NewMatchChannel();
+        // Advanced BEFORE publish: FindOrCreateSystem's SetOnInsert already stamped LastMessageAt/SentAt
+        // at T0, so a frozen clock would let AllocateSeq skip its own stamp and the assertions below
+        // would still pass against the creation-time value — this is the only way to prove AllocateSeq
+        // (not FindOrCreateSystem) is what advanced them.
+        _time.Advance(TimeSpan.FromHours(1));
 
-        var result = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
+        var result = await _publisher.Publish(channel, Intro(), dedupeKey: null);
 
-        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "a fresh publish must report Ok, not a partial-write code");
         Assert.That(result.Seq, Is.EqualTo(1), "the first message in a fresh channel gets seq 1");
 
         var stored = await _messageRepository.Load(result.MessageId);
@@ -93,6 +100,11 @@ public class SystemMessagePublisherTests : IntegrationTestBase
     {
         var channel = await NewMatchChannel();
         var expiryBefore = channel.ExpiresAt;
+        // Advanced BEFORE publish: at a frozen clock, a re-stamp with shellExpiresAt: now would write the
+        // IDENTICAL value FindOrCreateSystem already wrote, and this assertion would pass even under the
+        // exact mutation (shellExpiresAt: null -> ExpiryCalculator.ForChannelShell(channel, now)) D6 exists
+        // to forbid. Advancing the clock makes a re-stamp observably move ExpiresAt.
+        _time.Advance(TimeSpan.FromHours(1));
 
         await _publisher.Publish(channel, Intro(), dedupeKey: null);
 
@@ -110,7 +122,7 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         var first = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
         var second = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
 
-        Assert.That(second.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(second.Code, Is.EqualTo(ChatResultCode.Ok), "a dedupe retry is a success, not a conflict — the caller asked that the message exist");
         Assert.That(second.MessageId, Is.EqualTo(first.MessageId), "a retry returns the original message");
         Assert.That(second.Seq, Is.EqualTo(first.Seq), "a retry must not allocate or return a new seq");
 
@@ -130,7 +142,9 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         await _publisher.Publish(channel, Intro(), dedupeKey: null);
 
         Assert.That(_harness.SignalCount("conn-alice", ChatEvents.MessageReceived), Is.EqualTo(1), "a focused member must receive exactly one MessageReceived push");
-        var dto = _harness.PayloadFor("conn-alice", ChatEvents.MessageReceived) as MessageDto;
+        var payload = _harness.PayloadFor("conn-alice", ChatEvents.MessageReceived);
+        Assert.That(payload, Is.TypeOf<MessageDto>(), "the pushed payload for a MessageReceived push must be a MessageDto");
+        var dto = (MessageDto)payload;
         Assert.That(dto.Kind, Is.EqualTo(MessageKind.System), "the pushed payload must carry the System kind");
         Assert.That(dto.SystemMessage.FallbackText, Does.Contain("Amazonia"), "the pushed payload must carry the structured system body");
     }
@@ -147,5 +161,71 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         var all = await _messageRepository.LoadForModerator(channel.Id);
         Assert.That(all, Has.Count.EqualTo(2),
             "dedupe is opt-in — a caller that wants repeated system messages passes no key");
+    }
+
+    [Test]
+    public async Task Publish_WithEmptyDedupeKey_AllowsRepeats()
+    {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        var channel = await NewMatchChannel();
+
+        await _publisher.Publish(channel, Intro(), dedupeKey: "");
+        await _publisher.Publish(channel, Intro(), dedupeKey: "");
+
+        var all = await _messageRepository.LoadForModerator(channel.Id);
+        Assert.That(all, Has.Count.EqualTo(2),
+            "an empty string is normalized to \"no dedupe key\", the same as null — it must never be written to DedupeKey or dedupe against itself");
+        Assert.That(all, Has.All.Matches<ChannelMessage>(m => m.DedupeKey == null),
+            "an empty-string dedupeKey argument must never reach ChannelMessage.DedupeKey as a stored empty string");
+    }
+
+    [Test]
+    public async Task Publish_WithNullChannel_ReturnsNotFound()
+    {
+        var result = await _publisher.Publish(null, Intro(), dedupeKey: null);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.NotFound), "a null channel must be reported as NotFound, not throw or silently no-op");
+        Assert.That(result.MessageId, Is.Null, "a NotFound result must carry no message id");
+        Assert.That(result.Seq, Is.EqualTo(0), "a NotFound result must carry no seq");
+    }
+
+    // Forces the FIRST LoadByDedupeKey call (the publisher's pre-check) to miss regardless of what is
+    // actually stored, so a Publish call proceeds past the pre-check into AllocateSeq + Insert even
+    // though a same-keyed row already exists — reproducing the genuine concurrent race without timing
+    // or real parallelism. Every call after the first delegates to the real lookup, so the duplicate-key
+    // catch's own LoadByDedupeKey call sees the true winner.
+    private sealed class MissOnceMessageRepository(MongoClient mongoClient) : MessageRepository(mongoClient)
+    {
+        private int _callCount;
+
+        public override Task<ChannelMessage> LoadByDedupeKey(string channelId, string dedupeKey) =>
+            Interlocked.Increment(ref _callCount) == 1
+                ? Task.FromResult<ChannelMessage>(null)
+                : base.LoadByDedupeKey(channelId, dedupeKey);
+    }
+
+    [Test]
+    public async Task Publish_DuplicateKeyRace_ReturnsWinnersMessage_NotAnException()
+    {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        var channel = await NewMatchChannel();
+
+        // Seed the "winner" via a normal publish — this is the row the racing call below will collide with.
+        var winner = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
+
+        var racingRepository = new MissOnceMessageRepository(MongoClient);
+        var racingPublisher = new SystemMessagePublisher(racingRepository, _channelRepository, _fanOutEngine, _time);
+
+        // racingRepository's pre-check (call #1) is forced to miss despite the winner already existing,
+        // so this proceeds to AllocateSeq + Insert, which collides on ux_channelId_dedupeKey and must be
+        // resolved by the duplicate-key catch — including its own (real, call #2) LoadByDedupeKey lookup.
+        var result = await racingPublisher.Publish(channel, Intro(), dedupeKey: "match_intro");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "a duplicate-key race must resolve to Ok, not surface the write exception");
+        Assert.That(result.MessageId, Is.EqualTo(winner.MessageId), "the race must return the winner's message, not mint a second one");
+        Assert.That(result.Seq, Is.EqualTo(winner.Seq), "the race must return the winner's seq, not the seq this call itself allocated and orphaned");
+
+        var all = await _messageRepository.LoadForModerator(channel.Id);
+        Assert.That(all, Has.Count.EqualTo(1), "the loser's insert must never have landed a second row for the same key");
     }
 }

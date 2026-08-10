@@ -30,7 +30,8 @@ public record SystemMessagePublishResult(ChatResultCode Code, string MessageId, 
 /// inert in fan-out (it only ever participates in reference comparisons).
 /// </para>
 /// <para>
-/// IDEMPOTENCY: when <c>dedupeKey</c> is non-null the publish is at-most-once per (channel, key). The
+/// IDEMPOTENCY: when <c>dedupeKey</c> is non-null (and non-empty — an empty string is normalized to
+/// null up front, exactly like "no key") the publish is at-most-once per (channel, key). The
 /// pre-check handles the common retry; the duplicate-key catch handles a genuine concurrent race, since
 /// the seq allocation and the insert are not one atomic unit. A race burns a seq number — harmless,
 /// because paging is seq-ANCHORED and never assumes contiguity.
@@ -48,6 +49,11 @@ public class SystemMessagePublisher(
         {
             return new SystemMessagePublishResult(ChatResultCode.NotFound, null, 0);
         }
+
+        // Normalized once, here, so the pre-check, the insert, and the duplicate-key catch all agree
+        // on the same value — an empty string must never reach ChannelMessage.DedupeKey (it would be
+        // indexed and would silently dedupe every empty-key system message in the channel together).
+        dedupeKey = string.IsNullOrEmpty(dedupeKey) ? null : dedupeKey;
 
         if (dedupeKey != null)
         {
