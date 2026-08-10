@@ -162,7 +162,10 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         // exact env-only seam Startup.cs builds in production.
         _secrets = new InternalCallerSecrets(MmSecret, WbSecret);
 
-        _channelsController = new InternalChannelsController(_matchChannelService)
+        // Task 4's SystemMessagePublisher is wired over the SAME repositories/registries as everything
+        // else in this suite — no mock, the real publish→persist→fan-out path.
+        var systemMessagePublisher = new SystemMessagePublisher(_messageRepository, _channelRepository, _fanOutEngine, _time);
+        _channelsController = new InternalChannelsController(_matchChannelService, _channelRepository, systemMessagePublisher)
         {
             ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() },
         };
@@ -314,6 +317,21 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         var dto = await JsonSerializer.DeserializeAsync<InternalEpochSyncRequest>(http.Request.Body, JsonOptions);
         _channelsController.ControllerContext.HttpContext = http;
         return await _channelsController.EpochSync(dto);
+    }
+
+    // Task 4 — the system-message publish route, same hand-signed-through-the-real-filter idiom as the
+    // create/roster/epoch-sync helpers above.
+    private async Task<IActionResult> PostSystemMessage(string @ref, string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
+    {
+        var (passed, http) = await ThroughFilter("POST", $"/internal/channels/{@ref}/system-message", Utf8(bodyJson), secret, timestamp, allowed ?? MmOnlyAllowed);
+        if (!passed)
+        {
+            return new UnauthorizedResult();
+        }
+
+        var dto = await JsonSerializer.DeserializeAsync<InternalSystemMessageRequest>(http.Request.Body, JsonOptions);
+        _channelsController.ControllerContext.HttpContext = http;
+        return await _channelsController.PublishSystemMessage(@ref, dto);
     }
 
     private async Task<IActionResult> PostRelationshipChange(string bodyJson, string secret, string timestamp, InternalCaller[] allowed = null)
@@ -816,5 +834,79 @@ public class InternalApiIntegrationTests : IntegrationTestBase
         Assert.That(createDto.Id, Is.EqualTo(shell.Id), "the create resolves to the SAME shell channel");
         Assert.That(createDto.Name, Is.EqualTo("Real Match Name"), "the real create backfills the placeholder name");
         Assert.That(createDto.ExpiresAt, Is.EqualTo(shellExpiry), "the create does NOT reset the shell's own creation-anchored expiry");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+    // Task 4 — POST /internal/channels/{ref}/system-message: lookup-only publish into an EXISTING
+    // match channel, proved through the REAL HMAC filter + REAL controller + REAL SystemMessagePublisher.
+    // ════════════════════════════════════════════════════════════════════════════════════════════
+
+    [Test]
+    public async Task SystemMessage_PublishesIntoAnExistingMatchChannel()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-1\",\"name\":\"Sys Match\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>(), "precondition: the match channel must exist before the system-message publish is exercised");
+
+        var messageBody = "{\"key\":\"match_intro\",\"params\":{\"map\":\"Amazonia\"},"
+            + "\"listParams\":{\"players\":[\"Grubby#2136\",\"Happy#2233\"]},"
+            + "\"fallbackText\":\"Match on Amazonia \\u2014 Grubby#2136, Happy#2233\",\"dedupeKey\":\"match_intro\"}";
+
+        var result = await PostSystemMessage("match-sys-1", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<OkResult>(), "a valid signed system-message publish into an existing channel returns a body-free 200");
+    }
+
+    [Test]
+    public async Task SystemMessage_UnknownRef_Is404_AndCreatesNothing()
+    {
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\"}";
+
+        var result = await PostSystemMessage("never-existed", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(result, Is.InstanceOf<NotFoundObjectResult>(),
+            "the system-message route is lookup-only — an unknown ref is a 404, never an implicit create");
+        Assert.That(await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "never-existed"), Is.Null,
+            "the system-message route is lookup-only — it must NEVER create a channel on demand");
+    }
+
+    [Test]
+    public async Task SystemMessage_BlankKeyOrFallback_Is400()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-2\",\"name\":\"Sys Match 2\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp());
+        Assert.That(createResult, Is.InstanceOf<OkObjectResult>(), "precondition: the match channel must exist so the 400s below are genuinely validation failures, not masked 404s");
+
+        var blankKeyBody = "{\"key\":\"   \",\"fallbackText\":\"x\"}";
+        var blankKey = await PostSystemMessage("match-sys-2", blankKeyBody, MmSecret, NowTimestamp());
+
+        var blankFallbackBody = "{\"key\":\"match_intro\",\"fallbackText\":\"\"}";
+        var blankFallback = await PostSystemMessage("match-sys-2", blankFallbackBody, MmSecret, NowTimestamp());
+
+        Assert.That(blankKey, Is.InstanceOf<BadRequestObjectResult>(), "a whitespace-only key must never reach the publisher");
+        Assert.That(blankFallback, Is.InstanceOf<BadRequestObjectResult>(),
+            "fallbackText is the only thing a client that does not know the key can render — it is required");
+    }
+
+    [Test]
+    public async Task SystemMessage_RepeatedWithSameDedupeKey_Is200_AndPublishesOnce()
+    {
+        var createBody = "{\"kind\":\"match\",\"ref\":\"match-sys-3\",\"name\":\"Sys Match 3\",\"members\":[\"Alice#1\"]}";
+        var createResult = await PostChannelsCreate(createBody, MmSecret, NowTimestamp()) as OkObjectResult;
+        Assert.That(createResult, Is.Not.Null, "precondition: the match channel must exist before the repeated dedupeKey publish is exercised");
+        var channelDto = createResult.Value as InternalChannelDto;
+
+        var messageBody = "{\"key\":\"match_intro\",\"fallbackText\":\"Match on Amazonia\",\"dedupeKey\":\"match_intro\"}";
+
+        var first = await PostSystemMessage("match-sys-3", messageBody, MmSecret, NowTimestamp());
+        var second = await PostSystemMessage("match-sys-3", messageBody, MmSecret, NowTimestamp());
+
+        Assert.That(first, Is.InstanceOf<OkResult>(), "the first publish of a fresh dedupeKey must succeed");
+        Assert.That(second, Is.InstanceOf<OkResult>(),
+            "mm retries on timeout — a duplicate publish is a success, never an error");
+
+        var messages = await _messageRepository.LoadForModerator(channelDto.Id);
+        Assert.That(messages.Count(m => m.Kind == MessageKind.System), Is.EqualTo(1),
+            "the retried publish shares the SAME dedupeKey — it must be published exactly once, not twice");
     }
 }

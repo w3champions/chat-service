@@ -141,6 +141,27 @@ public class InternalRelationshipChangeRequest
 }
 
 /// <summary>
+/// <c>POST /internal/channels/{ref}/system-message</c> request body — a server-authored message
+/// published into an EXISTING channel. Lookup-only: unlike the create/roster routes this one never
+/// creates a channel, so an unknown ref is a 404 rather than an implicit create.
+/// <para>
+/// <see cref="Key"/> and <see cref="FallbackText"/> are both REQUIRED: the key is what a client
+/// renders through its own locale catalogue, and the fallback is the only thing a client that does not
+/// know the key (or the moderation history endpoint, which has no catalogue at all) can display.
+/// <see cref="DedupeKey"/> is optional but strongly recommended — mm retries on timeout, and without a
+/// key a retried publish posts twice.
+/// </para>
+/// </summary>
+public class InternalSystemMessageRequest
+{
+    public string Key { get; set; }
+    public Dictionary<string, string> Params { get; set; }
+    public Dictionary<string, List<string>> ListParams { get; set; }
+    public string FallbackText { get; set; }
+    public string DedupeKey { get; set; }
+}
+
+/// <summary>
 /// REST projection of a <see cref="ChatChannel"/> returned by <c>POST /internal/channels</c> (C7 Task
 /// 9) — System.Text.Json's default camelCase serialization matches the wire contract mm expects, so no
 /// custom naming policy is needed.

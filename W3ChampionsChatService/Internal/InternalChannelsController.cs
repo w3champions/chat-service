@@ -6,7 +6,10 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Serilog;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
+using W3ChampionsChatService.Messages;
+using W3ChampionsChatService.Protocol;
 
 namespace W3ChampionsChatService.Internal;
 
@@ -15,10 +18,13 @@ namespace W3ChampionsChatService.Internal;
 /// (idempotent create-or-get, 200 for BOTH a fresh channel and a duplicate call — the pinned idempotency
 /// contract), <c>PUT /internal/channels/{ref}/roster</c> (the authoritative full-set membership assertion,
 /// 2026-08-05 reconciliation spec, plan D1-D4/D7), <c>POST /internal/channels/epoch-sync</c> (mm's
-/// boot-time convergence sweep, plan D8), and <c>DELETE /internal/channels/{ref}</c> (hard teardown, 200
-/// even for an unknown ref — a 404 would only trigger a pointless mm retry). All four delegate to
-/// <see cref="MatchChannelService"/>; this controller owns ONLY input validation, the HTTP shape, and
-/// logging.
+/// boot-time convergence sweep, plan D8), <c>DELETE /internal/channels/{ref}</c> (hard teardown, 200
+/// even for an unknown ref — a 404 would only trigger a pointless mm retry), and
+/// <c>POST /internal/channels/{ref}/system-message</c> (Task 4 — a server-authored message published into
+/// an EXISTING channel; LOOKUP-ONLY, so an unknown ref is a 404 rather than an implicit create). The
+/// first four delegate to <see cref="MatchChannelService"/>; the system-message route delegates to
+/// <see cref="ChannelRepository.LoadBySystemRef"/> and <see cref="SystemMessagePublisher"/> instead. This
+/// controller owns ONLY input validation, the HTTP shape, and logging.
 /// <para>
 /// The roster route is named <c>.../roster</c> rather than <c>.../membership</c> deliberately — a
 /// one-character-away name from <c>.../members</c> would have collided with the now-removed legacy delta
@@ -43,7 +49,10 @@ namespace W3ChampionsChatService.Internal;
 [ApiController]
 [Route("internal/channels")]
 [InternalHmacAuth(InternalCaller.Mm)]
-public class InternalChannelsController(MatchChannelService matchChannelService) : ControllerBase
+public class InternalChannelsController(
+    MatchChannelService matchChannelService,
+    ChannelRepository channelRepository,
+    SystemMessagePublisher systemMessagePublisher) : ControllerBase
 {
     private const string MatchKind = "match";
     private const string GenericValidationError = "Invalid request.";
@@ -276,6 +285,76 @@ public class InternalChannelsController(MatchChannelService matchChannelService)
         catch (Exception ex)
         {
             LogUnexpected(ex, "DELETE", @ref);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Publishes a server-authored system message into the match channel identified by
+    /// <paramref name="systemRef"/>. LOOKUP-ONLY — deliberately unlike <c>POST /internal/channels</c>:
+    /// a system message is meaningless without the room it narrates, so an unknown ref is a 404 rather
+    /// than an implicit create (which would leave a memberless channel nobody can ever see).
+    /// Idempotent when the caller supplies a dedupeKey — a retry returns 200 with the original message.
+    /// </summary>
+    [HttpPost("{systemRef}/system-message")]
+    public async Task<IActionResult> PublishSystemMessage(string systemRef, [FromBody] InternalSystemMessageRequest request)
+    {
+        if (request == null || !IsValidRef(systemRef))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        var key = request.Key?.Trim();
+        var fallbackText = request.FallbackText?.Trim();
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(fallbackText))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        // Same character class as `ref` — the key is logged and becomes a client catalogue lookup, so it
+        // gets the same log-injection / control-char defense.
+        if (!IsValidRef(key))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        var dedupeKey = request.DedupeKey?.Trim();
+        if (dedupeKey != null && (dedupeKey.Length == 0 || !IsValidRef(dedupeKey)))
+        {
+            return BadRequest(new ErrorResult(GenericValidationError));
+        }
+
+        try
+        {
+            var channel = await channelRepository.LoadBySystemRef(SystemChannelKind.Match, systemRef);
+            if (channel == null)
+            {
+                return NotFound(new ErrorResult(GenericValidationError));
+            }
+
+            var body = new SystemMessageBody
+            {
+                Key = key,
+                Params = request.Params,
+                ListParams = request.ListParams,
+                FallbackText = fallbackText,
+            };
+
+            var result = await systemMessagePublisher.Publish(channel, body, dedupeKey);
+            if (result.Code != ChatResultCode.Ok)
+            {
+                return NotFound(new ErrorResult(GenericValidationError));
+            }
+
+            Log.Information(
+                "Internal system message succeeded {Caller} {Verb} {Ref} key={Key} seq={Seq}",
+                InternalHmacAuthFilter.ResolveCaller(HttpContext), "POST", systemRef, key, result.Seq);
+
+            return Ok();
+        }
+        catch (Exception ex)
+        {
+            LogUnexpected(ex, "POST", systemRef);
             throw;
         }
     }
