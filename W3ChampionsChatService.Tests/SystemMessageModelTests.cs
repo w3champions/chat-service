@@ -43,14 +43,14 @@ public class SystemMessageModelTests : IntegrationTestBase
 
         var read = await _messages.Load(written.Id);
 
-        Assert.That(read, Is.Not.Null);
+        Assert.That(read, Is.Not.Null, "persisted system message loads successfully");
         Assert.That(read.Kind, Is.EqualTo(MessageKind.System), "Kind survives the round-trip");
         Assert.That(read.Sender, Is.Null, "a system message has no sender snapshot");
         Assert.That(read.Content, Is.Null, "a system message carries no free-form content");
-        Assert.That(read.SystemMessage.Key, Is.EqualTo("match_intro"));
-        Assert.That(read.SystemMessage.Params["map"], Is.EqualTo("Amazonia"));
-        Assert.That(read.SystemMessage.ListParams["players"], Is.EqualTo(new[] { "Grubby#2136", "Happy#2233" }));
-        Assert.That(read.SystemMessage.FallbackText, Does.Contain("Amazonia"));
+        Assert.That(read.SystemMessage.Key, Is.EqualTo("match_intro"), "system message key survives bson round-trip");
+        Assert.That(read.SystemMessage.Params["map"], Is.EqualTo("Amazonia"), "string params dictionary survives bson round-trip");
+        Assert.That(read.SystemMessage.ListParams["players"], Is.EqualTo(new[] { "Grubby#2136", "Happy#2233" }), "nested list params survive bson round-trip without custom serializer");
+        Assert.That(read.SystemMessage.FallbackText, Does.Contain("Amazonia"), "fallback text survives bson round-trip");
     }
 
     [Test]
@@ -75,8 +75,8 @@ public class SystemMessageModelTests : IntegrationTestBase
 
         Assert.That(read.Kind, Is.EqualTo(MessageKind.User),
             "existing documents must deserialize as User with NO migration — Kind defaults");
-        Assert.That(read.SystemMessage, Is.Null);
-        Assert.That(read.DedupeKey, Is.Null);
+        Assert.That(read.SystemMessage, Is.Null, "pre-migration documents have no system message");
+        Assert.That(read.DedupeKey, Is.Null, "pre-migration documents have no dedupe key");
     }
 
     [Test]
