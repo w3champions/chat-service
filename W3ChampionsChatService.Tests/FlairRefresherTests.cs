@@ -282,6 +282,44 @@ public class FlairRefresherTests : IntegrationTestBase
             "the post-write validation must remove the entry RegisterUser resurrected once the authoritative session is gone");
     }
 
+    // A newer connection can replace this session between the ConnectionMapping write and the post-write
+    // check (e.g. two closely spaced profile changes). Once that happens, this refresh is stale: it must
+    // stop after cleaning up the mapping it wrote, not fall through and overwrite a newer directory
+    // profile or broadcast an older flair to live viewers.
+    [Test]
+    public async Task Refresh_WhenDisconnectRacesTheConnectionMappingWrite_PerformsNoDirectoryUpsertOrFanOut()
+    {
+        var connections = new ConnectionMapping();
+        connections.RegisterUser("conn-peter", UserWith(ChangedTag, AvatarCategory.HU, 1));
+
+        var identity = new W3CUserAuthentication { BattleTag = ChangedTag, Name = "peter" };
+        var liveSession = new ChatSession { ConnectionId = "conn-peter", Identity = identity, Context = null };
+
+        var sessions = new Mock<ISessionRegistry>();
+        sessions.SetupSequence(s => s.GetByBattleTag(ChangedTag))
+            .Returns(liveSession)      // initial lookup (Refresh's first read)
+            .Returns(liveSession)      // pre-write revalidation (after the GetUserFromIdentity await)
+            .Returns((ChatSession)null); // post-write validation: a newer connection took over in the gap
+
+        var auth = new Mock<IChatAuthenticationService>();
+        auth.Setup(a => a.GetUserFromIdentity(It.IsAny<W3CUserAuthentication>()))
+            .ReturnsAsync(new ChatUserResolution(UserWith(ChangedTag, AvatarCategory.NE, 7), true));
+
+        var refresher = new FlairRefresher(
+            sessions.Object, auth.Object, connections, _userDirectory, _focus,
+            _harness.HubContext, new FakeTimeProvider());
+
+        await refresher.Refresh(ChangedTag);
+
+        Assert.That(connections.GetUser("conn-peter"), Is.Null,
+            "the stale mapping write must still be cleaned up");
+        var entry = await _userDirectory.Load(ChangedTag);
+        Assert.That(entry, Is.Null,
+            "a stale refresh must not overwrite the directory profile a newer refresh may have already written");
+        Assert.That(_harness.AllSignals, Is.Empty,
+            "a stale refresh must not broadcast an outdated flair to live viewers");
+    }
+
     // Finding 3 (P2): the webhook-supplied battleTag can carry website-backend's storage casing, while
     // the live session identity carries the authoritative display casing. DisplayBattleTag must always
     // win with the identity's casing — matching the connect path (ChatHub.UpsertDirectory).

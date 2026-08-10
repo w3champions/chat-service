@@ -114,6 +114,7 @@ public class FlairRefresher(
         if (postWriteSession == null || postWriteSession.ConnectionId != current.ConnectionId)
         {
             _connections.Remove(current.ConnectionId);
+            return;
         }
 
         await UserDirectoryUpsert.Apply(
