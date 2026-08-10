@@ -50,6 +50,21 @@ public class SystemMessagePublisher(
             return new SystemMessagePublishResult(ChatResultCode.NotFound, null, 0);
         }
 
+        // The body gets the SAME up-front treatment as the channel, and for the same reason: this class
+        // is DI-registered and is "the ONE server-authored message insert path", i.e. an in-process API
+        // future code is invited to call — the controller is only today's caller, and its own validation
+        // is not this method's contract. Unguarded, a null body is an NRE at the Log.Information below,
+        // raised AFTER the seq is burned, the row inserted with a null SystemMessage, and fan-out already
+        // pushed it; a blank FallbackText is quieter and worse, since SystemMessageBody documents it as
+        // "Required — never null" and ModerationMessageDto projects it as the moderator's ONLY readable
+        // rendering of a system message. TooLong is the pinned mapping for unusable content — the exact
+        // C3 precedent ChatHub.SendMessage follows for empty-after-trim, since the 7-member enum has no
+        // InvalidContent member.
+        if (body == null || string.IsNullOrWhiteSpace(body.FallbackText))
+        {
+            return new SystemMessagePublishResult(ChatResultCode.TooLong, null, 0);
+        }
+
         // Normalized once, here, so the pre-check, the insert, and the duplicate-key catch all agree
         // on the same value — an empty string must never reach ChannelMessage.DedupeKey (it would be
         // indexed and would silently dedupe every empty-key system message in the channel together).
@@ -65,7 +80,21 @@ public class SystemMessagePublisher(
         }
 
         var now = timeProvider.GetUtcNow().UtcDateTime;
-        var seq = await channelRepository.AllocateSeq(channel.Id, now, shellExpiresAt: null);
+        long seq;
+        try
+        {
+            seq = await channelRepository.AllocateSeq(channel.Id, now, shellExpiresAt: null);
+        }
+        catch (InvalidOperationException)
+        {
+            // TOCTOU: match channels are TTL-backed shells and mm can also tear one down via
+            // DELETE /internal/channels/{ref}, so the channel can vanish between the caller's lookup and
+            // this allocation. AllocateSeq's $inc then matches no doc and throws (nothing was burned).
+            // Map it to the SAME typed NotFound the caller's own lookup miss produces — exactly
+            // ChatHub.SendMessage's step-7 precedent. Without this it escapes the controller as a
+            // body-free 500 and mm retries a call that can never succeed.
+            return new SystemMessagePublishResult(ChatResultCode.NotFound, null, 0);
+        }
 
         var message = new ChannelMessage
         {

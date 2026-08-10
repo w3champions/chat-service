@@ -88,7 +88,11 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         Assert.That(stored.Sender, Is.Null, "system messages carry no sender snapshot");
         Assert.That(stored.SystemMessage.Key, Is.EqualTo("match_intro"), "the structured body must round-trip through the insert");
         Assert.That(stored.SentAt, Is.EqualTo(Now), "SentAt must be the publisher's injected clock, not wall time");
-        Assert.That(stored.ExpiresAt, Is.Not.Null, "system messages follow the normal 30d message TTL");
+        // Pinned to the exact instant, not merely non-null: ExpiryCalculator.ForChannelMessage picks 30d
+        // for a System channel and 90d for Dm/GroupDm, and Is.Not.Null would pass just as happily under
+        // the wrong branch.
+        Assert.That(stored.ExpiresAt, Is.EqualTo(Now + RetentionPeriods.ChannelMessages),
+            "system messages follow the 30d CHANNEL-message TTL, not the 90d direct-message one");
 
         var reloaded = await _channelRepository.Load(channel.Id);
         Assert.That(reloaded.LastSeq, Is.EqualTo(1), "AllocateSeq ran — paging and unread both key off it");
@@ -195,6 +199,59 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         var result = await _publisher.Publish(null, Intro(), dedupeKey: null);
 
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.NotFound), "a null channel must be reported as NotFound, not throw or silently no-op");
+        Assert.That(result.MessageId, Is.Null, "a NotFound result must carry no message id");
+        Assert.That(result.Seq, Is.EqualTo(0), "a NotFound result must carry no seq");
+    }
+
+    // The controller validates key/fallbackText before ever calling Publish, but this class is
+    // DI-registered and documents itself as "the ONE server-authored message insert path" — an
+    // in-process API future code is invited to call. These pin that a malformed body is rejected UP
+    // FRONT, before a seq is burned and a half-formed row fans out to every member.
+
+    [Test]
+    public async Task Publish_WithNullBody_ReturnsTooLong_AndWritesNothing()
+    {
+        var channel = await NewMatchChannel();
+
+        var result = await _publisher.Publish(channel, null, dedupeKey: null);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.TooLong), "a null body must be a typed reject — unguarded it is an NRE raised AFTER the insert and the fan-out push");
+        var all = await _messageRepository.LoadForModerator(channel.Id);
+        Assert.That(all, Is.Empty, "a rejected publish must not persist a row with a null SystemMessage");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(0), "the guard must run BEFORE AllocateSeq — a rejected publish must not burn a seq");
+    }
+
+    [TestCase(null)]
+    [TestCase("")]
+    [TestCase("   ")]
+    public async Task Publish_WithBlankFallbackText_ReturnsTooLong_AndWritesNothing(string fallbackText)
+    {
+        var channel = await NewMatchChannel();
+        var body = Intro();
+        body.FallbackText = fallbackText;
+
+        var result = await _publisher.Publish(channel, body, dedupeKey: null);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.TooLong),
+            "SystemMessageBody documents FallbackText as required, and it is the moderator's ONLY readable rendering — a blank one must never reach the insert");
+        var all = await _messageRepository.LoadForModerator(channel.Id);
+        Assert.That(all, Is.Empty, "a rejected publish must not persist an unreadable system message");
+    }
+
+    [Test]
+    public async Task Publish_ChannelVanishesBeforeAllocateSeq_ReturnsNotFound_NotAnException()
+    {
+        var channel = await NewMatchChannel();
+        // The TOCTOU the guard exists for: mm's DELETE /internal/channels/{ref} (or the TTL) removes the
+        // shell after the caller resolved it. Deleting the doc while holding the already-loaded instance
+        // reproduces exactly that window — AllocateSeq's $inc then matches no document and throws.
+        await _channelRepository.Delete(channel.Id);
+
+        var result = await _publisher.Publish(channel, Intro(), dedupeKey: null);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.NotFound),
+            "a vanished channel must surface as the same typed NotFound a lookup miss produces, not escape as a body-free 500 mm would retry forever");
         Assert.That(result.MessageId, Is.Null, "a NotFound result must carry no message id");
         Assert.That(result.Seq, Is.EqualTo(0), "a NotFound result must carry no seq");
     }
