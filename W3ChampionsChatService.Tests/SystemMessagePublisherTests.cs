@@ -118,6 +118,13 @@ public class SystemMessagePublisherTests : IntegrationTestBase
     {
         await ChatDomainIndexes.EnsureAllAsync(MongoClient);
         var channel = await NewMatchChannel();
+        // Focused-member setup mirrors Publish_DeliversMessageReceivedToFocusedMembers — needed so the
+        // signal-count assertion below can distinguish "the retry pushed nothing" from "there was never
+        // anyone to push to".
+        _sessionRegistry.Register("conn-alice",
+            new W3CUserAuthentication { BattleTag = "Alice#1", Name = "Alice" }, null);
+        _onlineMemberRegistry.Join(channel.Id, "conn-alice", new MemberState("Alice#1", NotificationLevel.All, 0, ChannelType.System));
+        _focusRegistry.Focus("conn-alice", channel.Id, "Alice#1");
 
         var first = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
         var second = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
@@ -128,6 +135,9 @@ public class SystemMessagePublisherTests : IntegrationTestBase
 
         var all = await _messageRepository.LoadForModerator(channel.Id);
         Assert.That(all, Has.Count.EqualTo(1), "mm retries on timeout — the intro must never double-post");
+        Assert.That(all[0].DedupeKey, Is.EqualTo("match_intro"), "a non-empty dedupeKey argument must be persisted verbatim onto the stored row, not just used for the lookup");
+        Assert.That(_harness.SignalCount("conn-alice", ChatEvents.MessageReceived), Is.EqualTo(1),
+            "a deduped retry must return before fan-out runs — it must not re-push MessageReceived for a message the client already has");
     }
 
     [Test]
@@ -189,17 +199,22 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         Assert.That(result.Seq, Is.EqualTo(0), "a NotFound result must carry no seq");
     }
 
-    // Forces the FIRST LoadByDedupeKey call (the publisher's pre-check) to miss regardless of what is
-    // actually stored, so a Publish call proceeds past the pre-check into AllocateSeq + Insert even
-    // though a same-keyed row already exists — reproducing the genuine concurrent race without timing
-    // or real parallelism. Every call after the first delegates to the real lookup, so the duplicate-key
-    // catch's own LoadByDedupeKey call sees the true winner.
-    private sealed class MissOnceMessageRepository(MongoClient mongoClient) : MessageRepository(mongoClient)
+    // Forces the first `missCount` LoadByDedupeKey calls to return null regardless of what is actually
+    // stored, letting a Publish call proceed past a lookup that would otherwise resolve immediately —
+    // reproducing races and lookup failures without real concurrency or timing. Calls beyond `missCount`
+    // delegate to the real lookup. Configurations used by this file:
+    //   missCount: 1 — only the publisher's pre-check misses; the catch's own (real, call #2) lookup
+    //                  succeeds and finds the winner. Reproduces a genuine concurrent race that
+    //                  resolves to Ok.
+    //   missCount: 2 — the pre-check AND the catch's post-collision lookup both miss, so the catch
+    //                  cannot find a winner. Reproduces the "indexed row is unexpectedly absent" case
+    //                  and drives the `throw;` fallback.
+    private sealed class MissingDedupeLookupMessageRepository(MongoClient mongoClient, int missCount) : MessageRepository(mongoClient)
     {
         private int _callCount;
 
         public override Task<ChannelMessage> LoadByDedupeKey(string channelId, string dedupeKey) =>
-            Interlocked.Increment(ref _callCount) == 1
+            Interlocked.Increment(ref _callCount) <= missCount
                 ? Task.FromResult<ChannelMessage>(null)
                 : base.LoadByDedupeKey(channelId, dedupeKey);
     }
@@ -213,7 +228,7 @@ public class SystemMessagePublisherTests : IntegrationTestBase
         // Seed the "winner" via a normal publish — this is the row the racing call below will collide with.
         var winner = await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
 
-        var racingRepository = new MissOnceMessageRepository(MongoClient);
+        var racingRepository = new MissingDedupeLookupMessageRepository(MongoClient, missCount: 1);
         var racingPublisher = new SystemMessagePublisher(racingRepository, _channelRepository, _fanOutEngine, _time);
 
         // racingRepository's pre-check (call #1) is forced to miss despite the winner already existing,
@@ -227,5 +242,36 @@ public class SystemMessagePublisherTests : IntegrationTestBase
 
         var all = await _messageRepository.LoadForModerator(channel.Id);
         Assert.That(all, Has.Count.EqualTo(1), "the loser's insert must never have landed a second row for the same key");
+
+        // If the pre-check ever stopped missing (an off-by-one, or a future refactor that adds a real
+        // lookup before it), this call would resolve entirely in the pre-check and never reach
+        // AllocateSeq — degrading this test into a duplicate of Publish_IsIdempotentOnDedupeKey while
+        // still appearing to cover the catch clause. LastSeq only advances past the winner's own
+        // allocation (1) if the racing call actually burned a second seq, so 2 is proof this call went
+        // through the insert and the duplicate-key catch, not the pre-check.
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(2),
+            "the losing call must have allocated and orphaned a seq — proof it went through the insert and the duplicate-key catch, not the pre-check");
+    }
+
+    [Test]
+    public async Task Publish_DuplicateKeyRace_WinnerLookupAlsoMisses_RethrowsWriteException()
+    {
+        await ChatDomainIndexes.EnsureAllAsync(MongoClient);
+        var channel = await NewMatchChannel();
+
+        // Seed the row this call will collide with.
+        await _publisher.Publish(channel, Intro(), dedupeKey: "match_intro");
+
+        var racingRepository = new MissingDedupeLookupMessageRepository(MongoClient, missCount: 2);
+        var racingPublisher = new SystemMessagePublisher(racingRepository, _channelRepository, _fanOutEngine, _time);
+
+        // Both the pre-check (call #1) and the catch's post-collision lookup (call #2) are forced to
+        // miss, so the catch cannot resolve a winner and must fall through to `throw;`. The catch
+        // filters only on Category == DuplicateKey, not on which index collided, so this is the
+        // property standing between an unrelated unique-constraint failure and a bogus Ok result.
+        Assert.ThrowsAsync<MongoWriteException>(
+            () => racingPublisher.Publish(channel, Intro(), dedupeKey: "match_intro"),
+            "an unexplained duplicate-key failure whose winner cannot be found must surface, not be swallowed into a fabricated Ok");
     }
 }
