@@ -101,12 +101,20 @@ public partial class ChatHub(
     // PR36 follow-up (D2): the notification-preference carrier — JoinChannel's rejoin-seed path reads it,
     // SetNotificationLevel's write path (Public/SemiPublic only) writes it. Both live in
     // ChatHub.Channels.cs; this is the ONLY ctor change this task makes to ChatHub itself.
-    NotificationPreferenceRepository notificationPreferenceRepository) : Hub
+    NotificationPreferenceRepository notificationPreferenceRepository,
+    // PR44 review ("No shortcuts. Follow proper DI!"): resolves a roster battleTag into a
+    // ChannelViewerDto (display name + flair) for FocusChannel. This MUST be the SAME singleton
+    // ViewersAccumulator receives (registered in Startup.cs) — that shared instance is what
+    // guarantees an initial roster snapshot and a subsequent ViewersChanged join delta can never
+    // render the same viewer differently. Stateless — it holds only references to ISessionRegistry
+    // and ConnectionMapping (both already above), so injecting it costs nothing beyond the reference.
+    ViewerResolver viewerResolver) : Hub
 {
     private readonly ConnectionMapping _connections = connections;
     private readonly MuteReconciliationService _muteReconciliation = muteReconciliation;
     private readonly ITicketStore _ticketStore = ticketStore;
     private readonly ISessionRegistry _sessionRegistry = sessionRegistry;
+    private readonly ViewerResolver _viewerResolver = viewerResolver;
     private readonly UserDirectoryRepository _userDirectory = userDirectory;
     // C3 (Task 8): the SessionState snapshot assembler + the in-memory fan-out registries this hub
     // seeds on connect and tears down on disconnect. TimeProvider supplies the trusted server clock
@@ -223,6 +231,18 @@ public partial class ChatHub(
         // one round-trip per connect, not two. Still fire-and-forget and non-fatal.
         _ = PushFriendPresenceFromSnapshot(identity.BattleTag, wentOnline, Context.ConnectionId, relationshipSnapshot);
 
+        // Clan-channel reconciliation (2026-08-09) — MUST run BEFORE AssembleAndSeed, which reads the
+        // membership rows this may write. Reuses the clan id already carried by `resolution` (the same wb
+        // round-trip hoisted above for flair), so it costs no extra network call.
+        //
+        // PARTIALLY FATAL (PR40 review P1) — deliberately NOT fully fail-soft. Revoking a stale clan
+        // membership (and the read that identifies one) throws on failure, because a swallowed failure
+        // would leave the user with live access to a former clan's channel that AssembleAndSeed seeds on
+        // the very next line. Joining is fail-soft internally. So this await can fail the connect for the
+        // same class of Mongo fault that AssembleAndSeed below already treats as fatal — see
+        // ChatHub.Clan.cs for the full rationale.
+        await ReconcileClanMembership(identity, resolution, now);
+
         // C3 (Task 8): assemble the SessionState snapshot and seed this connection's fan-out state (the
         // OnlineMemberRegistry + the legacy mute cache, both done inside AssembleAndSeed), then push the
         // snapshot to the CALLER only — it is that connection's private state rebuild (spec acceptance
@@ -264,26 +284,8 @@ public partial class ChatHub(
     // ChatUser's flair. Non-fatal: a directory write must never fail a connect. `now` is the caller's
     // single injected-clock read (OnConnectedAsync) — routed through, not read again here, so this
     // stays on the SAME TimeProvider clock as the rest of the connect path.
-    private async Task UpsertDirectory(W3CUserAuthentication identity, ChatUserResolution resolution, DateTime now)
-    {
-        try
-        {
-            var entry = await _userDirectory.Load(identity.BattleTag)
-                ?? new UserDirectoryEntry { BattleTag = identity.BattleTag };
-            entry.DisplayBattleTag = identity.BattleTag;
-            entry.NormalizedName = identity.BattleTag?.Trim().ToLowerInvariant();
-            entry.LastSeenAt = now;
-            if (resolution.FreshFromWb)
-            {
-                entry.Profile = ChatProfileMapper.FromChatUser(resolution.User);
-            }
-            await _userDirectory.Upsert(entry);
-        }
-        catch (Exception ex)
-        {
-            Log.Warning(ex, "Failed to upsert user_directory entry for {BattleTag}", identity.BattleTag);
-        }
-    }
+    private Task UpsertDirectory(W3CUserAuthentication identity, ChatUserResolution resolution, DateTime now) =>
+        UserDirectoryUpsert.Apply(_userDirectory, identity.BattleTag, resolution, now);
 
     // C5 (Task 1): best-effort connect-time friend-presence push. Deliberately fire-and-forget — the
     // caller does NOT await it, so a slow/unreachable wb read never adds latency to (or fails) a connect.
@@ -482,6 +484,11 @@ public partial class ChatHub(
     /// no live session → <see cref="ChatResultCode.PermissionDenied"/> (there is no identity to attribute
     /// the delete to).</item>
     /// <item><see cref="Messages.MessageRepository.Load"/>; missing → <see cref="ChatResultCode.NotFound"/>.</item>
+    /// <item>Server-authored messages are not moderatable: a <see cref="MessageKind.System"/> message has
+    /// no <see cref="Messages.MessageSender"/>, so the author-exclusion fan-out at the tail of this method
+    /// would <c>NullReferenceException</c> on <c>message.Sender.BattleTag</c> — and there is no author to
+    /// moderate in any case. → <see cref="ChatResultCode.PermissionDenied"/>, BEFORE the durable
+    /// <see cref="Messages.MessageRepository.MarkDeleted"/>, so the whole method stays a no-op.</item>
     /// <item>Resolve the message's channel and enforce the SHARED moderation scope wall (spec §10 + plan
     /// D5): single-delete uses the EXACT SAME <see cref="ChannelModeration.IsModeratable"/> include-list as
     /// the cross-channel <see cref="PurgeMessagesFromUser"/> sweep (C4 Task 7: also shared with the REST
@@ -528,6 +535,15 @@ public partial class ChatHub(
         if (message == null)
         {
             return new ChannelOperationResult(ChatResultCode.NotFound);
+        }
+
+        // 2.5. Server-authored messages are not moderatable. A system message has no MessageSender, so
+        // the author-exclusion fan-out at the tail of this method (GetConnectionIdsForUser on
+        // message.Sender.BattleTag) would NullReferenceException — and there is no author to moderate
+        // in any case. Rejecting here, before the durable MarkDeleted, keeps the whole method a no-op.
+        if (message.Kind == MessageKind.System)
+        {
+            return new ChannelOperationResult(ChatResultCode.PermissionDenied);
         }
 
         // 3. Moderation scope wall (spec §10 + plan D5): single-delete shares the SAME include-list as the

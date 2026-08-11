@@ -8,17 +8,21 @@ namespace W3ChampionsChatService.Protocol;
 /// <see cref="FanOut.ViewersAccumulator"/>, and the SAME payload object is sent to EVERY current focused
 /// connection of the channel — there are no per-connection deltas (C3-plan decision 5).
 /// <para>
-/// <see cref="Joined"/>/<see cref="Left"/> are battleTags (NOT display names): the accumulator's only
-/// state sources are <see cref="FanOut.FocusRegistry"/> and the emit <c>IHubContext</c> — it never
-/// resolves names (that is <c>FocusChannel</c>'s job for the initial roster). A battleTag whose viewing
-/// state at flush equals its state at the START of the window appears in NEITHER list (idempotent — a
-/// join+leave or leave+rejoin flap within the window cancels). Clients apply the delta as an idempotent
-/// SET operation (union <see cref="Joined"/>, subtract <see cref="Left"/>), so a battleTag redundantly
-/// present in both the initial <c>FocusChannel</c> roster and a subsequent <see cref="Joined"/> is
-/// harmless.
+/// <see cref="Left"/> entries are bare battleTags — removing a viewer needs no more than that.
+/// <see cref="Joined"/> entries are full <see cref="ChannelViewerDto"/>s carrying display name and
+/// flair, resolved through the same <see cref="Chats.ViewerResolver"/> <c>FocusChannel</c> uses for
+/// the initial roster, so a viewer's rendering is identical whether the client learned about them
+/// from a focus response or from a later join delta.
+/// </para>
+/// <para>
+/// A battleTag whose viewing state at flush equals its state at the START of the window appears in
+/// NEITHER list (idempotent — a join+leave or leave+rejoin flap within the window cancels). Clients
+/// apply the delta as an idempotent SET operation (union <see cref="Joined"/>, subtract <see cref="Left"/>),
+/// so a battleTag redundantly present in both the initial <c>FocusChannel</c> roster and a subsequent
+/// <see cref="Joined"/> is harmless.
 /// </para>
 /// </summary>
 public record ViewersChangedDto(
     string ChannelId,
-    IReadOnlyList<string> Joined,
+    IReadOnlyList<ChannelViewerDto> Joined,
     IReadOnlyList<string> Left);

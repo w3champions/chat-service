@@ -102,6 +102,45 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     }
 
     /// <summary>
+    /// Advances <see cref="ChatChannel.LastMessage"/> to <paramref name="lastMessage"/>, but ONLY if it is
+    /// strictly newer than whatever is stored — a compare-and-set on <see cref="ChannelLastMessage.Seq"/>.
+    /// <para>
+    /// WHY a second write instead of folding this into <see cref="AllocateSeq"/>'s atomic $inc: the
+    /// projection needs the seq that call allocates, so setting it there would mean rewriting the service's
+    /// most concurrency-critical write as an aggregation-pipeline update. The seq is also not the only
+    /// reason — the projection must be skipped for shadow messages, which <see cref="AllocateSeq"/> has no
+    /// business knowing about. This costs one extra by-_id update per non-shadow Dm/GroupDm message, and in
+    /// exchange the seq allocator stays untouched and this write is monotonic by construction: two
+    /// concurrent sends that reach it out of order settle on the higher seq no matter which lands last.
+    /// </para>
+    /// <para>
+    /// The CONSENT half of the scope is enforced here rather than by the caller: a 1:1 Dm is projected only
+    /// once its request is <see cref="DmRequestState.Accepted"/>, and that is read from the durable doc in
+    /// the same command that writes. The caller decides scope from a channel it loaded BEFORE the send, and
+    /// a concurrent <c>AcceptRequest</c> can commit in between — deciding there would skip the projection
+    /// for a conversation that is accepted by the time the write runs, stranding the row on an older message
+    /// until the next send. A pending Dm is a no-op here, not an error: same shape as losing the seq CAS.
+    /// </para>
+    /// Returns true iff this call actually advanced the field.
+    /// </summary>
+    public virtual async Task<bool> TryAdvanceLastMessage(string channelId, ChannelLastMessage lastMessage)
+    {
+        var filterBuilder = Builders<ChatChannel>.Filter;
+        var filter = filterBuilder.And(
+            filterBuilder.Eq(c => c.Id, channelId),
+            filterBuilder.Or(
+                filterBuilder.Eq(c => c.Type, ChannelType.GroupDm),
+                filterBuilder.Eq(c => c.RequestState, DmRequestState.Accepted)),
+            filterBuilder.Or(
+                // A missing field matches Eq(..., null) in Mongo — this is the never-projected-yet case.
+                filterBuilder.Eq(c => c.LastMessage, null),
+                filterBuilder.Lt(c => c.LastMessage.Seq, lastMessage.Seq)));
+
+        var result = await Channels.UpdateOneAsync(filter, Builders<ChatChannel>.Update.Set(c => c.LastMessage, lastMessage));
+        return result.ModifiedCount == 1;
+    }
+
+    /// <summary>
     /// Implicit find-or-create for semiPublic channels (join resolution — acceptance 9a):
     /// $setOnInsert upsert keyed (Type=SemiPublic, NormalizedName), mirroring
     /// PublicChannelSeeder's idempotent pattern. Backed by the unique partial index
@@ -198,7 +237,10 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// omitting it, which the TTL convention documented on <see cref="Domain.ChatDomainIndexes"/>
     /// requires). Two concurrent calls for the SAME (kind, ref) resolve to exactly one document.
     /// </summary>
-    public async Task<ChatChannel> FindOrCreateSystem(SystemChannelKind kind, string systemRef, string name, DateTime now)
+    // Virtual: a test seam (same rationale as MembershipRepository.Delete / DeleteOrphanedForUser). PR41
+    // review (P2) moved this call onto the clan reconciler's FAIL-SOFT join path, and a throwing double is
+    // the only way to prove a shell-creation fault leaves the connect intact instead of rejecting it.
+    public virtual async Task<ChatChannel> FindOrCreateSystem(SystemChannelKind kind, string systemRef, string name, DateTime now)
     {
         var expiresAt = ExpiryCalculator.ForChannelShell(new ChatChannel { Type = ChannelType.System, SystemKind = kind }, now);
 
@@ -298,6 +340,15 @@ public class ChannelRepository(MongoClient mongoClient) : MongoDbRepositoryBase(
     /// invisible in-process (nothing between the latch and the member writes reads Detached).</summary>
     public virtual Task SetDetached(string channelId) =>
         Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Detached, true));
+
+    /// <summary>
+    /// Marks the room a LADDER match — see <see cref="ChatChannel.Ladder"/> for why the flag exists and
+    /// why it is STICKY-TRUE. Idempotent, and deliberately WRITE-ONLY-TRUE: there is no clearing
+    /// counterpart, so no update can un-moderate a live ladder room. (Deleting the channel does drop the
+    /// flag with the rest of the document — see the Ladder doc for why that is left alone.)
+    /// </summary>
+    public virtual Task SetLadder(string channelId) =>
+        Channels.UpdateOneAsync(c => c.Id == channelId, Builders<ChatChannel>.Update.Set(c => c.Ladder, true));
 
     /// <summary>
     /// Every System+Match channel eligible for an epoch sync — NOT detached (a detached room is excluded

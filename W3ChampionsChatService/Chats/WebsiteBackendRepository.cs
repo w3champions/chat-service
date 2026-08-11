@@ -37,9 +37,31 @@ public class WebsiteBackendRepository(IHttpClientFactory httpClientFactory) : IW
         httpClient.Timeout = TimeSpan.FromSeconds(2);
         var escapeDataString = Uri.EscapeDataString(battleTag);
         var result = await httpClient.GetAsync($"/api/players/{escapeDataString}/clan-and-picture");
+
+        // PR40 review (P1): FAIL LOUDLY on a non-success response instead of silently degrading to a
+        // default-valued DTO. Without this, a wb 4xx/5xx whose body still happens to deserialize (a JSON
+        // error envelope like {"error":"..."} binds happily to ChatDetailsDto, leaving every property
+        // null) returned a non-null DTO with ClanId == null and NO exception — so
+        // ChatAuthenticationService.GetUserFromIdentity never entered its catch and stamped the result
+        // FreshFromWb: TRUE. Callers that treat freshness as authoritative then acted on fabricated
+        // "absence" data:
+        //   * ChatHub.ReconcileClanMembership read "no clan" as a clan DEPARTURE and deleted the user's
+        //     clan membership — the exact eviction its never-clobber gate exists to prevent (the gate was
+        //     correct; the signal it trusted was not).
+        //   * ChatHub.UpsertDirectory replaced a good cached Profile with the near-null one — a LATENT
+        //     never-clobber violation that predates the clan work and is fixed by the same change.
+        // Throwing routes both back through the intended three-tier fallback (cache, then plain) with
+        // FreshFromWb: false, which is what "we could not reach wb" is supposed to look like.
+        result.EnsureSuccessStatusCode();
+
         var content = await result.Content.ReadAsStringAsync();
         var userDetails = JsonConvert.DeserializeObject<ChatDetailsDto>(content);
-        return userDetails;
+
+        // A 200 carrying an empty/whitespace/`null` body deserializes to a NULL DTO. That is a
+        // malformed response, not a player with no clan, so it must not be reported as fresh truth
+        // either — same reasoning as the status check above.
+        return userDetails ?? throw new InvalidOperationException(
+            $"wb returned a success status with an unusable clan-and-picture body for {battleTag}");
     }
 }
 

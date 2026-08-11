@@ -87,6 +87,7 @@ public class ChatHubFocusTests : IntegrationTestBase
 
     private ChatHub BuildHub(string connectionId)
     {
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileService,
@@ -113,7 +114,8 @@ public class ChatHubFocusTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         hub.Clients = new Mock<IHubCallerClients>().Object;
 
@@ -360,5 +362,62 @@ public class ChatHubFocusTests : IntegrationTestBase
 
         Assert.That(_focusRegistry.GetRoster(channel.Id), Is.EquivalentTo(new[] { BattleTag }));
         Assert.That(_focusRegistry.GetFocusedConnections(channel.Id), Is.EquivalentTo(new[] { "conn-1" }));
+    }
+
+    [Test]
+    public async Task FocusChannel_Roster_CarriesEachViewersFlair()
+    {
+        var channel = await CreateChannel();
+
+        RegisterSession("conn-peter", BattleTag, "Peter");
+        RegisterSession("conn-alice", OtherBattleTag, "Alice");
+        SeedMembership("conn-peter", channel.Id, BattleTag);
+        SeedMembership("conn-alice", channel.Id, OtherBattleTag);
+
+        // ConnectionMapping is what BuildSenderSnapshot reads for message flair, so seeding it here
+        // pins that the roster resolves from the SAME source — the two can never disagree.
+        _connectionMapping.RegisterUser("conn-alice", new ChatUser(
+            OtherBattleTag,
+            false,
+            "W3C",
+            new ProfilePicture { Race = AvatarCategory.NE, PictureId = 7, IsClassic = false },
+            new ChatColor("chat_color_purple"),
+            [new ChatIcon("chat_icon_crown")]));
+
+        var aliceHub = BuildHub("conn-alice");
+        await aliceHub.FocusChannel(channel.Id);
+
+        var peterHub = BuildHub("conn-peter");
+        var result = await peterHub.FocusChannel(channel.Id);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var alice = result.Viewers.Single(v => v.BattleTag == OtherBattleTag);
+        Assert.IsNotNull(alice.Profile, "A roster entry for an online, focused viewer must carry flair");
+        Assert.AreEqual(AvatarCategory.NE, alice.Profile.ProfilePicture.Race);
+        Assert.AreEqual(7, alice.Profile.ProfilePicture.PictureId);
+        Assert.AreEqual("W3C", alice.Profile.ClanId);
+        Assert.AreEqual("chat_color_purple", alice.Profile.ChatColor.ColorId);
+        Assert.AreEqual("chat_icon_crown", alice.Profile.ChatIcons.Single().IconId);
+    }
+
+    [Test]
+    public async Task FocusChannel_Roster_ViewerWithNoConnectionMappingEntry_YieldsNullProfile_NotAnException()
+    {
+        // Teardown race: a session exists but its ConnectionMapping entry is already gone. The entry
+        // must survive with a null Profile (the client falls back to its default avatar) rather than
+        // being dropped or throwing — mirroring the pre-existing battleTag name fallback.
+        var channel = await CreateChannel();
+
+        RegisterSession("conn-peter", BattleTag, "Peter");
+        SeedMembership("conn-peter", channel.Id, BattleTag);
+
+        var hub = BuildHub("conn-peter");
+        var result = await hub.FocusChannel(channel.Id);
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var peter = result.Viewers.Single();
+        Assert.AreEqual(BattleTag, peter.BattleTag);
+        Assert.AreEqual("Peter", peter.Name, "The display name must still resolve from the live session");
+        Assert.IsNull(peter.Profile);
     }
 }

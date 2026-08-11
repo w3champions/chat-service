@@ -61,6 +61,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
     private ViewersAccumulator _viewersAccumulator;
+    private ViewerResolver _viewerResolver;
     private PresenceInterestRegistry _presenceInterestRegistry; // the shared index under test
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
@@ -120,7 +121,8 @@ public class ChatHubPresenceTests : IntegrationTestBase
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         // The engine shares the SAME presence-interest registry the hubs mutate — so RegisterFocus (hub)
         // and GetInterestedConnections (engine's PushPresenceChanged) see one consistent index.
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, _presenceInterestRegistry, _viewersAccumulator, _time);
     }
@@ -158,7 +160,8 @@ public class ChatHubPresenceTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             _presenceInterestRegistry, // SHARED — same instance the engine reads
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));

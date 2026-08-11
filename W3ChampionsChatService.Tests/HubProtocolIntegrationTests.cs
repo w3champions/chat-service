@@ -76,6 +76,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
     private ViewersAccumulator _viewersAccumulator;
+    private ViewerResolver _viewerResolver;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationService _reconcileService;
@@ -131,7 +132,8 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         // registries the hubs mutate — so every push lands in a single ordered capture and the
         // coalescer/accumulator see the live roster/membership/read-state the hubs produce.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry(), _viewersAccumulator, _time);
     }
@@ -174,7 +176,8 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -303,6 +306,9 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
 
     private static bool Contains(IEnumerable<string> tags, string battleTag) =>
         tags.Any(t => string.Equals(t, battleTag, StringComparison.OrdinalIgnoreCase));
+
+    private static bool Contains(IEnumerable<ChannelViewerDto> viewers, string battleTag) =>
+        viewers.Any(v => string.Equals(v.BattleTag, battleTag, StringComparison.OrdinalIgnoreCase));
 
     // ============================================================================================
     // Scenario 1 — acceptance 1: the focused/unfocused fan-out split, end-to-end across 3 clients.
@@ -456,7 +462,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
 
         // Flush the establishing window so alpha+bravo are the baseline-VIEWING set of the next window.
         await _viewersAccumulator.FlushDue(T0.AddSeconds(5));
-        Assert.That(ViewersChangedFor("conn-alpha").SelectMany(v => v.Joined),
+        Assert.That(ViewersChangedFor("conn-alpha").SelectMany(v => v.Joined).Select(j => j.BattleTag),
             Is.EquivalentTo(new[] { AlphaTag, BravoTag }), "the establishing flush announces alpha+bravo joined");
 
         // Charlie joins mid the next window.

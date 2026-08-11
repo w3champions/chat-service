@@ -88,6 +88,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _connectionMapping,
             new MentionInboxRepository(MongoClient));
 
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+
         _chatHub = new ChatHub(
             _connectionMapping,
             new MuteReconciliationTestHarness(_connectionMapping, _muteRepository).Service,
@@ -114,7 +116,8 @@ public class ChatHubDeletionTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         _clients.Setup(c => c.All).Returns(_mockAllProxy.Object);
         _clients.Setup(c => c.AllExcept(It.IsAny<System.Collections.Generic.IReadOnlyList<string>>())).Returns(_mockAllExceptProxy.Object);
@@ -167,6 +170,23 @@ public class ChatHubDeletionTests : IntegrationTestBase
             SentAt = DateTime.UtcNow,
             Shadow = shadow,
             ExpiresAt = expiresAt,
+        };
+        await _messageRepository.Insert(message);
+        return message;
+    }
+
+    // Post-game chat Plan A Task 5: the server-authored counterpart of SeedMessage — same seq-allocation
+    // path, but no sender and a structured body instead of content.
+    private async Task<ChannelMessage> SeedSystemMessage(string channelId)
+    {
+        var seq = await _channelRepository.AllocateSeq(channelId, DateTime.UtcNow);
+        var message = new ChannelMessage
+        {
+            ChannelId = channelId,
+            Seq = seq,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" },
+            SentAt = DateTime.UtcNow,
         };
         await _messageRepository.Insert(message);
         return message;
@@ -465,6 +485,21 @@ public class ChatHubDeletionTests : IntegrationTestBase
         Assert.IsNull(reloaded.Deleted, "a message whose channel cannot be resolved must never be soft-deleted");
         Assert.IsEmpty(_pushHarness.AllSignals);
         Assert.IsEmpty(_mentionCleaner.Calls);
+    }
+
+    [Test]
+    public async Task DeleteMessage_OnSystemMessage_ReturnsPermissionDenied_AndDeletesNothing()
+    {
+        var channel = await CreateChannel();
+        var message = await SeedSystemMessage(channel.Id);
+
+        var result = await _chatHub.DeleteMessage(message.Id);
+
+        Assert.AreEqual(ChatResultCode.PermissionDenied, result.Code,
+            "a server-authored message has no author to moderate — and the author-exclusion fan-out would null-deref on Sender.BattleTag");
+
+        var reloaded = await _messageRepository.Load(message.Id);
+        Assert.IsNull(reloaded.Deleted, "the rejection happens BEFORE MarkDeleted — nothing is soft-deleted");
     }
 
     [Test]

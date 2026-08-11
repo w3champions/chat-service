@@ -44,6 +44,23 @@ public class InternalChannelCreateRequest
     public string Epoch { get; set; }
     public long? Seq { get; set; }
     public bool? Detached { get; set; }
+
+    /// <summary>
+    /// Declares this ref a LADDER match rather than a custom-game lobby. Absent/false ⇒ custom lobby
+    /// (today's behavior, byte-for-byte). The ONLY consumer is the send-path mute scope
+    /// (<see cref="Channels.ChannelModeration.IsMuteEnforced"/>): a lounge-muted or shadow-banned
+    /// player must not be able to talk in a ladder game's in-game/post-game room, while a custom
+    /// lobby stays exempt.
+    /// <para>
+    /// Deliberately SEPARATE from <see cref="Detached"/> even though mm happens to send both together
+    /// on the ladder create path today. Detach means "membership is frozen, sweeps skip this"; it is
+    /// also set on every custom lobby at GAME_STARTED, so it does not — and must never be made to —
+    /// answer "is this ladder". Inferring one from the other would silently un-moderate ladder rooms
+    /// the day mm's detach timing changes.
+    /// </para>
+    /// STICKY-TRUE server-side: see <see cref="Channels.ChatChannel.Ladder"/>.
+    /// </summary>
+    public bool? Ladder { get; set; }
 }
 
 /// <summary>
@@ -72,6 +89,22 @@ public class InternalRosterAssertRequest
     public List<string> Members { get; set; }
     public string Name { get; set; }
     public bool? Detached { get; set; }
+
+    /// <summary>
+    /// Same meaning as <see cref="InternalChannelCreateRequest.Ladder"/>. Carried on this route too
+    /// because the roster endpoint is ALSO a channel-creating path: mm's ladder create has a
+    /// retry-on-failure fallback that converges through <c>PUT .../roster</c> instead, and that
+    /// assertion may well be the call that creates the channel on demand. Without the flag here, a
+    /// ladder room born on the fallback path would be indistinguishable from a custom lobby and would
+    /// silently escape the mute gate.
+    /// <para>
+    /// Applied BEFORE the detach-freeze and staleness gates, and independently of them: it is a
+    /// property assertion about the ref, not a membership mutation, so a stale/duplicate/frozen
+    /// assertion that legitimately discards its ROSTER must still be able to correct the room's
+    /// classification.
+    /// </para>
+    /// </summary>
+    public bool? Ladder { get; set; }
 }
 
 /// <summary>
@@ -108,12 +141,54 @@ public class InternalRelationshipChangeRequest
 }
 
 /// <summary>
+/// <c>POST /internal/channels/{ref}/system-message</c> request body — a server-authored message
+/// published into an EXISTING channel. Lookup-only: unlike the create/roster routes this one never
+/// creates a channel, so an unknown ref is a 404 rather than an implicit create.
+/// <para>
+/// <see cref="Key"/> and <see cref="FallbackText"/> are both REQUIRED: the key is what a client
+/// renders through its own locale catalogue, and the fallback is the only thing a client that does not
+/// know the key (or the moderation history endpoint, which has no catalogue at all) can display.
+/// <see cref="Key"/> is re-validated server-side against the same character class as <c>ref</c> —
+/// <c>\A[A-Za-z0-9_-]{1,64}\z</c>, where 64 is <see cref="Domain.ChatLimits.InternalRefMaxLength"/> —
+/// so a dotted or namespaced catalogue key (e.g. <c>match.intro</c> or <c>chat:match_intro</c>) is
+/// rejected 400; catalogue keys for this endpoint must stick to alphanumerics, <c>_</c>, and <c>-</c>.
+/// <see cref="DedupeKey"/> is optional but strongly recommended — mm retries on timeout, and without a
+/// key a retried publish posts twice. An ABSENT, EMPTY, or WHITESPACE-ONLY <see cref="DedupeKey"/> all
+/// mean the same thing — "no dedupe" — and the endpoint deliberately never rejects the call over it;
+/// only a non-empty key that fails the <see cref="Key"/> character class above is a 400.
+/// </para>
+/// </summary>
+public class InternalSystemMessageRequest
+{
+    public string Key { get; set; }
+    public Dictionary<string, string> Params { get; set; }
+    public Dictionary<string, List<string>> ListParams { get; set; }
+    public string FallbackText { get; set; }
+    public string DedupeKey { get; set; }
+}
+
+/// <summary>
+/// Body of <c>POST /internal/profile-changes</c>: the players whose flair website-backend believes
+/// may have changed. Capped at <see cref="Domain.ChatLimits.InternalMaxMembersPerCall"/>; the sender
+/// chunks larger sets into separate requests.
+/// </summary>
+public class InternalProfileChangeRequest
+{
+    public List<string> BattleTags { get; set; }
+}
+
+/// <summary>
 /// REST projection of a <see cref="ChatChannel"/> returned by <c>POST /internal/channels</c> (C7 Task
 /// 9) — System.Text.Json's default camelCase serialization matches the wire contract mm expects, so no
 /// custom naming policy is needed.
 /// </summary>
-public record InternalChannelDto(string Id, string Ref, string Name, DateTime? ExpiresAt)
+/// <para>
+/// <c>Ladder</c> is the STORED classification read back, not an echo of the request: because the flag
+/// is sticky-true, "what mm sent" and "what the channel now holds" diverge on exactly the calls worth
+/// diagnosing (a create omitting the flag against an already-ladder ref). Additive — mm may ignore it.
+/// </para>
+public record InternalChannelDto(string Id, string Ref, string Name, DateTime? ExpiresAt, bool Ladder)
 {
     public static InternalChannelDto FromChannel(ChatChannel channel) =>
-        new(channel.Id, channel.SystemRef, channel.Name, channel.ExpiresAt);
+        new(channel.Id, channel.SystemRef, channel.Name, channel.ExpiresAt, channel.Ladder);
 }

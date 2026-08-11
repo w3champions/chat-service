@@ -51,7 +51,8 @@ public class Startup
             // ChatHub.Messaging.cs — defense-in-depth against a client sending an oversized frame to
             // force needless buffering/allocation ahead of the app-level validation.
             options.MaximumReceiveMessageSize = 16 * 1024;
-        });
+        })
+        .AddJsonProtocol(ChatJsonProtocol.Configure);
 
         // D9 (C6 Task 3): registers IHttpClientFactory — WebsiteBackendRepository is rebuilt on it,
         // killing the per-call `new HttpClient()` socket-exhaustion anti-pattern (a fresh HttpClient
@@ -165,6 +166,11 @@ public class Startup
         // (10s) and the accumulator (5s) on the injected TimeProvider clock. Without it the pure,
         // deterministic-time sinks above would never fire outside tests.
         services.AddHostedService<FanOutFlushService>();
+        // Fix round (P1): the live-flair drain's OWN hosted service, deliberately separate from
+        // FanOutFlushService above — a website-backend outage during FlairRefreshCoalescer.Flush must
+        // never stall the unrelated ActivityCoalescer/ViewersAccumulator fan-out on a shared loop. See
+        // FlairRefreshFlushService's doc comment.
+        services.AddHostedService<FlairRefreshFlushService>();
 
         // Task 10: JoinChannel's implicit-semiPublic-creation throttle. Singleton — a transient
         // registration would fragment each battleTag's per-hour creation counter across hub
@@ -173,6 +179,17 @@ public class Startup
         services.AddSingleton<ChannelCreationRateLimiter>();
 
         services.AddSingleton<ConnectionMapping>();
+        // Singleton: holds only the singleton ConnectionMapping + ISessionRegistry. Consumed by BOTH
+        // ViewersAccumulator and ChatHub (ctor-injected, PR44) — the SAME instance, which is what
+        // guarantees an initial roster and a ViewersChanged join delta can never render a viewer
+        // differently.
+        services.AddSingleton<ViewerResolver>();
+        // Singleton: holds only singletons plus the hub context. Consumed by FlairRefreshCoalescer.
+        services.AddSingleton<IFlairRefresher, FlairRefresher>();
+        // Task 5 (live flair propagation): coalesces bursty flair-change notifications into one refresh
+        // per flush tick. Singleton — it holds the pending battleTag set that RecordChange (Task 6's
+        // endpoint) writes and FlairRefreshFlushService drains; a transient would fragment that set.
+        services.AddSingleton<FlairRefreshCoalescer>();
         // Reconciles the live mute cache from every ban WRITE path (hub + REST controller).
         // Singleton: it only holds the singleton ConnectionMapping + IHubContext<ChatHub>.
         services.AddSingleton<MuteReconciliationService>();
@@ -235,6 +252,11 @@ public class Startup
         // TRANSIENT, so this singleton captures them as a captive dependency — safe ONLY because all three are
         // stateless MongoClient wrappers with no per-call state of their own to leak across calls.
         services.AddSingleton<MatchChannelService>();
+
+        // Post-game chat Plan A Task 3: the server-authored message insert path. Singleton for the same
+        // reason as MatchChannelService — no per-call state; its MessageRepository/ChannelRepository deps
+        // are transient MongoClient wrappers, safe to capture.
+        services.AddSingleton<SystemMessagePublisher>();
 
         Log.Information("Services added");
     }

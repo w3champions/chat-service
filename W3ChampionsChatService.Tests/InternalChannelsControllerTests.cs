@@ -9,6 +9,7 @@ using Microsoft.Extensions.Time.Testing;
 using NUnit.Framework;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.FanOut;
 using W3ChampionsChatService.Internal;
@@ -58,7 +59,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var focusRegistry = new FocusRegistry();
         var onlineMemberRegistry = new OnlineMemberRegistry();
         var activityCoalescer = new ActivityCoalescer(harness.HubContext, onlineMemberRegistry);
-        var viewersAccumulator = new ViewersAccumulator(harness.HubContext, focusRegistry);
+        // The accumulator's resolver shares the SAME sessionRegistry passed to the engine below (no test
+        // in this file ever registers a session or asserts on ViewersChanged content, so this is currently
+        // inert either way — wired for parity with the fixture's other real-registry sharing).
+        var viewersAccumulator = new ViewersAccumulator(harness.HubContext, focusRegistry, new ViewerResolver(sessionRegistry, new ConnectionMapping()));
         var fanOutEngine = new FanOutEngine(
             harness.HubContext,
             focusRegistry,
@@ -74,7 +78,10 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         _messageRepository = new MessageRepository(MongoClient);
         _matchChannelService = new MatchChannelService(_channelRepository, _membershipRepository, _messageRepository, fanOutEngine, _time);
 
-        _controller = new InternalChannelsController(_matchChannelService)
+        // Task 4 added a second, sibling constructor dependency for the system-message route — this
+        // file's SUT construction has to keep pace even though none of ITS tests exercise that route.
+        var systemMessagePublisher = new SystemMessagePublisher(_messageRepository, _channelRepository, fanOutEngine, _time);
+        _controller = new InternalChannelsController(_matchChannelService, _channelRepository, systemMessagePublisher)
         {
             ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() },
         };
@@ -500,6 +507,55 @@ public class InternalChannelsControllerTests : IntegrationTestBase
         var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "match-legacy");
         Assert.That(channel.AssertEpoch, Is.Null, "no stamp is written when epoch/seq are omitted — the back-compat pin for today's mm");
         Assert.That(channel.Detached, Is.False);
+        Assert.That(channel.Ladder, Is.False, "and an omitted `ladder` means custom-game lobby — the mute-exempt default");
+    }
+
+    // ── `ladder` — the send-path mute scope's discriminator ─────────────────────────────────────
+
+    [Test]
+    public async Task PostCreate_WithLadderTrue_200_AndChannelIsMarkedLadder()
+    {
+        var request = ValidCreateRequest(@ref: "ladder-1", members: "Peter#123");
+        request.Detached = true;
+        request.Ladder = true;
+
+        var result = await _controller.Create(request) as OkObjectResult;
+
+        Assert.That(result, Is.Not.Null);
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
+        Assert.That(channel.Ladder, Is.True);
+        Assert.That(ChannelModeration.IsMuteEnforced(channel), Is.True,
+            "which is the whole point: a lounge-muted player is silenced in a ladder match room");
+    }
+
+    [Test]
+    public async Task PostCreate_WithDetachedButNoLadder_200_AndChannelIsNotMuteGated()
+    {
+        // `detached` is NOT a ladder signal — mm sets it on every custom lobby at game start too. A
+        // custom lobby's post-game room must stay mute-exempt.
+        var request = ValidCreateRequest(@ref: "lobby-1", members: "Peter#123");
+        request.Detached = true;
+
+        await _controller.Create(request);
+
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "lobby-1");
+        Assert.That(channel.Detached, Is.True);
+        Assert.That(ChannelModeration.IsMuteEnforced(channel), Is.False,
+            "detach must never be inferred as ladder-ness — the two answer different questions");
+    }
+
+    [Test]
+    public async Task PutRoster_WithLadderTrue_200_AndChannelIsMarkedLadder()
+    {
+        // mm's ladder create-failure fallback lands here, and this assertion may itself create the room.
+        var request = ValidRosterRequest(detached: true, members: "Peter#123");
+        request.Ladder = true;
+
+        var result = await _controller.AssertRoster("ladder-1", request) as OkResult;
+
+        Assert.That(result, Is.Not.Null);
+        var channel = await _channelRepository.LoadBySystemRef(SystemChannelKind.Match, "ladder-1");
+        Assert.That(channel.Ladder, Is.True);
     }
 
     // ── POST /internal/channels/epoch-sync ──────────────────────────────────────────────────────

@@ -77,6 +77,7 @@ public class DmGroupIntegrationTests : IntegrationTestBase
     private ActivityCoalescer _activityCoalescer;
     private FanOutEngine _fanOutEngine;
     private ViewersAccumulator _viewersAccumulator;
+    private ViewerResolver _viewerResolver;
     private UserDirectoryRepository _userDirectory;
     private MuteRepository _muteRepository;
     private MuteReconciliationTestHarness _reconcileHarness;
@@ -130,7 +131,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         // The three fan-out sinks ALL push through the ONE shared harness and read the SHARED registries
         // the hubs mutate, so every push lands in a single ordered capture.
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
-        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry);
+        _viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
+        _viewersAccumulator = new ViewersAccumulator(_harness.HubContext, _focusRegistry, _viewerResolver);
         _fanOutEngine = new FanOutEngine(
             _harness.HubContext, _focusRegistry, _onlineMemberRegistry, _activityCoalescer, _sessionRegistry, new PresenceInterestRegistry(), _viewersAccumulator, _time);
 
@@ -204,7 +206,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
             MentionFanOutTestFactory.CreateIgnored(MongoClient),
             new PresenceInterestRegistry(),
             new MentionInboxRepository(MongoClient),
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            _viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         clients.Setup(c => c.Caller).Returns(CapturingSingle(connectionId));
@@ -825,7 +828,8 @@ public class DmGroupIntegrationTests : IntegrationTestBase
         // A FULL mute on the user's live connection (cache-only enforcement, the SendMessage mute gate seam).
         _connectionMapping.SetMute("conn-user", MuteStatus.Full, Now.AddDays(1));
 
-        // Public: gated → Muted (the control). DM + group: the mute gate is PUBLIC-ONLY, so both send Ok.
+        // Public: gated → Muted (the control). DM + group: the mute scope
+        // (ChannelModeration.IsMuteEnforced) covers only Public and LADDER match rooms, so both send Ok.
         Assert.That((await userHub.SendMessage(pub.Id, "public")).Code, Is.EqualTo(ChatResultCode.Muted), "a full mute gates a PUBLIC send");
         var dmSend = await userHub.SendMessage(dm.Channel.Id, "dm while muted");
         Assert.That(dmSend.Code, Is.EqualTo(ChatResultCode.Ok), "a full mute does NOT gate a DM send");

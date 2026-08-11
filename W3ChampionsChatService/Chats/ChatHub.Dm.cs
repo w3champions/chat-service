@@ -365,8 +365,8 @@ public partial class ChatHub
     /// (the next real seq a client would expect); clients dedupe by messageId, so the never-persisted id is
     /// harmless (D6 documented residuals).
     /// </summary>
-    private static SendMessageResult FakeSendAck(ChatChannel channel) =>
-        new SendMessageResult(ChatResultCode.Ok, MessageId: ObjectId.GenerateNewId().ToString(), Seq: channel.LastSeq + 1);
+    private static SendMessageResult FakeSendAck(ChatChannel channel, DateTime now) =>
+        new SendMessageResult(ChatResultCode.Ok, MessageId: ObjectId.GenerateNewId().ToString(), Seq: channel.LastSeq + 1, SentAt: now);
 
     /// <summary>
     /// Resolves the COUNTERPART battleTag of a 1:1 <see cref="ChannelType.Dm"/> from its
@@ -466,7 +466,7 @@ public partial class ChatHub
         {
             // Blocked: silent non-delivery. Nothing is persisted, delivered, or materialized (SendMessage
             // returns this before the persist/materialize/fan-out steps).
-            return FakeSendAck(channel);
+            return FakeSendAck(channel, now);
         }
 
         // (2) Pending machine.
@@ -492,13 +492,13 @@ public partial class ChatHub
                 var recipientSettings = await _userSettings.LoadOrDefault(counterpart);
                 if (recipientSettings.DmPrivacy is not DmPrivacy.Everyone)
                 {
-                    return FakeSendAck(channel);
+                    return FakeSendAck(channel, now);
                 }
 
                 // Pending-depth cap: only the initiator grows a pending conversation, so LastSeq is the depth.
                 if (channel.LastSeq >= ChatLimits.PendingConversationMaxMessages)
                 {
-                    return FakeSendAck(channel);
+                    return FakeSendAck(channel, now);
                 }
             }
         }

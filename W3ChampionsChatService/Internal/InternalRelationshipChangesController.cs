@@ -1,4 +1,3 @@
-using System.Linq;
 using Microsoft.AspNetCore.Mvc;
 using Serilog;
 using W3ChampionsChatService.Authentication;
@@ -68,12 +67,5 @@ public class InternalRelationshipChangesController(IRelationshipProvider relatio
         _ => false,
     };
 
-    // Non-blank AND control-char-free. IsNullOrWhiteSpace rejects null/empty/all-whitespace; char.IsControl
-    // catches an EMBEDDED '\n'/'\r'/'\t'/NUL that a partly-printable value would otherwise smuggle into the
-    // structured {Actor}/{Target} log sink (log-injection guard — same class the Task 9 ref review caught).
-    // char.IsControl does NOT cover U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR (category Zl/Zp, not
-    // Cc) — a downstream JS/JSON log viewer can render either as a line break, spoofing a log line. Rejected
-    // explicitly here.
-    private static bool IsValidParticipant(string value) =>
-        !string.IsNullOrWhiteSpace(value) && !value.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029');
+    private static bool IsValidParticipant(string value) => InternalValidation.IsValidBattleTag(value);
 }

@@ -72,7 +72,7 @@ public class ActivityCoalescerTests
         var focus = new FocusRegistry();
         var members = new OnlineMemberRegistry();
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus), TimeProvider.System);
+        var engine = new FanOutEngine(harness.HubContext, focus, members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, focus, ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
         return (harness, focus, members, engine);
     }
 
@@ -265,9 +265,9 @@ public class ActivityCoalescerTests
     public async Task CoalescedBurst_EmitsLatestPreview()
     {
         var (harness, _, coalescer) = NewCoalescer();
-        var preview1 = new DmActivityPreviewDto(AuthorTag, "Author", "first message");
-        var preview2 = new DmActivityPreviewDto(AuthorTag, "Author", "second message");
-        var preview3 = new DmActivityPreviewDto(AuthorTag, "Author", "third message — latest");
+        var preview1 = new ActivityPreviewDto(AuthorTag, "Author", "first message", ChannelType.Dm, null);
+        var preview2 = new ActivityPreviewDto(AuthorTag, "Author", "second message", ChannelType.Dm, null);
+        var preview3 = new ActivityPreviewDto(AuthorTag, "Author", "third message — latest", ChannelType.Dm, null);
 
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview1);                // immediate emit — opens the window
         await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview2);   // within window — coalesce
@@ -408,7 +408,7 @@ public class ActivityCoalescerTests
         var members = new OnlineMemberRegistry();
         members.Join(ChannelId, MemberConn, new MemberState(MemberTag, NotificationLevel.All, LastReadSeq: 0, ChannelType: ChannelType.Public));
         var coalescer = new ActivityCoalescer(harness.HubContext, members);
-        var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, new FocusRegistry()), TimeProvider.System);
+        var engine = new FanOutEngine(harness.HubContext, new FocusRegistry(), members, coalescer, new SessionRegistry(), new PresenceInterestRegistry(), new ViewersAccumulator(harness.HubContext, new FocusRegistry(), ViewersAccumulatorTestFactory.EmptyViewerResolver()), TimeProvider.System);
 
         // A send routes an offer to the unfocused level-All member, creating coalescing state.
         await engine.OnMessagePersisted(Channel(), Message(seq: 5), AuthorConn, isShadow: false, T0);
@@ -417,5 +417,101 @@ public class ActivityCoalescerTests
         // The hub's disconnect teardown routes through the engine (which owns the coalescer).
         engine.OnConnectionClosed(MemberConn);
         Assert.AreEqual(0, coalescer.TrackedChannelCount(MemberConn), "OnConnectionClosed must evict the connection's coalescing state");
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // SentAt — the message timestamp that makes ChannelActivity usable as a conversation-list sort key
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Offer_CarriesSentAtOnTheImmediateEmit()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+        var sentAt = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview: null, sentAt: sentAt);
+
+        var dto = harness.PayloadFor(MemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.AreEqual(sentAt, dto.SentAt,
+            "without this the client has no live ordering signal at all — LastMessageAt only refreshes on a snapshot or a GetConversations page");
+    }
+
+    [Test]
+    public async Task Offer_WithoutSentAt_LeavesItNull()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0);
+
+        var dto = harness.PayloadFor(MemberConn, ChatEvents.ChannelActivity) as ChannelActivityDto;
+        Assert.IsNull(dto.SentAt, "absence must stay distinguishable from a zero timestamp — a client reads it as 'no ordering information'");
+    }
+
+    [Test]
+    public async Task CoalescedBurst_FlushesTheLatestOfferedSentAt()
+    {
+        var (harness, _, coalescer) = NewCoalescer();
+        var first = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+        var latest = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
+
+        // Opens the window (emits immediately), then two more within it collapse into the pending.
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, preview: null, sentAt: first);
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview: null, sentAt: first.AddMinutes(1));
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 7, T0.AddSeconds(2), preview: null, sentAt: latest);
+
+        await coalescer.FlushDue(T0.AddSeconds(11));
+
+        var payloads = ActivityPayloads(harness, MemberConn);
+        Assert.AreEqual(2, payloads.Count, "one immediate emit plus one flushed pending");
+        Assert.AreEqual(first, payloads[0].SentAt);
+        Assert.AreEqual(latest, payloads[1].SentAt,
+            "the drained burst must carry the LATEST offered timestamp, mirroring the latest-offered-preview discipline beside it");
+        Assert.AreEqual(7, payloads[1].LastSeq);
+    }
+
+    [Test]
+    public async Task OutOfOrderOffer_DoesNotPairTheHigherSeqWithTheLowerMessagesTextAndTimestamp()
+    {
+        // Concurrent same-channel sends reach the lock in either order, and the emitted seq is the MAX of
+        // what was offered. If (Preview, SentAt) were kept latest-ARRIVED rather than highest-SEQ, a
+        // delayed lower offer would ride out under the higher seq — the row would show the second-newest
+        // message pinned at a seq the newest message can no longer replace (the client's projection merge
+        // is monotonic on exactly that seq).
+        var (harness, _, coalescer) = NewCoalescer();
+        var newerSentAt = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
+        var newer = new ActivityPreviewDto("peter#123", "peter", "the newest message", ChannelType.Dm, null);
+        var older = new ActivityPreviewDto("peter#123", "peter", "the delayed older message", ChannelType.Dm, null);
+
+        // seq 7 opens the window and emits; the delayed seq 6 then lands inside it.
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 7, T0, preview: newer, sentAt: newerSentAt);
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), preview: older, sentAt: newerSentAt.AddMinutes(-1));
+        await coalescer.FlushDue(T0.AddSeconds(11));
+
+        var payloads = ActivityPayloads(harness, MemberConn);
+        Assert.AreEqual(2, payloads.Count, "one immediate emit plus one flushed pending");
+        Assert.AreEqual(7, payloads[1].LastSeq, "the emitted seq stays at the max, as before");
+        Assert.AreEqual("the newest message", ((ActivityPreviewDto)payloads[1].Preview).Excerpt,
+            "the text must belong to the seq being emitted, not to whichever offer arrived last");
+        Assert.AreEqual(newerSentAt, payloads[1].SentAt, "and so must the timestamp beside it");
+    }
+
+    [Test]
+    public async Task SentAt_TravelsWithItsOwnPreview()
+    {
+        // The pair describes ONE message. If they were written or drained independently a client could
+        // render one message's text against another message's timestamp.
+        var (harness, _, coalescer) = NewCoalescer();
+        var olderSentAt = new DateTime(2026, 8, 9, 22, 47, 0, DateTimeKind.Utc);
+        var newerSentAt = new DateTime(2026, 8, 9, 22, 49, 0, DateTimeKind.Utc);
+        var older = new ActivityPreviewDto("peter#123", "peter", "older text", ChannelType.Dm, null);
+        var newer = new ActivityPreviewDto("peter#123", "peter", "newer text", ChannelType.Dm, null);
+
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 5, T0, older, olderSentAt);
+        await coalescer.Offer(MemberConn, ChannelId, lastSeq: 6, T0.AddSeconds(1), newer, newerSentAt);
+        await coalescer.FlushDue(T0.AddSeconds(11));
+
+        var flushed = ActivityPayloads(harness, MemberConn)[1];
+        Assert.AreEqual("newer text", ((ActivityPreviewDto)flushed.Preview).Excerpt);
+        Assert.AreEqual(newerSentAt, flushed.SentAt, "the flushed timestamp must belong to the same message as the flushed preview");
     }
 }

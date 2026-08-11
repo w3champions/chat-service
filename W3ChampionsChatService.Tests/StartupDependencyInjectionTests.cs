@@ -431,4 +431,16 @@ public class StartupDependencyInjectionTests
         Assert.AreEqual(16 * 1024, hubOptions.MaximumReceiveMessageSize,
             "MaximumReceiveMessageSize must be pinned to the explicit 16KB cap, not left at SignalR's 32KB default");
     }
+
+    [Test]
+    public void SystemMessagePublisher_IsSingleton_SharedAcrossResolutions()
+    {
+        using var provider = BuildProvider();
+
+        var first = provider.GetRequiredService<SystemMessagePublisher>();
+        var second = provider.GetRequiredService<SystemMessagePublisher>();
+
+        Assert.AreSame(first, second,
+            "SystemMessagePublisher MUST be a singleton — it is the shared server-authored insert path, and a transient would needlessly re-resolve the fan-out graph per publish");
+    }
 }

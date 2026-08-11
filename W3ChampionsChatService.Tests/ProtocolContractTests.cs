@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Text.Json;
+using Microsoft.AspNetCore.SignalR;
 using NUnit.Framework;
 using W3ChampionsChatService.Channels;
+using W3ChampionsChatService.Chats;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
@@ -31,6 +34,17 @@ public class ProtocolContractTests
         var json = JsonSerializer.Serialize(ChatResultCode.NotMember);
 
         Assert.AreEqual("\"NotMember\"", json);
+    }
+
+    [Test]
+    public void MessageKind_SerializesAsStringName()
+    {
+        // Same property, same reason, as ChatResultCode above: there is no global
+        // JsonStringEnumConverter (ChatJsonProtocol.Configure only sets DefaultIgnoreCondition), so
+        // without MessageKind's own [JsonConverter] the discriminator rides as an undocumented ordinal
+        // and a client ends up writing `if (msg.kind === 1)`.
+        Assert.AreEqual("\"System\"", JsonSerializer.Serialize(MessageKind.System));
+        Assert.AreEqual("\"User\"", JsonSerializer.Serialize(MessageKind.User));
     }
 
     [Test]
@@ -112,13 +126,24 @@ public class ProtocolContractTests
     [Test]
     public void FocusChannelResult_CarriesViewerRoster()
     {
-        var viewers = new[] { new ChannelViewerDto("Peter#123", "Peter") };
+        // Explicit Profile (Finding 3: ChannelViewerDto's Profile ctor arg no longer defaults to
+        // null — every construction site states its intent). Also asserts Profile itself rides the
+        // roster (Finding 4): a regression that stopped populating it would previously leave this
+        // wire-shape contract test green.
+        var profile = new ChatProfile
+        {
+            ProfilePicture = new ProfilePicture { Race = AvatarCategory.HU, PictureId = 3, IsClassic = true },
+        };
+        var viewers = new[] { new ChannelViewerDto("Peter#123", "Peter", profile) };
 
         var result = new FocusChannelResult(ChatResultCode.Ok, Viewers: viewers);
 
         Assert.AreEqual(1, result.Viewers.Count);
         Assert.AreEqual("Peter#123", result.Viewers[0].BattleTag);
         Assert.AreEqual("Peter", result.Viewers[0].Name);
+        Assert.AreSame(profile, result.Viewers[0].Profile);
+        Assert.AreEqual(AvatarCategory.HU, result.Viewers[0].Profile.ProfilePicture.Race);
+        Assert.AreEqual(3, result.Viewers[0].Profile.ProfilePicture.PictureId);
     }
 
     [Test]
@@ -387,12 +412,15 @@ public class ProtocolContractTests
     {
         // D6: AssertEpoch/AssertSeq/Detached are mm<->chat reconciliation bookkeeping, never client
         // protocol — the raw entity rides ChannelAddedDto.Channel / ChannelDto.Channel to clients.
+        // Ladder joins them: it is the mm-declared ladder-vs-custom classification the send-path mute
+        // gate reads server-side, not something a client is told or could act on.
         var channel = new ChatChannel
         {
             Id = "c1",
             AssertEpoch = "e1",
             AssertSeq = 5,
             Detached = true,
+            Ladder = true,
         };
 
         var json = JsonSerializer.Serialize(channel);
@@ -403,7 +431,168 @@ public class ProtocolContractTests
         StringAssert.DoesNotContain("AssertSeq", json);
         StringAssert.DoesNotContain("detached", json);
         StringAssert.DoesNotContain("Detached", json);
+        StringAssert.DoesNotContain("ladder", json);
+        StringAssert.DoesNotContain("Ladder", json);
         // Positive control — proves the object really did serialize.
         StringAssert.Contains("Id", json);
+    }
+
+    // ── Post-game chat Plan A Task 2 — MessageDto projects the system-message fields ────────
+
+    [Test]
+    public void ForUserDelivery_CarriesSystemKindAndBody()
+    {
+        var systemMessage = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = "chan1",
+            Seq = 3,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody
+            {
+                Key = "match_intro",
+                Params = new Dictionary<string, string> { ["map"] = "Amazonia" },
+                FallbackText = "Match on Amazonia",
+            },
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = MessageDto.ForUserDelivery("chan1", systemMessage);
+
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.System), "the client needs the discriminator to pick a renderer");
+        Assert.That(dto.SystemMessage.Key, Is.EqualTo("match_intro"), "key is the client's catalogue lookup token");
+        Assert.That(dto.SystemMessage.FallbackText, Is.EqualTo("Match on Amazonia"), "fallback text must survive the projection");
+        Assert.That(dto.Sender, Is.Null, "a system message has no sender snapshot on the wire either");
+        Assert.That(dto.Content, Is.Null, "a system message carries no free-form content on the wire either");
+    }
+
+    [Test]
+    public void ForModerator_CarriesSystemKindAndBody()
+    {
+        var systemMessage = new ChannelMessage
+        {
+            Id = "m1",
+            ChannelId = "chan1",
+            Seq = 3,
+            Kind = MessageKind.System,
+            SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" },
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = MessageDto.ForModerator("chan1", systemMessage);
+
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.System), "the moderator projection needs the discriminator too");
+        Assert.That(dto.SystemMessage.FallbackText, Is.EqualTo("Match on Amazonia"),
+            "moderation history renders fallbackText — it has no i18n catalogue");
+    }
+
+    [Test]
+    public void UserMessageProjection_DefaultsToUserKindWithNoSystemBody()
+    {
+        var userMessage = new ChannelMessage
+        {
+            Id = "m2",
+            ChannelId = "chan1",
+            Seq = 4,
+            Sender = new MessageSender { BattleTag = "A#1", Name = "A" },
+            Content = "gg",
+            SentAt = DateTime.UtcNow,
+        };
+
+        var dto = MessageDto.ForUserDelivery("chan1", userMessage);
+
+        Assert.That(dto.Kind, Is.EqualTo(MessageKind.User), "the client needs the discriminator to pick the ordinary-message renderer, not the system one");
+        Assert.That(dto.SystemMessage, Is.Null, "a populated body here would make the client try to render system content for a normal chat line");
+    }
+
+    [Test]
+    public void MessageDto_WireShape_KindAlwaysEmittedAsString_SystemBodyOmittedWhenAbsent()
+    {
+        // The three cases above assert on the C# record's PROPERTIES; this one asserts on the bytes a
+        // client actually receives, through the hub's real serializer options (the same
+        // ChatJsonProtocol.Configure that ChatJsonProtocolTests pins). Without it the wire shape of
+        // `kind` and `systemMessage` — the two fields Plan C's renderer branches on — is unpinned.
+        var options = ConfiguredHubOptions();
+
+        var systemJson = JsonSerializer.Serialize(
+            MessageDto.ForUserDelivery("chan1", new ChannelMessage
+            {
+                Id = "m1",
+                ChannelId = "chan1",
+                Seq = 3,
+                Kind = MessageKind.System,
+                SystemMessage = new SystemMessageBody { Key = "match_intro", FallbackText = "Match on Amazonia" },
+                SentAt = DateTime.UtcNow,
+            }),
+            options);
+
+        Assert.That(systemJson, Does.Contain("\"kind\":\"System\""),
+            "the discriminator must ride as a self-describing string, never as an ordinal a client has to guess");
+        Assert.That(systemJson, Does.Contain("\"systemMessage\""), "the structured body is the only thing a system message has to render");
+        Assert.That(systemJson, Does.Contain("\"fallbackText\":\"Match on Amazonia\""), "a client that does not know the key renders fallbackText");
+        Assert.That(systemJson, Does.Not.Contain("\"sender\""), "a system message has no sender — the null must be omitted, not sent as an explicit null");
+        Assert.That(systemJson, Does.Not.Contain("\"content\""), "a system message has no free-form content");
+
+        var userJson = JsonSerializer.Serialize(
+            MessageDto.ForUserDelivery("chan1", new ChannelMessage
+            {
+                Id = "m2",
+                ChannelId = "chan1",
+                Seq = 4,
+                Sender = new MessageSender { BattleTag = "A#1", Name = "A" },
+                Content = "gg",
+                SentAt = DateTime.UtcNow,
+            }),
+            options);
+
+        // Deliberately NOT shrunk with WhenWritingDefault: a discriminator that vanishes on the common
+        // case invites `msg.kind === undefined` bugs in the client, and ChatResultCode sets the
+        // always-emit precedent. See MessageKind's own doc comment.
+        Assert.That(userJson, Does.Contain("\"kind\":\"User\""),
+            "kind must be emitted on ORDINARY messages too — a discriminator present only sometimes is one a client cannot branch on");
+        Assert.That(userJson, Does.Not.Contain("systemMessage"), "a user message's null system body must not occupy wire bytes");
+    }
+
+    // ── Final review M2 — ChannelType/SystemChannelKind ordinals are a notification-routing
+    // discriminator, not just a wire curiosity ──────────────────────────────────────────────────
+
+    [Test]
+    public void ChannelType_HasExactPinnedNumericValues()
+    {
+        // ActivityPreviewDto rides ChannelType as its ORDINAL, deliberately (see that DTO's own doc
+        // comment) so a client can compare activityPreview.channelType directly against a channel's
+        // own `type` — post-game chat's one-time nudge gate is decided by that comparison. The existing
+        // wire test (ChatJsonProtocolTests.Configure_MatchChannelActivity_PreviewCarriesItsChannelClassOnTheWire)
+        // only asserts the KEY is present, not its value, so reordering this enum would silently reroute
+        // every client's notification routing with a fully green suite. Pin every member's NUMERIC
+        // VALUE — not just ChatResultCode_HasExactPinnedMembers's name-only check above — and every
+        // member, not only System/Dm which the nudge reads today, since a reorder anywhere shifts every
+        // value after it.
+        Assert.AreEqual(5, Enum.GetValues(typeof(ChannelType)).Length);
+        Assert.AreEqual(0, (int)ChannelType.Public);
+        Assert.AreEqual(1, (int)ChannelType.SemiPublic);
+        Assert.AreEqual(2, (int)ChannelType.System);
+        Assert.AreEqual(3, (int)ChannelType.Dm);
+        Assert.AreEqual(4, (int)ChannelType.GroupDm);
+    }
+
+    [Test]
+    public void SystemChannelKind_HasExactPinnedNumericValues()
+    {
+        // Same load-bearing reason as ChannelType_HasExactPinnedNumericValues above — SystemChannelKind
+        // is the OTHER half of the ordinal pair ActivityPreviewDto rides on the wire.
+        Assert.AreEqual(3, Enum.GetValues(typeof(SystemChannelKind)).Length);
+        Assert.AreEqual(0, (int)SystemChannelKind.Lobby);
+        Assert.AreEqual(1, (int)SystemChannelKind.Match);
+        Assert.AreEqual(2, (int)SystemChannelKind.Clan);
+    }
+
+    // The hub's REAL payload serializer options, so a wire-shape assertion above pins what a client
+    // actually receives rather than System.Text.Json's defaults (which would emit nulls).
+    private static JsonSerializerOptions ConfiguredHubOptions()
+    {
+        var options = new JsonHubProtocolOptions();
+        ChatJsonProtocol.Configure(options);
+        return options.PayloadSerializerOptions;
     }
 }

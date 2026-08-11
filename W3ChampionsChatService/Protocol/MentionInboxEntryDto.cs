@@ -1,4 +1,5 @@
 using System;
+using System.Text.Json.Serialization;
 
 namespace W3ChampionsChatService.Protocol;
 
@@ -18,4 +19,9 @@ public record MentionInboxEntryDto(
     string AuthorName,
     string Excerpt,
     DateTime CreatedAt,
+    // ChatJsonProtocol.Configure omits null properties from EVERY hub payload (WhenWritingNull), but
+    // a null ReadAt is not an absence here — it IS the "unread" state. Pinned to always serialize
+    // (even as null) so the client can keep using a presence/nullness check instead of every reader
+    // having to treat "key missing" and "key null" as the same thing.
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)]
     DateTime? ReadAt);

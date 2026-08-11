@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
 using Serilog;
 using W3ChampionsChatService.Authentication;
+using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
 using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
@@ -93,9 +94,14 @@ public partial class ChatHub
     /// <see cref="ChannelType.GroupDm"/> ONLY: block/consent/cap handling that may silently short-circuit
     /// with a fabricated <see cref="ChatResultCode.Ok"/> (<c>FakeSendAck</c>) or the one fail-closed
     /// <see cref="ChatResultCode.Throttled"/> — see <see cref="ApplyPrivateLaneGates"/>.</item>
-    /// <item>Mute gate — PUBLIC channels ONLY (guardrail: semiPublic/system/dm are exempt, preserving
-    /// the legacy mute-scope). Reads <see cref="ConnectionMapping.GetEffectiveMuteStatus"/> (cache-only,
-    /// zero DB): <see cref="MuteStatus.Full"/> → <see cref="ChatResultCode.Muted"/>;
+    /// <item>Mute gate — scoped by <see cref="Channels.ChannelModeration.IsMuteEnforced"/>: PUBLIC
+    /// channels and LADDER match rooms (<see cref="ChannelType.System"/> +
+    /// <see cref="SystemChannelKind.Match"/> + <see cref="Channels.ChatChannel.Ladder"/>). semiPublic /
+    /// dm / groupDm / System+Clan / System+Lobby AND custom-game match rooms are exempt — the legacy
+    /// mute scope, widened by exactly the ladder carve-in (a muted player must not be able to talk in a
+    /// ladder game's in-game/post-game room; a custom lobby is the host's own room and stays exempt).
+    /// Reads <see cref="ConnectionMapping.GetEffectiveMuteStatus"/> (cache-only, zero DB):
+    /// <see cref="MuteStatus.Full"/> → <see cref="ChatResultCode.Muted"/>;
     /// <see cref="MuteStatus.Shadow"/> → flag the message and persist (returns Ok — the illusion).</item>
     /// <item>Persist (C1 amendment, mandatory — else the TTL is inert):
     /// <see cref="Channels.ChannelRepository.AllocateSeq"/> atomically $inc LastSeq + $set LastMessageAt,
@@ -282,9 +288,11 @@ public partial class ChatHub
             }
         }
 
-        // 6. Mute gate — PUBLIC channels ONLY (guardrail: never gate semiPublic/system/dm).
+        // 6. Mute gate — the ChannelModeration.IsMuteEnforced scope: Public channels and LADDER match
+        // rooms (System+Match with Ladder=true). semiPublic / dm / groupDm / System+Clan / System+Lobby
+        // and CUSTOM-GAME match rooms stay exempt (the legacy mute scope, minus the ladder carve-in).
         var isShadow = false;
-        if (channel.Type == ChannelType.Public)
+        if (ChannelModeration.IsMuteEnforced(channel))
         {
             var muteStatus = _connections.GetEffectiveMuteStatus(connectionId, now);
             if (muteStatus == MuteStatus.Full)
@@ -340,6 +348,76 @@ public partial class ChatHub
             ExpiresAt = ExpiryCalculator.ForChannelMessage(channel.Type, now),
         };
         await _messageRepository.Insert(message);
+
+        // 7.25 Conversation-list projection (ChannelLastMessage): denormalize this message onto the channel
+        // doc so SessionState/GetConversations/ChannelAdded can render "who said what, and when" without
+        // reading the message collection. Before it, that text only ever existed in a live event, so a
+        // client had nothing to render a conversation list from at rest and no way to recover one after a
+        // reconnect (w3champions/launcher-e#848).
+        //
+        // Runs post-insert (the projection describes a durable message, so it must never precede it) and
+        // pre-fan-out (a client that reacts to the event by calling GetConversations must not race a
+        // not-yet-written projection). Skipped entirely for shadow — a shadow author's text must never
+        // reach a non-author, and this projection is channel-global with no per-viewer filtering, so the
+        // ONLY safe treatment is to not write one. Scope (accepted Dm + GroupDm) is CarriesLastMessageProjection.
+        //
+        // The write is a compare-and-set on seq (TryAdvanceLastMessage), so concurrent same-channel sends
+        // that reach it out of order settle on the higher seq regardless of arrival order — the same
+        // monotonic discipline AllocateSeq gives the counter itself. A false return means a concurrent
+        // newer message already won, which is the correct outcome and not an error.
+        //
+        // BEST-EFFORT, exactly like the fan-out below it: the message is already durable by this point,
+        // so a failure here must never propagate and turn a completed send into an error — the caller
+        // would get no ack for a message that exists, and a client retry would persist a duplicate.
+        // Introducing a second post-persist Mongo write is only acceptable on that condition. The cost
+        // of swallowing it is bounded and self-healing: the conversation row renders the previous
+        // message until the next one in that channel advances the projection.
+        //
+        // The ACCEPTED half of the scope is re-decided inside TryAdvanceLastMessage, against the durable
+        // channel doc rather than this in-memory snapshot — `channel` was loaded before the send and a
+        // concurrent AcceptRequest can commit in between, which would otherwise skip the projection for
+        // a conversation that is accepted by the time this runs. Only the shape gate (Dm/GroupDm) and
+        // the shadow rule, neither of which any concurrent write can change, are decided here.
+        if (!isShadow && CarriesLastMessageProjection(channel))
+        {
+            try
+            {
+                var projection = BuildLastMessageProjection(message);
+                if (await _channelRepository.TryAdvanceLastMessage(channelId, projection))
+                {
+                    // Mirror the successful write onto the in-memory channel: step 7.5 below re-announces
+                    // this same instance via ChannelAdded (MaterializeDmRecipientAndNotify), and a recipient
+                    // whose notification level is Mentions/None — or whose activity is unread-suppressed —
+                    // has no second chance to learn the projection. Announcing the copy we just wrote is
+                    // free; re-reading the doc would be another round-trip.
+                    channel.LastMessage = projection;
+                }
+                else if (channel.Type == ChannelType.Dm)
+                {
+                    // Lost the CAS: a concurrent same-channel send already wrote a HIGHER seq, and this
+                    // instance still holds whatever it was loaded with. Normally that costs nothing — but
+                    // THIS send may still be the one that materializes the recipient below, while the send
+                    // that won the CAS finds the registry already seeded and re-announces nothing. So the
+                    // one announcement that will ever be made would carry a stale or absent projection.
+                    // Re-read for the winner. Scoped to Dm because that is the only type step 7.5 re-
+                    // announces, and to the lost-CAS branch, which requires genuinely concurrent sends in
+                    // one conversation — this is not a per-message read.
+                    var winner = await _channelRepository.Load(channelId);
+                    if (winner?.LastMessage != null)
+                    {
+                        channel.LastMessage = winner.LastMessage;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(
+                    ex,
+                    "Conversation-list projection failed for channel {ChannelId} seq {Seq} — message is persisted and delivery continues; the row stays on the previous message until the next send",
+                    channelId,
+                    message.Seq);
+            }
+        }
 
         // 7.5 Dm recipient materialization + RequestReceived (C5 Task 4, D4) — post-persist, BEFORE fan-out.
         // Lazily creates the counterpart's membership on first delivery (seeding their registry via
@@ -400,7 +478,9 @@ public partial class ChatHub
         }
 
         // 9. Typed ack.
-        return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq);
+        // SentAt: the sender is skipped by BOTH fan-out paths for their own message, so this ack is the
+        // only place the server's timestamp reaches them — see SendMessageResult for why that matters.
+        return new SendMessageResult(ChatResultCode.Ok, MessageId: message.Id, Seq: seq, SentAt: message.SentAt);
     }
 
     /// <summary>
@@ -534,12 +614,15 @@ public partial class ChatHub
         //
         // This branch does NOT re-apply the {Public, SemiPublic, System+Match} scope wall that
         // single-delete/purge/the REST endpoint enforce — it is safe only emergently, by construction
-        // of the write paths: a shadow==true row can exist ONLY in a Public channel (the shadow flag is
-        // set Public-only at send time), and a deleted!=null row can exist ONLY in a moderatable channel
-        // (both delete paths are themselves scope-walled). So in any DM/GroupDm/System+Clan/System+Lobby
-        // channel a moderator happens to be a member of, ForModerator is byte-identical to
-        // ForUserDelivery — no private content or flag leaks. This safety depends on those write-time
-        // invariants holding in the send path and delete paths; it is not re-verified here.
+        // of the write paths: a shadow==true row can exist ONLY where the send-path mute gate runs, i.e.
+        // ChannelModeration.IsMuteEnforced — Public or a LADDER System+Match room — and a deleted!=null
+        // row can exist ONLY in a moderatable channel (both delete paths are themselves scope-walled).
+        // BOTH of those sets are SUBSETS of IsModeratable, which is what makes this safe: in any
+        // DM/GroupDm/System+Clan/System+Lobby channel a moderator happens to be a member of,
+        // ForModerator is byte-identical to ForUserDelivery — no private content or flag leaks. (The
+        // ladder carve-in did not widen the exposure: System+Match was already inside IsModeratable, so
+        // a ladder room's shadow rows are legitimately moderator-visible.) This safety depends on those
+        // write-time invariants holding in the send path and delete paths; it is not re-verified here.
         if (session.HasPermission(EPermission.Moderation))
         {
             var moderatorPage = aroundSeq.HasValue
@@ -730,4 +813,42 @@ public partial class ChatHub
             Flair = ChatProfileMapper.FromChatUser(chatUser),
         };
     }
+
+    /// <summary>
+    /// Which channels carry the <see cref="ChannelLastMessage"/> conversation-list projection: the two
+    /// conversation shapes, nothing else. See <see cref="ChannelLastMessage"/> for why the set is this
+    /// narrow — the public/system exclusion keeps room content out of the <c>PublicCatalog</c> shells that
+    /// ship to NON-members.
+    /// <para>
+    /// This is the TYPE half of the scope only. The consent wall — a pending Dm is not projected, so a
+    /// recipient never sees a stranger's text before accepting, the same rule that suppresses their
+    /// <c>ChannelActivity</c> — is enforced inside
+    /// <see cref="ChannelRepository.TryAdvanceLastMessage"/>'s own filter instead, because it is the half
+    /// a concurrent write can change between the send loading this channel and the projection landing.
+    /// A channel's TYPE is immutable, so deciding that here is safe by construction.
+    /// </para>
+    /// <para>
+    /// A Dm accepted AFTER messages already exist is not backfilled: the projection appears with the
+    /// conversation's next message. Backfilling would mean reading the message collection on the accept
+    /// path to publish text the recipient has, until that moment, deliberately not been shown.
+    /// </para>
+    /// </summary>
+    internal static bool CarriesLastMessageProjection(ChatChannel channel) =>
+        channel.Type is ChannelType.Dm or ChannelType.GroupDm;
+
+    /// <summary>
+    /// The single message→projection mapping. <see cref="Excerpts.Bounded"/> is the SAME helper that builds
+    /// <see cref="ActivityPreviewDto.Excerpt"/>, at the SAME <see cref="ChatLimits.DmPreviewExcerptLength"/>
+    /// cap, so the excerpt a client renders from the live event and the one it renders from the snapshot
+    /// can never disagree about the same message. The limit is passed explicitly because post-game chat
+    /// generalized this helper over three different caps and deliberately dropped its DM-shaped default.
+    /// </summary>
+    private static ChannelLastMessage BuildLastMessageProjection(ChannelMessage message) => new()
+    {
+        Seq = message.Seq,
+        SenderBattleTag = message.Sender.BattleTag,
+        SenderName = message.Sender.Name,
+        Excerpt = Excerpts.Bounded(message.Content, ChatLimits.DmPreviewExcerptLength),
+        SentAt = message.SentAt,
+    };
 }

@@ -120,6 +120,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
 
     private ChatHub BuildHub(string connectionId)
     {
+        var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
         var hub = new ChatHub(
             _connectionMapping,
             _reconcileHarness.Service,
@@ -146,7 +147,8 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _mentionFanOut,
             new PresenceInterestRegistry(),
             _mentionInboxRepository,
-            new NotificationPreferenceRepository(MongoClient));
+            new NotificationPreferenceRepository(MongoClient),
+            viewerResolver);
 
         var clients = new Mock<IHubCallerClients>();
         var callerProxy = new Mock<ISingleClientProxy>();
@@ -180,6 +182,23 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public)
     {
         var channel = new ChatChannel { Type = type, Name = name, NormalizedName = ChannelNames.Normalize(name) };
+        await _channelRepository.Insert(channel);
+        return channel;
+    }
+
+    // A System+Match channel — the shape mm's /internal/channels create produces. `ladder` is mm's
+    // own declaration that this ref is a LADDER match (as opposed to a custom-game lobby); it is the
+    // sole discriminator between the two, since both share SystemKind.Match.
+    private async Task<ChatChannel> CreateMatchChannel(string systemRef, bool ladder)
+    {
+        var channel = new ChatChannel
+        {
+            Type = ChannelType.System,
+            SystemKind = SystemChannelKind.Match,
+            SystemRef = systemRef,
+            Name = systemRef,
+            Ladder = ladder,
+        };
         await _channelRepository.Insert(channel);
         return channel;
     }
@@ -462,6 +481,91 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         var persisted = await _messageRepository.Load(result.MessageId);
         Assert.IsNotNull(persisted);
         Assert.IsTrue(persisted.Shadow, "A shadow-muted send must persist with Shadow=true");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Mute gate — LADDER match channels (System+Match with Ladder=true)
+    //
+    // A ladder match's post-game room is moderated exactly like a Public room: a full mute rejects the
+    // send, a shadow ban persists flagged. A CUSTOM-GAME lobby's room is the same channel shape
+    // (System+Match) with Ladder=false and stays exempt — mm's `ladder` flag is the only thing that
+    // separates them.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task Send_FullMuted_LadderMatchChannel_ReturnsMuted()
+    {
+        var channel = await CreateMatchChannel("ladder-ref-1", ladder: true);
+        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Full, muteEnd: Now.AddDays(1));
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, "gg ez");
+
+        Assert.AreEqual(ChatResultCode.Muted, result.Code);
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.AreEqual(0L, reloaded.LastSeq, "A full-muted send in a ladder match channel must not persist");
+    }
+
+    [Test]
+    public async Task Send_ShadowMuted_LadderMatchChannel_ReturnsOk_PersistsFlagged()
+    {
+        var channel = await CreateMatchChannel("ladder-ref-2", ladder: true);
+        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Shadow, muteEnd: Now.AddDays(1));
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, "shadow whisper");
+
+        // Same illusion as a Public room: Ok to the sender, persisted flagged, delivered to nobody else.
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsNotNull(persisted);
+        Assert.IsTrue(persisted.Shadow, "A shadow-muted send in a ladder match channel must persist with Shadow=true");
+    }
+
+    [Test]
+    public async Task Send_Unmuted_LadderMatchChannel_SendsNormally()
+    {
+        var channel = await CreateMatchChannel("ladder-ref-3", ladder: true);
+        SeedMember("conn-1", BattleTag, channel.Id);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, "gg wp");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsFalse(persisted.Shadow, "An unmuted ladder send is never flagged");
+    }
+
+    [Test]
+    public async Task Send_FullMuted_CustomLobbyMatchChannel_StillSends()
+    {
+        // Custom-game lobby/post-game stays EXEMPT (explicit product decision): same channel shape,
+        // Ladder=false.
+        var channel = await CreateMatchChannel("custom-ref-1", ladder: false);
+        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Full, muteEnd: Now.AddDays(1));
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, "lobby chatter");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsNotNull(persisted, "A full-muted send in a custom-lobby match channel must still persist");
+        Assert.IsFalse(persisted.Shadow, "A full-mute is not a shadow flag");
+    }
+
+    [Test]
+    public async Task Send_ShadowMuted_CustomLobbyMatchChannel_PersistsUnflagged()
+    {
+        var channel = await CreateMatchChannel("custom-ref-2", ladder: false);
+        SeedMember("conn-1", BattleTag, channel.Id, mute: MuteStatus.Shadow, muteEnd: Now.AddDays(1));
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.SendMessage(channel.Id, "lobby chatter");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var persisted = await _messageRepository.Load(result.MessageId);
+        Assert.IsFalse(persisted.Shadow,
+            "A custom-lobby match channel is outside the mute scope — a shadow ban must not flag the message there");
     }
 
     // ---------------------------------------------------------------------------------------------

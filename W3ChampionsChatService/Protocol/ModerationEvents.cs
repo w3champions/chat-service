@@ -43,6 +43,14 @@ public record BulkMessagesDeletedDto(string ChannelId, IReadOnlyList<string> Mes
 /// <see cref="MessageSender"/> snapshot), this DTO flattens the sender fields for the REST moderation
 /// surface and additionally exposes WHO deleted a row and WHEN — ban <c>reason</c>/<c>author</c> are
 /// NOT message fields and must never appear here.
+/// <para>
+/// System-message case: a server-authored (<see cref="MessageKind.System"/>) row has no
+/// <see cref="ChannelMessage.Sender"/>, so <see cref="SenderBattleTag"/>/<see cref="SenderName"/> are
+/// null — the truthful representation, there is no author. <see cref="Content"/> is likewise null on
+/// the source message, so it is projected from the system body's <c>FallbackText</c> (the
+/// server-rendered English) instead, since the moderation surface has no i18n catalogue of its own to
+/// render <c>SystemMessage.Key</c> against.
+/// </para>
 /// </summary>
 public record ModerationMessageDto(
     string Id,
@@ -62,9 +70,9 @@ public record ModerationMessageDto(
             Id: message.Id,
             ChannelId: channelId,
             Seq: message.Seq,
-            SenderBattleTag: message.Sender.BattleTag,
-            SenderName: message.Sender.Name,
-            Content: message.Content,
+            SenderBattleTag: message.Sender?.BattleTag,
+            SenderName: message.Sender?.Name,
+            Content: message.Content ?? message.SystemMessage?.FallbackText,
             SentAt: message.SentAt,
             Deleted: message.Deleted != null,
             DeletedBy: message.Deleted?.By,

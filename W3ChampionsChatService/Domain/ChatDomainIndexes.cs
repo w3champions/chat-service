@@ -147,6 +147,17 @@ public static class ChatDomainIndexes
             new CreateIndexModel<ChannelMessage>(
                 Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ExpiresAt),
                 new CreateIndexOptions { Name = "ttl_expiresAt", ExpireAfter = TimeSpan.Zero }),
+            // Post-game chat Plan A Task 1: per-channel idempotency for server-authored messages.
+            // Partial on DedupeKey's existence so it constrains ONLY system messages — ordinary
+            // user messages never carry the field and must stay completely unaffected.
+            new CreateIndexModel<ChannelMessage>(
+                Builders<ChannelMessage>.IndexKeys.Ascending(m => m.ChannelId).Ascending(m => m.DedupeKey),
+                new CreateIndexOptions<ChannelMessage>
+                {
+                    Name = "ux_channelId_dedupeKey",
+                    Unique = true,
+                    PartialFilterExpression = Builders<ChannelMessage>.Filter.Exists(m => m.DedupeKey),
+                }),
         ]);
     }
 

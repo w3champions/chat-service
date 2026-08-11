@@ -198,16 +198,33 @@ public class FanOutEngine(
             return;
         }
 
-        // C5 (Task 9, D15): DM activity preview. Built ONCE per persisted message (identical for every
-        // Offer call in the loop below) — OQ-7 pins this to `Dm` channels only; GroupDm/Public/System
-        // activity always carries a null Preview. A pending Dm never reaches the Offer call below at all
-        // (the suppression `continue` skips every recipient, and the initiator/sender is skipped just
-        // after it), so this is only ever OFFERED for an accepted Dm — building it unconditionally for
-        // any Dm channel is harmless (it is simply never read for a still-pending one). Sender fields are
-        // REUSED from `dto.Sender` (the same MessageDto already built above for focused delivery) rather
-        // than a fresh lookup — no extra Mongo read.
-        object dmPreview = channel.Type == ChannelType.Dm
-            ? new DmActivityPreviewDto(dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content))
+        // C5 (Task 9, D15) + post-game chat Plan A Task 6: the activity preview. Built ONCE per persisted
+        // message (identical for every Offer call in the loop below). ONE slot, carrying a preview that
+        // NAMES its own channel class — a client routes on that class, never on the slot being present.
+        // Two classes are eligible today:
+        //   - Dm (C5/OQ-7): the original scope. A pending Dm never reaches the Offer call below at all
+        //     (the suppression `continue` skips every recipient, and the initiator/sender is skipped just
+        //     after it), so this is only ever OFFERED for an accepted Dm — building it unconditionally
+        //     for any Dm channel is harmless (it is simply never read for a still-pending one).
+        //   - System + Match (post-game chat): the client's ONE-TIME nudge toast after the score screen
+        //     closes needs a sender and an excerpt; without a preview it has nothing to render, which is
+        //     precisely why post-game messages were previously silent.
+        // GroupDm / Public / SemiPublic / System+Clan deliberately stay preview-free — a busy lounge or
+        // clan room keeps its badge-only treatment. Widening the set is this one condition plus the
+        // client's own switch on ChannelType/SystemKind; it is NOT a new wire field, which is the whole
+        // reason the preview carries its class.
+        // Sender fields are REUSED from `dto.Sender` (the MessageDto already built above) rather than a
+        // fresh lookup — no extra Mongo read. The User conjunct is LOAD-BEARING, not defensive:
+        // SystemMessagePublisher calls this method on exactly a System+Match channel, and a system
+        // message's Sender is null — without it the dto.Sender dereference below is a guaranteed
+        // NullReferenceException on every published intro.
+        var wantsPreview = message.Kind == MessageKind.User
+            && (channel.Type == ChannelType.Dm
+                || (channel.Type == ChannelType.System && channel.SystemKind == SystemChannelKind.Match));
+        object activityPreview = wantsPreview
+            ? new ActivityPreviewDto(
+                dto.Sender.BattleTag, dto.Sender.Name, Excerpts.Bounded(message.Content, ChatLimits.DmPreviewExcerptLength),
+                channel.Type, channel.SystemKind)
             : null;
 
         // Activity routing (fan-out decision 3): unfocused level-All members are offered the seq; the
@@ -251,7 +268,14 @@ public class FanOutEngine(
                 continue;
             }
 
-            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, dmPreview);
+            // `message.SentAt`, not `now`: they are the same instant on the send path today, but the
+            // client uses this to ORDER conversations against `LastMessageAt`/`ChannelLastMessage.SentAt`,
+            // both of which are stamped from the message itself. Passing the message's own timestamp keeps
+            // all three the same value for the same message by construction rather than by coincidence.
+            // Offered for EVERY channel type (unlike `activityPreview`, which is preview-eligible-only):
+            // a group conversation needs its sort position updated just as much as a 1:1 one, and a
+            // timestamp carries no content.
+            await _activityCoalescer.Offer(connectionId, channel.Id, message.Seq, now, activityPreview, message.SentAt);
         }
     }
 
