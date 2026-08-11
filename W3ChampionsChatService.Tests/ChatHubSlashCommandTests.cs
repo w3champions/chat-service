@@ -337,6 +337,36 @@ public class ChatHubSlashCommandTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task Send_AstralFormatCharacterPrefixedSlashCommand_UnsupportedCommand_NothingPersisted()
+    {
+        // Pins the SURROGATE-PAIR ADVANCE in NormalizeSendContent (the `? 2 : 1` step). U+E0001
+        // LANGUAGE TAG is a FORMAT character (Cf) outside the BMP, so it occupies TWO chars. With a
+        // bare `1` advance the scan consumes the high surrogate, then meets the orphaned LOW surrogate
+        // — category Surrogate, neither Format nor whitespace — and stops, leaving the content still
+        // prefixed so the anchored pattern misses it and the send sails past the step-4.5 guard. That
+        // is a narrower re-opening of the very BOM hole this normalization closed, and NO other test
+        // notices: every other astral assertion here is BMP-only.
+        // (Verified by mutation. Downstream of the missed guard the send does not actually persist —
+        // the orphaned \uDC01 fails BSON serialization with an EncoderFallbackException — so the
+        // mutant dies on an exception rather than on the Assert below. Either way the load-bearing
+        // property is the same and only this test observes it: the command was NOT rejected.)
+        var channel = await CreateChannel("W3C Lounge");
+        SeedMember("conn-1", Sender, channel.Id);
+        var hub = BuildHub("conn-1");
+        var content = char.ConvertFromUtf32(0xE0001) + "/w Grubby hi";
+
+        var result = await hub.SendMessage(channel.Id, content);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.UnsupportedCommand),
+            "a leading ASTRAL format character defeats the anchor exactly like a BOM does, so the " +
+            "normalization must advance by whole code points, not by single chars");
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo(0L), "a rejected command must not allocate a seq");
+        var messages = await _messageRepository.LoadPageBefore(channel.Id, Sender, null, 10);
+        Assert.That(messages, Is.Empty, "an astral-prefixed command must not persist — F1/F2");
+    }
+
+    [Test]
     public async Task Send_BomPrefixedOrdinaryContent_Ok_PersistedWithBomStripped()
     {
         var channel = await CreateChannel("W3C Lounge");

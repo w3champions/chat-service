@@ -666,9 +666,16 @@ public partial class ChatHub
     /// <para>
     /// LEADING ONLY, by design. A format character in the MIDDLE or at the END of a message is the
     /// sender's content and is left exactly as typed — this is a normalization of the anchor position,
-    /// not a content sanitizer. Consequence worth knowing: the guard is anchored, so a mid-string format
-    /// character is also the one remaining place the two engines' <c>\s</c> sets diverge — see the
-    /// divergence note on <see cref="Domain.SlashCommandDetector"/>.
+    /// not a content sanitizer. The trailing <see cref="string.TrimEnd()"/> likewise strips whitespace
+    /// only, never a format character; the launcher mirrors both halves exactly, so a trailing BOM is
+    /// content on both sides (see the note on <see cref="Domain.SlashCommandDetector"/>).
+    /// </para>
+    /// <para>
+    /// SECOND BEHAVIOUR CHANGE, worth knowing before someone finds it in the data: a message consisting
+    /// ONLY of format characters — a lone U+FEFF, say — used to survive <c>Trim()</c> as a 1-character
+    /// message and persist. It now normalizes to empty and returns <see cref="ChatResultCode.TooLong"/>
+    /// via the empty-after-normalization branch, exactly like a whitespace-only message always has.
+    /// Intended: an invisible message is not content, and the two cases should not behave differently.
     /// </para>
     /// <para>
     /// Advances by whole code points (<see cref="char.IsSurrogatePair(string, int)"/>) so the astral

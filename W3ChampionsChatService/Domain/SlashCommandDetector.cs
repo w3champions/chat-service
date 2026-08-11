@@ -25,31 +25,32 @@ namespace W3ChampionsChatService.Domain;
 /// pinned by <c>SlashCommandDetectorTests.IsSlashCommand_LeadingWhitespace_False_BecauseCallerTrimsFirst</c>.
 /// </para>
 /// <para>
-/// KNOWN <c>\s</c> DIVERGENCE (verified empirically on .NET 8 / V8, design §4). Two code points differ,
-/// and only in the SEPARATOR position.
+/// NO KNOWN DIVERGENCE (verified empirically on .NET 8 / V8, design §4). The client agrees with this
+/// parser on every input tested, in all three positions — leading, trailing, and the separator between
+/// verb and argument.
 /// <para>
-/// The LEADING position is fully converged: both sides strip the identical class before the anchored
-/// check — whitespace and Unicode format characters, in any interleaving, astral included. Server side
-/// that is <see cref="Chats.ChatHub"/>'s <c>NormalizeSendContent</c>; client side it is
-/// <c>chat-command.helper.ts</c>'s <c>LEADING_IGNORABLE_PATTERN</c>
-/// (<c>/^[\p{White_Space}\p{Cf}]+/u</c>). The client deliberately uses <c>\p{White_Space}</c> and NOT
-/// <c>\s</c>, because JavaScript's <c>\s</c> omits U+0085: the two strip sets were compared code point
-/// by code point across the whole BMP and are IDENTICAL (68 code points).
+/// This rests on one measured fact worth not forgetting: .NET's regex <c>\s</c>, .NET's
+/// <see cref="char.IsWhiteSpace(char)"/>, and .NET's <see cref="string.TrimEnd()"/> are all the SAME
+/// 25-code-point set, and JavaScript's <c>\p{White_Space}</c> is an EXACT match for it (compared code
+/// point by code point across the whole BMP, zero delta in either direction). JavaScript's <c>\s</c> is
+/// NOT that set — it omits U+0085 (NEL) and adds U+FEFF (BOM) — which is why the client spells every
+/// position with <c>\p{White_Space}</c> and never with <c>\s</c>. Four inputs used to disagree because
+/// of that (<c>/w</c>+NEL+<c>hi</c>, <c>/w</c>+BOM+<c>hi</c>, <c>/stats</c>+NEL, <c>/stats</c>+BOM);
+/// none do now.
 /// </para>
-/// What remains divergent:
-/// <list type="bullet">
-/// <item><c>/w</c> + U+0085 (NEL) + <c>hi</c> — BLOCKED here, allowed by the client: .NET <c>\s</c>
-/// matches U+0085, JavaScript's does not.</item>
-/// <item><c>/w</c> + U+FEFF (BOM) + <c>hi</c> — allowed here, BLOCKED by the client: JavaScript's
-/// <c>\s</c> matches U+FEFF, .NET's does not.</item>
-/// </list>
-/// Both directions degrade safely. This server is the authority, so the NEL case is still refused on
-/// the wire; the composer's <c>?? "other"</c> fallback (<c>MentionComposer.tsx</c>, the
-/// <c>UnsupportedCommand</c> arm) keeps the error copy sensible when the client cannot classify what the
-/// server rejected. The U+FEFF case is only a client-side false positive on what was a whisper attempt
-/// anyway. Chasing exact <c>\s</c> parity across two regex engines costs more than it returns for two
-/// code points in one position; this is documented rather than fixed, so a future editor does not
-/// assume an equivalence that has no edges.
+/// <para>
+/// The three mirrored positions: LEADING — <see cref="Chats.ChatHub"/>'s <c>NormalizeSendContent</c>
+/// against <c>chat-command.helper.ts</c>'s <c>LEADING_IGNORABLE_PATTERN</c> (whitespace and format
+/// characters, 68 code points, astral included). TRAILING — <see cref="string.TrimEnd()"/> against
+/// <c>TRAILING_WHITESPACE_PATTERN</c> (whitespace ONLY: neither side strips a trailing format
+/// character, so a trailing BOM is content on both). SEPARATOR — this parser's <c>(?:\s|\z)</c> against
+/// the client's <c>(?:\p{White_Space}|$)</c>.
+/// </para>
+/// <para>
+/// If you change the grammar here, change the client's to match and re-check those four inputs. The
+/// server remains the enforcement point regardless: the composer's <c>?? "other"</c> fallback
+/// (<c>MentionComposer.tsx</c>, the <c>UnsupportedCommand</c> arm) keeps the error copy sensible for
+/// anything this server rejects that the client did not classify.
 /// </para>
 /// <para>
 /// No backtracking exposure: content is normalized and capped at
