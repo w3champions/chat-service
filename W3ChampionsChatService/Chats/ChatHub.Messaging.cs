@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.SignalR;
@@ -35,9 +36,12 @@ public partial class ChatHub
     /// <list type="number">
     /// <item>Fail-closed session resolution: an unregistered connection (never authenticated, or its
     /// session was displaced/torn down) → <see cref="ChatResultCode.PermissionDenied"/>.</item>
-    /// <item>Trim + length: empty-after-trim OR over <see cref="ChatLimits.MaxMessageLength"/> →
-    /// <see cref="ChatResultCode.TooLong"/> (empty→TooLong is a pinned plan decision — the enum has no
-    /// InvalidContent value).</item>
+    /// <item>Normalize + length (<see cref="NormalizeSendContent"/> — strips leading whitespace AND
+    /// leading Unicode format characters, then trailing whitespace): empty-after-normalization OR over
+    /// <see cref="ChatLimits.MaxMessageLength"/> → <see cref="ChatResultCode.TooLong"/> (empty→TooLong is
+    /// a pinned plan decision — the enum has no InvalidContent value). Everything downstream — the
+    /// length bound, the slash-command guard at 4.5, mention extraction, and the persisted content —
+    /// sees this normalized string.</item>
     /// <item>Membership via <see cref="FanOut.OnlineMemberRegistry.IsMember"/> (seeded at connect, zero
     /// DB, O(1) reverse-index lookup — no roster copy) → <see cref="ChatResultCode.NotMember"/> if the
     /// caller isn't a member.</item>
@@ -47,6 +51,10 @@ public partial class ChatHub
     /// with the retry-after. On the SINGLE decision that escalates into hard auto-throttle
     /// (<see cref="FanOut.RateLimitDecision.JustAutoThrottled"/>), push exactly one
     /// <see cref="ChatEvents.ThrottleNotice"/> to the caller.</item>
+    /// <item>Slash-command guard (step 4.5): command-shaped content per
+    /// <see cref="Domain.SlashCommandDetector"/> → <see cref="ChatResultCode.UnsupportedCommand"/>.
+    /// Content-intrinsic, so it precedes the private-lane gates (5.5) and the mute gate (6) for the
+    /// same identical-outcome reason as the mention cap at 5.25.</item>
     /// <item>Channel load; missing → <see cref="ChatResultCode.NotFound"/> (the member-of-a-deleted-
     /// channel edge).</item>
     /// <item>Mention markup validation (C6 Task 4, step 5.25 — D1/D2, amended by the "strip &amp; deliver
@@ -119,8 +127,8 @@ public partial class ChatHub
 
         var connectionId = Context.ConnectionId;
 
-        // 2. Trim + length. Empty-after-trim maps to TooLong by pinned plan decision.
-        content = content?.Trim();
+        // 2. Normalize + length. Empty-after-normalization maps to TooLong by pinned plan decision.
+        content = NormalizeSendContent(content);
         if (string.IsNullOrEmpty(content) || content.Length > ChatLimits.MaxMessageLength)
         {
             return new SendMessageResult(ChatResultCode.TooLong);
@@ -159,6 +167,29 @@ public partial class ChatHub
         if (!decision.Allowed)
         {
             return new SendMessageResult(ChatResultCode.Throttled, decision.RetryAfterSeconds);
+        }
+
+        // 4.5 Slash-command guard (content-intrinsic). Players habitually type Battle.net-style commands
+        // (/w, /whisper, /r, /join). Nothing here implements them, so broadcasting one verbatim leaks
+        // both the intended recipient and the body the sender believed was private to the whole channel.
+        // Placement is load-bearing in three directions:
+        //   - AFTER the rate limiter (4), so command spam still consumes throttle budget. Empty and
+        //     over-length content bypasses the limiter today because step 2 precedes step 4; a third
+        //     free-spam path is avoidable. Mirrors the mention cap, which also sits after the limiter.
+        //   - BEFORE the channel load (5), so the reject costs no DB read.
+        //   - BEFORE the private-lane gates (5.5) and the mute gate (6), so a DM-blocked sender and an
+        //     unblocked sender get IDENTICAL outcomes for identical content — running it after 5.5 would
+        //     let that step's silent fake-Ok mask the reject and leak block state. Same rationale as the
+        //     mention cap at 5.25. A shadow/full-muted sender's command is likewise rejected normally;
+        //     a rejection breaks neither illusion.
+        // Consequence: a THROTTLED caller typing a command sees Throttled, not UnsupportedCommand. The
+        // launcher performs the same check client-side (launcher-e/src/helpers/chat-command.helper.ts).
+        // Once the matching launcher release is out, only old launchers and non-launcher clients reach
+        // this branch — which is exactly why it stays authoritative: the client check is a UX
+        // accelerator, never the enforcement point.
+        if (SlashCommandDetector.IsSlashCommand(content))
+        {
+            return new SendMessageResult(ChatResultCode.UnsupportedCommand);
         }
 
         // 5. Load the channel — a member whose channel doc is gone (deleted) → NotFound.
@@ -610,6 +641,62 @@ public partial class ChatHub
 
         // 6. Typed ack.
         return new ChannelOperationResult(ChatResultCode.Ok);
+    }
+
+    /// <summary>
+    /// Step 2's content normalization: strips LEADING whitespace and LEADING Unicode format characters
+    /// (<see cref="UnicodeCategory.Format"/>, i.e. <c>Cf</c> — the U+FEFF byte-order mark, zero-width
+    /// space/joiner, the bidi marks), then trims trailing whitespace.
+    /// <para>
+    /// WHY <see cref="string.Trim()"/> ALONE IS NOT ENOUGH: U+FEFF stopped counting as whitespace in
+    /// .NET 4.0, so <c>Trim()</c> leaves it in place. Since <see cref="Domain.SlashCommandDetector"/>'s
+    /// pattern is ANCHORED, a single leading BOM defeated it entirely — <c>"[BOM]/w Grubby &lt;secret&gt;"</c>
+    /// missed the pattern at step 4.5 and was persisted and fanned out to the whole channel, which is
+    /// precisely the leak that guard exists to prevent. Reachable from an ordinary BOM-bearing paste.
+    /// (JavaScript's <c>trim()</c> DOES strip U+FEFF, so the launcher's mirror already blocked this —
+    /// the two sides disagreed until this normalization landed.)
+    /// </para>
+    /// <para>
+    /// ONE INTERLEAVED PASS, not one pass of each: the two classes can alternate, so
+    /// <c>"[BOM]  /w hi"</c> and <c>"  [BOM]/w hi"</c> must both normalize to <c>"/w hi"</c>. Stripping
+    /// all whitespace and then all format characters (or the reverse) would leave one of those two cases
+    /// intact and still bypassing the guard.
+    /// </para>
+    /// <para>
+    /// LEADING ONLY, by design. A format character in the MIDDLE or at the END of a message is the
+    /// sender's content and is left exactly as typed — this is a normalization of the anchor position,
+    /// not a content sanitizer. Consequence worth knowing: the guard is anchored, so a mid-string format
+    /// character is also the one remaining place the two engines' <c>\s</c> sets diverge — see the
+    /// divergence note on <see cref="Domain.SlashCommandDetector"/>.
+    /// </para>
+    /// <para>
+    /// Advances by whole code points (<see cref="char.IsSurrogatePair(string, int)"/>) so the astral
+    /// format characters — U+E0001 LANGUAGE TAG and the U+E0020..U+E007F tag block — are stripped too
+    /// rather than being seen as a lone surrogate and silently ending the scan. A leading astral Cf
+    /// defeats the anchor exactly like a BOM does, so a BMP-only fix would have left the hole half open.
+    /// </para>
+    /// </summary>
+    private static string NormalizeSendContent(string content)
+    {
+        if (string.IsNullOrEmpty(content))
+        {
+            return content;
+        }
+
+        var start = 0;
+        while (start < content.Length)
+        {
+            var isIgnorable = char.IsWhiteSpace(content, start)
+                || CharUnicodeInfo.GetUnicodeCategory(content, start) == UnicodeCategory.Format;
+            if (!isIgnorable)
+            {
+                break;
+            }
+
+            start += char.IsSurrogatePair(content, start) ? 2 : 1;
+        }
+
+        return content[start..].TrimEnd();
     }
 
     /// <summary>
