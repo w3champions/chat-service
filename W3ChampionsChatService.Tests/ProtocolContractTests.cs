@@ -21,7 +21,7 @@ public class ProtocolContractTests
     [Test]
     public void ChatResultCode_HasExactPinnedMembers()
     {
-        var pinned = new[] { "Ok", "Throttled", "NotMember", "Muted", "TooLong", "NotFound", "PermissionDenied" };
+        var pinned = new[] { "Ok", "Throttled", "NotMember", "Muted", "TooLong", "NotFound", "PermissionDenied", "UnsupportedCommand" };
         var actual = Enum.GetNames(typeof(ChatResultCode));
 
         Assert.AreEqual(pinned.Length, actual.Length);

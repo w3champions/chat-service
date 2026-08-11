@@ -350,6 +350,28 @@ public class ChatHubMentionValidationTests : IntegrationTestBase
 
         var blockedResult = await blockedHub.SendMessage(blockedChannel.Id, overCapContent);
 
+        // Armed-block control: proves SetBlocked is actually LIVE, not merely configured-but-inert. If
+        // the block wiring were ever defanged, the "blocked" lane above would behave exactly like an
+        // unblocked one for over-cap content too — both would return TooLong, and the equality assertion
+        // below would pass having proven nothing about the leak property this test is named for.
+        // The disambiguator is ORDINARY content: a genuinely blocked DM never reaches the real persist
+        // path — it short-circuits through ApplyPrivateLaneGates.FakeSendAck (ChatHub.Dm.cs), which
+        // fabricates Ok with a non-null MessageId (a fresh ObjectId) and a Seq computed as LastSeq+1,
+        // WITHOUT ever calling ChannelRepository.AllocateSeq. A live send, by contrast, ALWAYS allocates
+        // a real seq. So Ok + non-null MessageId + an UNMOVED LastSeq is a signature only the fake ack
+        // produces — if the block were dead, this send would persist for real and bump LastSeq to 1.
+        // ORDERING DEPENDENCY — do not move this below the unblocked lane: SessionRegistry is
+        // single-session-per-battleTag, so seeding "conn-unblocked" for the SAME Sender displaces
+        // conn-blocked's session and every later call on blockedHub fail-closes with PermissionDenied.
+        // (Mirrors the identical control in ChatHubSlashCommandTests.)
+        var armedControlResult = await blockedHub.SendMessage(blockedChannel.Id, "gg wp");
+        Assert.That(armedControlResult.Code, Is.EqualTo(ChatResultCode.Ok),
+            "a blocked DM's ordinary content is silently swallowed as a fabricated ack, not rejected");
+        Assert.That(armedControlResult.MessageId, Is.Not.Null,
+            "FakeSendAck fabricates a MessageId even though nothing was persisted");
+        Assert.That((await _channelRepository.Load(blockedChannel.Id)).LastSeq, Is.EqualTo(0L),
+            "a fabricated ack must not allocate a seq — a real send would have bumped LastSeq to 1");
+
         // Unblocked control: identical content, a DIFFERENT DM pair with no block relationship at all
         // (same sender, so a genuinely comparable "what does THIS sender see" control).
         const string UnblockedRecipient = "frank#789";
