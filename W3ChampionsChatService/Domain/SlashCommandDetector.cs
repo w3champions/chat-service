@@ -20,15 +20,23 @@ namespace W3ChampionsChatService.Domain;
 /// test project, in <c>SlashCommandDetectorTests</c>.
 /// </para>
 /// <para>
-/// That copy DOES trim (it holds raw composer input); this one does NOT, because <c>SendMessage</c>
-/// step 2 has already normalized. Do NOT add a trim here — the no-trim contract is pinned by
-/// <c>SlashCommandDetectorTests.IsSlashCommand_LeadingWhitespace_False_BecauseCallerTrimsFirst</c>.
+/// That copy DOES normalize its own input (it holds raw composer text); this one does NOT, because
+/// <c>SendMessage</c> step 2 has already normalized. Do NOT add a trim here — the no-trim contract is
+/// pinned by <c>SlashCommandDetectorTests.IsSlashCommand_LeadingWhitespace_False_BecauseCallerTrimsFirst</c>.
 /// </para>
 /// <para>
 /// KNOWN <c>\s</c> DIVERGENCE (verified empirically on .NET 8 / V8, design §4). Two code points differ,
-/// and only in the SEPARATOR position — the leading position converged once <c>ChatHub.SendMessage</c>
-/// step 2 began stripping leading format characters (<c>NormalizeSendContent</c>), matching what
-/// JavaScript's <c>trim()</c> already did to a leading U+FEFF:
+/// and only in the SEPARATOR position.
+/// <para>
+/// The LEADING position is fully converged: both sides strip the identical class before the anchored
+/// check — whitespace and Unicode format characters, in any interleaving, astral included. Server side
+/// that is <see cref="Chats.ChatHub"/>'s <c>NormalizeSendContent</c>; client side it is
+/// <c>chat-command.helper.ts</c>'s <c>LEADING_IGNORABLE_PATTERN</c>
+/// (<c>/^[\p{White_Space}\p{Cf}]+/u</c>). The client deliberately uses <c>\p{White_Space}</c> and NOT
+/// <c>\s</c>, because JavaScript's <c>\s</c> omits U+0085: the two strip sets were compared code point
+/// by code point across the whole BMP and are IDENTICAL (68 code points).
+/// </para>
+/// What remains divergent:
 /// <list type="bullet">
 /// <item><c>/w</c> + U+0085 (NEL) + <c>hi</c> — BLOCKED here, allowed by the client: .NET <c>\s</c>
 /// matches U+0085, JavaScript's does not.</item>
@@ -39,11 +47,9 @@ namespace W3ChampionsChatService.Domain;
 /// the wire; the composer's <c>?? "other"</c> fallback (<c>MentionComposer.tsx</c>, the
 /// <c>UnsupportedCommand</c> arm) keeps the error copy sensible when the client cannot classify what the
 /// server rejected. The U+FEFF case is only a client-side false positive on what was a whisper attempt
-/// anyway. A related, equally benign asymmetry: step 2 strips EVERY leading <c>Cf</c> character, while
-/// the client's <c>trim()</c> strips only U+FEFF among them — so a command behind a leading U+200B or
-/// U+200E is refused by the server on the round trip rather than instantly in the composer. Chasing
-/// exact <c>\s</c> parity across two regex engines costs more than it returns; this is documented rather
-/// than fixed, so a future editor does not assume an equivalence that has no edges.
+/// anyway. Chasing exact <c>\s</c> parity across two regex engines costs more than it returns for two
+/// code points in one position; this is documented rather than fixed, so a future editor does not
+/// assume an equivalence that has no edges.
 /// </para>
 /// <para>
 /// No backtracking exposure: content is normalized and capped at

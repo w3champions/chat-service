@@ -4,9 +4,13 @@ using W3ChampionsChatService.Domain;
 namespace W3ChampionsChatService.Tests;
 
 /// <summary>
-/// The canonical slash-command case table (design §4). This table is mirrored byte-for-byte by the
-/// launcher's own detector at <c>launcher-e/src/helpers/chat-command.helper.ts</c> — a change here
-/// without the matching change there means the client and the server disagree about what a command is.
+/// The canonical slash-command case table (design §4). This table is mirrored by the launcher's own
+/// detector at <c>launcher-e/src/helpers/chat-command.helper.ts</c> — behaviourally, on all printable
+/// input, NOT byte-for-byte: .NET and JavaScript disagree about <c>\s</c> for U+0085 and U+FEFF, which
+/// is why the two detectors differ on one position for two code points. See the divergence note on
+/// <see cref="SlashCommandDetector"/> for the exact set and why both directions degrade safely.
+/// A change here without the matching change there means the client and the server disagree about what
+/// a command is.
 /// </summary>
 public class SlashCommandDetectorTests
 {

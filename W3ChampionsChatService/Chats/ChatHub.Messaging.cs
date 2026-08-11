@@ -653,8 +653,9 @@ public partial class ChatHub
     /// pattern is ANCHORED, a single leading BOM defeated it entirely — <c>"[BOM]/w Grubby &lt;secret&gt;"</c>
     /// missed the pattern at step 4.5 and was persisted and fanned out to the whole channel, which is
     /// precisely the leak that guard exists to prevent. Reachable from an ordinary BOM-bearing paste.
-    /// (JavaScript's <c>trim()</c> DOES strip U+FEFF, so the launcher's mirror already blocked this —
-    /// the two sides disagreed until this normalization landed.)
+    /// (JavaScript's <c>trim()</c> strips U+FEFF, so the launcher's mirror blocked this case even back
+    /// when it only trimmed — the two sides disagreed until this normalization landed. They now strip an
+    /// IDENTICAL set; see the divergence note on <see cref="Domain.SlashCommandDetector"/>.)
     /// </para>
     /// <para>
     /// ONE INTERLEAVED PASS, not one pass of each: the two classes can alternate, so
