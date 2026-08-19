@@ -43,7 +43,14 @@ public class AuthSessionController(
         try { token = UserHasPermissionFilter.GetToken(Request.Headers[HeaderNames.Authorization]); }
         catch (SecurityTokenValidationException) { rateLimiter.Record(ipKey, now); return Unauthorized(); }
 
-        var identity = authService.GetUserByTokenEnforcingLifetime(token);
+        // `exp` enforcement here is governed by ChatLimits.EnforceJwtLifetimeOnTicketMint (see that
+        // const for the full rationale). Both overloads verify the SIGNATURE identically — an
+        // unverifiable token is rejected either way; the toggle only decides whether a validly-signed
+        // but expired token may still mint. Ternary (not `if`) so the compile-time const cannot make
+        // either branch unreachable code.
+        var identity = ChatLimits.EnforceJwtLifetimeOnTicketMint
+            ? authService.GetUserByTokenEnforcingLifetime(token)
+            : authService.GetUserByToken(token);
         if (identity == null) { rateLimiter.Record(ipKey, now); return Unauthorized(); }
 
         if (!rateLimiter.TryAcquire($"bt:{identity.BattleTag}", ChatLimits.TicketMintPerBattleTagLimit, now))

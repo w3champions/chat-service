@@ -115,8 +115,15 @@ public class AuthSessionControllerTests
         Assert.IsNull(secondIdentity);
     }
 
+    /// <summary>
+    /// The mint path's `exp` handling is governed by <see cref="ChatLimits.EnforceJwtLifetimeOnTicketMint"/>,
+    /// so this test follows the toggle rather than hard-coding one outcome — flipping the const must
+    /// keep the suite green in BOTH positions, and this is the test that proves it.
+    /// <para>Asserted via computed expectations (not if/else) because the toggle is a compile-time
+    /// <c>const</c>: a literal branch on it would be unreachable code (CS0162) in one position.</para>
+    /// </summary>
     [Test]
-    public void ExpiredJwt_Returns401()
+    public void ExpiredJwt_MintOutcome_FollowsTheEnforcementToggle()
     {
         var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" },
             expires: DateTime.UtcNow.AddMinutes(-10));
@@ -127,8 +134,67 @@ public class AuthSessionControllerTests
 
         var result = controller.MintTicket();
 
-        Assert.IsInstanceOf<UnauthorizedResult>(result, "An expired JWT must be rejected with 401");
-        Assert.AreEqual(0, ticketStore.Count, "No ticket must be minted for an expired JWT");
+        var enforced = ChatLimits.EnforceJwtLifetimeOnTicketMint;
+
+        Assert.AreEqual(enforced, result is UnauthorizedResult, enforced
+            ? "with enforcement ON, an expired JWT must be rejected with 401"
+            : "with enforcement OFF, an expired JWT must still mint — the connect handshake mirrors "
+              + "website-backend's WebsiteBackendHub, which does not validate lifetime at connect");
+        Assert.AreEqual(enforced ? 0 : 1, ticketStore.Count,
+            "the ticket store must reflect the toggle: no ticket when enforcing, exactly one when not");
+    }
+
+    /// <summary>
+    /// The identity carried by a ticket minted from an EXPIRED token must be the real, signature-proven
+    /// identity — turning off the lifetime check must never weaken signature verification or silently
+    /// drop claims. Only meaningful while enforcement is off; a no-op assertion otherwise.
+    /// </summary>
+    [Test]
+    public void ExpiredJwt_WhenNotEnforcing_MintsTicketCarryingTheProvenIdentity()
+    {
+        // Read into a local FIRST: branching on the const directly makes one arm unreachable (CS0162).
+        // A local is not a constant expression, so reachability analysis leaves both arms alone.
+        var enforced = ChatLimits.EnforceJwtLifetimeOnTicketMint;
+        if (enforced)
+        {
+            Assert.Pass("enforcement is ON — an expired token mints nothing; covered by the toggle test above");
+        }
+
+        var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" },
+            expires: DateTime.UtcNow.AddMinutes(-10));
+        var authService = new W3CAuthenticationService(publicKeyPem);
+        var ticketStore = new TicketStore();
+        var controller = BuildController(authService, ticketStore, new MintRateLimiter(), $"Bearer {jwt}");
+
+        var result = controller.MintTicket() as OkObjectResult;
+        Assert.IsNotNull(result, "an expired but validly-signed JWT mints while enforcement is off");
+
+        var ticket = ((TicketResponse)result.Value).Ticket;
+        Assert.IsTrue(ticketStore.TryConsume(ticket, DateTime.UtcNow, out var identity));
+        Assert.AreEqual("peter#123", identity.BattleTag, "the battleTag claim must survive intact");
+        Assert.IsTrue(identity.IsAdmin, "the isAdmin claim must survive intact");
+        Assert.IsTrue(identity.Permissions.Contains(EPermission.Moderation),
+            "permission claims must survive intact — skipping the lifetime check must not drop claims");
+    }
+
+    /// <summary>
+    /// Skipping `exp` must NOT skip signature verification: a token signed by a different key is
+    /// rejected regardless of the toggle. This is the invariant that keeps the toggle safe.
+    /// </summary>
+    [Test]
+    public void BadSignature_IsAlwaysRejected_RegardlessOfTheEnforcementToggle()
+    {
+        var (jwt, _) = CreateSignedJwt("peter#123", true, new[] { "Moderation" });
+        var (_, otherKeyPem) = CreateSignedJwt("someoneElse#1", false, Array.Empty<string>());
+        var authService = new W3CAuthenticationService(otherKeyPem);
+        var ticketStore = new TicketStore();
+        var controller = BuildController(authService, ticketStore, new MintRateLimiter(), $"Bearer {jwt}");
+
+        var result = controller.MintTicket();
+
+        Assert.IsInstanceOf<UnauthorizedResult>(result,
+            "a signature mismatch must 401 whether or not the lifetime check is enforced");
+        Assert.AreEqual(0, ticketStore.Count, "no ticket may ever be minted for an unverifiable token");
     }
 
     [Test]
