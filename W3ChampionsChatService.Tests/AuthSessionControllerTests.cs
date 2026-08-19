@@ -370,10 +370,12 @@ public class AuthSessionControllerTests
     }
 
     [Test]
-    public void PerBattleTagThrottledMint_ChargesThePerIpBudget()
+    public void PerBattleTagThrottledMint_DoesNotChargeThePerIpBudget()
     {
-        // A per-battleTag-throttled attempt is itself a REJECTION, so it charges the per-IP budget too —
-        // while the 10 SUCCESSFUL mints that exhausted the per-battleTag cap did not charge it at all.
+        // A per-battleTag-throttled attempt reaches the throttle only by presenting a VALIDLY SIGNED
+        // token — it has already paid full RSA validation, so it was never the cheap pre-validation
+        // attack the per-IP shield exists to stop. Charging the shared IP budget for it let ONE client
+        // degrade every other user behind the same address, so it no longer does.
         var (jwt, publicKeyPem) = CreateSignedJwt("peter#123", true, new[] { "Moderation" });
         var authService = new W3CAuthenticationService(publicKeyPem);
         var ticketStore = new TicketStore();
@@ -391,9 +393,45 @@ public class AuthSessionControllerTests
 
         var throttled = BuildController(authService, ticketStore, limiter, $"Bearer {jwt}", ip).MintTicket();
 
-        Assert.IsInstanceOf<StatusCodeResult>(throttled, "the 11th mint is per-battleTag-throttled");
+        Assert.IsInstanceOf<StatusCodeResult>(throttled, "the 11th mint is still per-battleTag-throttled");
         Assert.AreEqual(StatusCodes.Status429TooManyRequests, ((StatusCodeResult)throttled).StatusCode);
-        Assert.IsTrue(limiter.IsAtLimit($"ip:{ip}", 1, DateTime.UtcNow),
-            "the per-battleTag-throttled rejection must have charged the per-IP budget once");
+        Assert.IsFalse(limiter.IsAtLimit($"ip:{ip}", 1, DateTime.UtcNow),
+            "the per-battleTag-throttled rejection must NOT charge the per-IP budget — the per-battleTag "
+            + "cap is the correct bound for a proven identity, and the IP budget is not its overflow");
+    }
+
+    /// <summary>
+    /// The amplification regression test. One client flapping far past its own per-battleTag cap must
+    /// not degrade its NEIGHBOURS: behind CGNAT or a shared proxy, everyone else on that address is an
+    /// unrelated user who did nothing wrong. Before this, ~40 requests from a single reconnect loop
+    /// exhausted the shared per-IP budget and 429'd every valid token behind the same address.
+    /// </summary>
+    [Test]
+    public void OneFlappingBattleTag_CannotLockOutOtherUsersBehindTheSameIp()
+    {
+        using var rsa = RSA.Create(2048);
+        var publicKeyPem = rsa.ExportSubjectPublicKeyInfoPem();
+        var authService = new W3CAuthenticationService(publicKeyPem);
+        var ticketStore = new TicketStore();
+        var limiter = new MintRateLimiter();
+        const string sharedNatIp = "100.64.0.1"; // RFC 6598 CGNAT space — the realistic shared-address case
+
+        // The flapper: burns its per-battleTag cap, then keeps hammering well past the per-IP limit.
+        var flapperJwt = SignJwt(rsa, "flapper#1", isAdmin: false, new[] { "Moderation" });
+        var attempts = ChatLimits.TicketMintPerBattleTagLimit + ChatLimits.TicketMintPerIpLimit + 5;
+        for (var i = 0; i < attempts; i++)
+        {
+            BuildController(authService, ticketStore, limiter, $"Bearer {flapperJwt}", sharedNatIp).MintTicket();
+        }
+
+        Assert.IsFalse(limiter.IsAtLimit($"ip:{sharedNatIp}", ChatLimits.TicketMintPerIpLimit, DateTime.UtcNow),
+            "a single flapping battleTag must never exhaust the shared per-IP budget");
+
+        // The innocent neighbour: a DIFFERENT valid battleTag on the SAME address must still mint.
+        var neighbourJwt = SignJwt(rsa, "neighbour#2", isAdmin: false, new[] { "Moderation" });
+        var result = BuildController(authService, ticketStore, limiter, $"Bearer {neighbourJwt}", sharedNatIp).MintTicket();
+
+        Assert.IsInstanceOf<OkObjectResult>(result,
+            "an unrelated valid user behind the same shared IP must still mint after a neighbour's reconnect loop");
     }
 }

@@ -95,13 +95,22 @@ public static class ChatLimits
     /// bounding per-user abuse.
     ///
     /// <para><see cref="TicketMintPerIpLimit"/> = 30/window is a pre-validation DoS shield that, after the
-    /// F1 reconnect-storm rework, caps ONLY REJECTED mint attempts per source IP — auth failures
-    /// (bad/expired token) and per-battleTag-throttled attempts. A SUCCESSFUL mint (valid, non-expired
-    /// JWT under the per-battleTag cap) does NOT charge this budget, so a legitimate mass reconnect of
-    /// thousands of DISTINCT valid battleTags behind one shared/NAT'd proxy IP is never IP-throttled
-    /// (each is still bounded by the per-battleTag cap). It stays a hard-coded const by the ChatLimits
-    /// philosophy; the forwarded-headers TRUST boundary (Startup) is likewise hardcoded to the sibling
-    /// services' convention, so the shield keys on the real client IP.</para></summary>
+    /// F1 reconnect-storm rework, caps ONLY REJECTED mint attempts per source IP. A SUCCESSFUL mint does
+    /// NOT charge this budget, so a legitimate mass reconnect of thousands of DISTINCT valid battleTags
+    /// behind one shared/NAT'd proxy IP is never IP-throttled (each is still bounded by the per-battleTag
+    /// cap). It stays a hard-coded const by the ChatLimits philosophy; the forwarded-headers TRUST
+    /// boundary (Startup) is likewise hardcoded to the sibling services' convention, so the shield keys
+    /// on the real client IP.</para>
+    ///
+    /// <para>Only the two genuinely CHEAP rejection paths charge it: a malformed/non-Bearer header and a
+    /// signature failure. Per-battleTag-THROTTLED attempts deliberately do not (they once did): reaching
+    /// that throttle requires a validly signed token, so the attempt has already paid full RSA validation
+    /// and is bounded by <see cref="TicketMintPerBattleTagLimit"/> anyway. Charging the shared IP budget
+    /// for it meant a single flapping client (≈40 requests in one window) could exhaust the budget and
+    /// 429 every OTHER user behind the same address — an availability hit to unrelated users behind CGNAT
+    /// or a shared proxy. RESIDUAL, accepted: a holder of one valid JWT can now drive unbounded
+    /// past-cap attempts from a single IP without ever tripping the shield, each costing one signature
+    /// validation. Bounding that needs a cost-based (not count-based) limiter, tracked separately.</para></summary>
     public const int TicketMintPerBattleTagLimit = 10;
     public const int TicketMintPerIpLimit = 30;
     public static readonly TimeSpan TicketMintWindow = TimeSpan.FromMinutes(1);
