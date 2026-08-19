@@ -60,19 +60,57 @@ public static class ChatLimits
     /// <summary>Auth ticket TTL (one-time).</summary>
     public static readonly TimeSpan TicketTtl = TimeSpan.FromSeconds(60);
 
+    /// <summary>
+    /// Whether <c>POST /auth/session</c> enforces the JWT's <c>exp</c> when minting a connect ticket.
+    /// Toggle in the identification-service <c>AuthorizationController.ENFORCE_*</c> spirit — one const,
+    /// flip it here, no env plumbing (the ChatLimits philosophy).
+    ///
+    /// <para>Currently <c>false</c>. identification-service issues JWTs with a 7-day lifetime
+    /// (<c>W3CUserAuthentication.Create</c>: <c>expires: DateTime.UtcNow.AddDays(7)</c>) and exposes NO
+    /// refresh/renew endpoint — the only way to obtain a new token is a full Blizzard OAuth re-login.
+    /// Meanwhile website-backend deliberately does NOT validate lifetime on its player-facing surfaces,
+    /// notably its SignalR connect (<c>WebsiteBackendHub</c>, <c>GetUserByToken(accessToken, false)</c>).
+    /// With this ON, chat was the strict outlier: a user past day 7 still browsed the website and still
+    /// looked logged in, but could not connect to chat — surfacing as an unexplained auth error.
+    /// OFF makes our connect handshake match the equivalent website-backend surface.</para>
+    ///
+    /// <para>SCOPE — this governs the TICKET-MINT path ONLY. Two things are deliberately unaffected:
+    /// signature verification (an unverifiable token is ALWAYS rejected — the invariant that keeps this
+    /// toggle safe), and the moderation REST surface
+    /// (<see cref="Authentication.UserHasPermissionFilter"/>), which keeps enforcing <c>exp</c> and
+    /// keeps returning <c>AUTH_TOKEN_EXPIRED</c>. That split mirrors website-backend exactly: lax at
+    /// hub connect, strict on the permission filter.</para>
+    ///
+    /// <para>KNOWN COST: <see cref="Sessions.ChatSession.HasPermission"/> gates moderation HUB methods
+    /// on the claims carried by the consumed ticket, so while this is off, an expired-but-validly-signed
+    /// admin token retains its in-hub moderation powers until the holder's permissions change upstream.
+    /// website-backend's hub already carries this same posture. The durable fix is a refresh endpoint in
+    /// identification-service; flip this back to <c>true</c> once one exists.</para>
+    /// </summary>
+    public const bool EnforceJwtLifetimeOnTicketMint = false;
+
     /// <summary>Ticket mint rate limit (C2): fixed window (<see cref="TicketMintWindow"/>). Values are a
     /// C2 plan decision (not spec §13). <see cref="TicketMintPerBattleTagLimit"/> = 10/min caps
     /// SUCCESSFUL-or-not mint attempts per validated battleTag, tolerating reconnect flapping while
     /// bounding per-user abuse.
     ///
     /// <para><see cref="TicketMintPerIpLimit"/> = 30/window is a pre-validation DoS shield that, after the
-    /// F1 reconnect-storm rework, caps ONLY REJECTED mint attempts per source IP — auth failures
-    /// (bad/expired token) and per-battleTag-throttled attempts. A SUCCESSFUL mint (valid, non-expired
-    /// JWT under the per-battleTag cap) does NOT charge this budget, so a legitimate mass reconnect of
-    /// thousands of DISTINCT valid battleTags behind one shared/NAT'd proxy IP is never IP-throttled
-    /// (each is still bounded by the per-battleTag cap). It stays a hard-coded const by the ChatLimits
-    /// philosophy; the forwarded-headers TRUST boundary (Startup) is likewise hardcoded to the sibling
-    /// services' convention, so the shield keys on the real client IP.</para></summary>
+    /// F1 reconnect-storm rework, caps ONLY REJECTED mint attempts per source IP. A SUCCESSFUL mint does
+    /// NOT charge this budget, so a legitimate mass reconnect of thousands of DISTINCT valid battleTags
+    /// behind one shared/NAT'd proxy IP is never IP-throttled (each is still bounded by the per-battleTag
+    /// cap). It stays a hard-coded const by the ChatLimits philosophy; the forwarded-headers TRUST
+    /// boundary (Startup) is likewise hardcoded to the sibling services' convention, so the shield keys
+    /// on the real client IP.</para>
+    ///
+    /// <para>Only the two genuinely CHEAP rejection paths charge it: a malformed/non-Bearer header and a
+    /// signature failure. Per-battleTag-THROTTLED attempts deliberately do not (they once did): reaching
+    /// that throttle requires a validly signed token, so the attempt has already paid full RSA validation
+    /// and is bounded by <see cref="TicketMintPerBattleTagLimit"/> anyway. Charging the shared IP budget
+    /// for it meant a single flapping client (≈40 requests in one window) could exhaust the budget and
+    /// 429 every OTHER user behind the same address — an availability hit to unrelated users behind CGNAT
+    /// or a shared proxy. RESIDUAL, accepted: a holder of one valid JWT can now drive unbounded
+    /// past-cap attempts from a single IP without ever tripping the shield, each costing one signature
+    /// validation. Bounding that needs a cost-based (not count-based) limiter, tracked separately.</para></summary>
     public const int TicketMintPerBattleTagLimit = 10;
     public const int TicketMintPerIpLimit = 30;
     public static readonly TimeSpan TicketMintWindow = TimeSpan.FromMinutes(1);
