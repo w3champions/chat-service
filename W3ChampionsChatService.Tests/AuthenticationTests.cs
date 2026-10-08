@@ -162,6 +162,19 @@ public class AuthenticationTests
         CollectionAssert.AreEquivalent(new[] { EPermission.Moderation, EPermission.Queue }, result.Permissions);
     }
 
+    [Test]
+    public void FromJWT_TokenWithCommercialLicensePermission_RetainsIt()
+    {
+        var (jwt, publicKeyPem) = CreateSignedJwt("admin#1", isAdmin: true,
+            new[] { "Moderation", "CommercialLicense" });
+
+        var result = W3CUserAuthentication.FromJWT(jwt, publicKeyPem);
+
+        Assert.IsNotNull(result);
+        CollectionAssert.AreEquivalent(new[] { EPermission.Moderation, EPermission.CommercialLicense }, result.Permissions);
+        Assert.AreEqual(13, (int)EPermission.CommercialLicense, "Value must match the other services' EPermission contract");
+    }
+
     // ── Exp-enforcing JWT validation path for ticket mint ──────────────────────────────────
     //
     // The REST/MVC path (/api/loungeMute) keeps validating WITHOUT lifetime enforcement — that
