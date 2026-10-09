@@ -15,4 +15,5 @@ public enum EPermission
     SmurfCheckerAdministration,
     Warnings,
     Jobs,
+    CommercialLicense = 13,
 }
