@@ -1,3 +1,4 @@
+using System;
 using System.Threading.Tasks;
 using MongoDB.Driver;
 using NUnit.Framework;
@@ -25,6 +26,9 @@ public class MongoTestServer
         _container = new MongoDbBuilder("mongo:7.0").Build();
         await _container.StartAsync();
         Client = new MongoClient(_container.GetConnectionString());
+        // Startup.ConfigureServices fails fast without MONGO_CONNECTION_STRING; tests that run the real
+        // composition root get the throwaway container's connection string.
+        Environment.SetEnvironmentVariable("MONGO_CONNECTION_STRING", _container.GetConnectionString());
     }
 
     [OneTimeTearDown]

@@ -37,7 +37,7 @@ public class InternalProfileChangesController(FlairRefreshCoalescer coalescer) :
             coalescer.RecordChange(battleTag);
         }
 
-        Log.Information("Internal profile change {Caller} count={Count}",
+        Log.Debug("Internal profile change {Caller} count={Count}",
             InternalHmacAuthFilter.ResolveCaller(HttpContext), request.BattleTags.Count);
 
         return Ok();

@@ -218,7 +218,7 @@ public class MatchChannelService(
         {
             await channelRepository.SetDetached(channel.Id);
             channel.Detached = true;
-            Log.Information("CreateOrGet: match channel {Ref} marked detached", systemRef);
+            Log.Debug("CreateOrGet: match channel {Ref} marked detached", systemRef);
         }
 
         return channel;
