@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Mvc;
 using Serilog;
+using Serilog.Events;
 using W3ChampionsChatService.Authentication;
 using W3ChampionsChatService.Channels;
 using W3ChampionsChatService.Domain;
@@ -205,8 +206,13 @@ public class InternalChannelsController(
             // "succeeded" wording — a discarded assertion (stale/duplicate or against a frozen channel)
             // used to log a contradictory "succeeded" line here ALONGSIDE the domain layer's own discard
             // line, exactly on the storm paths (an mm retry storm, or mm asserting a frozen lobby) the
-            // staleness/detach gates exist to absorb. One line, the real outcome.
-            Log.Debug(
+            // staleness/detach gates exist to absorb. One line, the real outcome. Routine Applied
+            // assertions are Debug (log-noise reduction); Discarded outcomes stay at Information because
+            // the domain layer's own discard lines are Debug and the endpoint still returns 200, so this is
+            // the only production record of a stale/frozen assertion (retry storms, roster divergence).
+            var level = outcome == RosterAssertionOutcome.Applied ? LogEventLevel.Debug : LogEventLevel.Information;
+            Log.Write(
+                level,
                 "Internal channel roster-assert {Outcome} {Caller} {Verb} {Ref} epoch={Epoch} seq={Seq} memberCount={MemberCount} detached={Detached} ladder={Ladder}",
                 outcome, InternalHmacAuthFilter.ResolveCaller(HttpContext), "PUT", @ref,
                 request.Epoch, request.Seq, request.Members.Count, request.Detached ?? false, request.Ladder ?? false);
