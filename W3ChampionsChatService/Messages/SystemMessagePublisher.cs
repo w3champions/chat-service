@@ -125,7 +125,7 @@ public class SystemMessagePublisher(
 
         await fanOutEngine.OnMessagePersisted(channel, message, senderConnectionId: null, isShadow: false, now);
 
-        Log.Information(
+        Log.Debug(
             "System message published {Key} channel={ChannelId} seq={Seq} dedupeKey={DedupeKey}",
             body.Key, channel.Id, seq, dedupeKey);
 

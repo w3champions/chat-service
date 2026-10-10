@@ -27,13 +27,30 @@ namespace W3ChampionsChatService;
 
 public class Startup
 {
+    /// <summary>
+    /// Resolves the Mongo connection string from the MONGO_CONNECTION_STRING value. Fails fast when it is
+    /// missing: silently falling back to a hard-coded host would point a misconfigured deployment at a
+    /// shared database.
+    /// </summary>
+    public static string ResolveMongoConnectionString(string rawValue)
+    {
+        var connectionString = rawValue?.Replace("'", "").Trim();
+        if (string.IsNullOrEmpty(connectionString))
+        {
+            throw new InvalidOperationException(
+                "MONGO_CONNECTION_STRING environment variable is not set or empty; refusing to start without an explicit MongoDB connection string.");
+        }
+
+        return connectionString;
+    }
+
     public void ConfigureServices(IServiceCollection services)
     {
         Log.Information("Adding services");
         services.AddControllers();
 
-        var mongoConnectionString = Environment.GetEnvironmentVariable("MONGO_CONNECTION_STRING") ?? "mongodb://157.90.1.251:3513";
-        var mongoClient = new MongoClient(mongoConnectionString.Replace("'", ""));
+        var mongoConnectionString = ResolveMongoConnectionString(Environment.GetEnvironmentVariable("MONGO_CONNECTION_STRING"));
+        var mongoClient = new MongoClient(mongoConnectionString);
         services.AddSingleton(mongoClient);
 
         // SECURITY: the hub permission filter enforces Moderation on the moderator-only hub methods.
