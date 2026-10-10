@@ -1,3 +1,4 @@
+using System;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Hosting;
 using Serilog;
@@ -18,8 +19,21 @@ public class Program
             .MinimumLevel.Override("System.Net.Http", LogEventLevel.Warning) // Filter out verbose System.Net.Http logs
             .WriteTo.Console(new JsonFormatter(), restrictedToMinimumLevel: LogEventLevel.Information) // Write to Console to allow log scraping
             .CreateLogger();
-        Log.Information("Starting Chat Service");
-        CreateHostBuilder(args).Build().Run();
+        try
+        {
+            Log.Information("Starting Chat Service");
+            CreateHostBuilder(args).Build().Run();
+        }
+        catch (Exception e)
+        {
+            // Emit startup failures (e.g. missing MONGO_CONNECTION_STRING) as structured JSON before exiting.
+            Log.Fatal(e, "Host terminated unexpectedly");
+            throw;
+        }
+        finally
+        {
+            Log.CloseAndFlush();
+        }
     }
 
     public static IHostBuilder CreateHostBuilder(string[] args) =>
