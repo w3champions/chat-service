@@ -7,8 +7,9 @@ surface, backed by MongoDB, providing:
 - Durable per-channel message history (soft-delete aware, seq-anchored pagination).
 - Presence/focus tracking, coalesced activity notifications, and viewer rosters.
 - Moderation: message delete/purge, shadow-bans, and full/shadow lounge mutes.
-- A one-time-ticket auth handshake fronting the identification-service JWT (`POST /auth/session` →
-  SignalR `access_token`).
+- A short-lived-ticket auth handshake fronting the identification-service JWT (`POST /auth/session` →
+  SignalR `access_token`). A ticket lives 60s from mint and can be redeemed up to 5 times, one
+  connection at a time, so a reconnecting launcher doesn't have to mint per attempt.
 
 Clients are the W3Champions launcher (SignalR) and the website-backend, which proxies a subset of the
 moderation surface (see below) to the admin UI.

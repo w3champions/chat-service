@@ -159,15 +159,16 @@ public partial class ChatHub(
 
     public override async Task OnConnectedAsync()
     {
-        // HARD CUTOVER (C2): access_token carries a one-time TICKET minted by POST /auth/session.
-        // A raw JWT lands here too — it is simply not a valid ticket and is rejected.
+        // HARD CUTOVER (C2): access_token carries a TICKET minted by POST /auth/session.
+        // A raw JWT lands here too — it is simply not a valid ticket and is rejected. This connection
+        // holds the ticket until OnDisconnectedAsync releases it (redemption rules on TicketStore).
         var ticket = Context.GetHttpContext()?.Request.Query["access_token"].ToString();
         // Deliberate wall-clock seam, NOT routed through _timeProvider: the ticket is minted with
         // DateTime.UtcNow by the REST AuthSessionController (a separate process boundary that has no
         // access to this hub's injected clock), so the consume-side check MUST compare against the
         // same wall clock the mint side used. This is intentionally decoupled from the injectable
         // fan-out clock below — TicketStore TTL correctness does not depend on TimeProvider.
-        if (string.IsNullOrEmpty(ticket) || !_ticketStore.TryConsume(ticket, DateTime.UtcNow, out var identity))
+        if (string.IsNullOrEmpty(ticket) || !_ticketStore.TryRedeem(ticket, Context.ConnectionId, DateTime.UtcNow, out var identity))
         {
             Log.Warning("Receiver {ConnectionId} failed to authenticate", Context.ConnectionId);
             await Clients.Caller.SendAsync("AuthorizationFailed");
@@ -318,6 +319,11 @@ public partial class ChatHub(
 
     public override async Task OnDisconnectedAsync(Exception exception)
     {
+        // Free the ticket so a reconnect inside its TTL can redeem it again. If OnConnectedAsync threw
+        // after redeeming, SignalR skips this method and the ticket stays held: its next presentation
+        // revokes it, and the launcher mints a new one.
+        _ticketStore.Release(Context.ConnectionId);
+
         // D9 (C6 Task 3): capture the disconnecting session's identity BEFORE Unregister —
         // TryGetByConnectionId is fail-closed for a DISPLACED old socket: once the NEW connection's
         // Register() call overwrote SessionRegistry's battleTag→session pointer, this OLD connectionId

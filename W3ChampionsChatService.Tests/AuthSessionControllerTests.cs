@@ -104,14 +104,18 @@ public class AuthSessionControllerTests
             "ExpiresInSeconds must derive from ChatLimits.TicketTtl, not a literal");
         Assert.IsNotNull(response.Ticket);
 
-        // The ticket must be single-use against the SAME store instance the controller minted from.
-        var consumed = ticketStore.TryConsume(response.Ticket, DateTime.UtcNow, out var identity);
-        Assert.IsTrue(consumed, "The minted ticket must be consumable from the same store");
+        Assert.AreEqual(ChatLimits.TicketMaxRedemptions, response.MaxRedemptions,
+            "maxRedemptions tells the launcher this server allows ticket reuse");
+
+        // The ticket must be redeemable against the SAME store instance the controller minted from, by
+        // one connection at a time.
+        var redeemed = ticketStore.TryRedeem(response.Ticket, "conn-1", DateTime.UtcNow, out var identity);
+        Assert.IsTrue(redeemed, "The minted ticket must be redeemable from the same store");
         Assert.IsNotNull(identity);
         Assert.AreEqual("peter#123", identity.BattleTag);
 
-        var secondConsume = ticketStore.TryConsume(response.Ticket, DateTime.UtcNow, out var secondIdentity);
-        Assert.IsFalse(secondConsume, "A second consume of the same ticket must fail (single-use)");
+        var concurrent = ticketStore.TryRedeem(response.Ticket, "conn-2", DateTime.UtcNow, out var secondIdentity);
+        Assert.IsFalse(concurrent, "A second connection on a held ticket must fail");
         Assert.IsNull(secondIdentity);
     }
 
@@ -170,7 +174,7 @@ public class AuthSessionControllerTests
         Assert.IsNotNull(result, "an expired but validly-signed JWT mints while enforcement is off");
 
         var ticket = ((TicketResponse)result.Value).Ticket;
-        Assert.IsTrue(ticketStore.TryConsume(ticket, DateTime.UtcNow, out var identity));
+        Assert.IsTrue(ticketStore.TryRedeem(ticket, "conn-1", DateTime.UtcNow, out var identity));
         Assert.AreEqual("peter#123", identity.BattleTag, "the battleTag claim must survive intact");
         Assert.IsTrue(identity.IsAdmin, "the isAdmin claim must survive intact");
         Assert.IsTrue(identity.Permissions.Contains(EPermission.Moderation),

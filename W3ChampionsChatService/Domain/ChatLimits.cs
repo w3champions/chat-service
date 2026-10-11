@@ -57,8 +57,15 @@ public static class ChatLimits
     /// <summary>ViewersChanged flush interval per channel.</summary>
     public static readonly TimeSpan ViewersChangedFlush = TimeSpan.FromSeconds(5);
 
-    /// <summary>Auth ticket TTL (one-time).</summary>
+    /// <summary>Auth ticket TTL, counted from mint and never extended by a redemption.</summary>
     public static readonly TimeSpan TicketTtl = TimeSpan.FromSeconds(60);
+
+    /// <summary>Most presentations a ticket accepts inside its TTL (see <see cref="Sessions.TicketStore"/>).
+    /// Lets the launcher's reconnect loop (first retry within 10s, then 2.5-7.5s, 5-15s, 10-30s) reuse
+    /// one ticket for about a minute instead of minting per attempt. Surfaced to the client as
+    /// MaxRedemptions, which is how a launcher knows this server allows reuse. Matches
+    /// website-backend's SessionLimits.TicketMaxRedemptions.</summary>
+    public const int TicketMaxRedemptions = 5;
 
     /// <summary>
     /// Whether <c>POST /auth/session</c> enforces the JWT's <c>exp</c> when minting a connect ticket.

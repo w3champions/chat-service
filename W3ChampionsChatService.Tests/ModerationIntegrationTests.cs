@@ -217,7 +217,7 @@ public class ModerationIntegrationTests : IntegrationTestBase
         return hub;
     }
 
-    // Mints a fresh one-time ticket (real wall-clock, matching OnConnectedAsync's DateTime.UtcNow
+    // Mints a fresh ticket (real wall-clock, matching OnConnectedAsync's DateTime.UtcNow
     // consumption — the deliberate seam decoupled from the FakeTimeProvider) and drives the SHIPPED
     // connect path end-to-end for a regular user identity.
     private async Task<ChatHub> Connect(string connectionId, string battleTag) =>
