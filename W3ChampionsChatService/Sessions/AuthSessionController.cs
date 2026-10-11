@@ -16,7 +16,8 @@ public class AuthSessionController(
     MintRateLimiter rateLimiter) : ControllerBase
 {
     // Contract §3 (pinned): Bearer W3C JWT in; signature + exp enforced (tolerant permission
-    // parse inside FromJWT); one-time 60s ticket out. Called from launcher Rust only (L1).
+    // parse inside FromJWT); 60s ticket out, redeemable up to ChatLimits.TicketMaxRedemptions times
+    // one connection at a time (TicketStore). Called from launcher Rust only (L1).
     [HttpPost("session")]
     public IActionResult MintTicket()
     {
@@ -76,6 +77,7 @@ public class AuthSessionController(
         {
             Ticket = ticketStore.Mint(identity, now),
             ExpiresInSeconds = (int)ChatLimits.TicketTtl.TotalSeconds,
+            MaxRedemptions = ChatLimits.TicketMaxRedemptions,
         });
     }
 }
@@ -84,4 +86,8 @@ public class TicketResponse
 {
     public string Ticket { get; set; }
     public int ExpiresInSeconds { get; set; }
+
+    /// <summary>Presentations the ticket accepts inside its TTL. Its presence tells the launcher it may
+    /// reuse the ticket across reconnects; older servers omit it and burn the ticket on first use.</summary>
+    public int MaxRedemptions { get; set; }
 }

@@ -168,7 +168,7 @@ public class ChatHubPresenceReadTests : IntegrationTestBase
         return hub;
     }
 
-    // Mints a fresh one-time ticket (real wall-clock, matching OnConnectedAsync's DateTime.UtcNow
+    // Mints a fresh ticket (real wall-clock, matching OnConnectedAsync's DateTime.UtcNow
     // consumption) and drives the SHIPPED connect path end-to-end — including the Task 3 connect-time
     // directory upsert.
     private async Task<ChatHub> Connect(string connectionId, string battleTag)

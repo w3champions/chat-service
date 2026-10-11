@@ -47,7 +47,7 @@ namespace W3ChampionsChatService.Tests;
 /// any <c>Clients.Group</c> broadcast (recorded under the sentinel target "group", so a private-lane
 /// event mistakenly broadcast is caught) into the shared <see cref="_hubSends"/>. TIME is deterministic
 /// via a single <see cref="FakeTimeProvider"/> SHARED with the relationship provider (so snapshot
-/// freshness and the hub clock agree); the one real-clock seam is the one-time ticket
+/// freshness and the hub clock agree); the one real-clock seam is the ticket
 /// (<see cref="ChatHub.OnConnectedAsync"/> consumes it with <c>DateTime.UtcNow</c>, so tickets are minted
 /// the same way — exactly as <see cref="ModerationIntegrationTests"/> handles it). NUnit constraint style.
 /// </para>

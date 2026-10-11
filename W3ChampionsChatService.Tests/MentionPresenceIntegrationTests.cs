@@ -45,7 +45,7 @@ namespace W3ChampionsChatService.Tests;
 /// <see cref="ChatHubFriendPresenceTests"/> presence wiring.
 /// <para>
 /// These are ACCEPTANCE tests over already-shipped code (Tasks 1-11), so they were GREEN on write. TIME is
-/// DETERMINISTIC via a single <see cref="FakeTimeProvider"/>; the one real-clock seam is the one-time ticket
+/// DETERMINISTIC via a single <see cref="FakeTimeProvider"/>; the one real-clock seam is the ticket
 /// (<see cref="ChatHub.OnConnectedAsync"/> consumes it with <c>DateTime.UtcNow</c>, so tickets are minted
 /// with <c>DateTime.UtcNow</c> too — exactly as <see cref="HubProtocolIntegrationTests"/>/
 /// <see cref="ModerationIntegrationTests"/> handle it). Two capture surfaces, both keyed by connectionId:

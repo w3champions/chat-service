@@ -45,7 +45,7 @@ namespace W3ChampionsChatService.Tests;
 /// <see cref="FanOutFlushService"/> timer is never relied on here.
 /// </para>
 /// <para>
-/// One deliberate real-clock seam: <see cref="ChatHub.OnConnectedAsync"/> consumes the one-time ticket
+/// One deliberate real-clock seam: <see cref="ChatHub.OnConnectedAsync"/> redeems the ticket
 /// with <c>DateTime.UtcNow</c> (the ticket TTL is wall-clock, independent of the fan-out coalescing
 /// windows), so tickets are minted with <c>DateTime.UtcNow</c> too — mirroring
 /// <see cref="ChatHubConnectionTests"/>. The <see cref="FakeTimeProvider"/> governs only the fan-out /
@@ -195,7 +195,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
         return hub;
     }
 
-    // Mints a fresh one-time ticket (real wall-clock, matching OnConnectedAsync's DateTime.UtcNow
+    // Mints a fresh ticket (real wall-clock, matching OnConnectedAsync's DateTime.UtcNow
     // consumption) and drives the SHIPPED connect path end-to-end: OnConnectedAsync consumes the
     // ticket, registers the session, assembles + seeds, and pushes SessionState to the caller.
     private async Task<ChatHub> Connect(string connectionId, string battleTag)

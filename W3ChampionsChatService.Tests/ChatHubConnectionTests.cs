@@ -30,9 +30,9 @@ using W3ChampionsChatService.Users;
 namespace W3ChampionsChatService.Tests;
 
 /// <summary>
-/// C2 connect-path tests: the SignalR hub now authenticates via a one-time TICKET carried in the
+/// C2 connect-path tests: the SignalR hub now authenticates via a TICKET carried in the
 /// standard <c>access_token</c> query param (hard cutover — a raw JWT is no longer accepted). Covers
-/// valid connect + single-use consumption, all rejection shapes (raw JWT / reused ticket / missing
+/// valid connect + ticket hold/release/reuse, all rejection shapes (raw JWT / replayed ticket / missing
 /// ticket → <c>AuthorizationFailed</c> + <c>Context.Abort()</c>), battleTag displacement
 /// (<c>ConnectionDisplaced</c> BEFORE close — acceptance 4), the displaced-old-socket disconnect race,
 /// and the directory stub upsert. Drives the REAL <c>Context.GetHttpContext()</c> resolution path via
@@ -224,7 +224,7 @@ public class ChatHubConnectionTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task ValidTicket_Connects_RegistersSession_AndConsumesTicketOnce()
+    public async Task ValidTicket_Connects_RegistersSession_AndHoldsTicket()
     {
         var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
         var (hub, _) = BuildConnection("conn-1", ticket);
@@ -236,15 +236,15 @@ public class ChatHubConnectionTests : IntegrationTestBase
         Assert.AreEqual(BattleTag, session.Identity.BattleTag, "The registered identity is the ticket's snapshot");
         Assert.IsNotNull(_connectionMapping.GetUser("conn-1"),
             "The assembler seeds the legacy connection→user mapping (RegisterUser) so MuteReconciliationService can still reach this connection");
-        Assert.IsFalse(_ticketStore.TryConsume(ticket, DateTime.UtcNow, out _),
-            "The ticket must be single-use — it was already consumed at connect");
+        Assert.IsFalse(_ticketStore.TryRedeem(ticket, "conn-other", DateTime.UtcNow, out _),
+            "conn-1 holds the ticket, so no other connection can redeem it");
     }
 
     [Test]
     public async Task RawJwt_AsAccessToken_IsRejected()
     {
         // Acceptance 3: a client that mistakenly presents a raw (even cryptographically valid) JWT as
-        // access_token is rejected — the hub consumes ONLY one-time tickets after the hard cutover.
+        // access_token is rejected — the hub accepts ONLY minted tickets after the hard cutover.
         var (jwt, _) = CreateSignedJwt(BattleTag, isAdmin: false, new[] { "Moderation" });
         var (hub, _) = BuildConnection("conn-jwt", jwt);
 
@@ -259,10 +259,10 @@ public class ChatHubConnectionTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task ReusedTicket_SecondConnect_IsRejected()
+    public async Task TicketReplayedWhileHeld_SecondConnect_IsRejected()
     {
-        // Acceptance 1 at the hub: the ticket is one-time. A second connect presenting the SAME ticket
-        // is rejected even though the first succeeded.
+        // A second connect presenting the SAME ticket while the first connection still holds it is a
+        // replay: rejected, and the first connection stays live.
         var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
         var (first, _) = BuildConnection("conn-a", ticket);
         await first.OnConnectedAsync();
@@ -275,6 +275,31 @@ public class ChatHubConnectionTests : IntegrationTestBase
         Assert.IsTrue(_sends.Contains(("conn-b", "ABORT")));
         Assert.IsFalse(_sessionRegistry.TryGetByConnectionId("conn-b", out _), "No session for the rejected connect");
         Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-a", out _), "The first connection stays live");
+
+        // The replay revoked the ticket: even after the holder leaves, it can't be redeemed again.
+        await first.OnDisconnectedAsync(null);
+        var (third, _) = BuildConnection("conn-c", ticket);
+        await third.OnConnectedAsync();
+        Assert.IsTrue(_sends.Contains(("conn-c", "AuthorizationFailed")), "A revoked ticket stays revoked");
+    }
+
+    [Test]
+    public async Task ReconnectAfterDisconnect_ReusesTicket()
+    {
+        // The launcher's reconnect loop presents the same ticket again after its connection dropped.
+        // Inside the TTL that must work, so a reconnect burst doesn't mint.
+        var ticket = _ticketStore.Mint(Identity(), DateTime.UtcNow);
+        var (first, _) = BuildConnection("conn-a", ticket);
+        await first.OnConnectedAsync();
+        await first.OnDisconnectedAsync(null);
+
+        var (second, _) = BuildConnection("conn-b", ticket);
+        await second.OnConnectedAsync();
+
+        Assert.IsFalse(_sends.Contains(("conn-b", "AuthorizationFailed")), "A released ticket must be reusable");
+        Assert.IsTrue(_sessionRegistry.TryGetByConnectionId("conn-b", out var session), "The reconnect registers a session");
+        Assert.AreEqual(BattleTag, session.Identity.BattleTag);
+        Assert.IsTrue(_sends.Contains(("conn-b", ChatEvents.SessionState)));
     }
 
     [Test]
