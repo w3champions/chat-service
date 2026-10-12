@@ -175,6 +175,12 @@ public class AuthenticationTests
         Assert.AreEqual(13, (int)EPermission.CommercialLicense, "Value must match the other services' EPermission contract");
     }
 
+    [Test]
+    public void EPermission_Replays_HasContractValue()
+    {
+        Assert.AreEqual(14, (int)EPermission.Replays, "Value must match the other services' EPermission contract");
+    }
+
     // ── Exp-enforcing JWT validation path for ticket mint ──────────────────────────────────
     //
     // The REST/MVC path (/api/loungeMute) keeps validating WITHOUT lifetime enforcement — that
