@@ -480,9 +480,11 @@ public partial class ChatHub
         // round-trip (block-check snapshots resolved CONCURRENTLY, so at most ONE ~2s wb HTTP timeout when
         // wb is degraded — see the F2b comment above). That is an accepted trade (Marco round 2026-08-05),
         // not an artifact; other viewers' delivery is unaffected because the fan-out engine above already ran.
+        // The sender's trusted session.Identity.IsAdmin is threaded in: an admin's mentions skip ONLY the
+        // target's block check (no wb round-trip at all), consistent with the step-5.5 admin gate bypass.
         if (!isShadow && mentionTags.Count > 0)
         {
-            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
+            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now, session.Identity.IsAdmin);
         }
 
         // 9. Typed ack.

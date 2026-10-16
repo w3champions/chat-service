@@ -497,6 +497,48 @@ public class MentionFanOutTests : IntegrationTestBase
         Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible member control still fires");
     }
 
+    // Admin chat priority (defence in depth — WB already filters admins out of `blocked`, but a fail-open /
+    // empty-roster WB would leak the block back in): a trusted ADMIN sender bypasses ONLY the D1 block
+    // check. Every other eligibility rule (membership wall, notification level, decline) still applies.
+    [Test]
+    public async Task Notify_AdminSender_TargetBlockedSender_StillNotified()
+    {
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+        var fanOut = BuildFanOutWithBlock(blockingTargetTag: "wolf#456", blockedBattleTag: Sender);
+
+        await fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "wolf#456" }, Now, senderIsAdmin: true);
+
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1), "an admin's mention reaches a target who blocked them");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Notify_AdminSender_TargetLevelNone_StillSuppressed()
+    {
+        await SeedMembership("silent#1", NotificationLevel.None);
+        RegisterSession("conn-silent", "silent#1");
+        await SeedMembership("control#1", NotificationLevel.All);
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "silent#1", "control#1" }, Now, senderIsAdmin: true);
+
+        Assert.That(await InboxOf("silent#1"), Is.Empty, "the admin bypass is block-only — an explicit None opt-out still wins");
+        Assert.That(MentionEventCount("conn-silent"), Is.EqualTo(0));
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "control: the eligible member is notified");
+    }
+
+    [Test]
+    public async Task Notify_AdminSender_NonMemberOfWalledChannel_StillSuppressed()
+    {
+        await SeedDirectory("outsider#1");
+        RegisterSession("conn-outsider", "outsider#1");
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "outsider#1" }, Now, senderIsAdmin: true);
+
+        Assert.That(await InboxOf("outsider#1"), Is.Empty, "the admin bypass never lifts the Dm excerpt privacy wall");
+        Assert.That(MentionEventCount("conn-outsider"), Is.EqualTo(0));
+    }
+
     [Test]
     public async Task Notify_BlockCheckThrows_DeliversFailOpen_NoSuppressionOfOtherwiseEligibleTarget()
     {
