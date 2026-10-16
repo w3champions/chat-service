@@ -227,7 +227,7 @@ public partial class ChatHub
                 // and so never re-announces it.
                 if (_sessionRegistry.GetByBattleTag(target) != null)
                 {
-                    await ReAnnounceAcceptedDm(shell, target, knownRecipientMembership: null);
+                    await ReAnnounceAcceptedDm(shell, target);
                 }
             }
 
@@ -625,7 +625,7 @@ public partial class ChatHub
     /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) even if already registry-seeded, so
     /// their client learns the shell is now Accepted (the RequestReceived branch is skipped — the channel is
     /// no longer Pending) — via <see cref="ReAnnounceAcceptedDm"/>, which re-loads the post-allocation
-    /// channel and preserves the recipient's live registry state.</item>
+    /// channel and merges it with the recipient's live registry state.</item>
     /// </list>
     /// </summary>
     private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now, bool reAnnounceAcceptedState)
@@ -663,7 +663,7 @@ public partial class ChatHub
         {
             // Admin flip: announce the PERSISTED post-allocation channel while preserving any live
             // registry state (see ReAnnounceAcceptedDm). Ordinary sends never take this branch.
-            await ReAnnounceAcceptedDm(channel, counterpart, recipientMembership);
+            await ReAnnounceAcceptedDm(channel, counterpart);
         }
         else if (newlyMaterialized || needsReAnnounce)
         {
@@ -722,26 +722,22 @@ public partial class ChatHub
     /// predates <see cref="Channels.ChannelRepository.AllocateSeq"/>, so its LastSeq/LastMessageAt/ExpiresAt
     /// are stale — and a Mentions/None recipient gets no ChannelActivity to learn the new seq otherwise.
     /// A vanished doc falls back to <paramref name="channel"/>.</item>
-    /// <item>The push uses <c>preserveLiveMemberState</c>: the recipient may already be registry-seeded, and
-    /// their live read cursor / notification level can be newer than any membership row read here.</item>
-    /// <item><paramref name="knownRecipientMembership"/> null ⇒ loaded; still absent ⇒ nothing to announce
-    /// (the recipient never knew the shell; the first send materializes it as Accepted).</item>
+    /// <item>The push goes through <see cref="FanOut.FanOutEngine.ReAnnounceChannelAdded"/>: the recipient may
+    /// already be registry-seeded, so the engine observes their live entry BEFORE re-loading the membership
+    /// row and merges the two (newer notification level wins, max read cursor) instead of overwriting.
+    /// The row is therefore always re-read here — even on the send path, whose earlier InsertIfAbsent read
+    /// precedes that observation. No row ⇒ nothing to announce (the recipient never knew the shell; the
+    /// first send materializes it as Accepted).</item>
     /// <item>BEST-EFFORT: on the send path the message is already durable, so a failure here must never
     /// turn the ack into an error (a retry would duplicate it); reconnect heals via SessionState.</item>
     /// </list>
     /// </summary>
-    private async Task ReAnnounceAcceptedDm(ChatChannel channel, string recipient, ChannelMembership knownRecipientMembership)
+    private async Task ReAnnounceAcceptedDm(ChatChannel channel, string recipient)
     {
         try
         {
-            var membership = knownRecipientMembership ?? await _membershipRepository.Load(channel.Id, recipient);
-            if (membership == null)
-            {
-                return;
-            }
-
             var persisted = await _channelRepository.Load(channel.Id) ?? channel;
-            await _fanOutEngine.PushChannelAdded(persisted, membership, focus: false, preserveLiveMemberState: true);
+            await _fanOutEngine.ReAnnounceChannelAdded(persisted, recipient, () => _membershipRepository.Load(channel.Id, recipient));
         }
         catch (Exception ex)
         {

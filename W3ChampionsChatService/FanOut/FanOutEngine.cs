@@ -298,15 +298,9 @@ public class FanOutEngine(
     /// starting with the very next message — without this seed the newly-added channel would stay
     /// invisible to activity routing until the user's next reconnect re-seeds it via
     /// <see cref="SessionStateAssembler"/>.</item>
-    /// <item><paramref name="preserveLiveMemberState"/> (default false — a plain <see cref="OnlineMemberRegistry.Join"/>
-    /// overwrite, unchanged for every first-add caller): set ONLY when RE-announcing a channel the
-    /// connection may already track (the admin DM Pending → Accepted re-announce). An existing registry
-    /// entry is then kept (<see cref="OnlineMemberRegistry.JoinPreservingLiveState"/>) and the pushed
-    /// <see cref="MembershipDto"/> carries that live level/cursor instead of
-    /// <paramref name="membership"/>'s possibly older snapshot.</item>
     /// </list>
     /// </summary>
-    public async Task PushChannelAdded(ChatChannel channel, ChannelMembership membership, bool focus, bool preserveLiveMemberState = false)
+    public async Task PushChannelAdded(ChatChannel channel, ChannelMembership membership, bool focus)
     {
         var battleTag = membership.BattleTag;
 
@@ -329,23 +323,61 @@ public class FanOutEngine(
 
         // AUTHORITATIVE — must always run (it precedes the best-effort send): seeding the registry is what
         // makes this channel's activity fan-out reach the connection from the very next message.
-        var seed = new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type);
-        MembershipDto membershipDto;
-        if (preserveLiveMemberState)
+        _onlineMemberRegistry.Join(
+            channel.Id,
+            session.ConnectionId,
+            new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type));
+
+        await SendChannelAddedAsync(session.ConnectionId, battleTag, new ChannelAddedDto(channel, MembershipDto.From(membership), focus));
+    }
+
+    /// <summary>
+    /// RE-announces <paramref name="channel"/> (<c>ChannelAdded</c>, focus:false) to <paramref name="battleTag"/>'s
+    /// live connection when that connection may ALREADY track it — the admin DM Pending → Accepted
+    /// re-announcement (<c>ChatHub.ReAnnounceAcceptedDm</c>). Unlike <see cref="PushChannelAdded"/> it never
+    /// blindly overwrites the live <see cref="MemberState"/>: it observes the registry entry FIRST, THEN
+    /// invokes <paramref name="loadMembership"/>, and merges via
+    /// <see cref="OnlineMemberRegistry.JoinPreservingLiveState"/> (newer level wins, max cursor — see there
+    /// for why the observe-then-load order makes that decidable). The pushed <see cref="MembershipDto"/>
+    /// carries exactly the merged state, so the client's upsert cannot regress it either.
+    /// <list type="bullet">
+    /// <item><paramref name="loadMembership"/> returns null ⇒ nothing to announce (no push, no seed, no
+    /// interest update).</item>
+    /// <item>Offline ⇒ only the presence-interest update runs, mirroring <see cref="PushChannelAdded"/>.</item>
+    /// </list>
+    /// </summary>
+    public async Task ReAnnounceChannelAdded(ChatChannel channel, string battleTag, Func<Task<ChannelMembership>> loadMembership)
+    {
+        var session = _sessionRegistry.GetByBattleTag(battleTag);
+        MemberState observed = null;
+        if (session != null && _onlineMemberRegistry.TryGetMember(channel.Id, session.ConnectionId, out var current))
         {
-            // Re-announcement of a channel the connection may already track: never regress its live
-            // cursor/level with the caller's earlier membership read, and announce the SAME state the
-            // registry now holds so the client's upsert cannot regress it either.
-            var live = _onlineMemberRegistry.JoinPreservingLiveState(channel.Id, session.ConnectionId, seed);
-            membershipDto = new MembershipDto(live.NotificationLevel, live.LastReadSeq, membership.Role);
-        }
-        else
-        {
-            _onlineMemberRegistry.Join(channel.Id, session.ConnectionId, seed);
-            membershipDto = MembershipDto.From(membership);
+            observed = current;
         }
 
-        var dto = new ChannelAddedDto(channel, membershipDto, focus);
+        var membership = await loadMembership();
+        if (membership == null)
+        {
+            return;
+        }
+
+        _presenceInterestRegistry.OnMemberAdded(channel.Id, battleTag);
+        if (session == null)
+        {
+            return;
+        }
+
+        var live = _onlineMemberRegistry.JoinPreservingLiveState(
+            channel.Id,
+            session.ConnectionId,
+            new MemberState(membership.BattleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type),
+            observed);
+        var membershipDto = new MembershipDto(live.NotificationLevel, live.LastReadSeq, membership.Role);
+        await SendChannelAddedAsync(session.ConnectionId, battleTag, new ChannelAddedDto(channel, membershipDto, Focus: false));
+    }
+
+    private async Task SendChannelAddedAsync(string connectionId, string battleTag, ChannelAddedDto dto)
+    {
         // Fault isolation (review fix, SEC-Low-3): the ChannelAdded push is a BEST-EFFORT live
         // notification — the channel + membership are already durably persisted and the registry seeded
         // above, and a reconnecting client re-derives its channel list from SessionState, so a torn-down
@@ -353,11 +385,11 @@ public class FanOutEngine(
         // (AddGroupMember/OpenDm/CreateGroup) after its durable mutation already succeeded.
         try
         {
-            await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelAdded, dto);
+            await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.ChannelAdded, dto);
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Push of ChannelAdded failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, session.ConnectionId, channel.Id);
+            Log.Warning(ex, "Push of ChannelAdded failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, connectionId, dto.Channel.Id);
         }
     }
 

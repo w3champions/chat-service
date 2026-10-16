@@ -369,41 +369,60 @@ public class FanOutRegistryTests
         Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
     }
 
-    // OnlineMemberRegistry.JoinPreservingLiveState (admin DM accepted-state re-announcement): seeds only an
-    // ABSENT entry; an existing one keeps its live level and takes the max cursor.
+    // OnlineMemberRegistry.JoinPreservingLiveState (admin DM accepted-state re-announcement): the caller
+    // observes the entry BEFORE loading the persisted row. Unchanged since then ⇒ the persisted level wins;
+    // changed ⇒ the live level wins. The cursor always takes the max.
     [Test]
-    public void JoinPreservingLiveState_NoExistingEntry_SeedsAndReturnsGivenState()
+    public void JoinPreservingLiveState_NoExistingEntry_SeedsAndReturnsPersistedState()
     {
-        var given = new MemberState("peter#123", NotificationLevel.All, 5, ChannelType.Dm);
+        var persisted = new MemberState("peter#123", NotificationLevel.All, 5, ChannelType.Dm);
 
-        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", given);
+        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", persisted, observedBeforeLoad: null);
 
-        Assert.That(effective, Is.EqualTo(given));
-        Assert.That(_memberRegistry.GetMembers("channel-a").Single(), Is.EqualTo(given));
+        Assert.That(effective, Is.EqualTo(persisted));
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single(), Is.EqualTo(persisted));
     }
 
     [Test]
-    public void JoinPreservingLiveState_ExistingEntry_KeepsLiveLevelAndHigherCursor()
+    public void JoinPreservingLiveState_EntryUnchangedSinceObservation_PersistedLevelWins_MaxCursor()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.None, 10, ChannelType.Dm));
+        var observed = new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm);
+        _memberRegistry.Join("channel-a", "conn-1", observed);
 
-        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm));
+        var effective = _memberRegistry.JoinPreservingLiveState(
+            "channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.None, 3, ChannelType.Dm), observed);
 
         var member = _memberRegistry.GetMembers("channel-a").Single();
-        Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.None), "a stale snapshot never overwrites the live level");
-        Assert.That(member.LastReadSeq, Is.EqualTo(10), "nor regresses the live cursor");
+        Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the load is at least as new as the unchanged entry");
+        Assert.That(member.LastReadSeq, Is.EqualTo(10), "the cursor never regresses");
         Assert.That(effective, Is.EqualTo(member), "the returned state is what the registry now holds");
     }
 
     [Test]
-    public void JoinPreservingLiveState_ExistingEntry_AdvancesLowerCursor()
+    public void JoinPreservingLiveState_EntryChangedSinceObservation_LiveLevelWins()
     {
-        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm));
+        var observed = new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm);
+        _memberRegistry.Join("channel-a", "conn-1", observed);
+        _memberRegistry.SetNotificationLevel("channel-a", "conn-1", NotificationLevel.Mentions);
 
-        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm));
+        var effective = _memberRegistry.JoinPreservingLiveState(
+            "channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm), observed);
 
+        Assert.That(effective.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "a newer DB-first write already reached the registry");
         Assert.That(effective.LastReadSeq, Is.EqualTo(10));
-        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10));
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single(), Is.EqualTo(effective));
+    }
+
+    [Test]
+    public void JoinPreservingLiveState_EntryAppearedAfterNullObservation_LiveLevelWins()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.Mentions, 2, ChannelType.Dm));
+
+        var effective = _memberRegistry.JoinPreservingLiveState(
+            "channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 1, ChannelType.Dm), observedBeforeLoad: null);
+
+        Assert.That(effective.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
+        Assert.That(effective.LastReadSeq, Is.EqualTo(2));
     }
 
     [Test]

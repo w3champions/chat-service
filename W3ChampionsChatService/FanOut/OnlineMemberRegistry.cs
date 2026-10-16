@@ -95,23 +95,45 @@ public class OnlineMemberRegistry
     }
 
     /// <summary>
-    /// Seeds (channelId, connectionId) with <paramref name="state"/> ONLY if no entry exists yet, and
-    /// returns the entry that is live afterwards. An existing entry is kept as-is, except that its
-    /// <see cref="MemberState.LastReadSeq"/> takes <c>Math.Max</c> with <paramref name="state"/>'s (the
-    /// cursor is monotonic in both stores). Used by a RE-announcement of a channel the connection may
-    /// already track (<see cref="FanOutEngine.PushChannelAdded"/> with <c>preserveLiveMemberState</c>):
-    /// its <paramref name="state"/> comes from a membership row read earlier, and the hub writes the DB
-    /// BEFORE the registry on <c>MarkRead</c>/<c>SetNotificationLevel</c>, so the live entry is never
-    /// older than that row — overwriting it would regress a newer cursor or notification level. Single
-    /// locked pass (no caller-side TryGetMember/Join TOCTOU window).
+    /// Merges a freshly-loaded <paramref name="persisted"/> membership state into (channelId, connectionId)
+    /// for a RE-announcement of a channel the connection may already track
+    /// (<see cref="FanOutEngine.ReAnnounceChannelAdded"/>), and returns the entry that is live afterwards.
+    /// <paramref name="observedBeforeLoad"/> is the entry the caller saw (via <see cref="TryGetMember"/>)
+    /// BEFORE loading <paramref name="persisted"/>, or null if there was none. The hub writes Mongo BEFORE
+    /// the registry on <c>SetNotificationLevel</c>/<c>MarkRead</c>, which makes the merge decidable:
+    /// <list type="bullet">
+    /// <item>No entry ⇒ seed <paramref name="persisted"/> as-is.</item>
+    /// <item>NotificationLevel: entry level still equal to the observation ⇒ no registry write landed since
+    /// the observation, and every registry level was first committed to Mongo, so the later load is at
+    /// least as new — <paramref name="persisted"/>'s level wins (this is the DB-written-but-registry-not-
+    /// yet window). Entry changed (or appeared after a null observation) ⇒ a DB-first write reached the
+    /// registry after the observation, possibly after the load too — the live level wins; any write
+    /// still in flight lands its own registry update afterwards and converges it.</item>
+    /// <item>LastReadSeq: monotonic in both stores ⇒ <c>Math.Max</c> of live and persisted.</item>
+    /// <item>BattleTag/ChannelType are immutable for an entry; the live values are kept.</item>
+    /// </list>
+    /// Single locked pass (no caller-side TryGetMember/Join TOCTOU window at the write).
     /// </summary>
-    public MemberState JoinPreservingLiveState(string channelId, string connectionId, MemberState state)
+    public MemberState JoinPreservingLiveState(string channelId, string connectionId, MemberState persisted, MemberState observedBeforeLoad)
     {
         lock (_lock)
         {
-            var effective = TryGetNoLock(channelId, connectionId, out var existing)
-                ? existing with { LastReadSeq = Math.Max(existing.LastReadSeq, state.LastReadSeq) }
-                : state;
+            MemberState effective;
+            if (!TryGetNoLock(channelId, connectionId, out var current))
+            {
+                effective = persisted;
+            }
+            else
+            {
+                var levelUnchangedSinceObservation = observedBeforeLoad != null
+                    && current.NotificationLevel == observedBeforeLoad.NotificationLevel;
+                effective = current with
+                {
+                    NotificationLevel = levelUnchangedSinceObservation ? persisted.NotificationLevel : current.NotificationLevel,
+                    LastReadSeq = Math.Max(current.LastReadSeq, persisted.LastReadSeq),
+                };
+            }
+
             JoinNoLock(channelId, connectionId, effective);
             return effective;
         }

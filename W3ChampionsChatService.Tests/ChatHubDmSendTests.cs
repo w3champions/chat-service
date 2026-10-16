@@ -129,7 +129,7 @@ public class ChatHubDmSendTests : IntegrationTestBase
             new MuteRepository(MongoClient),
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId, ChannelRepository channelRepository = null)
@@ -1190,24 +1190,24 @@ public class ChatHubDmSendTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task AdminDmSend_PendingShellReAnnounce_PreservesRecipientLiveMemberState()
+    public async Task AdminDmSend_PendingShellReAnnounce_NewerPersistedLevelWins_LiveCursorKept()
     {
         var channel = await CreateAdminDm(DmRequestState.Pending);
         await BumpLastSeq(channel.Id, 2);
         SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
-        await SeedOnlineRecipient(channel.Id); // durable row: level All, cursor 0
-        // The live registry entry is AHEAD of the durable row (a MarkRead + SetNotificationLevel committed
-        // after the row the send path reads): the re-announcement must not regress it.
-        _onlineMemberRegistry.Join(channel.Id, RecipientConn, new MemberState(Recipient, NotificationLevel.Mentions, 2, ChannelType.Dm));
+        // Durable row: level None (a SetNotificationLevel committed to Mongo, registry not updated yet),
+        // cursor 0. Live registry entry: level All, cursor 2 (a MarkRead whose $max row write is behind).
+        await SeedOnlineRecipient(channel.Id, NotificationLevel.None);
+        _onlineMemberRegistry.Join(channel.Id, RecipientConn, new MemberState(Recipient, NotificationLevel.All, 2, ChannelType.Dm));
 
         var result = await BuildHub(AdminConn).SendMessage(channel.Id, "important");
 
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
         Assert.That(_onlineMemberRegistry.TryGetMember(channel.Id, RecipientConn, out var live), Is.True);
-        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "the live registry level is preserved");
-        Assert.That(live.LastReadSeq, Is.EqualTo(2L), "the live registry cursor is preserved");
+        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the newer persisted level wins over the unchanged registry");
+        Assert.That(live.LastReadSeq, Is.EqualTo(2L), "the live registry cursor is never regressed");
         var added = (ChannelAddedDto)_harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded);
-        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
+        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.None));
         Assert.That(added.Membership.LastReadSeq, Is.EqualTo(2L));
     }
 

@@ -105,7 +105,7 @@ public class ChatHubOpenDmTests : IntegrationTestBase
             new MuteRepository(MongoClient),
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)
@@ -734,15 +734,16 @@ public class ChatHubOpenDmTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task OpenDm_Admin_AcceptsPendingShell_ReAnnouncesAcceptedToOnlineRecipient_PreservingLiveState()
+    public async Task OpenDm_Admin_AcceptsPendingShell_ReAnnouncesAcceptedToOnlineRecipient_MergingLiveState()
     {
         await SeedDirectory(AdminTarget);
         var shell = await SeedDeclinedPendingShell(Admin, AdminTarget);
         var harness = UseCapturingFanOut();
         RegisterSession("conn-target", AdminTarget);
-        // The recipient's live registry entry is AHEAD of their durable row (a MarkRead/SetNotificationLevel
-        // committed after any snapshot the re-announcement could read): it must not be regressed.
-        _onlineMemberRegistry.Join(shell.Id, "conn-target", new MemberState(AdminTarget, NotificationLevel.Mentions, 3, ChannelType.Dm));
+        // Durable row: level None (committed to Mongo, registry not updated yet), cursor 0. Live registry
+        // entry: level All, cursor 3. The newer persisted level and the higher live cursor must both win.
+        await _membershipRepository.SetNotificationLevel(shell.Id, AdminTarget, NotificationLevel.None);
+        _onlineMemberRegistry.Join(shell.Id, "conn-target", new MemberState(AdminTarget, NotificationLevel.All, 3, ChannelType.Dm));
         RegisterSession("conn-1", Admin, isAdmin: true);
 
         var result = await BuildHub("conn-1").OpenDm(AdminTarget);
@@ -754,10 +755,10 @@ public class ChatHubOpenDmTests : IntegrationTestBase
         Assert.That(added.Channel.Id, Is.EqualTo(shell.Id));
         Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
         Assert.That(added.Focus, Is.False);
-        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "the live level is announced, not the stale row");
+        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the newer persisted level is announced");
         Assert.That(added.Membership.LastReadSeq, Is.EqualTo(3L), "the live read cursor is announced, not the stale row");
         Assert.That(_onlineMemberRegistry.TryGetMember(shell.Id, "conn-target", out var live), Is.True);
-        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "the live registry level is preserved");
+        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the registry adopts the newer persisted level");
         Assert.That(live.LastReadSeq, Is.EqualTo(3L), "the live registry cursor is preserved");
         Assert.That(harness.SignalCount("conn-1", ChatEvents.ChannelAdded), Is.EqualTo(0), "the admin caller gets the OpenDm result, not a push");
     }

@@ -99,6 +99,107 @@ public class ChannelEventEmitterTests
         Assert.AreEqual(7, state.LastReadSeq);
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // ReAnnounceChannelAdded (admin DM accepted-state re-announcement). The hub writes Mongo BEFORE the
+    // registry on SetNotificationLevel/MarkRead, so the engine observes the registry BEFORE invoking the
+    // membership loader: a registry still equal to that observation means the load is at least as new
+    // (persisted level wins); a registry that changed meanwhile already holds a newer DB-first write
+    // (live level wins). The cursor is monotonic in both stores, so it always takes the max. The loader
+    // callbacks below simulate the concurrent write deterministically — no timing involved.
+    // ---------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task ReAnnounce_PersistedLevelNewerThanUnchangedRegistry_PersistedLevelWins()
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Public));
+
+        // A concurrent SetNotificationLevel committed None to Mongo but has not reached the registry yet.
+        await engine.ReAnnounceChannelAdded(Channel(), BattleTag, () => Task.FromResult(Membership(NotificationLevel.None, lastReadSeq: 0)));
+
+        var dto = (ChannelAddedDto)harness.PayloadFor(ConnectionId, ChatEvents.ChannelAdded);
+        Assert.AreEqual(NotificationLevel.None, dto.Membership.NotificationLevel, "the newer persisted level is announced");
+        Assert.IsTrue(members.TryGetMember(ChannelId, ConnectionId, out var live));
+        Assert.AreEqual(NotificationLevel.None, live.NotificationLevel, "and seeded into the registry");
+        Assert.IsFalse(dto.Focus);
+    }
+
+    [Test]
+    public async Task ReAnnounce_RegistryChangedAfterObservation_LiveLevelWins()
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Public));
+
+        // The load returns a row read BEFORE a concurrent SetNotificationLevel(Mentions) that then fully
+        // completed (Mongo, then registry) before the merge.
+        await engine.ReAnnounceChannelAdded(Channel(), BattleTag, () =>
+        {
+            var staleRow = Membership(NotificationLevel.All, lastReadSeq: 0);
+            members.SetNotificationLevel(ChannelId, ConnectionId, NotificationLevel.Mentions);
+            return Task.FromResult(staleRow);
+        });
+
+        var dto = (ChannelAddedDto)harness.PayloadFor(ConnectionId, ChatEvents.ChannelAdded);
+        Assert.AreEqual(NotificationLevel.Mentions, dto.Membership.NotificationLevel, "a stale row never overwrites a newer live level");
+        Assert.IsTrue(members.TryGetMember(ChannelId, ConnectionId, out var live));
+        Assert.AreEqual(NotificationLevel.Mentions, live.NotificationLevel);
+    }
+
+    [TestCase(9, 3, 9)]
+    [TestCase(3, 9, 9)]
+    public async Task ReAnnounce_ReadCursor_TakesMaxOfLiveAndPersisted(long liveSeq, long persistedSeq, long expected)
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, liveSeq, ChannelType.Public));
+
+        await engine.ReAnnounceChannelAdded(Channel(), BattleTag, () => Task.FromResult(Membership(NotificationLevel.All, persistedSeq)));
+
+        var dto = (ChannelAddedDto)harness.PayloadFor(ConnectionId, ChatEvents.ChannelAdded);
+        Assert.AreEqual(expected, dto.Membership.LastReadSeq);
+        Assert.IsTrue(members.TryGetMember(ChannelId, ConnectionId, out var live));
+        Assert.AreEqual(expected, live.LastReadSeq);
+    }
+
+    [Test]
+    public async Task ReAnnounce_NoRegistryEntry_SeedsFromPersistedRow()
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+
+        await engine.ReAnnounceChannelAdded(Channel(), BattleTag, () => Task.FromResult(Membership(NotificationLevel.Mentions, lastReadSeq: 4)));
+
+        Assert.AreEqual(1, harness.SignalCount(ConnectionId, ChatEvents.ChannelAdded));
+        Assert.IsTrue(members.TryGetMember(ChannelId, ConnectionId, out var live));
+        Assert.AreEqual(NotificationLevel.Mentions, live.NotificationLevel);
+        Assert.AreEqual(4, live.LastReadSeq);
+    }
+
+    [Test]
+    public async Task ReAnnounce_NoPersistedMembership_NoPushNoSeed()
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+
+        await engine.ReAnnounceChannelAdded(Channel(), BattleTag, () => Task.FromResult<ChannelMembership>(null));
+
+        Assert.IsEmpty(harness.AllSignals);
+        Assert.IsFalse(members.IsMember(ConnectionId, ChannelId));
+    }
+
+    [Test]
+    public async Task ReAnnounce_OfflineUser_NoPushNoSeed()
+    {
+        var (harness, _, members, _, engine) = NewFixture();
+
+        await engine.ReAnnounceChannelAdded(Channel(), BattleTag, () => Task.FromResult(Membership()));
+
+        Assert.IsEmpty(harness.AllSignals);
+        Assert.IsFalse(members.IsMember(ConnectionId, ChannelId));
+    }
+
     [Test]
     public async Task PushChannelRemoved_SendsChannelId_CleansRegistriesAndFocus()
     {
