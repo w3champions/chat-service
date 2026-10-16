@@ -152,10 +152,16 @@ public class ChatHubOpenDmTests : IntegrationTestBase
         return hub;
     }
 
-    private void RegisterSession(string connectionId, string battleTag) =>
+    private void RegisterSession(string connectionId, string battleTag, bool isAdmin = false) =>
         _sessionRegistry.Register(
             connectionId,
-            new W3CUserAuthentication { BattleTag = battleTag, Name = battleTag.Split('#')[0] },
+            new W3CUserAuthentication
+            {
+                BattleTag = battleTag,
+                Name = battleTag.Split('#')[0],
+                IsAdmin = isAdmin,
+                Permissions = isAdmin ? new HashSet<EPermission> { EPermission.Moderation } : new HashSet<EPermission>(),
+            },
             null);
 
     private Task SeedDirectory(string battleTag) =>
@@ -555,5 +561,192 @@ public class ChatHubOpenDmTests : IntegrationTestBase
         Assert.That(members.Select(m => m.BattleTag), Is.EquivalentTo(new[] { caller }));
         Assert.That(_onlineMemberRegistry.IsMember("conn-target", result.Channel.Id), Is.False,
             "the target's in-memory session state is untouched — the opened-but-unmessaged DM is invisible to them");
+    }
+
+    // ------------------------------------------------------------------------------------------------
+    // Admin path — an admin caller (server-side session.Identity.IsAdmin) opens a born-Accepted DM past
+    // the target's dmPrivacy, the stranger-initiation cap, and a relationship outage. The D14 directory
+    // check still applies to a non-friend target with no existing shell.
+    // ------------------------------------------------------------------------------------------------
+
+    private const string Admin = "admin#1";
+    private const string AdminTarget = "wolf#456";
+
+    private static void AssertAcceptedOk(OpenDmResult result)
+    {
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_StrangerNobodyPrivacy_BornAccepted_NoInitiationRecorded()
+    {
+        await SeedDirectory(AdminTarget);
+        await SeedPrivacy(AdminTarget, DmPrivacy.Nobody);
+        RegisterSession("conn-1", Admin, isAdmin: true);
+        var hub = BuildHub("conn-1");
+
+        var result = await hub.OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(result.Channel.RequestInitiatedBy, Is.EqualTo(Admin));
+        Assert.That((result.Channel.ExpiresAt.Value - Now.AddDays(365)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
+            "an admin-opened shell is born Accepted with the +1y expiry");
+        Assert.That(_onlineMemberRegistry.IsMember("conn-1", result.Channel.Id), Is.True);
+        Assert.That(_dmInitiationTracker.CountActive(Admin, Now), Is.EqualTo(0), "the admin path never records an initiation");
+        Assert.That((await _membershipRepository.LoadForChannel(result.Channel.Id)).Select(m => m.BattleTag),
+            Is.EquivalentTo(new[] { Admin }), "only the admin's own membership is created at open time");
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_FriendsOnlyPrivacy_BornAccepted()
+    {
+        await SeedDirectory(AdminTarget);
+        await SeedPrivacy(AdminTarget, DmPrivacy.Friends);
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_BeyondStrangerCap_Opens()
+    {
+        await SeedDirectory(AdminTarget);
+        await SeedPrivacy(AdminTarget, DmPrivacy.Everyone);
+        for (var i = 0; i < ChatLimits.StrangerDmInitiationCap; i++)
+        {
+            _dmInitiationTracker.Record(Admin, $"dummy{i}#0", Now);
+        }
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(_dmInitiationTracker.CountActive(Admin, Now), Is.EqualTo(ChatLimits.StrangerDmInitiationCap),
+            "the admin path neither checks nor records against the cap");
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_RelationshipUnavailable_StillOpensAccepted()
+    {
+        await SeedDirectory(AdminTarget);
+        await SeedPrivacy(AdminTarget, DmPrivacy.Nobody);
+        _relationshipSource.ShouldThrow = true; // no cache warmed => GetSnapshotAsync throws
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_StaleSnapshot_StillOpensAccepted()
+    {
+        await SeedDirectory(AdminTarget);
+        await SeedPrivacy(AdminTarget, DmPrivacy.Nobody);
+        await _relationshipProvider.GetSnapshotAsync(Admin);
+        _relationshipSource.ShouldThrow = true;
+        _time.Advance(ChatLimits.RelationshipCacheTtl + TimeSpan.FromMinutes(1));
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_TargetNotInDirectory_NotFound()
+    {
+        const string ghost = "ghost#999"; // deliberately NOT in user_directory
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(ghost);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.NotFound), "the admin path keeps the D14 directory check");
+        Assert.That(await _channelRepository.LoadByPairKey(Admin, ghost), Is.Null);
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_FriendNotInDirectory_BornAccepted()
+    {
+        SetFriends(Admin, AdminTarget); // a fresh friend edge proves the target exists — no directory row needed
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+    }
+
+    // Seeds a pending shell initiated by `initiator` (an active tracker initiation + a declined recipient row).
+    private async Task<ChatChannel> SeedDeclinedPendingShell(string initiator, string recipient)
+    {
+        var shell = await _channelRepository.FindOrCreateDm(initiator, recipient, initiator, DmRequestState.Pending, Now);
+        _dmInitiationTracker.Record(initiator, recipient.ToLowerInvariant(), Now);
+        await _membershipRepository.InsertIfAbsent(new ChannelMembership
+        {
+            ChannelId = shell.Id,
+            BattleTag = recipient,
+            Role = MembershipRole.Member,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        await _membershipRepository.SetDeclinedUntil(shell.Id, recipient, Now + ChatLimits.DmDeclineSuppression);
+        return shell;
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_ExistingAdminInitiatedPendingShell_AcceptedOnOpen_ClearsDecline_FreesSlot()
+    {
+        await SeedDirectory(AdminTarget);
+        var shell = await SeedDeclinedPendingShell(Admin, AdminTarget);
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(result.Channel.Id, Is.EqualTo(shell.Id), "the existing shell is reused");
+        Assert.That((result.Channel.ExpiresAt.Value - Now.AddDays(365)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)));
+        Assert.That((await _channelRepository.Load(shell.Id)).RequestState, Is.EqualTo(DmRequestState.Accepted),
+            "the flip is persisted");
+        Assert.That((await _membershipRepository.Load(shell.Id, AdminTarget)).DeclinedUntil, Is.Null,
+            "the recipient's decline window is cleared");
+        Assert.That(_dmInitiationTracker.CountActive(Admin, Now), Is.EqualTo(0), "the admin's initiation slot is freed");
+        Assert.That(_onlineMemberRegistry.IsMember("conn-1", shell.Id), Is.True);
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_ExistingPendingShellInitiatedByTarget_StaysPending()
+    {
+        await SeedDirectory(AdminTarget);
+        var shell = await _channelRepository.FindOrCreateDm(AdminTarget, Admin, AdminTarget, DmRequestState.Pending, Now);
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Channel.Id, Is.EqualTo(shell.Id));
+        Assert.That(result.Channel.RequestState, Is.EqualTo(DmRequestState.Pending),
+            "opening a request someone else sent does not accept it — accepting stays an explicit action");
+        Assert.That((await _channelRepository.Load(shell.Id)).RequestState, Is.EqualTo(DmRequestState.Pending));
+    }
+
+    [Test]
+    public async Task OpenDm_NonAdminInitiator_ExistingPendingShell_StaysPending_DeclineKept()
+    {
+        const string caller = "peter#123";
+        await SeedDirectory(AdminTarget);
+        var shell = await SeedDeclinedPendingShell(caller, AdminTarget);
+        RegisterSession("conn-1", caller);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.Channel.Id, Is.EqualTo(shell.Id));
+        Assert.That(result.Channel.RequestState, Is.EqualTo(DmRequestState.Pending));
+        Assert.That((await _membershipRepository.Load(shell.Id, AdminTarget)).DeclinedUntil, Is.Not.Null,
+            "a non-admin re-open never touches the recipient's decline window");
+        Assert.That(_dmInitiationTracker.CountActive(caller, Now), Is.EqualTo(1));
     }
 }

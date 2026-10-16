@@ -55,6 +55,12 @@ public partial class ChatHub
     /// <see cref="ChatResultCode.Throttled"/> (retry-after from the tracker, no DB write); otherwise the
     /// admitted initiation is recorded, the pending shell is created, the caller's membership ensured, the
     /// registry seeded, and Ok returned.</item>
+    /// <item>ADMIN path (the caller's own server-side <c>session.Identity.IsAdmin</c>, checked after the
+    /// self-DM guard): a relationship outage or stale snapshot never fails an admin closed; the open is
+    /// delegated to <see cref="OpenDmAsAdmin"/>, which returns a born-<see cref="DmRequestState.Accepted"/>
+    /// shell past the target's dmPrivacy and the stranger-initiation cap (no initiation is recorded),
+    /// accepts the admin's OWN still-pending request, and keeps the D14 directory check for a non-friend
+    /// target with no existing shell. Non-admin callers never reach it.</item>
     /// </list>
     /// The block check is NEVER consulted here (D5): the observable result is computed from friendship +
     /// the target's dmPrivacy ALONE, so a caller blocked by the target walks the identical path (their
@@ -95,14 +101,24 @@ public partial class ChatHub
 
         // 3. Fetch the CALLER's snapshot (never the target's — D5). No usable snapshot at all is an outage:
         // the outcome would need the stranger path (we cannot prove friendship), so fail closed retriable.
-        RelationshipSnapshot snapshot;
+        RelationshipSnapshot snapshot = null;
         try
         {
             snapshot = await _relationshipProvider.GetSnapshotAsync(caller);
         }
-        catch (RelationshipUnavailableException)
+        catch (RelationshipUnavailableException) when (!session.Identity.IsAdmin)
         {
             return new OpenDmResult(ChatResultCode.Throttled, ChatLimits.RelationshipRetryAfterSeconds);
+        }
+        catch (RelationshipUnavailableException)
+        {
+            // Admin caller: an outage never blocks an admin open — proceed without a snapshot.
+        }
+
+        // ADMIN path — the caller's own server-side admin flag (never a client claim).
+        if (session.Identity.IsAdmin)
+        {
+            return await OpenDmAsAdmin(caller, target, snapshot, now);
         }
 
         // 4. FRIEND path — friends bypass consent, dmPrivacy, and the directory check; a friendship proof
@@ -170,6 +186,51 @@ public partial class ChatHub
         var created = await _channelRepository.FindOrCreateDm(
             caller, target, initiator: caller, DmRequestState.Pending, now);
 
+        var callerMembership = await EnsureCallerMembership(created.Id, caller, now);
+        return new OpenDmResult(ChatResultCode.Ok, Channel: created, Membership: callerMembership);
+    }
+
+    /// <summary>
+    /// The ADMIN branch of <see cref="OpenDm"/> (step 3, after the self-DM guard). An admin opens a
+    /// born-<see cref="DmRequestState.Accepted"/> conversation past the target's dmPrivacy, the stranger-
+    /// initiation cap, and a relationship outage/staleness (<paramref name="snapshot"/> is null on an
+    /// outage). Never reads or records <see cref="FanOut.DmInitiationTracker"/> and never reads the
+    /// target's settings. Resolution order:
+    /// <list type="number">
+    /// <item>An existing shell the admin themself initiated that is still <see cref="DmRequestState.Pending"/>
+    /// is accepted via <see cref="AcceptPendingCore"/> (clears the recipient's decline window, frees the
+    /// slot) and returned reloaded; any OTHER existing shell (accepted, or a request the target sent) is
+    /// returned as-is — opening a request someone else sent never accepts it on their behalf.</item>
+    /// <item>No shell and no proven friendship: the D14 directory check still applies →
+    /// <see cref="ChatResultCode.NotFound"/>.</item>
+    /// <item>Otherwise a born-Accepted shell is find-or-created.</item>
+    /// </list>
+    /// Every Ok path ensures the caller's own membership (and registry seed) only.
+    /// </summary>
+    private async Task<OpenDmResult> OpenDmAsAdmin(string caller, string target, RelationshipSnapshot snapshot, DateTime now)
+    {
+        var existingShell = await _channelRepository.LoadByPairKey(caller, target);
+        if (existingShell != null)
+        {
+            var shell = existingShell;
+            if (shell.RequestState == DmRequestState.Pending
+                && string.Equals(shell.RequestInitiatedBy, caller, StringComparison.OrdinalIgnoreCase))
+            {
+                await AcceptPendingCore(shell.Id, shell.RequestInitiatedBy, target, now);
+                shell = await _channelRepository.Load(shell.Id) ?? shell;
+            }
+
+            var membership = await EnsureCallerMembership(shell.Id, caller, now);
+            return new OpenDmResult(ChatResultCode.Ok, Channel: shell, Membership: membership);
+        }
+
+        if (snapshot?.IsFriendWith(target) != true && await _userDirectory.Load(target) == null)
+        {
+            return new OpenDmResult(ChatResultCode.NotFound);
+        }
+
+        var created = await _channelRepository.FindOrCreateDm(
+            caller, target, initiator: caller, DmRequestState.Accepted, now);
         var callerMembership = await EnsureCallerMembership(created.Id, caller, now);
         return new OpenDmResult(ChatResultCode.Ok, Channel: created, Membership: callerMembership);
     }
