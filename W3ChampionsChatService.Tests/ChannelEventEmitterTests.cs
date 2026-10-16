@@ -129,6 +129,44 @@ public class ChannelEventEmitterTests
         Assert.AreSame(live, after, "the registry entry is not rewritten (not even with equal values)");
     }
 
+    // Codex round 4: the read of the live entry and the enqueue of the ChannelAdded must be ONE atomic step
+    // relative to every registry mutation (SetNotificationLevel/LeaveChannel/MarkRead mutate the registry
+    // under the same lock BEFORE their hub result is written). Enqueueing while the lock is held means a
+    // racing mutation either lands first (and is read) or lands after the enqueue (so its own result
+    // reaches the client after this ChannelAdded and is applied last). Pinned via the lock-held seam at the
+    // exact instant of the send — deterministic, no thread timing.
+    [Test]
+    public async Task PushChannelState_EnqueuesTheSendWhileHoldingTheRegistryLock()
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Dm));
+        bool? lockHeldAtEnqueue = null;
+        harness.OnSend(ConnectionId, (_, _) => lockHeldAtEnqueue = members.IsLockHeldByCurrentThread);
+
+        var pushed = await engine.PushChannelStateToTrackedMember(Channel(), BattleTag, MembershipRole.Member);
+
+        Assert.IsTrue(pushed);
+        Assert.AreEqual(true, lockHeldAtEnqueue, "the ChannelAdded is enqueued inside the registry lock");
+        Assert.IsFalse(members.IsLockHeldByCurrentThread, "and the lock is released before the send is awaited");
+    }
+
+    [Test]
+    public async Task PushChannelState_MutationLandedFirst_IsWhatGetsAnnounced()
+    {
+        var (harness, _, members, sessions, engine) = NewFixture();
+        RegisterOnline(sessions, ConnectionId, BattleTag);
+        members.Join(ChannelId, ConnectionId, new MemberState(BattleTag, NotificationLevel.All, 0, ChannelType.Dm));
+        members.SetNotificationLevel(ChannelId, ConnectionId, NotificationLevel.None); // won the lock first
+        members.AdvanceLastReadSeq(ChannelId, ConnectionId, 4);
+
+        await engine.PushChannelStateToTrackedMember(Channel(), BattleTag, MembershipRole.Member);
+
+        var dto = (ChannelAddedDto)harness.PayloadFor(ConnectionId, ChatEvents.ChannelAdded);
+        Assert.AreEqual(NotificationLevel.None, dto.Membership.NotificationLevel);
+        Assert.AreEqual(4, dto.Membership.LastReadSeq);
+    }
+
     [Test]
     public async Task PushChannelState_OnlineButNotTracked_NoPushNoSeed()
     {

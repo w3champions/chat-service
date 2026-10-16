@@ -43,6 +43,11 @@ public sealed class HubPushCaptureHarness
     // lock (_sends) alongside the other lookup dictionaries for the same reason.
     private readonly Dictionary<string, Task> _gatedConnections = new();
 
+    // ConnectionIds configured (via OnSend) to run a caller-supplied callback SYNCHRONOUSLY at the instant
+    // SendCoreAsync is invoked (the moment a real SignalR single-connection send enqueues) — lets a test
+    // observe what the sender holds at enqueue time (e.g. a lock). Guarded by lock (_sends).
+    private readonly Dictionary<string, Action<string, object>> _sendCallbacks = new();
+
     public HubPushCaptureHarness()
     {
         var hubClients = new Mock<IHubClients>();
@@ -57,11 +62,15 @@ public sealed class HubPushCaptureHarness
                     {
                         Exception exceptionToThrow;
                         Task gate;
+                        Action<string, object> callback;
                         lock (_sends)
                         {
                             _throwingConnections.TryGetValue(connectionId, out exceptionToThrow);
                             _gatedConnections.TryGetValue(connectionId, out gate);
+                            _sendCallbacks.TryGetValue(connectionId, out callback);
                         }
+
+                        callback?.Invoke(method, args.Length > 0 ? args[0] : null);
 
                         if (exceptionToThrow != null)
                         {
@@ -120,6 +129,18 @@ public sealed class HubPushCaptureHarness
         lock (_sends)
         {
             _gatedConnections[connectionId] = gate;
+        }
+    }
+
+    /// <summary>
+    /// Runs <paramref name="callback"/> (method, payload) synchronously, on the sending thread, at the
+    /// instant every subsequent send to <paramref name="connectionId"/> is invoked — before it is recorded.
+    /// </summary>
+    public void OnSend(string connectionId, Action<string, object> callback)
+    {
+        lock (_sends)
+        {
+            _sendCallbacks[connectionId] = callback;
         }
     }
 
