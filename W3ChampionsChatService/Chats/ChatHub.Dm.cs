@@ -481,6 +481,13 @@ public partial class ChatHub
     /// accepted-shell expiry rather than the +30d pending one. Honored EXACTLY in this order:
     /// <list type="number">
     /// <item><b>GroupDm</b>: membership was already checked at step 3 — no block/consent gates; proceed.</item>
+    /// <item><b>Admin sender</b> (<paramref name="senderIsAdmin"/> — the sender's own server-side
+    /// <c>session.Identity.IsAdmin</c>): skips EVERY gate below — no snapshot is fetched, so a block or a
+    /// relationship outage never stops the send. A <see cref="DmRequestState.Pending"/> shell is accepted
+    /// first via <see cref="AcceptPendingCore"/> (admin-initiated: the counterpart is the recipient;
+    /// player-initiated: the admin is), which clears the recipient's decline window and frees the
+    /// initiation slot; then proceed as Accepted — never capped, no dmPrivacy recheck. Gating is keyed on
+    /// the SENDER only: a non-admin sending to an admin walks the gates below unchanged.</item>
     /// <item><b>Dm block gate</b> (EVERY Dm send, pending OR accepted — a block silences an established lane
     /// too): fetch the COUNTERPART's snapshot ONCE (reused below). If it has BLOCKED the sender ⇒
     /// <see cref="FakeSendAck"/> (persist NOTHING, deliver NOTHING, materialize NO membership — "never
@@ -501,7 +508,7 @@ public partial class ChatHub
     /// </list></item>
     /// </list>
     /// </summary>
-    private async Task<SendMessageResult> ApplyPrivateLaneGates(ChatChannel channel, string senderBattleTag, DateTime now)
+    private async Task<SendMessageResult> ApplyPrivateLaneGates(ChatChannel channel, string senderBattleTag, bool senderIsAdmin, DateTime now)
     {
         // GroupDm: no consent/block gates — membership already proven at step 3.
         if (channel.Type == ChannelType.GroupDm)
@@ -510,6 +517,21 @@ public partial class ChatHub
         }
 
         var counterpart = ResolveDmCounterpart(channel, senderBattleTag);
+
+        // Admin sender (the SENDER's own server-side flag, never a client claim): no snapshot fetch, so no
+        // block gate and no outage Throttled; a pending shell is accepted BEFORE persist (whoever initiated
+        // it) so no consent wall, dmPrivacy recheck, pending cap or decline window applies.
+        if (senderIsAdmin)
+        {
+            if (channel.RequestState == DmRequestState.Pending)
+            {
+                var isInitiator = string.Equals(senderBattleTag, channel.RequestInitiatedBy, StringComparison.OrdinalIgnoreCase);
+                await AcceptPendingCore(channel.Id, channel.RequestInitiatedBy, isInitiator ? counterpart : senderBattleTag, now);
+                channel.RequestState = DmRequestState.Accepted;
+            }
+
+            return null;
+        }
 
         // (1) Block gate — the counterpart's snapshot, reused for the friend check below.
         RelationshipSnapshot snapshot;
@@ -587,9 +609,14 @@ public partial class ChatHub
     /// has elapsed — <c>now ≥ DeclinedUntil</c>, cleared first so the request resurfaces). Suppressed while
     /// still inside the decline window, and NOT re-fired on every pending message (the tray is already live).
     /// A reply/auto-accept flipped the in-memory RequestState to Accepted, so those never re-notify here.</item>
+    /// <item><paramref name="reAnnounceAcceptedState"/>: set by the caller ONLY for an admin send that flipped
+    /// the shell Pending → Accepted at step 5.5. An online recipient then gets
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) even if already registry-seeded, so
+    /// their client learns the shell is now Accepted (the RequestReceived branch is skipped — the channel is
+    /// no longer Pending).</item>
     /// </list>
     /// </summary>
-    private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now)
+    private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now, bool reAnnounceAcceptedState)
     {
         var counterpart = ResolveDmCounterpart(channel, senderBattleTag);
 
@@ -617,7 +644,10 @@ public partial class ChatHub
             && recipientSession != null
             && !_onlineMemberRegistry.IsMember(recipientSession.ConnectionId, channel.Id);
 
-        if (newlyMaterialized || needsReAnnounce)
+        // Admin send that just flipped Pending → Accepted (reAnnounceAcceptedState): an online recipient's
+        // client still holds the shell as Pending, so push ChannelAdded (an upsert client-side) even when
+        // already seeded — it carries RequestState Accepted. Ordinary sends never set the flag.
+        if (newlyMaterialized || needsReAnnounce || (reAnnounceAcceptedState && recipientSession != null))
         {
             // Seeds the recipient's OnlineMemberRegistry + pushes ChannelAdded(focus:false) if they are
             // online; a no-op for an offline recipient (their SessionState picks the channel up on connect).

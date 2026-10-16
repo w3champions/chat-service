@@ -173,10 +173,16 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         return hub;
     }
 
-    private void RegisterSession(string connectionId, string battleTag) =>
+    private void RegisterSession(string connectionId, string battleTag, bool isAdmin = false) =>
         _sessionRegistry.Register(
             connectionId,
-            new W3CUserAuthentication { BattleTag = battleTag, Name = battleTag.Split('#')[0] },
+            new W3CUserAuthentication
+            {
+                BattleTag = battleTag,
+                Name = battleTag.Split('#')[0],
+                IsAdmin = isAdmin,
+                Permissions = isAdmin ? new HashSet<EPermission> { EPermission.Moderation } : new HashSet<EPermission>(),
+            },
             null);
 
     private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public)
@@ -766,6 +772,28 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-3", ChatEvents.MentionNotified),
             "a third focused member who was NOT mentioned must capture zero MentionNotified — targeting is exact, never a broadcast");
         Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("frank#789"));
+    }
+
+    [Test]
+    public async Task AdminDmMention_RecipientHadDeclined_MentionDelivered()
+    {
+        const string admin = "admin#1";
+        const string recipient = "wolf#456";
+        var channel = await _channelRepository.FindOrCreateDm(admin, recipient, admin, DmRequestState.Pending, Now);
+        RegisterSession("conn-admin", admin, isAdmin: true);
+        _connectionMapping.RegisterUser("conn-admin", FlairUser(admin));
+        _onlineMemberRegistry.Join(channel.Id, "conn-admin", new MemberState(admin, NotificationLevel.All, 0, ChannelType.Dm));
+        await SeedMentionTarget("conn-2", recipient, channel.Id);
+        await _membershipRepository.SetDeclinedUntil(channel.Id, recipient, Now + ChatLimits.DmDeclineSuppression);
+        var hub = BuildHub("conn-admin");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention(recipient)} please read");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var inbox = await _mentionInboxRepository.LoadForUser(recipient);
+        Assert.AreEqual(1, inbox.Count, "the admin's accept cleared the decline, so the mention reaches the inbox");
+        Assert.AreEqual(result.MessageId, inbox[0].MessageId);
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
     }
 
     [Test]

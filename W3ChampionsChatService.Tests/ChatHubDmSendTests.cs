@@ -42,6 +42,8 @@ public class ChatHubDmSendTests : IntegrationTestBase
     private const string Recipient = "wolf#456";
     private const string InitiatorConn = "conn-init";
     private const string RecipientConn = "conn-recip";
+    private const string Admin = "admin#1";
+    private const string AdminConn = "conn-admin";
 
     private static readonly DateTimeOffset FixedNow = new(2026, 7, 4, 12, 0, 0, TimeSpan.Zero);
 
@@ -191,10 +193,16 @@ public class ChatHubDmSendTests : IntegrationTestBase
         return proxy.Object;
     }
 
-    private void RegisterSession(string connectionId, string battleTag) =>
+    private void RegisterSession(string connectionId, string battleTag, bool isAdmin = false) =>
         _sessionRegistry.Register(
             connectionId,
-            new W3CUserAuthentication { BattleTag = battleTag, Name = battleTag.Split('#')[0] },
+            new W3CUserAuthentication
+            {
+                BattleTag = battleTag,
+                Name = battleTag.Split('#')[0],
+                IsAdmin = isAdmin,
+                Permissions = isAdmin ? new HashSet<EPermission> { EPermission.Moderation } : new HashSet<EPermission>(),
+            },
             null);
 
     // Seeds a connection the SAME way the connect path does for the SENDER: a live session, the cached
@@ -202,10 +210,10 @@ public class ChatHubDmSendTests : IntegrationTestBase
     // C5 (Task 5, D11): the registry entry's ChannelType defaults to Dm — the overwhelming majority of
     // this file's tests seed a Dm sender — with the Group/Public tests passing their own channel's type
     // explicitly.
-    private void SeedMember(string connectionId, string battleTag, string channelId, ChannelType type = ChannelType.Dm)
+    private void SeedMember(string connectionId, string battleTag, string channelId, ChannelType type = ChannelType.Dm, bool isAdmin = false)
     {
-        RegisterSession(connectionId, battleTag);
-        _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, false, battleTag.Split('#')[0], new ProfilePicture(), null, null));
+        RegisterSession(connectionId, battleTag, isAdmin);
+        _connectionMapping.RegisterUser(connectionId, new ChatUser(battleTag, isAdmin, battleTag.Split('#')[0], new ProfilePicture(), null, null));
         _onlineMemberRegistry.Join(channelId, connectionId, new MemberState(battleTag, NotificationLevel.All, 0, type));
     }
 
@@ -220,6 +228,25 @@ public class ChatHubDmSendTests : IntegrationTestBase
 
     private Task<ChatChannel> CreateDm(DmRequestState state) =>
         _channelRepository.FindOrCreateDm(Initiator, Recipient, Initiator, state, Now);
+
+    private Task<ChatChannel> CreateAdminDm(DmRequestState state) =>
+        _channelRepository.FindOrCreateDm(Admin, Recipient, Admin, state, Now);
+
+    // "Recipient online, seeded": a live session, a durable membership row, and a registry entry for the
+    // channel — so an ordinary message never re-announces the shell to them.
+    private async Task SeedOnlineRecipient(string channelId, NotificationLevel level = NotificationLevel.All)
+    {
+        RegisterSession(RecipientConn, Recipient);
+        await _membershipRepository.InsertIfAbsent(new ChannelMembership
+        {
+            ChannelId = channelId,
+            BattleTag = Recipient,
+            Role = MembershipRole.Member,
+            NotificationLevel = level,
+            JoinedAt = Now,
+        });
+        _onlineMemberRegistry.Join(channelId, RecipientConn, new MemberState(Recipient, level, 0, ChannelType.Dm));
+    }
 
     // Bumps a channel's LastSeq to a chosen value via direct repo AllocateSeq (no rate limiter, no
     // shell-expiry) — used to place a pending shell exactly at/under the 25-message cap boundary.
@@ -1060,4 +1087,229 @@ public class ChatHubDmSendTests : IntegrationTestBase
         channel.Type == ChannelType.System ? $"System+{channel.SystemKind}(ladder={channel.Ladder})"
         : channel.Type == ChannelType.Dm ? $"Dm({channel.RequestState})"
         : channel.Type.ToString();
+
+    // ------------------------------------------------------------------------------------------------
+    // Admin chat priority (CS2): an admin SENDER bypasses the private-lane gates — block, relationship
+    // outage, consent (pending → accepted before persist), recipient dmPrivacy, pending cap, decline.
+    // Gating is keyed on the SENDER's own server-side IsAdmin only.
+    // ------------------------------------------------------------------------------------------------
+
+    [Test]
+    public async Task AdminDmSend_BlockedByRecipient_PersistsAndDelivers()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Accepted);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        RegisterSession(RecipientConn, Recipient);
+        SetBlocked(Recipient, Admin);
+        var hub = BuildHub(AdminConn);
+
+        var result = await hub.SendMessage(channel.Id, "moderation notice");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1), "an admin's DM is persisted past a block");
+        Assert.That((await _channelRepository.Load(channel.Id)).LastSeq, Is.EqualTo(1L));
+        Assert.That(await _membershipRepository.Load(channel.Id, Recipient), Is.Not.Null, "the recipient's membership is materialized");
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task AdminDmSend_RelationshipUnavailable_PersistsInsteadOfThrottled()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Accepted);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        _relationshipSource.ShouldThrow = true;
+        var hub = BuildHub(AdminConn);
+
+        var result = await hub.SendMessage(channel.Id, "outage-proof");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok), "a relationship outage never blocks an admin send");
+        Assert.That(result.RetryAfterSeconds, Is.Null);
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public async Task AdminDmSend_PendingShell_RecipientNobody_AcceptsBeforePersist_NoRequestReceived()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Pending);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        await SeedPrivacy(Recipient, DmPrivacy.Nobody);
+        RegisterSession(RecipientConn, Recipient);
+        var hub = BuildHub(AdminConn);
+
+        var result = await hub.SendMessage(channel.Id, "please read");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.RequestState, Is.EqualTo(DmRequestState.Accepted), "an admin send accepts its pending shell before persist");
+        Assert.That((reloaded.ExpiresAt.Value - Now.AddDays(365)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
+            "the shell is re-stamped with the +1y accepted expiry");
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1));
+        Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(0), "an accepted admin DM is never a request");
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added, Is.Not.Null);
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(added.Focus, Is.False);
+    }
+
+    [Test]
+    public async Task AdminDmSend_PendingShellAtCap_NotCapped()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Pending);
+        await BumpLastSeq(channel.Id, ChatLimits.PendingConversationMaxMessages);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        var hub = BuildHub(AdminConn);
+
+        var result = await hub.SendMessage(channel.Id, "past the cap");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var reloaded = await _channelRepository.Load(channel.Id);
+        Assert.That(reloaded.LastSeq, Is.EqualTo((long)ChatLimits.PendingConversationMaxMessages + 1), "an admin send is never capped");
+        Assert.That(reloaded.RequestState, Is.EqualTo(DmRequestState.Accepted));
+    }
+
+    [Test]
+    public async Task AdminDmSend_PendingShell_RecipientDeclined_ClearsDeclineAndReAnnouncesAccepted()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Pending);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        await SeedOnlineRecipient(channel.Id);
+        await _membershipRepository.SetDeclinedUntil(channel.Id, Recipient, Now + ChatLimits.DmDeclineSuppression);
+        _dmInitiationTracker.Record(Admin, Recipient.ToLowerInvariant(), Now);
+        var hub = BuildHub(AdminConn);
+
+        var result = await hub.SendMessage(channel.Id, "important");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That((await _membershipRepository.Load(channel.Id, Recipient)).DeclinedUntil, Is.Null, "the accept clears the recipient's decline window");
+        Assert.That(_dmInitiationTracker.CountActive(Admin, Now), Is.EqualTo(0));
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1),
+            "the seeded recipient still gets one ChannelAdded so the client learns the shell is now Accepted");
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(HubSignalCount(RecipientConn, ChatEvents.RequestReceived), Is.EqualTo(0));
+    }
+
+    [Test]
+    public async Task AdminDmSend_PendingShellInitiatedByPlayer_AcceptsAndDelivers()
+    {
+        var channel = await _channelRepository.FindOrCreateDm(Recipient, Admin, Recipient, DmRequestState.Pending, Now);
+        await SeedPrivacy(Admin, DmPrivacy.Nobody);
+        await SeedOnlineRecipient(channel.Id);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        var hub = BuildHub(AdminConn);
+
+        var result = await hub.SendMessage(channel.Id, "replying to your request");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1));
+        Assert.That((await _channelRepository.Load(channel.Id)).RequestState, Is.EqualTo(DmRequestState.Accepted));
+    }
+
+    [Test]
+    public async Task AdminDmSend_AcceptedShell_AlreadySeededRecipient_NoReAnnounce()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Accepted);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        await SeedOnlineRecipient(channel.Id);
+
+        await BuildHub(AdminConn).SendMessage(channel.Id, "ordinary admin message");
+
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(0),
+            "no forced re-announce when the shell was already Accepted");
+    }
+
+    [Test]
+    public async Task AdminDmSend_RecipientLeftAndBlockedAdmin_ReMaterializesAndSurfaces()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Accepted);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        await SeedOnlineRecipient(channel.Id);
+        await BuildHub(RecipientConn).LeaveChannel(channel.Id);
+        Assert.That(await _membershipRepository.Load(channel.Id, Recipient), Is.Null, "precondition: the recipient left");
+        Assert.That(_onlineMemberRegistry.IsMember(RecipientConn, channel.Id), Is.False, "precondition: registry evicted");
+        SetBlocked(Recipient, Admin);
+
+        var result = await BuildHub(AdminConn).SendMessage(channel.Id, "you still need to read this");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        var row = await _membershipRepository.Load(channel.Id, Recipient);
+        Assert.That(row, Is.Not.Null, "the recipient's membership is re-materialized");
+        Assert.That(row.NotificationLevel, Is.EqualTo(NotificationLevel.All));
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1));
+        Assert.That(_onlineMemberRegistry.IsMember(RecipientConn, channel.Id), Is.True);
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelActivity), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task AdminDmSend_RecipientMuted_LevelKept_NoActivityPing()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Accepted);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        await SeedOnlineRecipient(channel.Id, NotificationLevel.None);
+
+        var result = await BuildHub(AdminConn).SendMessage(channel.Id, "muted recipient");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1));
+        Assert.That((await _membershipRepository.Load(channel.Id, Recipient)).NotificationLevel, Is.EqualTo(NotificationLevel.None),
+            "an admin send never overrides the recipient's own notification level");
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelActivity), Is.EqualTo(0));
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(0));
+    }
+
+    [Test]
+    public async Task NonAdminDmSend_BlockedByAdminRecipient_StillFakeSendAck()
+    {
+        var channel = await CreateDm(DmRequestState.Accepted);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        RegisterSession(RecipientConn, Recipient, isAdmin: true); // the RECIPIENT is the admin
+        SetBlocked(Recipient, Initiator);
+
+        var result = await BuildHub(InitiatorConn).SendMessage(channel.Id, "hello?");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.MessageId, Is.Not.Null.And.Not.Empty);
+        Assert.That(result.Seq, Is.EqualTo(1L));
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Is.Empty, "a non-admin sender's blocked send still stores nothing");
+        Assert.That(await _membershipRepository.Load(channel.Id, Recipient), Is.Null);
+    }
+
+    [Test]
+    public async Task NonAdminDmSend_PendingRecipientNobody_StillFakeSendAck_StaysPending()
+    {
+        var channel = await CreateDm(DmRequestState.Pending);
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        RegisterSession(RecipientConn, Recipient, isAdmin: true);
+        await SeedPrivacy(Recipient, DmPrivacy.Nobody);
+
+        var result = await BuildHub(InitiatorConn).SendMessage(channel.Id, "still there?");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(result.MessageId, Is.Not.Null.And.Not.Empty);
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Is.Empty);
+        Assert.That((await _channelRepository.Load(channel.Id)).RequestState, Is.EqualTo(DmRequestState.Pending));
+    }
+
+    [Test]
+    public async Task NonAdminRecipientReplyAccept_NoForcedChannelAddedToSeededInitiator()
+    {
+        var channel = await CreateDm(DmRequestState.Pending);
+        await _membershipRepository.InsertIfAbsent(new ChannelMembership
+        {
+            ChannelId = channel.Id,
+            BattleTag = Initiator,
+            Role = MembershipRole.Member,
+            NotificationLevel = NotificationLevel.All,
+            JoinedAt = Now,
+        });
+        SeedMember(InitiatorConn, Initiator, channel.Id);
+        SeedMember(RecipientConn, Recipient, channel.Id);
+
+        var result = await BuildHub(RecipientConn).SendMessage(channel.Id, "sure");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That((await _channelRepository.Load(channel.Id)).RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(_harness.SignalCount(InitiatorConn, ChatEvents.ChannelAdded), Is.EqualTo(0),
+            "a non-admin reply-accept never forces a ChannelAdded re-announce");
+    }
 }

@@ -279,9 +279,12 @@ public partial class ChatHub
         // FakeSendAck for a blocked/pending-cap/dmPrivacy drop, or the one fail-closed Throttled when the
         // relationship snapshot is entirely unavailable) or null to proceed. It may FLIP channel.RequestState
         // in-memory (reply/auto-accept) so the persist step below computes the +1y accepted-shell expiry.
+        // An ADMIN sender (session.Identity.IsAdmin, server-side) bypasses these gates and accepts a pending
+        // shell; wasPending lets step 7.5 re-announce that flip to an already-seeded recipient.
+        var wasPending = channel.RequestState == DmRequestState.Pending;
         if (channel.Type is ChannelType.Dm or ChannelType.GroupDm)
         {
-            var shortCircuit = await ApplyPrivateLaneGates(channel, session.Identity.BattleTag, now);
+            var shortCircuit = await ApplyPrivateLaneGates(channel, session.Identity.BattleTag, session.Identity.IsAdmin, now);
             if (shortCircuit != null)
             {
                 return shortCircuit;
@@ -425,7 +428,11 @@ public partial class ChatHub
         // fresh/resurfaced pending request. GroupDm needs none of this (all members already have rows).
         if (channel.Type == ChannelType.Dm)
         {
-            await MaterializeDmRecipientAndNotify(channel, session.Identity.BattleTag, now);
+            await MaterializeDmRecipientAndNotify(
+                channel,
+                session.Identity.BattleTag,
+                now,
+                reAnnounceAcceptedState: session.Identity.IsAdmin && wasPending && channel.RequestState == DmRequestState.Accepted);
         }
 
         // 7.75 Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
