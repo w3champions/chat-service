@@ -315,6 +315,35 @@ public class MentionFanOutTests : IntegrationTestBase
         Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1), "and still gets the event");
     }
 
+    // A DeclineRequest racing an acceptance (AcceptPendingCore flips the channel, then clears DeclinedUntil;
+    // the decline's membership write is not conditioned on Pending) can leave a fresh window on the row of
+    // a now-Accepted Dm. The decline window is a PENDING-request concept, so an Accepted Dm never honours it.
+    [Test]
+    public async Task Notify_AcceptedDm_RacedDeclineWindow_StillNotified()
+    {
+        await SeedMembership("recipient#1", NotificationLevel.All, declinedUntil: Now.AddHours(24));
+        RegisterSession("conn-recipient", "recipient#1");
+        var accepted = new ChatChannel { Id = ChannelId, Type = ChannelType.Dm, RequestState = DmRequestState.Accepted };
+
+        await _fanOut.NotifyAsync(accepted, Message(), new[] { "recipient#1" }, Now);
+
+        Assert.That(await InboxOf("recipient#1"), Has.Count.EqualTo(1), "an Accepted Dm ignores a stale decline window");
+        Assert.That(MentionEventCount("conn-recipient"), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Notify_PendingDm_ActiveDecline_StillSuppressed()
+    {
+        await SeedMembership("recipient#1", NotificationLevel.All, declinedUntil: Now.AddHours(1));
+        RegisterSession("conn-recipient", "recipient#1");
+        var pending = new ChatChannel { Id = ChannelId, Type = ChannelType.Dm, RequestState = DmRequestState.Pending };
+
+        await _fanOut.NotifyAsync(pending, Message(), new[] { "recipient#1" }, Now);
+
+        Assert.That(await InboxOf("recipient#1"), Is.Empty, "a Pending Dm still honours the decline window");
+        Assert.That(MentionEventCount("conn-recipient"), Is.EqualTo(0));
+    }
+
     [Test]
     public async Task Notify_ExpiredDeclineSuppression_NotifiesNormally()
     {

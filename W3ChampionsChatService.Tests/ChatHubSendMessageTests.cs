@@ -798,6 +798,28 @@ public class ChatHubSendMessageTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task AdminDmMention_AcceptedShell_RecipientRowCarriesRacedDecline_MentionDelivered()
+    {
+        // The post-race state Codex described: the admin's acceptance flipped the shell and cleared the
+        // window, then a racing DeclineRequest wrote a fresh 24h DeclinedUntil onto the recipient's row.
+        const string admin = "admin#1";
+        const string recipient = "wolf#456";
+        var channel = await _channelRepository.FindOrCreateDm(admin, recipient, admin, DmRequestState.Accepted, Now);
+        RegisterSession("conn-admin", admin, isAdmin: true);
+        _connectionMapping.RegisterUser("conn-admin", FlairUser(admin));
+        _onlineMemberRegistry.Join(channel.Id, "conn-admin", new MemberState(admin, NotificationLevel.All, 0, ChannelType.Dm));
+        await SeedMentionTarget("conn-2", recipient, channel.Id);
+        await _membershipRepository.SetDeclinedUntil(channel.Id, recipient, Now + ChatLimits.DmDeclineSuppression);
+        var hub = BuildHub("conn-admin");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention(recipient)} please read");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser(recipient)).Count, "an accepted DM never honours a raced decline window");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
+    }
+
+    [Test]
     public async Task AdminDmMention_RecipientBlockedAdmin_MentionDelivered()
     {
         const string admin = "admin#1";

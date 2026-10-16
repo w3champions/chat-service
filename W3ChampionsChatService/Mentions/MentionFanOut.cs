@@ -273,7 +273,13 @@ public class MentionFanOut(
             {
                 return false;
             }
-            if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
+            // The decline window is a PENDING-request concept, so an Accepted Dm never honours it. Every
+            // acceptance clears it (AcceptPendingCore), but a DeclineRequest racing that acceptance can still
+            // write a fresh window afterwards (its membership write cannot be conditioned on the separate
+            // channel doc still being Pending); skipping it here makes such a raced window inert. Identical
+            // for every other channel: outside that race an Accepted Dm row never carries a window.
+            if (channel.RequestState != DmRequestState.Accepted
+                && membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
             {
                 return false;
             }
