@@ -100,7 +100,8 @@ public partial class ChatHub
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
         // 3. Fetch the CALLER's snapshot (never the target's — D5). No usable snapshot at all is an outage:
-        // the outcome would need the stranger path (we cannot prove friendship), so fail closed retriable.
+        // the outcome would need the stranger path (we cannot prove friendship), so a non-admin fails closed
+        // retriable. Admins proceed without a snapshot (their sends never take the stranger path).
         RelationshipSnapshot snapshot = null;
         try
         {

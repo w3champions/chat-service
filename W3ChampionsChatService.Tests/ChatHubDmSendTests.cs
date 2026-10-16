@@ -1211,6 +1211,30 @@ public class ChatHubDmSendTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task AdminDmSend_PendingShellInitiatedByPlayer_MixedCaseJwtTags_AcceptsAndDelivers()
+    {
+        // Real Battle.net JWTs carry mixed case. The shell stores RequestInitiatedBy verbatim (the player's
+        // JWT casing) while the pair-key / memberships are lowercased, and the admin's session identity is
+        // their own JWT-cased tag: the isInitiator / RequestInitiatedBy comparisons must be case-insensitive.
+        const string mixedAdmin = "Admin#1234";
+        const string mixedRecipient = "Wolf#456";
+        var channel = await _channelRepository.FindOrCreateDm(mixedRecipient, mixedAdmin, mixedRecipient, DmRequestState.Pending, Now);
+        Assert.That(channel.RequestInitiatedBy, Is.EqualTo(mixedRecipient), "precondition: initiator stored verbatim");
+        await SeedPrivacy(mixedAdmin.ToLowerInvariant(), DmPrivacy.Nobody);
+        await SeedOnlineRecipient(channel.Id);
+        SeedMember(AdminConn, mixedAdmin, channel.Id, isAdmin: true);
+
+        var result = await BuildHub(AdminConn).SendMessage(channel.Id, "replying to your request");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1));
+        Assert.That((await _channelRepository.Load(channel.Id)).RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1));
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+    }
+
+    [Test]
     public async Task AdminDmSend_AcceptedShell_AlreadySeededRecipient_NoReAnnounce()
     {
         var channel = await CreateAdminDm(DmRequestState.Accepted);
