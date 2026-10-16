@@ -200,14 +200,16 @@ public partial class ChatHub
     /// <list type="number">
     /// <item>An existing shell the admin themself initiated that is still <see cref="DmRequestState.Pending"/>
     /// is accepted via <see cref="AcceptPendingCore"/> (clears the recipient's decline window, frees the
-    /// slot) and returned reloaded; any OTHER existing shell (accepted, or a request the target sent) is
+    /// slot), re-announced to an online recipient who already holds it (<see cref="ReAnnounceAcceptedDm"/>),
+    /// and returned reloaded; any OTHER existing shell (accepted, or a request the target sent) is
     /// returned as-is — opening a request someone else sent never accepts it on their behalf.</item>
     /// <item>No shell and no proven friendship: the D14 directory check still applies →
     /// <see cref="ChatResultCode.NotFound"/>. During a relationship outage (<paramref name="snapshot"/> null)
     /// friendship cannot be proven, so even a friend with no <c>user_directory</c> row gets NotFound (fails safe).</item>
     /// <item>Otherwise a born-Accepted shell is find-or-created.</item>
     /// </list>
-    /// Every Ok path ensures the caller's own membership (and registry seed) only.
+    /// Every Ok path ensures the caller's own membership (and registry seed) only; the accept-on-open
+    /// re-announcement never creates the recipient's membership.
     /// </summary>
     private async Task<OpenDmResult> OpenDmAsAdmin(string caller, string target, RelationshipSnapshot snapshot, DateTime now)
     {
@@ -219,6 +221,14 @@ public partial class ChatHub
             {
                 await AcceptPendingCore(shell.Id, shell.RequestInitiatedBy, target, now);
                 shell = await _channelRepository.Load(shell.Id) ?? shell;
+
+                // An online recipient who already holds this shell (as Pending, possibly declined) must learn
+                // it is now Accepted HERE: a later admin send finds it already Accepted (dmWasPending false)
+                // and so never re-announces it.
+                if (_sessionRegistry.GetByBattleTag(target) != null)
+                {
+                    await ReAnnounceAcceptedDm(shell, target, knownRecipientMembership: null);
+                }
             }
 
             var membership = await EnsureCallerMembership(shell.Id, caller, now);
@@ -614,7 +624,8 @@ public partial class ChatHub
     /// the shell Pending → Accepted at step 5.5. An online recipient then gets
     /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) even if already registry-seeded, so
     /// their client learns the shell is now Accepted (the RequestReceived branch is skipped — the channel is
-    /// no longer Pending).</item>
+    /// no longer Pending) — via <see cref="ReAnnounceAcceptedDm"/>, which re-loads the post-allocation
+    /// channel and preserves the recipient's live registry state.</item>
     /// </list>
     /// </summary>
     private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now, bool reAnnounceAcceptedState)
@@ -648,7 +659,13 @@ public partial class ChatHub
         // Admin send that just flipped Pending → Accepted (reAnnounceAcceptedState): an online recipient's
         // client still holds the shell as Pending, so push ChannelAdded (an upsert client-side) even when
         // already seeded — it carries RequestState Accepted. Ordinary sends never set the flag.
-        if (newlyMaterialized || needsReAnnounce || (reAnnounceAcceptedState && recipientSession != null))
+        if (reAnnounceAcceptedState && (newlyMaterialized || recipientSession != null))
+        {
+            // Admin flip: announce the PERSISTED post-allocation channel while preserving any live
+            // registry state (see ReAnnounceAcceptedDm). Ordinary sends never take this branch.
+            await ReAnnounceAcceptedDm(channel, counterpart, recipientMembership);
+        }
+        else if (newlyMaterialized || needsReAnnounce)
         {
             // Seeds the recipient's OnlineMemberRegistry + pushes ChannelAdded(focus:false) if they are
             // online; a no-op for an offline recipient (their SessionState picks the channel up on connect).
@@ -692,6 +709,43 @@ public partial class ChatHub
             {
                 Log.Warning(ex, "RequestReceived push failed for {ConnectionId} on channel {ChannelId} — best-effort, tray resurfaces it via SessionState", recipientSession.ConnectionId, channel.Id);
             }
+        }
+    }
+
+    /// <summary>
+    /// Admin chat priority: re-announces an admin-accepted Dm shell to <paramref name="recipient"/> via
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) so a client still holding it as
+    /// Pending (possibly declined) learns it is Accepted. Called from <see cref="OpenDmAsAdmin"/> (accept on
+    /// open) and <see cref="MaterializeDmRecipientAndNotify"/> (accept on send).
+    /// <list type="bullet">
+    /// <item>The channel is RE-LOADED, not taken from the caller: on the send path the caller's instance
+    /// predates <see cref="Channels.ChannelRepository.AllocateSeq"/>, so its LastSeq/LastMessageAt/ExpiresAt
+    /// are stale — and a Mentions/None recipient gets no ChannelActivity to learn the new seq otherwise.
+    /// A vanished doc falls back to <paramref name="channel"/>.</item>
+    /// <item>The push uses <c>preserveLiveMemberState</c>: the recipient may already be registry-seeded, and
+    /// their live read cursor / notification level can be newer than any membership row read here.</item>
+    /// <item><paramref name="knownRecipientMembership"/> null ⇒ loaded; still absent ⇒ nothing to announce
+    /// (the recipient never knew the shell; the first send materializes it as Accepted).</item>
+    /// <item>BEST-EFFORT: on the send path the message is already durable, so a failure here must never
+    /// turn the ack into an error (a retry would duplicate it); reconnect heals via SessionState.</item>
+    /// </list>
+    /// </summary>
+    private async Task ReAnnounceAcceptedDm(ChatChannel channel, string recipient, ChannelMembership knownRecipientMembership)
+    {
+        try
+        {
+            var membership = knownRecipientMembership ?? await _membershipRepository.Load(channel.Id, recipient);
+            if (membership == null)
+            {
+                return;
+            }
+
+            var persisted = await _channelRepository.Load(channel.Id) ?? channel;
+            await _fanOutEngine.PushChannelAdded(persisted, membership, focus: false, preserveLiveMemberState: true);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Accepted-state re-announcement of Dm {ChannelId} to {Recipient} failed — best-effort, SessionState heals it on reconnect", channel.Id, recipient);
         }
     }
 

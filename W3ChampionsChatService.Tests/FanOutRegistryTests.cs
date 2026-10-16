@@ -369,6 +369,43 @@ public class FanOutRegistryTests
         Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
     }
 
+    // OnlineMemberRegistry.JoinPreservingLiveState (admin DM accepted-state re-announcement): seeds only an
+    // ABSENT entry; an existing one keeps its live level and takes the max cursor.
+    [Test]
+    public void JoinPreservingLiveState_NoExistingEntry_SeedsAndReturnsGivenState()
+    {
+        var given = new MemberState("peter#123", NotificationLevel.All, 5, ChannelType.Dm);
+
+        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", given);
+
+        Assert.That(effective, Is.EqualTo(given));
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single(), Is.EqualTo(given));
+    }
+
+    [Test]
+    public void JoinPreservingLiveState_ExistingEntry_KeepsLiveLevelAndHigherCursor()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.None, 10, ChannelType.Dm));
+
+        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm));
+
+        var member = _memberRegistry.GetMembers("channel-a").Single();
+        Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.None), "a stale snapshot never overwrites the live level");
+        Assert.That(member.LastReadSeq, Is.EqualTo(10), "nor regresses the live cursor");
+        Assert.That(effective, Is.EqualTo(member), "the returned state is what the registry now holds");
+    }
+
+    [Test]
+    public void JoinPreservingLiveState_ExistingEntry_AdvancesLowerCursor()
+    {
+        _memberRegistry.Join("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 3, ChannelType.Dm));
+
+        var effective = _memberRegistry.JoinPreservingLiveState("channel-a", "conn-1", new MemberState("peter#123", NotificationLevel.All, 10, ChannelType.Dm));
+
+        Assert.That(effective.LastReadSeq, Is.EqualTo(10));
+        Assert.That(_memberRegistry.GetMembers("channel-a").Single().LastReadSeq, Is.EqualTo(10));
+    }
+
     [Test]
     public void GetMembers_UnknownChannel_ReturnsEmpty()
     {

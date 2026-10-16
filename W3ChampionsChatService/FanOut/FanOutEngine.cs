@@ -298,9 +298,15 @@ public class FanOutEngine(
     /// starting with the very next message — without this seed the newly-added channel would stay
     /// invisible to activity routing until the user's next reconnect re-seeds it via
     /// <see cref="SessionStateAssembler"/>.</item>
+    /// <item><paramref name="preserveLiveMemberState"/> (default false — a plain <see cref="OnlineMemberRegistry.Join"/>
+    /// overwrite, unchanged for every first-add caller): set ONLY when RE-announcing a channel the
+    /// connection may already track (the admin DM Pending → Accepted re-announce). An existing registry
+    /// entry is then kept (<see cref="OnlineMemberRegistry.JoinPreservingLiveState"/>) and the pushed
+    /// <see cref="MembershipDto"/> carries that live level/cursor instead of
+    /// <paramref name="membership"/>'s possibly older snapshot.</item>
     /// </list>
     /// </summary>
-    public async Task PushChannelAdded(ChatChannel channel, ChannelMembership membership, bool focus)
+    public async Task PushChannelAdded(ChatChannel channel, ChannelMembership membership, bool focus, bool preserveLiveMemberState = false)
     {
         var battleTag = membership.BattleTag;
 
@@ -323,12 +329,23 @@ public class FanOutEngine(
 
         // AUTHORITATIVE — must always run (it precedes the best-effort send): seeding the registry is what
         // makes this channel's activity fan-out reach the connection from the very next message.
-        _onlineMemberRegistry.Join(
-            channel.Id,
-            session.ConnectionId,
-            new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type));
+        var seed = new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type);
+        MembershipDto membershipDto;
+        if (preserveLiveMemberState)
+        {
+            // Re-announcement of a channel the connection may already track: never regress its live
+            // cursor/level with the caller's earlier membership read, and announce the SAME state the
+            // registry now holds so the client's upsert cannot regress it either.
+            var live = _onlineMemberRegistry.JoinPreservingLiveState(channel.Id, session.ConnectionId, seed);
+            membershipDto = new MembershipDto(live.NotificationLevel, live.LastReadSeq, membership.Role);
+        }
+        else
+        {
+            _onlineMemberRegistry.Join(channel.Id, session.ConnectionId, seed);
+            membershipDto = MembershipDto.From(membership);
+        }
 
-        var dto = new ChannelAddedDto(channel, MembershipDto.From(membership), focus);
+        var dto = new ChannelAddedDto(channel, membershipDto, focus);
         // Fault isolation (review fix, SEC-Low-3): the ChannelAdded push is a BEST-EFFORT live
         // notification — the channel + membership are already durably persisted and the registry seeded
         // above, and a reconnecting client re-derives its channel list from SessionState, so a torn-down

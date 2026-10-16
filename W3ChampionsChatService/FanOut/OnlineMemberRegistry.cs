@@ -94,6 +94,29 @@ public class OnlineMemberRegistry
         }
     }
 
+    /// <summary>
+    /// Seeds (channelId, connectionId) with <paramref name="state"/> ONLY if no entry exists yet, and
+    /// returns the entry that is live afterwards. An existing entry is kept as-is, except that its
+    /// <see cref="MemberState.LastReadSeq"/> takes <c>Math.Max</c> with <paramref name="state"/>'s (the
+    /// cursor is monotonic in both stores). Used by a RE-announcement of a channel the connection may
+    /// already track (<see cref="FanOutEngine.PushChannelAdded"/> with <c>preserveLiveMemberState</c>):
+    /// its <paramref name="state"/> comes from a membership row read earlier, and the hub writes the DB
+    /// BEFORE the registry on <c>MarkRead</c>/<c>SetNotificationLevel</c>, so the live entry is never
+    /// older than that row — overwriting it would regress a newer cursor or notification level. Single
+    /// locked pass (no caller-side TryGetMember/Join TOCTOU window).
+    /// </summary>
+    public MemberState JoinPreservingLiveState(string channelId, string connectionId, MemberState state)
+    {
+        lock (_lock)
+        {
+            var effective = TryGetNoLock(channelId, connectionId, out var existing)
+                ? existing with { LastReadSeq = Math.Max(existing.LastReadSeq, state.LastReadSeq) }
+                : state;
+            JoinNoLock(channelId, connectionId, effective);
+            return effective;
+        }
+    }
+
     /// <summary>Removes a single (channelId, connectionId) membership entry. No-op if absent.</summary>
     public void Leave(string channelId, string connectionId)
     {

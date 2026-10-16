@@ -1190,6 +1190,51 @@ public class ChatHubDmSendTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task AdminDmSend_PendingShellReAnnounce_PreservesRecipientLiveMemberState()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Pending);
+        await BumpLastSeq(channel.Id, 2);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        await SeedOnlineRecipient(channel.Id); // durable row: level All, cursor 0
+        // The live registry entry is AHEAD of the durable row (a MarkRead + SetNotificationLevel committed
+        // after the row the send path reads): the re-announcement must not regress it.
+        _onlineMemberRegistry.Join(channel.Id, RecipientConn, new MemberState(Recipient, NotificationLevel.Mentions, 2, ChannelType.Dm));
+
+        var result = await BuildHub(AdminConn).SendMessage(channel.Id, "important");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(_onlineMemberRegistry.TryGetMember(channel.Id, RecipientConn, out var live), Is.True);
+        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "the live registry level is preserved");
+        Assert.That(live.LastReadSeq, Is.EqualTo(2L), "the live registry cursor is preserved");
+        var added = (ChannelAddedDto)_harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded);
+        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
+        Assert.That(added.Membership.LastReadSeq, Is.EqualTo(2L));
+    }
+
+    [Test]
+    public async Task AdminDmSend_PendingShellReAnnounce_CarriesPostAllocationCounters()
+    {
+        var channel = await CreateAdminDm(DmRequestState.Pending);
+        await BumpLastSeq(channel.Id, 3);
+        SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
+        // Level None: no ChannelActivity follows, so the ChannelAdded is the recipient's only signal.
+        await SeedOnlineRecipient(channel.Id, NotificationLevel.None);
+        _time.Advance(TimeSpan.FromHours(1));
+
+        var result = await BuildHub(AdminConn).SendMessage(channel.Id, "important");
+
+        Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelActivity), Is.EqualTo(0), "precondition: no activity carries the seq");
+        var added = (ChannelAddedDto)_harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded);
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(added.Channel.LastSeq, Is.EqualTo(4L), "the announced channel carries this message's seq");
+        Assert.That(added.Channel.LastMessageAt, Is.EqualTo(Now), "and its LastMessageAt");
+        Assert.That((added.Channel.ExpiresAt.Value - Now.AddDays(365)).Duration(), Is.LessThan(TimeSpan.FromSeconds(1)),
+            "and the accepted-shell +1y expiry stamped by the allocation");
+        Assert.That(added.Channel.LastMessage?.Seq, Is.EqualTo(4L), "and the conversation-list projection");
+    }
+
+    [Test]
     public async Task AdminDmSend_PendingShellInitiatedByPlayer_AcceptsAndDelivers()
     {
         var channel = await _channelRepository.FindOrCreateDm(Recipient, Admin, Recipient, DmRequestState.Pending, Now);

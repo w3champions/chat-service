@@ -716,6 +716,83 @@ public class ChatHubOpenDmTests : IntegrationTestBase
         Assert.That(_onlineMemberRegistry.IsMember("conn-1", shell.Id), Is.True);
     }
 
+    // Swaps the ignored fan-out engine for one that captures pushes and shares this fixture's registries,
+    // so a test can assert the ChannelAdded re-announcement (and its registry seed) on OpenDm.
+    private HubPushCaptureHarness UseCapturingFanOut()
+    {
+        var harness = new HubPushCaptureHarness();
+        _fanOutEngine = new FanOutEngine(
+            harness.HubContext,
+            _focusRegistry,
+            _onlineMemberRegistry,
+            new ActivityCoalescer(harness.HubContext, _onlineMemberRegistry),
+            _sessionRegistry,
+            new PresenceInterestRegistry(),
+            ViewersAccumulatorTestFactory.CreateIgnored(),
+            _time);
+        return harness;
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_AcceptsPendingShell_ReAnnouncesAcceptedToOnlineRecipient_PreservingLiveState()
+    {
+        await SeedDirectory(AdminTarget);
+        var shell = await SeedDeclinedPendingShell(Admin, AdminTarget);
+        var harness = UseCapturingFanOut();
+        RegisterSession("conn-target", AdminTarget);
+        // The recipient's live registry entry is AHEAD of their durable row (a MarkRead/SetNotificationLevel
+        // committed after any snapshot the re-announcement could read): it must not be regressed.
+        _onlineMemberRegistry.Join(shell.Id, "conn-target", new MemberState(AdminTarget, NotificationLevel.Mentions, 3, ChannelType.Dm));
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(harness.SignalCount("conn-target", ChatEvents.ChannelAdded), Is.EqualTo(1),
+            "the online recipient learns the shell is now Accepted (a later send cannot repair it — it is no longer Pending)");
+        var added = (ChannelAddedDto)harness.PayloadFor("conn-target", ChatEvents.ChannelAdded);
+        Assert.That(added.Channel.Id, Is.EqualTo(shell.Id));
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(added.Focus, Is.False);
+        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "the live level is announced, not the stale row");
+        Assert.That(added.Membership.LastReadSeq, Is.EqualTo(3L), "the live read cursor is announced, not the stale row");
+        Assert.That(_onlineMemberRegistry.TryGetMember(shell.Id, "conn-target", out var live), Is.True);
+        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions), "the live registry level is preserved");
+        Assert.That(live.LastReadSeq, Is.EqualTo(3L), "the live registry cursor is preserved");
+        Assert.That(harness.SignalCount("conn-1", ChatEvents.ChannelAdded), Is.EqualTo(0), "the admin caller gets the OpenDm result, not a push");
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_AcceptsPendingShell_RecipientOffline_NoPush()
+    {
+        await SeedDirectory(AdminTarget);
+        await SeedDeclinedPendingShell(Admin, AdminTarget);
+        var harness = UseCapturingFanOut();
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(harness.AllSignals, Is.Empty, "an offline recipient picks the Accepted state up from SessionState on connect");
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_AcceptsPendingShell_RecipientNeverMaterialized_NoPush()
+    {
+        await SeedDirectory(AdminTarget);
+        var shell = await _channelRepository.FindOrCreateDm(Admin, AdminTarget, Admin, DmRequestState.Pending, Now);
+        var harness = UseCapturingFanOut();
+        RegisterSession("conn-target", AdminTarget);
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(harness.SignalCount("conn-target", ChatEvents.ChannelAdded), Is.EqualTo(0),
+            "a recipient with no membership never knew the shell — the first send materializes it as Accepted");
+        Assert.That(await _membershipRepository.Load(shell.Id, AdminTarget), Is.Null, "OpenDm still materializes only the caller");
+    }
+
     [Test]
     public async Task OpenDm_Admin_ExistingAcceptedShell_ReusedUnchanged_NoSecondAccept()
     {
