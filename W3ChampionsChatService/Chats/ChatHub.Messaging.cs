@@ -280,8 +280,9 @@ public partial class ChatHub
         // relationship snapshot is entirely unavailable) or null to proceed. It may FLIP channel.RequestState
         // in-memory (reply/auto-accept) so the persist step below computes the +1y accepted-shell expiry.
         // An ADMIN sender (session.Identity.IsAdmin, server-side) bypasses these gates and accepts a pending
-        // shell; wasPending lets step 7.5 re-announce that flip to an already-seeded recipient.
-        var wasPending = channel.RequestState == DmRequestState.Pending;
+        // shell; dmWasPending (Dm-only — GroupDm/Public are never Pending) lets step 7.5 re-announce that
+        // flip to an already-seeded recipient.
+        var dmWasPending = channel.Type == ChannelType.Dm && channel.RequestState == DmRequestState.Pending;
         if (channel.Type is ChannelType.Dm or ChannelType.GroupDm)
         {
             var shortCircuit = await ApplyPrivateLaneGates(channel, session.Identity.BattleTag, session.Identity.IsAdmin, now);
@@ -432,7 +433,7 @@ public partial class ChatHub
                 channel,
                 session.Identity.BattleTag,
                 now,
-                reAnnounceAcceptedState: session.Identity.IsAdmin && wasPending && channel.RequestState == DmRequestState.Accepted);
+                reAnnounceAcceptedState: session.Identity.IsAdmin && dmWasPending && channel.RequestState == DmRequestState.Accepted);
         }
 
         // 7.75 Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived

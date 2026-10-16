@@ -202,17 +202,17 @@ public partial class ChatHub
     /// slot) and returned reloaded; any OTHER existing shell (accepted, or a request the target sent) is
     /// returned as-is — opening a request someone else sent never accepts it on their behalf.</item>
     /// <item>No shell and no proven friendship: the D14 directory check still applies →
-    /// <see cref="ChatResultCode.NotFound"/>.</item>
+    /// <see cref="ChatResultCode.NotFound"/>. During a relationship outage (<paramref name="snapshot"/> null)
+    /// friendship cannot be proven, so even a friend with no <c>user_directory</c> row gets NotFound (fails safe).</item>
     /// <item>Otherwise a born-Accepted shell is find-or-created.</item>
     /// </list>
     /// Every Ok path ensures the caller's own membership (and registry seed) only.
     /// </summary>
     private async Task<OpenDmResult> OpenDmAsAdmin(string caller, string target, RelationshipSnapshot snapshot, DateTime now)
     {
-        var existingShell = await _channelRepository.LoadByPairKey(caller, target);
-        if (existingShell != null)
+        var shell = await _channelRepository.LoadByPairKey(caller, target);
+        if (shell != null)
         {
-            var shell = existingShell;
             if (shell.RequestState == DmRequestState.Pending
                 && string.Equals(shell.RequestInitiatedBy, caller, StringComparison.OrdinalIgnoreCase))
             {

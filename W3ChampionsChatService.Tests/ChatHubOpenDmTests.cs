@@ -717,6 +717,26 @@ public class ChatHubOpenDmTests : IntegrationTestBase
     }
 
     [Test]
+    public async Task OpenDm_Admin_ExistingAcceptedShell_ReusedUnchanged_NoSecondAccept()
+    {
+        await SeedDirectory(AdminTarget);
+        var shell = await _channelRepository.FindOrCreateDm(Admin, AdminTarget, Admin, DmRequestState.Accepted, Now);
+        var originalExpiresAt = (await _channelRepository.Load(shell.Id)).ExpiresAt;
+        _dmInitiationTracker.Record(Admin, AdminTarget.ToLowerInvariant(), Now);
+        _time.Advance(TimeSpan.FromHours(1));
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(result.Channel.Id, Is.EqualTo(shell.Id), "the existing shell is reused");
+        var reloaded = await _channelRepository.Load(shell.Id);
+        Assert.That(reloaded.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(reloaded.ExpiresAt, Is.EqualTo(originalExpiresAt), "no second accept re-stamps the expiry");
+        Assert.That(_dmInitiationTracker.CountActive(Admin, Now), Is.EqualTo(1), "no accept side-effect frees a slot");
+    }
+
+    [Test]
     public async Task OpenDm_Admin_ExistingPendingShellInitiatedByTarget_StaysPending()
     {
         await SeedDirectory(AdminTarget);

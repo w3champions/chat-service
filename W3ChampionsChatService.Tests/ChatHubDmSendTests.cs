@@ -1203,6 +1203,11 @@ public class ChatHubDmSendTests : IntegrationTestBase
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
         Assert.That(await _messageRepository.LoadForModerator(channel.Id), Has.Count.EqualTo(1));
         Assert.That((await _channelRepository.Load(channel.Id)).RequestState, Is.EqualTo(DmRequestState.Accepted));
+        // Admin-only: the seeded, online initiator is re-announced the Accepted state (a non-admin
+        // reply-accept never forces this — see NonAdminRecipientReplyAccept_NoForcedChannelAddedToSeededInitiator).
+        Assert.That(_harness.SignalCount(RecipientConn, ChatEvents.ChannelAdded), Is.EqualTo(1));
+        var added = _harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded) as ChannelAddedDto;
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
     }
 
     [Test]
