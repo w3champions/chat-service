@@ -209,7 +209,7 @@ public partial class ChatHub
     /// <item>Otherwise a born-Accepted shell is find-or-created.</item>
     /// </list>
     /// Every Ok path ensures the caller's own membership (and registry seed) only; the accept-on-open
-    /// re-announcement never creates the recipient's membership.
+    /// re-announcement never creates or seeds the recipient's membership (state-only, tracked recipients only).
     /// </summary>
     private async Task<OpenDmResult> OpenDmAsAdmin(string caller, string target, RelationshipSnapshot snapshot, DateTime now)
     {
@@ -227,7 +227,7 @@ public partial class ChatHub
                 // and so never re-announces it.
                 if (_sessionRegistry.GetByBattleTag(target) != null)
                 {
-                    await ReAnnounceAcceptedDm(shell, target);
+                    await ReAnnounceAcceptedDm(shell, target, firstAddMembership: null);
                 }
             }
 
@@ -625,7 +625,7 @@ public partial class ChatHub
     /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) even if already registry-seeded, so
     /// their client learns the shell is now Accepted (the RequestReceived branch is skipped — the channel is
     /// no longer Pending) — via <see cref="ReAnnounceAcceptedDm"/>, which re-loads the post-allocation
-    /// channel and merges it with the recipient's live registry state.</item>
+    /// channel; a recipient already tracking the shell gets a state-only push that leaves the registry untouched.</item>
     /// </list>
     /// </summary>
     private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now, bool reAnnounceAcceptedState)
@@ -659,11 +659,16 @@ public partial class ChatHub
         // Admin send that just flipped Pending → Accepted (reAnnounceAcceptedState): an online recipient's
         // client still holds the shell as Pending, so push ChannelAdded (an upsert client-side) even when
         // already seeded — it carries RequestState Accepted. Ordinary sends never set the flag.
-        if (reAnnounceAcceptedState && (newlyMaterialized || recipientSession != null))
+        if (reAnnounceAcceptedState && (newlyMaterialized || needsReAnnounce))
         {
-            // Admin flip: announce the PERSISTED post-allocation channel while preserving any live
-            // registry state (see ReAnnounceAcceptedDm). Ordinary sends never take this branch.
-            await ReAnnounceAcceptedDm(channel, counterpart);
+            // Admin flip, recipient not yet tracking the channel: the normal first-add join path, but with
+            // the PERSISTED post-allocation channel (see ReAnnounceAcceptedDm).
+            await ReAnnounceAcceptedDm(channel, counterpart, firstAddMembership: recipientMembership);
+        }
+        else if (reAnnounceAcceptedState && recipientSession != null)
+        {
+            // Admin flip, recipient already tracking the channel: state-only, registry untouched.
+            await ReAnnounceAcceptedDm(channel, counterpart, firstAddMembership: null);
         }
         else if (newlyMaterialized || needsReAnnounce)
         {
@@ -715,8 +720,8 @@ public partial class ChatHub
     }
 
     /// <summary>
-    /// Admin chat priority: re-announces an admin-accepted Dm shell to <paramref name="recipient"/> via
-    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) so a client still holding it as
+    /// Admin chat priority: re-announces an admin-accepted Dm shell to <paramref name="recipient"/>
+    /// (<c>ChannelAdded</c>, focus:false — the event the client upserts and drops a pending-tray entry on) so a client still holding it as
     /// Pending (possibly declined) learns it is Accepted. Called from <see cref="OpenDmAsAdmin"/> (accept on
     /// open) and <see cref="MaterializeDmRecipientAndNotify"/> (accept on send).
     /// <list type="bullet">
@@ -724,22 +729,32 @@ public partial class ChatHub
     /// predates <see cref="Channels.ChannelRepository.AllocateSeq"/>, so its LastSeq/LastMessageAt/ExpiresAt
     /// are stale — and a Mentions/None recipient gets no ChannelActivity to learn the new seq otherwise.
     /// A vanished doc falls back to <paramref name="channel"/>.</item>
-    /// <item>The push goes through <see cref="FanOut.FanOutEngine.ReAnnounceChannelAdded"/>: the recipient may
-    /// already be registry-seeded, so the engine observes their live entry BEFORE re-loading the membership
-    /// row and merges the two (newer notification level wins, max read cursor) instead of overwriting.
-    /// The row is therefore always re-read here — even on the send path, whose earlier InsertIfAbsent read
-    /// precedes that observation. No row ⇒ nothing to announce (the recipient never knew the shell; the
-    /// first send materializes it as Accepted).</item>
+    /// <item><paramref name="firstAddMembership"/> non-null (send path: the recipient was just materialized
+    /// or is online but not tracking the shell) ⇒ the normal first-add join path,
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>, exactly as an ordinary send uses it.</item>
+    /// <item>Null (the recipient may already track the shell) ⇒
+    /// <see cref="FanOut.FanOutEngine.PushChannelStateToTrackedMember"/>: a state-only ChannelAdded built from
+    /// the LIVE registry entry, pushed only if that entry exists, and writing nothing — so no membership
+    /// read can regress the live level/cursor or resurrect a completed leave, and the accept-on-open path
+    /// never creates or seeds the recipient's membership. 1:1 Dm memberships are always
+    /// <see cref="MembershipRole.Member"/>.</item>
     /// <item>BEST-EFFORT: on the send path the message is already durable, so a failure here must never
     /// turn the ack into an error (a retry would duplicate it); reconnect heals via SessionState.</item>
     /// </list>
     /// </summary>
-    private async Task ReAnnounceAcceptedDm(ChatChannel channel, string recipient)
+    private async Task ReAnnounceAcceptedDm(ChatChannel channel, string recipient, ChannelMembership firstAddMembership)
     {
         try
         {
             var persisted = await _channelRepository.Load(channel.Id) ?? channel;
-            await _fanOutEngine.ReAnnounceChannelAdded(persisted, recipient, () => _membershipRepository.Load(channel.Id, recipient));
+            if (firstAddMembership != null)
+            {
+                await _fanOutEngine.PushChannelAdded(persisted, firstAddMembership, focus: false);
+            }
+            else
+            {
+                await _fanOutEngine.PushChannelStateToTrackedMember(persisted, recipient, MembershipRole.Member);
+            }
         }
         catch (Exception ex)
         {

@@ -1190,24 +1190,25 @@ public class ChatHubDmSendTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task AdminDmSend_PendingShellReAnnounce_NewerPersistedLevelWins_LiveCursorKept()
+    public async Task AdminDmSend_PendingShellReAnnounce_TrackedRecipient_RegistryUntouched_StateFromLiveEntry()
     {
         var channel = await CreateAdminDm(DmRequestState.Pending);
         await BumpLastSeq(channel.Id, 2);
         SeedMember(AdminConn, Admin, channel.Id, isAdmin: true);
-        // Durable row: level None (a SetNotificationLevel committed to Mongo, registry not updated yet),
-        // cursor 0. Live registry entry: level All, cursor 2 (a MarkRead whose $max row write is behind).
+        // The durable row and the live registry entry disagree (any in-flight SetNotificationLevel/MarkRead
+        // interleaving): the re-announcement must neither rewrite the registry from the row nor announce it.
         await SeedOnlineRecipient(channel.Id, NotificationLevel.None);
-        _onlineMemberRegistry.Join(channel.Id, RecipientConn, new MemberState(Recipient, NotificationLevel.All, 2, ChannelType.Dm));
+        var live = new MemberState(Recipient, NotificationLevel.All, 2, ChannelType.Dm);
+        _onlineMemberRegistry.Join(channel.Id, RecipientConn, live);
 
         var result = await BuildHub(AdminConn).SendMessage(channel.Id, "important");
 
         Assert.That(result.Code, Is.EqualTo(ChatResultCode.Ok));
-        Assert.That(_onlineMemberRegistry.TryGetMember(channel.Id, RecipientConn, out var live), Is.True);
-        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the newer persisted level wins over the unchanged registry");
-        Assert.That(live.LastReadSeq, Is.EqualTo(2L), "the live registry cursor is never regressed");
+        Assert.That(_onlineMemberRegistry.TryGetMember(channel.Id, RecipientConn, out var after), Is.True);
+        Assert.That(after, Is.SameAs(live), "the tracked recipient's registry entry is never rewritten by the re-announcement");
         var added = (ChannelAddedDto)_harness.PayloadFor(RecipientConn, ChatEvents.ChannelAdded);
-        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.None));
+        Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
+        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.All), "the live level is announced, not the row");
         Assert.That(added.Membership.LastReadSeq, Is.EqualTo(2L));
     }
 

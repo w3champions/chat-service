@@ -734,33 +734,52 @@ public class ChatHubOpenDmTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task OpenDm_Admin_AcceptsPendingShell_ReAnnouncesAcceptedToOnlineRecipient_MergingLiveState()
+    public async Task OpenDm_Admin_AcceptsPendingShell_ReAnnouncesAcceptedToTrackedRecipient_RegistryUntouched()
     {
         await SeedDirectory(AdminTarget);
         var shell = await SeedDeclinedPendingShell(Admin, AdminTarget);
         var harness = UseCapturingFanOut();
         RegisterSession("conn-target", AdminTarget);
-        // Durable row: level None (committed to Mongo, registry not updated yet), cursor 0. Live registry
-        // entry: level All, cursor 3. The newer persisted level and the higher live cursor must both win.
+        // The durable row (level None) and the live registry entry (level All, cursor 3) disagree, as they
+        // can mid-SetNotificationLevel/MarkRead: the re-announcement announces the live entry, writes nothing.
         await _membershipRepository.SetNotificationLevel(shell.Id, AdminTarget, NotificationLevel.None);
-        _onlineMemberRegistry.Join(shell.Id, "conn-target", new MemberState(AdminTarget, NotificationLevel.All, 3, ChannelType.Dm));
+        var live = new MemberState(AdminTarget, NotificationLevel.All, 3, ChannelType.Dm);
+        _onlineMemberRegistry.Join(shell.Id, "conn-target", live);
         RegisterSession("conn-1", Admin, isAdmin: true);
 
         var result = await BuildHub("conn-1").OpenDm(AdminTarget);
 
         AssertAcceptedOk(result);
         Assert.That(harness.SignalCount("conn-target", ChatEvents.ChannelAdded), Is.EqualTo(1),
-            "the online recipient learns the shell is now Accepted (a later send cannot repair it — it is no longer Pending)");
+            "the tracked recipient learns the shell is now Accepted (a later send cannot repair it — it is no longer Pending)");
         var added = (ChannelAddedDto)harness.PayloadFor("conn-target", ChatEvents.ChannelAdded);
         Assert.That(added.Channel.Id, Is.EqualTo(shell.Id));
         Assert.That(added.Channel.RequestState, Is.EqualTo(DmRequestState.Accepted));
         Assert.That(added.Focus, Is.False);
-        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the newer persisted level is announced");
-        Assert.That(added.Membership.LastReadSeq, Is.EqualTo(3L), "the live read cursor is announced, not the stale row");
-        Assert.That(_onlineMemberRegistry.TryGetMember(shell.Id, "conn-target", out var live), Is.True);
-        Assert.That(live.NotificationLevel, Is.EqualTo(NotificationLevel.None), "the registry adopts the newer persisted level");
-        Assert.That(live.LastReadSeq, Is.EqualTo(3L), "the live registry cursor is preserved");
+        Assert.That(added.Membership.NotificationLevel, Is.EqualTo(NotificationLevel.All), "the live level is announced");
+        Assert.That(added.Membership.LastReadSeq, Is.EqualTo(3L), "the live cursor is announced");
+        Assert.That(_onlineMemberRegistry.TryGetMember(shell.Id, "conn-target", out var after), Is.True);
+        Assert.That(after, Is.SameAs(live), "the registry entry is never rewritten");
         Assert.That(harness.SignalCount("conn-1", ChatEvents.ChannelAdded), Is.EqualTo(0), "the admin caller gets the OpenDm result, not a push");
+    }
+
+    [Test]
+    public async Task OpenDm_Admin_AcceptsPendingShell_OnlineRecipientNotTracked_NoPushNoSeed()
+    {
+        // A durable row but no live registry entry (e.g. a LeaveChannel racing the accept already evicted it,
+        // or the connection never tracked the shell): the client holds no Pending state to repair, and the
+        // accept must never (re)create the recipient's live membership.
+        await SeedDirectory(AdminTarget);
+        var shell = await SeedDeclinedPendingShell(Admin, AdminTarget);
+        var harness = UseCapturingFanOut();
+        RegisterSession("conn-target", AdminTarget);
+        RegisterSession("conn-1", Admin, isAdmin: true);
+
+        var result = await BuildHub("conn-1").OpenDm(AdminTarget);
+
+        AssertAcceptedOk(result);
+        Assert.That(harness.SignalCount("conn-target", ChatEvents.ChannelAdded), Is.EqualTo(0));
+        Assert.That(_onlineMemberRegistry.IsMember("conn-target", shell.Id), Is.False);
     }
 
     [Test]

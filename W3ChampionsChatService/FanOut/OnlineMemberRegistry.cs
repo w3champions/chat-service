@@ -94,51 +94,6 @@ public class OnlineMemberRegistry
         }
     }
 
-    /// <summary>
-    /// Merges a freshly-loaded <paramref name="persisted"/> membership state into (channelId, connectionId)
-    /// for a RE-announcement of a channel the connection may already track
-    /// (<see cref="FanOutEngine.ReAnnounceChannelAdded"/>), and returns the entry that is live afterwards.
-    /// <paramref name="observedBeforeLoad"/> is the entry the caller saw (via <see cref="TryGetMember"/>)
-    /// BEFORE loading <paramref name="persisted"/>, or null if there was none. The hub writes Mongo BEFORE
-    /// the registry on <c>SetNotificationLevel</c>/<c>MarkRead</c>, which makes the merge decidable:
-    /// <list type="bullet">
-    /// <item>No entry ⇒ seed <paramref name="persisted"/> as-is.</item>
-    /// <item>NotificationLevel: entry level still equal to the observation ⇒ no registry write landed since
-    /// the observation, and every registry level was first committed to Mongo, so the later load is at
-    /// least as new — <paramref name="persisted"/>'s level wins (this is the DB-written-but-registry-not-
-    /// yet window). Entry changed (or appeared after a null observation) ⇒ a DB-first write reached the
-    /// registry after the observation, possibly after the load too — the live level wins; any write
-    /// still in flight lands its own registry update afterwards and converges it.</item>
-    /// <item>LastReadSeq: monotonic in both stores ⇒ <c>Math.Max</c> of live and persisted.</item>
-    /// <item>BattleTag/ChannelType are immutable for an entry; the live values are kept.</item>
-    /// </list>
-    /// Single locked pass (no caller-side TryGetMember/Join TOCTOU window at the write).
-    /// </summary>
-    public MemberState JoinPreservingLiveState(string channelId, string connectionId, MemberState persisted, MemberState observedBeforeLoad)
-    {
-        lock (_lock)
-        {
-            MemberState effective;
-            if (!TryGetNoLock(channelId, connectionId, out var current))
-            {
-                effective = persisted;
-            }
-            else
-            {
-                var levelUnchangedSinceObservation = observedBeforeLoad != null
-                    && current.NotificationLevel == observedBeforeLoad.NotificationLevel;
-                effective = current with
-                {
-                    NotificationLevel = levelUnchangedSinceObservation ? persisted.NotificationLevel : current.NotificationLevel,
-                    LastReadSeq = Math.Max(current.LastReadSeq, persisted.LastReadSeq),
-                };
-            }
-
-            JoinNoLock(channelId, connectionId, effective);
-            return effective;
-        }
-    }
-
     /// <summary>Removes a single (channelId, connectionId) membership entry. No-op if absent.</summary>
     public void Leave(string channelId, string connectionId)
     {

@@ -332,48 +332,36 @@ public class FanOutEngine(
     }
 
     /// <summary>
-    /// RE-announces <paramref name="channel"/> (<c>ChannelAdded</c>, focus:false) to <paramref name="battleTag"/>'s
-    /// live connection when that connection may ALREADY track it — the admin DM Pending → Accepted
-    /// re-announcement (<c>ChatHub.ReAnnounceAcceptedDm</c>). Unlike <see cref="PushChannelAdded"/> it never
-    /// blindly overwrites the live <see cref="MemberState"/>: it observes the registry entry FIRST, THEN
-    /// invokes <paramref name="loadMembership"/>, and merges via
-    /// <see cref="OnlineMemberRegistry.JoinPreservingLiveState"/> (newer level wins, max cursor — see there
-    /// for why the observe-then-load order makes that decidable). The pushed <see cref="MembershipDto"/>
-    /// carries exactly the merged state, so the client's upsert cannot regress it either.
+    /// STATE-ONLY re-announcement of <paramref name="channel"/> (<c>ChannelAdded</c>, focus:false) to
+    /// <paramref name="battleTag"/>'s live connection, ONLY if that connection already tracks the channel
+    /// (an <see cref="OnlineMemberRegistry"/> entry exists) — the admin DM Pending → Accepted re-announce
+    /// (<c>ChatHub.ReAnnounceAcceptedDm</c>), whose client still holds the shell as Pending.
     /// <list type="bullet">
-    /// <item><paramref name="loadMembership"/> returns null ⇒ nothing to announce (no push, no seed, no
-    /// interest update).</item>
-    /// <item>Offline ⇒ only the presence-interest update runs, mirroring <see cref="PushChannelAdded"/>.</item>
+    /// <item>Writes NOTHING server-side: neither the registry nor the presence-interest index. The live
+    /// entry is already authoritative for this connection (seeded at connect/join and kept current by
+    /// <c>MarkRead</c>/<c>SetNotificationLevel</c>), so no membership row read here could be fresher, and a
+    /// stale one can never regress it (ABA level flips) or resurrect it after a completed
+    /// <c>LeaveChannel</c>.</item>
+    /// <item>The pushed <see cref="MembershipDto"/> is built from that live entry (level + cursor) and
+    /// <paramref name="role"/>, so the client's ChannelAdded upsert matches the server's live view.</item>
+    /// <item>Returns false — and pushes nothing — when the user is offline or the connection does not track
+    /// the channel (it holds no Pending state to repair; SessionState/the first send announce it).</item>
     /// </list>
+    /// Residual, client-healed window: the entry is read and the push is issued with no await in between,
+    /// but a <c>SetNotificationLevel</c>/<c>LeaveChannel</c> completing on another thread in that instant
+    /// still has its own ack written to the same connection afterwards, which the client applies last.
     /// </summary>
-    public async Task ReAnnounceChannelAdded(ChatChannel channel, string battleTag, Func<Task<ChannelMembership>> loadMembership)
+    public async Task<bool> PushChannelStateToTrackedMember(ChatChannel channel, string battleTag, MembershipRole role)
     {
         var session = _sessionRegistry.GetByBattleTag(battleTag);
-        MemberState observed = null;
-        if (session != null && _onlineMemberRegistry.TryGetMember(channel.Id, session.ConnectionId, out var current))
+        if (session == null || !_onlineMemberRegistry.TryGetMember(channel.Id, session.ConnectionId, out var live))
         {
-            observed = current;
+            return false;
         }
 
-        var membership = await loadMembership();
-        if (membership == null)
-        {
-            return;
-        }
-
-        _presenceInterestRegistry.OnMemberAdded(channel.Id, battleTag);
-        if (session == null)
-        {
-            return;
-        }
-
-        var live = _onlineMemberRegistry.JoinPreservingLiveState(
-            channel.Id,
-            session.ConnectionId,
-            new MemberState(membership.BattleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type),
-            observed);
-        var membershipDto = new MembershipDto(live.NotificationLevel, live.LastReadSeq, membership.Role);
+        var membershipDto = new MembershipDto(live.NotificationLevel, live.LastReadSeq, role);
         await SendChannelAddedAsync(session.ConnectionId, battleTag, new ChannelAddedDto(channel, membershipDto, Focus: false));
+        return true;
     }
 
     private async Task SendChannelAddedAsync(string connectionId, string battleTag, ChannelAddedDto dto)
