@@ -111,7 +111,7 @@ public class ChatHubPresenceReadTests : IntegrationTestBase
             new MuteRepository(MongoClient),
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
     }
 
     // ---- fixture plumbing (mirrors HubProtocolIntegrationTests / ChatHubPresenceTests) --------------

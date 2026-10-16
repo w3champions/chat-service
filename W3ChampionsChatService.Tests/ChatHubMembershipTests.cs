@@ -84,7 +84,7 @@ public class ChatHubMembershipTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
     }
 
     // Fix round 1 (finding F2b): optional channelRepository lets a single test swap in

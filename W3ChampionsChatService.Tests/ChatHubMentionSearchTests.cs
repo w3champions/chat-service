@@ -91,7 +91,7 @@ public class ChatHubMentionSearchTests : IntegrationTestBase
             new MuteRepository(MongoClient),
             _onlineMemberRegistry,
             _connectionMapping,
-            _mentionInboxRepository);
+            _mentionInboxRepository, new UserDirectoryRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId, IChatAuthenticationService authService = null)

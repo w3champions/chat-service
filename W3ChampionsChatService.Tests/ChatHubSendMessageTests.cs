@@ -116,7 +116,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            _mentionInboxRepository);
+            _mentionInboxRepository, new UserDirectoryRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)

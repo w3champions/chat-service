@@ -29,6 +29,7 @@ using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -186,7 +187,7 @@ public class InternalApiIntegrationTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            _mentionInboxRepository);
+            _mentionInboxRepository, new UserDirectoryRepository(MongoClient));
     }
 
     // ────────────────────────────────────────────────────────────────────────────────────────────

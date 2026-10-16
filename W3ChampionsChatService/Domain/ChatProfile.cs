@@ -1,3 +1,4 @@
+using System.Linq;
 using W3ChampionsChatService.Chats;
 
 namespace W3ChampionsChatService.Domain;
@@ -23,4 +24,12 @@ public class ChatProfile
     public int? GateWay { get; set; }
     public int? GamesPlayed { get; set; }
     public int? Season { get; set; }
+
+    /// <summary>
+    /// Whether this profile carries the admin icon. Trustworthy: chat-service prepends
+    /// <see cref="ChatIcon.AdminIcon"/> ONLY when the trusted JWT says <c>IsAdmin</c>
+    /// (<c>ChatAuthenticationService.BuildChatUser</c>) — website-backend never emits that icon id — and
+    /// it is exactly the admin flair every client already renders publicly.
+    /// </summary>
+    public bool HasAdminIcon() => ChatIcons?.Contains(ChatIcon.AdminIcon) == true;
 }

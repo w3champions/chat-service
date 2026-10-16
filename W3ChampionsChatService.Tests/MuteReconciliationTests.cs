@@ -76,7 +76,7 @@ public class MuteReconciliationTests : IntegrationTestBase
                 _muteRepository,
                 _onlineMemberRegistry,
                 _connectionMapping,
-                new MentionInboxRepository(MongoClient)),
+                new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient)),
             new FocusRegistry(),
             _onlineMemberRegistry,
             new MessageRateLimiter(),

@@ -97,7 +97,7 @@ public class ChatHubClanChannelTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
     }
 
     /// <summary>Points the flair resolver at a given clan id / freshness tier.</summary>

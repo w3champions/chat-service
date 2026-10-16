@@ -695,7 +695,9 @@ public partial class ChatHub
 
         if (recipientSession != null)
         {
-            var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now);
+            // SenderIsAdmin is false by construction here: an admin sender's step-5.5 gate always accepts the
+            // shell before persist, so a still-Pending channel was necessarily sent by a non-admin.
+            var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now, SenderIsAdmin: false);
             // Fault isolation (C5 LOW-1, security review): the RequestReceived push is a BEST-EFFORT live
             // notification — the message is already durably persisted (SendMessage's step 7, before this
             // post-persist hook), so a torn-down recipient connection must NEVER propagate out of

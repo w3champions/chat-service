@@ -174,7 +174,7 @@ public class MentionPresenceIntegrationTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            _mentionInboxRepository);
+            _mentionInboxRepository, new UserDirectoryRepository(MongoClient));
 
         // The engine + coalescer + accumulator ALL push through the ONE shared harness and read the SHARED
         // registries the hubs mutate, so every push lands in a single ordered capture. The engine shares the

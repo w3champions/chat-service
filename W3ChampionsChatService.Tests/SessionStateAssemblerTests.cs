@@ -15,6 +15,7 @@ using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
 using W3ChampionsChatService.Relationships;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Tests;
 
@@ -34,6 +35,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
     private OnlineMemberRegistry _onlineMemberRegistry;
     private ConnectionMapping _connectionMapping;
     private MentionInboxRepository _mentionInboxRepository;
+    private UserDirectoryRepository _userDirectory;
     private SessionStateAssembler _assembler;
 
     [SetUp]
@@ -46,6 +48,7 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         _onlineMemberRegistry = new OnlineMemberRegistry();
         _connectionMapping = new ConnectionMapping();
         _mentionInboxRepository = new MentionInboxRepository(MongoClient);
+        _userDirectory = new UserDirectoryRepository(MongoClient);
 
         // D9: AssembleAndSeed no longer resolves the ChatUser itself — the caller (ChatHub, hoisted)
         // hands it the already-resolved chatUser. ChatUserFor below stands in for what the mocked
@@ -57,7 +60,8 @@ public class SessionStateAssemblerTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            _mentionInboxRepository);
+            _mentionInboxRepository,
+            _userDirectory);
     }
 
     private static W3CUserAuthentication Identity(string battleTag, string name = null, bool isAdmin = false, params EPermission[] perms) =>
@@ -386,6 +390,66 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         // The INITIATOR never sees their OWN outgoing request in the tray (it is not a request TO them).
         var (initiatorDto, _) = await _assembler.AssembleAndSeed(Identity(initiator), "conn-init", requestedAt, ChatUserFor(Identity(initiator)));
         Assert.IsEmpty(initiatorDto.PendingDmRequests, "the initiator never sees their own outgoing request in the tray");
+    }
+
+    // Admin chat priority: each tray entry carries `senderIsAdmin`, derived from the REQUESTER's cached
+    // user_directory flair — the AdminIcon chat-service itself forces onto a profile ONLY from the trusted
+    // JWT IsAdmin (wb never emits it). One batched directory read, only when the tray is non-empty.
+    private Task SeedDirectoryProfile(string battleTag, params ChatIcon[] icons) =>
+        _userDirectory.Upsert(new UserDirectoryEntry
+        {
+            BattleTag = battleTag,
+            DisplayBattleTag = battleTag,
+            NormalizedName = battleTag.ToLowerInvariant(),
+            LastSeenAt = DateTime.UtcNow,
+            Profile = new ChatProfile { ChatIcons = icons },
+        });
+
+    [Test]
+    public async Task SessionState_Tray_SenderIsAdmin_FromRequesterAdminFlair()
+    {
+        const string recipient = "Wolf#456";
+        var requestedAt = new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc);
+        var fromAdmin = await InsertDmChannel("Admin#1", recipient, DmRequestState.Pending, requestedAt);
+        var fromPlayer = await InsertDmChannel("Peter#123", recipient, DmRequestState.Pending, requestedAt);
+        var fromUnknown = await InsertDmChannel("Ghost#9", recipient, DmRequestState.Pending, requestedAt);
+        foreach (var channel in new[] { fromAdmin, fromPlayer, fromUnknown })
+        {
+            await InsertMembership(channel.Id, recipient, lastReadSeq: 0);
+        }
+        await SeedDirectoryProfile("Admin#1", ChatIcon.AdminIcon, new ChatIcon("chat_icon_other"));
+        await SeedDirectoryProfile("Peter#123", new ChatIcon("chat_icon_other"));
+
+        var (dto, _) = await _assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt, ChatUserFor(Identity(recipient)));
+
+        var byChannel = dto.PendingDmRequests.ToDictionary(r => r.ChannelId);
+        Assert.AreEqual(3, byChannel.Count);
+        Assert.IsTrue(byChannel[fromAdmin.Id].SenderIsAdmin, "a requester carrying the server-forced admin icon is flagged");
+        Assert.IsFalse(byChannel[fromPlayer.Id].SenderIsAdmin, "an ordinary requester is not");
+        Assert.IsFalse(byChannel[fromUnknown.Id].SenderIsAdmin, "a requester with no directory row defaults to false");
+    }
+
+    [Test]
+    public async Task SessionState_Tray_DirectoryReadFails_TrayStillListed_SenderIsAdminFalse()
+    {
+        const string recipient = "Wolf#456";
+        var requestedAt = new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc);
+        var channel = await InsertDmChannel("Admin#1", recipient, DmRequestState.Pending, requestedAt);
+        await InsertMembership(channel.Id, recipient, lastReadSeq: 0);
+        var assembler = new SessionStateAssembler(
+            _membershipRepository, _channelRepository, _messageRepository, _muteRepository,
+            _onlineMemberRegistry, _connectionMapping, _mentionInboxRepository, new ThrowingLoadManyDirectory(MongoClient));
+
+        var (dto, _) = await assembler.AssembleAndSeed(Identity(recipient), "conn-recip", requestedAt, ChatUserFor(Identity(recipient)));
+
+        Assert.AreEqual(1, dto.PendingDmRequests.Count, "a directory outage never hides a pending request or fails connect");
+        Assert.IsFalse(dto.PendingDmRequests[0].SenderIsAdmin);
+    }
+
+    private sealed class ThrowingLoadManyDirectory(MongoClient client) : UserDirectoryRepository(client)
+    {
+        public override Task<List<UserDirectoryEntry>> LoadMany(IEnumerable<string> battleTags) =>
+            throw new MongoException("simulated directory outage");
     }
 
     [Test]
@@ -1024,7 +1088,8 @@ public class SessionStateAssemblerTests : IntegrationTestBase
         _muteRepository,
         _onlineMemberRegistry,
         _connectionMapping,
-        _mentionInboxRepository);
+        _mentionInboxRepository,
+        _userDirectory);
 
     // A MembershipRepository whose DeleteOrphanedForUser always throws — simulating a Mongo write
     // failure on the connect-time self-heal's best-effort delete (mirrors ChatHubMembershipTests'

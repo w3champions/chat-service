@@ -349,6 +349,18 @@ public class ProtocolContractTests
     }
 
     [Test]
+    public void PendingDmRequestDto_SerializesSenderIsAdmin_CamelCase_EvenWhenFalse()
+    {
+        var requestedAt = new DateTime(2026, 7, 4, 12, 0, 0, DateTimeKind.Utc);
+
+        var adminJson = JsonSerializer.Serialize(new PendingDmRequestDto("c1", "Admin#1", requestedAt, SenderIsAdmin: true), ConfiguredHubOptions());
+        var playerJson = JsonSerializer.Serialize(new PendingDmRequestDto("c2", "Peter#123", requestedAt), ConfiguredHubOptions());
+
+        StringAssert.Contains("\"senderIsAdmin\":true", adminJson);
+        StringAssert.Contains("\"senderIsAdmin\":false", playerJson, "false is a real value and is serialized, not omitted");
+    }
+
+    [Test]
     public void MembershipDto_NeverSerializesDeclinedUntil()
     {
         // D3 leak pin: DeclinedUntil lives on the RECIPIENT's membership row and must never reach
