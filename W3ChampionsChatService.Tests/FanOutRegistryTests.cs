@@ -369,6 +369,39 @@ public class FanOutRegistryTests
         Assert.That(member.NotificationLevel, Is.EqualTo(NotificationLevel.Mentions));
     }
 
+    // OnlineMemberRegistry.TryWithMember: runs the callback with the live entry INSIDE the registry lock (so
+    // it is atomic w.r.t. every mutation), or not at all when the entry is absent.
+    [Test]
+    public void TryWithMember_ExistingEntry_RunsCallbackUnderLockWithLiveState()
+    {
+        var live = new MemberState("peter#123", NotificationLevel.Mentions, 7, ChannelType.Dm);
+        _memberRegistry.Join("channel-a", "conn-1", live);
+        MemberState seen = null;
+        var heldInside = false;
+
+        var found = _memberRegistry.TryWithMember("channel-a", "conn-1", state =>
+        {
+            seen = state;
+            heldInside = _memberRegistry.IsLockHeldByCurrentThread;
+        });
+
+        Assert.That(found, Is.True);
+        Assert.That(seen, Is.SameAs(live));
+        Assert.That(heldInside, Is.True);
+        Assert.That(_memberRegistry.IsLockHeldByCurrentThread, Is.False);
+    }
+
+    [Test]
+    public void TryWithMember_AbsentEntry_ReturnsFalse_CallbackNotRun()
+    {
+        var ran = false;
+
+        var found = _memberRegistry.TryWithMember("channel-a", "conn-1", _ => ran = true);
+
+        Assert.That(found, Is.False);
+        Assert.That(ran, Is.False);
+    }
+
     [Test]
     public void GetMembers_UnknownChannel_ReturnsEmpty()
     {

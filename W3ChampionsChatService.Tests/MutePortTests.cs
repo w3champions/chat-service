@@ -122,7 +122,7 @@ public class MutePortTests : IntegrationTestBase
 
     private SessionStateAssembler NewAssembler(IMuteRepository muteRepository) =>
         new(_membershipRepository, _channelRepository, _messageRepository, muteRepository, _onlineMemberRegistry, _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
 
     // The ViewerResolver is deliberately paired with `viewers`, not always _viewerResolver: passing
     // _viewerResolver alongside a throwaway ViewersAccumulatorTestFactory.CreateIgnored() would resolve a

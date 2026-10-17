@@ -157,7 +157,7 @@ public class DmGroupIntegrationTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
 
         _moderationController = new ModerationHistoryController(_channelRepository, _messageRepository);
     }

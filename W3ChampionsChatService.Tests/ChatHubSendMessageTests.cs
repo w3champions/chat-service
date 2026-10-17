@@ -17,6 +17,7 @@ using W3ChampionsChatService.Memberships;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Protocol;
+using W3ChampionsChatService.Relationships;
 using W3ChampionsChatService.Sessions;
 using W3ChampionsChatService.Users;
 
@@ -115,7 +116,7 @@ public class ChatHubSendMessageTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            _mentionInboxRepository);
+            _mentionInboxRepository, new UserDirectoryRepository(MongoClient));
     }
 
     private ChatHub BuildHub(string connectionId)
@@ -173,10 +174,16 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         return hub;
     }
 
-    private void RegisterSession(string connectionId, string battleTag) =>
+    private void RegisterSession(string connectionId, string battleTag, bool isAdmin = false) =>
         _sessionRegistry.Register(
             connectionId,
-            new W3CUserAuthentication { BattleTag = battleTag, Name = battleTag.Split('#')[0] },
+            new W3CUserAuthentication
+            {
+                BattleTag = battleTag,
+                Name = battleTag.Split('#')[0],
+                IsAdmin = isAdmin,
+                Permissions = isAdmin ? new HashSet<EPermission> { EPermission.Moderation } : new HashSet<EPermission>(),
+            },
             null);
 
     private async Task<ChatChannel> CreateChannel(string name, ChannelType type = ChannelType.Public)
@@ -766,6 +773,82 @@ public class ChatHubSendMessageTests : IntegrationTestBase
         Assert.AreEqual(0, _mentionPushHarness.SignalCount("conn-3", ChatEvents.MentionNotified),
             "a third focused member who was NOT mentioned must capture zero MentionNotified — targeting is exact, never a broadcast");
         Assert.IsEmpty(await _mentionInboxRepository.LoadForUser("frank#789"));
+    }
+
+    [Test]
+    public async Task AdminDmMention_RecipientHadDeclined_MentionDelivered()
+    {
+        const string admin = "admin#1";
+        const string recipient = "wolf#456";
+        var channel = await _channelRepository.FindOrCreateDm(admin, recipient, admin, DmRequestState.Pending, Now);
+        RegisterSession("conn-admin", admin, isAdmin: true);
+        _connectionMapping.RegisterUser("conn-admin", FlairUser(admin));
+        _onlineMemberRegistry.Join(channel.Id, "conn-admin", new MemberState(admin, NotificationLevel.All, 0, ChannelType.Dm));
+        await SeedMentionTarget("conn-2", recipient, channel.Id);
+        await _membershipRepository.SetDeclinedUntil(channel.Id, recipient, Now + ChatLimits.DmDeclineSuppression);
+        var hub = BuildHub("conn-admin");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention(recipient)} please read");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        var inbox = await _mentionInboxRepository.LoadForUser(recipient);
+        Assert.AreEqual(1, inbox.Count, "the admin's accept cleared the decline, so the mention reaches the inbox");
+        Assert.AreEqual(result.MessageId, inbox[0].MessageId);
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
+    }
+
+    [Test]
+    public async Task AdminDmMention_AcceptedShell_RecipientRowCarriesRacedDecline_MentionDelivered()
+    {
+        // The post-race state Codex described: the admin's acceptance flipped the shell and cleared the
+        // window, then a racing DeclineRequest wrote a fresh 24h DeclinedUntil onto the recipient's row.
+        const string admin = "admin#1";
+        const string recipient = "wolf#456";
+        var channel = await _channelRepository.FindOrCreateDm(admin, recipient, admin, DmRequestState.Accepted, Now);
+        RegisterSession("conn-admin", admin, isAdmin: true);
+        _connectionMapping.RegisterUser("conn-admin", FlairUser(admin));
+        _onlineMemberRegistry.Join(channel.Id, "conn-admin", new MemberState(admin, NotificationLevel.All, 0, ChannelType.Dm));
+        await SeedMentionTarget("conn-2", recipient, channel.Id);
+        await _membershipRepository.SetDeclinedUntil(channel.Id, recipient, Now + ChatLimits.DmDeclineSuppression);
+        var hub = BuildHub("conn-admin");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention(recipient)} please read");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser(recipient)).Count, "an accepted DM never honours a raced decline window");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
+    }
+
+    [Test]
+    public async Task AdminDmMention_RecipientBlockedAdmin_MentionDelivered()
+    {
+        const string admin = "admin#1";
+        const string recipient = "wolf#456";
+        // The mention fan-out's D1 source lists the admin in the recipient's blocked set (WB fail-open case).
+        var blockingSource = new FakeRelationshipSource((tag, snapshotNow) => new RelationshipSnapshot(
+            tag,
+            new HashSet<string>(),
+            string.Equals(tag, recipient, StringComparison.OrdinalIgnoreCase) ? new HashSet<string> { admin } : new HashSet<string>(),
+            snapshotNow));
+        _mentionFanOut = new MentionFanOut(
+            _mentionPushHarness.HubContext,
+            _sessionRegistry,
+            _membershipRepository,
+            _mentionInboxRepository,
+            _userDirectory, new RelationshipProvider(blockingSource, _time), new NotificationPreferenceRepository(MongoClient));
+        var channel = await _channelRepository.FindOrCreateDm(admin, recipient, admin, DmRequestState.Accepted, Now);
+        RegisterSession("conn-admin", admin, isAdmin: true);
+        _connectionMapping.RegisterUser("conn-admin", FlairUser(admin));
+        _onlineMemberRegistry.Join(channel.Id, "conn-admin", new MemberState(admin, NotificationLevel.All, 0, ChannelType.Dm));
+        await SeedMentionTarget("conn-2", recipient, channel.Id);
+        var hub = BuildHub("conn-admin");
+
+        var result = await hub.SendMessage(channel.Id, $"hey {Mention(recipient)} please read");
+
+        Assert.AreEqual(ChatResultCode.Ok, result.Code);
+        Assert.AreEqual(1, (await _mentionInboxRepository.LoadForUser(recipient)).Count,
+            "the hub threads the sender's admin status into the mention fan-out, bypassing the block");
+        Assert.AreEqual(1, _mentionPushHarness.SignalCount("conn-2", ChatEvents.MentionNotified));
     }
 
     [Test]

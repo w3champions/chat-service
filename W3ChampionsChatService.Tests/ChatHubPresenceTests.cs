@@ -116,7 +116,7 @@ public class ChatHubPresenceTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
 
         _activityCoalescer = new ActivityCoalescer(_harness.HubContext, _onlineMemberRegistry);
         // The engine shares the SAME presence-interest registry the hubs mutate — so RegisterFocus (hub)

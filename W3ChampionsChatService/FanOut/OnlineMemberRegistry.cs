@@ -94,6 +94,33 @@ public class OnlineMemberRegistry
         }
     }
 
+    /// <summary>
+    /// Runs <paramref name="whileLocked"/> with the live entry for (channelId, connectionId) INSIDE the
+    /// registry lock and returns true, or returns false without running it when no entry exists. Because
+    /// every mutation of this registry takes the same lock, whatever the callback does is atomic relative
+    /// to them: a concurrent <c>SetNotificationLevel</c>/<c>LeaveChannel</c>/<c>MarkRead</c> either completed
+    /// before the callback (and is visible in the entry) or starts after it returns. The callback must be
+    /// short and must never block or await (it runs under a process-wide lock) — the only caller starts a
+    /// non-blocking SignalR single-connection send (<see cref="FanOutEngine.PushChannelStateToTrackedMember"/>).
+    /// </summary>
+    public bool TryWithMember(string channelId, string connectionId, Action<MemberState> whileLocked)
+    {
+        lock (_lock)
+        {
+            if (!TryGetNoLock(channelId, connectionId, out var state))
+            {
+                return false;
+            }
+
+            whileLocked(state);
+            return true;
+        }
+    }
+
+    // Test seam (assembly has InternalsVisibleTo): whether the calling thread currently holds the registry
+    // lock — proves an action ran atomically with respect to every registry mutation.
+    internal bool IsLockHeldByCurrentThread => System.Threading.Monitor.IsEntered(_lock);
+
     /// <summary>Removes a single (channelId, connectionId) membership entry. No-op if absent.</summary>
     public void Leave(string channelId, string connectionId)
     {

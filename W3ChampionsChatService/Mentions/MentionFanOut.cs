@@ -142,8 +142,11 @@ public class MentionFanOut(
     /// see the class doc for the six eligibility rules and the fault-isolation contract.
     /// <paramref name="now"/> is the trusted server clock the hub already read once for this send
     /// (threaded in, not re-read, so the entry's CreatedAt/ExpiresAt decide against the same instant).
+    /// <paramref name="senderIsAdmin"/> is the SENDER's trusted server-side <c>session.Identity.IsAdmin</c>
+    /// (never client-supplied): true bypasses ONLY the D1 block check (admin chat priority); false — the
+    /// default for every non-admin and non-hub caller — leaves behaviour unchanged.
     /// </summary>
-    public async Task NotifyAsync(ChatChannel channel, ChannelMessage message, IReadOnlyList<string> mentionTags, DateTime now)
+    public async Task NotifyAsync(ChatChannel channel, ChannelMessage message, IReadOnlyList<string> mentionTags, DateTime now, bool senderIsAdmin = false)
     {
         // Rule (a), defense-in-depth: a shadow message notifies NOBODY. The PRIMARY guard is the
         // SendMessage call-site skip (it never calls this for a shadow message); this early-return is the
@@ -207,9 +210,16 @@ public class MentionFanOut(
         // individually (IsBlockedFailOpenAsync) — a relationship-provider outage on ONE target's fetch
         // never suppresses another target whose own snapshot resolves fine, and never blanket-mutes the
         // whole message or breaks the send pipeline.
+        // Admin chat priority: a trusted ADMIN sender (the caller's server-side session.Identity.IsAdmin)
+        // skips this stage entirely — no snapshot is fetched, and no target counts as blocking them.
+        // Defence in depth: WB already filters admins out of every `blocked` list, but a fail-open /
+        // empty-roster WB would otherwise leak the block back in here. Only the block check is bypassed;
+        // stage 1's membership wall, notification level, and decline rules above still applied.
         var senderTag = message.Sender?.BattleTag;
-        var blockedFlags = await Task.WhenAll(
-            otherwiseEligible.Select(target => IsBlockedFailOpenAsync(target.Tag, senderTag, channel.Id, message.Id)));
+        var blockedFlags = senderIsAdmin
+            ? new bool[otherwiseEligible.Count]
+            : await Task.WhenAll(
+                otherwiseEligible.Select(target => IsBlockedFailOpenAsync(target.Tag, senderTag, channel.Id, message.Id)));
 
         // STAGE 3 — write (inbox insert + live push) for every non-blocked target, sequentially. PER-TARGET
         // FAULT ISOLATION (mirrors FanOutEngine.OnMessagePersisted): a single target's failed inbox insert
@@ -263,7 +273,13 @@ public class MentionFanOut(
             {
                 return false;
             }
-            if (membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
+            // The decline window is a PENDING-request concept, so an Accepted Dm never honours it. Every
+            // acceptance clears it (AcceptPendingCore), but a DeclineRequest racing that acceptance can still
+            // write a fresh window afterwards (its membership write cannot be conditioned on the separate
+            // channel doc still being Pending); skipping it here makes such a raced window inert. Identical
+            // for every other channel: outside that race an Accepted Dm row never carries a window.
+            if (channel.RequestState != DmRequestState.Accepted
+                && membership.DeclinedUntil.HasValue && membership.DeclinedUntil.Value > now)
             {
                 return false;
             }

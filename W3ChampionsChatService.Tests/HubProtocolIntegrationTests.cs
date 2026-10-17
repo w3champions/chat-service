@@ -126,7 +126,7 @@ public class HubProtocolIntegrationTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
 
         // The three fan-out sinks ALL push through the ONE shared harness and read the SHARED
         // registries the hubs mutate — so every push lands in a single ordered capture and the

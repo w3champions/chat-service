@@ -86,7 +86,7 @@ public class ChatHubDeletionTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
 
         var viewerResolver = new ViewerResolver(_sessionRegistry, _connectionMapping);
 

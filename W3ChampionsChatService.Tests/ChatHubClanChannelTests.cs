@@ -97,7 +97,7 @@ public class ChatHubClanChannelTests : IntegrationTestBase
             _muteRepository,
             _onlineMemberRegistry,
             _connectionMapping,
-            new MentionInboxRepository(MongoClient));
+            new MentionInboxRepository(MongoClient), new UserDirectoryRepository(MongoClient));
     }
 
     /// <summary>Points the flair resolver at a given clan id / freshness tier.</summary>
@@ -324,7 +324,7 @@ public class ChatHubClanChannelTests : IntegrationTestBase
     }
 
     [Test]
-    public async Task Connect_WhenClanShellCreationFails_StillConnects_WithoutTheClanChannel()
+    public void Connect_WhenClanShellCreationFails_StillConnects_WithoutTheClanChannel()
     {
         // PR41 review (P2): creating the channel shell is part of the GRANT, not the revocation, so it
         // belongs on the fail-soft path. Creating a shell grants nobody access, and this call sits on the

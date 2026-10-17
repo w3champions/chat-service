@@ -328,7 +328,67 @@ public class FanOutEngine(
             session.ConnectionId,
             new MemberState(battleTag, membership.NotificationLevel, membership.LastReadSeq, channel.Type));
 
-        var dto = new ChannelAddedDto(channel, MembershipDto.From(membership), focus);
+        await SendChannelAddedAsync(session.ConnectionId, battleTag, new ChannelAddedDto(channel, MembershipDto.From(membership), focus));
+    }
+
+    /// <summary>
+    /// STATE-ONLY re-announcement of <paramref name="channel"/> (<c>ChannelAdded</c>, focus:false) to
+    /// <paramref name="battleTag"/>'s live connection, ONLY if that connection already tracks the channel
+    /// (an <see cref="OnlineMemberRegistry"/> entry exists) — the admin DM Pending → Accepted re-announce
+    /// (<c>ChatHub.ReAnnounceAcceptedDm</c>), whose client still holds the shell as Pending.
+    /// <list type="bullet">
+    /// <item>Writes NOTHING server-side: neither the registry nor the presence-interest index. The live
+    /// entry is already authoritative for this connection (seeded at connect/join and kept current by
+    /// <c>MarkRead</c>/<c>SetNotificationLevel</c>), so no membership row read here could be fresher, and a
+    /// stale one can never regress it (ABA level flips) or resurrect it after a completed
+    /// <c>LeaveChannel</c>.</item>
+    /// <item>The pushed <see cref="MembershipDto"/> is built from that live entry (level + cursor) and
+    /// <paramref name="role"/>, so the client's ChannelAdded upsert matches the server's live view.</item>
+    /// <item>Returns false — and pushes nothing — when the user is offline or the connection does not track
+    /// the channel (it holds no Pending state to repair; SessionState/the first send announce it).</item>
+    /// </list>
+    /// <para>
+    /// ATOMIC read-and-enqueue (no stale-overwrite window): the entry is read AND the send is started inside
+    /// <see cref="OnlineMemberRegistry.TryWithMember"/>, i.e. under the registry lock that
+    /// <c>SetNotificationLevel</c>/<c>LeaveChannel</c>/<c>MarkRead</c> take to mutate it — and each of those
+    /// mutates the registry BEFORE returning, so its hub result is written to the connection only after that
+    /// mutation. Either the mutation wins the lock (this push reads the new level, or finds no entry and
+    /// sends nothing), or this push wins it — and then its ChannelAdded is enqueued on the connection before
+    /// the mutation, hence before that operation's result, which the client applies last (the launcher applies
+    /// a level change / leave only on the hub result). Starting the send under the lock is safe: with no
+    /// backplane a single-connection send runs synchronously into SignalR's per-connection writer, which
+    /// either writes into the transport pipe (flush completes asynchronously) or queues on its FIFO write
+    /// semaphore — it never blocks on the network, and nothing on that path re-enters the registry. The send
+    /// is awaited only after the lock is released.
+    /// </para>
+    /// </summary>
+    public async Task<bool> PushChannelStateToTrackedMember(ChatChannel channel, string battleTag, MembershipRole role)
+    {
+        var session = _sessionRegistry.GetByBattleTag(battleTag);
+        if (session == null)
+        {
+            return false;
+        }
+
+        Task send = null;
+        var tracked = _onlineMemberRegistry.TryWithMember(channel.Id, session.ConnectionId, live =>
+        {
+            var membershipDto = new MembershipDto(live.NotificationLevel, live.LastReadSeq, role);
+            // Started, NOT awaited, under the lock: SendChannelAddedAsync runs synchronously up to the
+            // SignalR enqueue and captures any send fault into its own (fault-isolated) task.
+            send = SendChannelAddedAsync(session.ConnectionId, battleTag, new ChannelAddedDto(channel, membershipDto, Focus: false));
+        });
+        if (!tracked)
+        {
+            return false;
+        }
+
+        await send;
+        return true;
+    }
+
+    private async Task SendChannelAddedAsync(string connectionId, string battleTag, ChannelAddedDto dto)
+    {
         // Fault isolation (review fix, SEC-Low-3): the ChannelAdded push is a BEST-EFFORT live
         // notification — the channel + membership are already durably persisted and the registry seeded
         // above, and a reconnecting client re-derives its channel list from SessionState, so a torn-down
@@ -336,11 +396,11 @@ public class FanOutEngine(
         // (AddGroupMember/OpenDm/CreateGroup) after its durable mutation already succeeded.
         try
         {
-            await _hubContext.Clients.Client(session.ConnectionId).SendAsync(ChatEvents.ChannelAdded, dto);
+            await _hubContext.Clients.Client(connectionId).SendAsync(ChatEvents.ChannelAdded, dto);
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "Push of ChannelAdded failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, session.ConnectionId, channel.Id);
+            Log.Warning(ex, "Push of ChannelAdded failed for {BattleTag} connection {ConnectionId} on channel {ChannelId} — dropped; the client re-derives it from SessionState on reconnect", battleTag, connectionId, dto.Channel.Id);
         }
     }
 

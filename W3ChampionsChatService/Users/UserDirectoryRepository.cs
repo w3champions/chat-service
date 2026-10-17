@@ -129,8 +129,9 @@ public class UserDirectoryRepository(MongoClient mongoClient) : MongoDbRepositor
         return Directory.Find(filter).Limit(limit).ToListAsync();
     }
 
-    /// <summary>Batch point-read (T8/T10 enrichment) — lowercased <c>$in</c> on the primary key.</summary>
-    public Task<List<UserDirectoryEntry>> LoadMany(IEnumerable<string> battleTags)
+    /// <summary>Batch point-read (T8/T10 enrichment) — lowercased <c>$in</c> on the primary key. Virtual
+    /// solely so tests can simulate a failure (same reason as <see cref="Load"/>).</summary>
+    public virtual Task<List<UserDirectoryEntry>> LoadMany(IEnumerable<string> battleTags)
     {
         var tags = battleTags.Select(NormalizeTag).ToList();
         return Directory.Find(e => tags.Contains(e.BattleTag)).ToListAsync();

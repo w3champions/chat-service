@@ -279,9 +279,13 @@ public partial class ChatHub
         // FakeSendAck for a blocked/pending-cap/dmPrivacy drop, or the one fail-closed Throttled when the
         // relationship snapshot is entirely unavailable) or null to proceed. It may FLIP channel.RequestState
         // in-memory (reply/auto-accept) so the persist step below computes the +1y accepted-shell expiry.
+        // An ADMIN sender (session.Identity.IsAdmin, server-side) bypasses these gates and accepts a pending
+        // shell; dmWasPending (Dm-only — GroupDm/Public are never Pending) lets step 7.5 re-announce that
+        // flip to an already-seeded recipient.
+        var dmWasPending = channel.Type == ChannelType.Dm && channel.RequestState == DmRequestState.Pending;
         if (channel.Type is ChannelType.Dm or ChannelType.GroupDm)
         {
-            var shortCircuit = await ApplyPrivateLaneGates(channel, session.Identity.BattleTag, now);
+            var shortCircuit = await ApplyPrivateLaneGates(channel, session.Identity.BattleTag, session.Identity.IsAdmin, now);
             if (shortCircuit != null)
             {
                 return shortCircuit;
@@ -425,7 +429,11 @@ public partial class ChatHub
         // fresh/resurfaced pending request. GroupDm needs none of this (all members already have rows).
         if (channel.Type == ChannelType.Dm)
         {
-            await MaterializeDmRecipientAndNotify(channel, session.Identity.BattleTag, now);
+            await MaterializeDmRecipientAndNotify(
+                channel,
+                session.Identity.BattleTag,
+                now,
+                reAnnounceAcceptedState: session.Identity.IsAdmin && dmWasPending && channel.RequestState == DmRequestState.Accepted);
         }
 
         // 7.75 Fan-out seam (Task 12 focused delivery + Task 13 activity routing): focused MessageReceived
@@ -472,9 +480,11 @@ public partial class ChatHub
         // round-trip (block-check snapshots resolved CONCURRENTLY, so at most ONE ~2s wb HTTP timeout when
         // wb is degraded — see the F2b comment above). That is an accepted trade (Marco round 2026-08-05),
         // not an artifact; other viewers' delivery is unaffected because the fan-out engine above already ran.
+        // The sender's trusted session.Identity.IsAdmin is threaded in: an admin's mentions skip ONLY the
+        // target's block check (no wb round-trip at all), consistent with the step-5.5 admin gate bypass.
         if (!isShadow && mentionTags.Count > 0)
         {
-            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now);
+            await _mentionFanOut.NotifyAsync(channel, message, mentionTags, now, session.Identity.IsAdmin);
         }
 
         // 9. Typed ack.

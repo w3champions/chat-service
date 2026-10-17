@@ -55,6 +55,12 @@ public partial class ChatHub
     /// <see cref="ChatResultCode.Throttled"/> (retry-after from the tracker, no DB write); otherwise the
     /// admitted initiation is recorded, the pending shell is created, the caller's membership ensured, the
     /// registry seeded, and Ok returned.</item>
+    /// <item>ADMIN path (the caller's own server-side <c>session.Identity.IsAdmin</c>, checked after the
+    /// self-DM guard): a relationship outage or stale snapshot never fails an admin closed; the open is
+    /// delegated to <see cref="OpenDmAsAdmin"/>, which returns a born-<see cref="DmRequestState.Accepted"/>
+    /// shell past the target's dmPrivacy and the stranger-initiation cap (no initiation is recorded),
+    /// accepts the admin's OWN still-pending request, and keeps the D14 directory check for a non-friend
+    /// target with no existing shell. Non-admin callers never reach it.</item>
     /// </list>
     /// The block check is NEVER consulted here (D5): the observable result is computed from friendship +
     /// the target's dmPrivacy ALONE, so a caller blocked by the target walks the identical path (their
@@ -94,15 +100,26 @@ public partial class ChatHub
         var now = _timeProvider.GetUtcNow().UtcDateTime;
 
         // 3. Fetch the CALLER's snapshot (never the target's — D5). No usable snapshot at all is an outage:
-        // the outcome would need the stranger path (we cannot prove friendship), so fail closed retriable.
-        RelationshipSnapshot snapshot;
+        // the outcome would need the stranger path (we cannot prove friendship), so a non-admin fails closed
+        // retriable. Admins proceed without a snapshot (their sends never take the stranger path).
+        RelationshipSnapshot snapshot = null;
         try
         {
             snapshot = await _relationshipProvider.GetSnapshotAsync(caller);
         }
-        catch (RelationshipUnavailableException)
+        catch (RelationshipUnavailableException) when (!session.Identity.IsAdmin)
         {
             return new OpenDmResult(ChatResultCode.Throttled, ChatLimits.RelationshipRetryAfterSeconds);
+        }
+        catch (RelationshipUnavailableException)
+        {
+            // Admin caller: an outage never blocks an admin open — proceed without a snapshot.
+        }
+
+        // ADMIN path — the caller's own server-side admin flag (never a client claim).
+        if (session.Identity.IsAdmin)
+        {
+            return await OpenDmAsAdmin(caller, target, snapshot, now);
         }
 
         // 4. FRIEND path — friends bypass consent, dmPrivacy, and the directory check; a friendship proof
@@ -170,6 +187,61 @@ public partial class ChatHub
         var created = await _channelRepository.FindOrCreateDm(
             caller, target, initiator: caller, DmRequestState.Pending, now);
 
+        var callerMembership = await EnsureCallerMembership(created.Id, caller, now);
+        return new OpenDmResult(ChatResultCode.Ok, Channel: created, Membership: callerMembership);
+    }
+
+    /// <summary>
+    /// The ADMIN branch of <see cref="OpenDm"/> (step 3, after the self-DM guard). An admin opens a
+    /// born-<see cref="DmRequestState.Accepted"/> conversation past the target's dmPrivacy, the stranger-
+    /// initiation cap, and a relationship outage/staleness (<paramref name="snapshot"/> is null on an
+    /// outage). Never reads or records <see cref="FanOut.DmInitiationTracker"/> and never reads the
+    /// target's settings. Resolution order:
+    /// <list type="number">
+    /// <item>An existing shell the admin themself initiated that is still <see cref="DmRequestState.Pending"/>
+    /// is accepted via <see cref="AcceptPendingCore"/> (clears the recipient's decline window, frees the
+    /// slot), re-announced to an online recipient who already holds it (<see cref="ReAnnounceAcceptedDm"/>),
+    /// and returned reloaded; any OTHER existing shell (accepted, or a request the target sent) is
+    /// returned as-is — opening a request someone else sent never accepts it on their behalf.</item>
+    /// <item>No shell and no proven friendship: the D14 directory check still applies →
+    /// <see cref="ChatResultCode.NotFound"/>. During a relationship outage (<paramref name="snapshot"/> null)
+    /// friendship cannot be proven, so even a friend with no <c>user_directory</c> row gets NotFound (fails safe).</item>
+    /// <item>Otherwise a born-Accepted shell is find-or-created.</item>
+    /// </list>
+    /// Every Ok path ensures the caller's own membership (and registry seed) only; the accept-on-open
+    /// re-announcement never creates or seeds the recipient's membership (state-only, tracked recipients only).
+    /// </summary>
+    private async Task<OpenDmResult> OpenDmAsAdmin(string caller, string target, RelationshipSnapshot snapshot, DateTime now)
+    {
+        var shell = await _channelRepository.LoadByPairKey(caller, target);
+        if (shell != null)
+        {
+            if (shell.RequestState == DmRequestState.Pending
+                && string.Equals(shell.RequestInitiatedBy, caller, StringComparison.OrdinalIgnoreCase))
+            {
+                await AcceptPendingCore(shell.Id, shell.RequestInitiatedBy, target, now);
+                shell = await _channelRepository.Load(shell.Id) ?? shell;
+
+                // An online recipient who already holds this shell (as Pending, possibly declined) must learn
+                // it is now Accepted HERE: a later admin send finds it already Accepted (dmWasPending false)
+                // and so never re-announces it.
+                if (_sessionRegistry.GetByBattleTag(target) != null)
+                {
+                    await ReAnnounceAcceptedDm(shell, target, firstAddMembership: null);
+                }
+            }
+
+            var membership = await EnsureCallerMembership(shell.Id, caller, now);
+            return new OpenDmResult(ChatResultCode.Ok, Channel: shell, Membership: membership);
+        }
+
+        if (snapshot?.IsFriendWith(target) != true && await _userDirectory.Load(target) == null)
+        {
+            return new OpenDmResult(ChatResultCode.NotFound);
+        }
+
+        var created = await _channelRepository.FindOrCreateDm(
+            caller, target, initiator: caller, DmRequestState.Accepted, now);
         var callerMembership = await EnsureCallerMembership(created.Id, caller, now);
         return new OpenDmResult(ChatResultCode.Ok, Channel: created, Membership: callerMembership);
     }
@@ -420,6 +492,13 @@ public partial class ChatHub
     /// accepted-shell expiry rather than the +30d pending one. Honored EXACTLY in this order:
     /// <list type="number">
     /// <item><b>GroupDm</b>: membership was already checked at step 3 — no block/consent gates; proceed.</item>
+    /// <item><b>Admin sender</b> (<paramref name="senderIsAdmin"/> — the sender's own server-side
+    /// <c>session.Identity.IsAdmin</c>): skips EVERY gate below — no snapshot is fetched, so a block or a
+    /// relationship outage never stops the send. A <see cref="DmRequestState.Pending"/> shell is accepted
+    /// first via <see cref="AcceptPendingCore"/> (admin-initiated: the counterpart is the recipient;
+    /// player-initiated: the admin is), which clears the recipient's decline window and frees the
+    /// initiation slot; then proceed as Accepted — never capped, no dmPrivacy recheck. Gating is keyed on
+    /// the SENDER only: a non-admin sending to an admin walks the gates below unchanged.</item>
     /// <item><b>Dm block gate</b> (EVERY Dm send, pending OR accepted — a block silences an established lane
     /// too): fetch the COUNTERPART's snapshot ONCE (reused below). If it has BLOCKED the sender ⇒
     /// <see cref="FakeSendAck"/> (persist NOTHING, deliver NOTHING, materialize NO membership — "never
@@ -440,7 +519,7 @@ public partial class ChatHub
     /// </list></item>
     /// </list>
     /// </summary>
-    private async Task<SendMessageResult> ApplyPrivateLaneGates(ChatChannel channel, string senderBattleTag, DateTime now)
+    private async Task<SendMessageResult> ApplyPrivateLaneGates(ChatChannel channel, string senderBattleTag, bool senderIsAdmin, DateTime now)
     {
         // GroupDm: no consent/block gates — membership already proven at step 3.
         if (channel.Type == ChannelType.GroupDm)
@@ -449,6 +528,21 @@ public partial class ChatHub
         }
 
         var counterpart = ResolveDmCounterpart(channel, senderBattleTag);
+
+        // Admin sender (the SENDER's own server-side flag, never a client claim): no snapshot fetch, so no
+        // block gate and no outage Throttled; a pending shell is accepted BEFORE persist (whoever initiated
+        // it) so no consent wall, dmPrivacy recheck, pending cap or decline window applies.
+        if (senderIsAdmin)
+        {
+            if (channel.RequestState == DmRequestState.Pending)
+            {
+                var isInitiator = string.Equals(senderBattleTag, channel.RequestInitiatedBy, StringComparison.OrdinalIgnoreCase);
+                await AcceptPendingCore(channel.Id, channel.RequestInitiatedBy, isInitiator ? counterpart : senderBattleTag, now);
+                channel.RequestState = DmRequestState.Accepted;
+            }
+
+            return null;
+        }
 
         // (1) Block gate — the counterpart's snapshot, reused for the friend check below.
         RelationshipSnapshot snapshot;
@@ -526,9 +620,15 @@ public partial class ChatHub
     /// has elapsed — <c>now ≥ DeclinedUntil</c>, cleared first so the request resurfaces). Suppressed while
     /// still inside the decline window, and NOT re-fired on every pending message (the tray is already live).
     /// A reply/auto-accept flipped the in-memory RequestState to Accepted, so those never re-notify here.</item>
+    /// <item><paramref name="reAnnounceAcceptedState"/>: set by the caller ONLY for an admin send that flipped
+    /// the shell Pending → Accepted at step 5.5. An online recipient then gets
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>(focus:false) even if already registry-seeded, so
+    /// their client learns the shell is now Accepted (the RequestReceived branch is skipped — the channel is
+    /// no longer Pending) — via <see cref="ReAnnounceAcceptedDm"/>, which re-loads the post-allocation
+    /// channel; a recipient already tracking the shell gets a state-only push that leaves the registry untouched.</item>
     /// </list>
     /// </summary>
-    private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now)
+    private async Task MaterializeDmRecipientAndNotify(ChatChannel channel, string senderBattleTag, DateTime now, bool reAnnounceAcceptedState)
     {
         var counterpart = ResolveDmCounterpart(channel, senderBattleTag);
 
@@ -556,7 +656,21 @@ public partial class ChatHub
             && recipientSession != null
             && !_onlineMemberRegistry.IsMember(recipientSession.ConnectionId, channel.Id);
 
-        if (newlyMaterialized || needsReAnnounce)
+        // Admin send that just flipped Pending → Accepted (reAnnounceAcceptedState): an online recipient's
+        // client still holds the shell as Pending, so push ChannelAdded (an upsert client-side) even when
+        // already seeded — it carries RequestState Accepted. Ordinary sends never set the flag.
+        if (reAnnounceAcceptedState && (newlyMaterialized || needsReAnnounce))
+        {
+            // Admin flip, recipient not yet tracking the channel: the normal first-add join path, but with
+            // the PERSISTED post-allocation channel (see ReAnnounceAcceptedDm).
+            await ReAnnounceAcceptedDm(channel, counterpart, firstAddMembership: recipientMembership);
+        }
+        else if (reAnnounceAcceptedState && recipientSession != null)
+        {
+            // Admin flip, recipient already tracking the channel: state-only, registry untouched.
+            await ReAnnounceAcceptedDm(channel, counterpart, firstAddMembership: null);
+        }
+        else if (newlyMaterialized || needsReAnnounce)
         {
             // Seeds the recipient's OnlineMemberRegistry + pushes ChannelAdded(focus:false) if they are
             // online; a no-op for an offline recipient (their SessionState picks the channel up on connect).
@@ -586,7 +700,9 @@ public partial class ChatHub
 
         if (recipientSession != null)
         {
-            var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now);
+            // SenderIsAdmin is false by construction here: an admin sender's step-5.5 gate always accepts the
+            // shell before persist, so a still-Pending channel was necessarily sent by a non-admin.
+            var dto = new PendingDmRequestDto(channel.Id, channel.RequestInitiatedBy, channel.LastMessageAt ?? now, SenderIsAdmin: false);
             // Fault isolation (C5 LOW-1, security review): the RequestReceived push is a BEST-EFFORT live
             // notification — the message is already durably persisted (SendMessage's step 7, before this
             // post-persist hook), so a torn-down recipient connection must NEVER propagate out of
@@ -600,6 +716,49 @@ public partial class ChatHub
             {
                 Log.Warning(ex, "RequestReceived push failed for {ConnectionId} on channel {ChannelId} — best-effort, tray resurfaces it via SessionState", recipientSession.ConnectionId, channel.Id);
             }
+        }
+    }
+
+    /// <summary>
+    /// Admin chat priority: re-announces an admin-accepted Dm shell to <paramref name="recipient"/>
+    /// (<c>ChannelAdded</c>, focus:false — the event the client upserts and drops a pending-tray entry on) so a client still holding it as
+    /// Pending (possibly declined) learns it is Accepted. Called from <see cref="OpenDmAsAdmin"/> (accept on
+    /// open) and <see cref="MaterializeDmRecipientAndNotify"/> (accept on send).
+    /// <list type="bullet">
+    /// <item>The channel is RE-LOADED, not taken from the caller: on the send path the caller's instance
+    /// predates <see cref="Channels.ChannelRepository.AllocateSeq"/>, so its LastSeq/LastMessageAt/ExpiresAt
+    /// are stale — and a Mentions/None recipient gets no ChannelActivity to learn the new seq otherwise.
+    /// A vanished doc falls back to <paramref name="channel"/>.</item>
+    /// <item><paramref name="firstAddMembership"/> non-null (send path: the recipient was just materialized
+    /// or is online but not tracking the shell) ⇒ the normal first-add join path,
+    /// <see cref="FanOut.FanOutEngine.PushChannelAdded"/>, exactly as an ordinary send uses it.</item>
+    /// <item>Null (the recipient may already track the shell) ⇒
+    /// <see cref="FanOut.FanOutEngine.PushChannelStateToTrackedMember"/>: a state-only ChannelAdded built from
+    /// the LIVE registry entry, pushed only if that entry exists, and writing nothing — so no membership
+    /// read can regress the live level/cursor or resurrect a completed leave, and the accept-on-open path
+    /// never creates or seeds the recipient's membership. 1:1 Dm memberships are always
+    /// <see cref="MembershipRole.Member"/>.</item>
+    /// <item>BEST-EFFORT: on the send path the message is already durable, so a failure here must never
+    /// turn the ack into an error (a retry would duplicate it); reconnect heals via SessionState.</item>
+    /// </list>
+    /// </summary>
+    private async Task ReAnnounceAcceptedDm(ChatChannel channel, string recipient, ChannelMembership firstAddMembership)
+    {
+        try
+        {
+            var persisted = await _channelRepository.Load(channel.Id) ?? channel;
+            if (firstAddMembership != null)
+            {
+                await _fanOutEngine.PushChannelAdded(persisted, firstAddMembership, focus: false);
+            }
+            else
+            {
+                await _fanOutEngine.PushChannelStateToTrackedMember(persisted, recipient, MembershipRole.Member);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Accepted-state re-announcement of Dm {ChannelId} to {Recipient} failed — best-effort, SessionState heals it on reconnect", channel.Id, recipient);
         }
     }
 

@@ -13,6 +13,7 @@ using W3ChampionsChatService.Mentions;
 using W3ChampionsChatService.Messages;
 using W3ChampionsChatService.Mutes;
 using W3ChampionsChatService.Relationships;
+using W3ChampionsChatService.Users;
 
 namespace W3ChampionsChatService.Protocol;
 
@@ -42,7 +43,10 @@ public class SessionStateAssembler(
     OnlineMemberRegistry onlineMemberRegistry,
     ConnectionMapping connectionMapping,
     // C6 (Task 6, D6): backs the real MentionUnreadCount below (replaces the C3 hardcoded-0 stub).
-    MentionInboxRepository mentionInboxRepository)
+    MentionInboxRepository mentionInboxRepository,
+    // Admin chat priority: the pending tray's senderIsAdmin source — the requesters' cached flair. Read
+    // once (batched) per connect, and only when the tray is non-empty.
+    UserDirectoryRepository userDirectory)
 {
     // The only EPermission values the client is ever told about (explicit allow-list — see
     // OwnProfileDto's boundary-privacy doc). Extend deliberately, one at a time, as new
@@ -175,7 +179,7 @@ public class SessionStateAssembler(
         var dto = new SessionStateDto(
             Channels: channelDtos,
             PublicCatalog: effectivePublicCatalog,
-            PendingDmRequests: BuildPendingDmTray(snapshotMemberships, channelsById, identity.BattleTag, now),
+            PendingDmRequests: await WithRequesterAdminFlags(BuildPendingDmTray(snapshotMemberships, channelsById, identity.BattleTag, now)),
             MentionUnreadCount: (int)mentionUnreadCount,
             OwnProfile: ToOwnProfileDto(identity, chatUser),
             MuteState: ToMuteStateDto(muteStatus, mutedPlayer));
@@ -366,6 +370,39 @@ public class SessionStateAssembler(
         }
 
         return tray;
+    }
+
+    /// <summary>
+    /// Sets <see cref="PendingDmRequestDto.SenderIsAdmin"/> on each tray entry from the requester's cached
+    /// user_directory flair (<see cref="ChatProfile.HasAdminIcon"/>). The flag cannot be stamped on the shell
+    /// instead: the trays it matters for are pending shells created BEFORE admin DMs were born Accepted
+    /// (or by a user promoted since), whose docs carry no such stamp. ONE batched point-read on the
+    /// directory's primary key, skipped for an empty tray (the common case). Best-effort: a directory
+    /// failure leaves every flag false (the pre-existing tray, unchanged) rather than failing connect.
+    /// </summary>
+    private async Task<IReadOnlyList<PendingDmRequestDto>> WithRequesterAdminFlags(IReadOnlyList<PendingDmRequestDto> tray)
+    {
+        if (tray.Count == 0)
+        {
+            return tray;
+        }
+
+        try
+        {
+            var requesters = await userDirectory.LoadMany(tray.Select(r => r.FromBattleTag).Distinct(StringComparer.OrdinalIgnoreCase));
+            var adminRequesters = requesters
+                .Where(entry => entry.Profile?.HasAdminIcon() == true)
+                .Select(entry => entry.BattleTag)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            return tray
+                .Select(request => adminRequesters.Contains(request.FromBattleTag) ? request with { SenderIsAdmin = true } : request)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Pending-tray requester flair lookup failed — senderIsAdmin defaults to false for this SessionState");
+            return tray;
+        }
     }
 
     private static OwnProfileDto ToOwnProfileDto(W3CUserAuthentication identity, ChatUser chatUser)

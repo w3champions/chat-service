@@ -315,6 +315,35 @@ public class MentionFanOutTests : IntegrationTestBase
         Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1), "and still gets the event");
     }
 
+    // A DeclineRequest racing an acceptance (AcceptPendingCore flips the channel, then clears DeclinedUntil;
+    // the decline's membership write is not conditioned on Pending) can leave a fresh window on the row of
+    // a now-Accepted Dm. The decline window is a PENDING-request concept, so an Accepted Dm never honours it.
+    [Test]
+    public async Task Notify_AcceptedDm_RacedDeclineWindow_StillNotified()
+    {
+        await SeedMembership("recipient#1", NotificationLevel.All, declinedUntil: Now.AddHours(24));
+        RegisterSession("conn-recipient", "recipient#1");
+        var accepted = new ChatChannel { Id = ChannelId, Type = ChannelType.Dm, RequestState = DmRequestState.Accepted };
+
+        await _fanOut.NotifyAsync(accepted, Message(), new[] { "recipient#1" }, Now);
+
+        Assert.That(await InboxOf("recipient#1"), Has.Count.EqualTo(1), "an Accepted Dm ignores a stale decline window");
+        Assert.That(MentionEventCount("conn-recipient"), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Notify_PendingDm_ActiveDecline_StillSuppressed()
+    {
+        await SeedMembership("recipient#1", NotificationLevel.All, declinedUntil: Now.AddHours(1));
+        RegisterSession("conn-recipient", "recipient#1");
+        var pending = new ChatChannel { Id = ChannelId, Type = ChannelType.Dm, RequestState = DmRequestState.Pending };
+
+        await _fanOut.NotifyAsync(pending, Message(), new[] { "recipient#1" }, Now);
+
+        Assert.That(await InboxOf("recipient#1"), Is.Empty, "a Pending Dm still honours the decline window");
+        Assert.That(MentionEventCount("conn-recipient"), Is.EqualTo(0));
+    }
+
     [Test]
     public async Task Notify_ExpiredDeclineSuppression_NotifiesNormally()
     {
@@ -495,6 +524,48 @@ public class MentionFanOutTests : IntegrationTestBase
             "a directory-resolvable non-member who has blocked the sender gets NO entry");
         Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(0));
         Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "the eligible member control still fires");
+    }
+
+    // Admin chat priority (defence in depth — WB already filters admins out of `blocked`, but a fail-open /
+    // empty-roster WB would leak the block back in): a trusted ADMIN sender bypasses ONLY the D1 block
+    // check. Every other eligibility rule (membership wall, notification level, decline) still applies.
+    [Test]
+    public async Task Notify_AdminSender_TargetBlockedSender_StillNotified()
+    {
+        await SeedMembership("wolf#456", NotificationLevel.All);
+        RegisterSession("conn-wolf", "wolf#456");
+        var fanOut = BuildFanOutWithBlock(blockingTargetTag: "wolf#456", blockedBattleTag: Sender);
+
+        await fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "wolf#456" }, Now, senderIsAdmin: true);
+
+        Assert.That(await InboxOf("wolf#456"), Has.Count.EqualTo(1), "an admin's mention reaches a target who blocked them");
+        Assert.That(MentionEventCount("conn-wolf"), Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Notify_AdminSender_TargetLevelNone_StillSuppressed()
+    {
+        await SeedMembership("silent#1", NotificationLevel.None);
+        RegisterSession("conn-silent", "silent#1");
+        await SeedMembership("control#1", NotificationLevel.All);
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "silent#1", "control#1" }, Now, senderIsAdmin: true);
+
+        Assert.That(await InboxOf("silent#1"), Is.Empty, "the admin bypass is block-only — an explicit None opt-out still wins");
+        Assert.That(MentionEventCount("conn-silent"), Is.EqualTo(0));
+        Assert.That(await InboxOf("control#1"), Has.Count.EqualTo(1), "control: the eligible member is notified");
+    }
+
+    [Test]
+    public async Task Notify_AdminSender_NonMemberOfWalledChannel_StillSuppressed()
+    {
+        await SeedDirectory("outsider#1");
+        RegisterSession("conn-outsider", "outsider#1");
+
+        await _fanOut.NotifyAsync(Channel(ChannelType.Dm), Message(), new[] { "outsider#1" }, Now, senderIsAdmin: true);
+
+        Assert.That(await InboxOf("outsider#1"), Is.Empty, "the admin bypass never lifts the Dm excerpt privacy wall");
+        Assert.That(MentionEventCount("conn-outsider"), Is.EqualTo(0));
     }
 
     [Test]
