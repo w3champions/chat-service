@@ -3,6 +3,7 @@ using System.Net;
 using Serilog;
 
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Cors.Infrastructure;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Extensions.DependencyInjection;
@@ -27,6 +28,17 @@ namespace W3ChampionsChatService;
 
 public class Startup
 {
+    /// <summary>
+    /// Any origin may call the REST endpoints, never with credentials: the hub authenticates with a one-time ticket,
+    /// the internal API with HMAC, and nothing reads a cookie. A reflected origin together with credentials would let
+    /// any site send a visitor's cookies here and read the answer.
+    /// </summary>
+    public static void ConfigureCors(CorsPolicyBuilder policy) =>
+        policy
+            .AllowAnyOrigin()
+            .AllowAnyHeader()
+            .AllowAnyMethod();
+
     /// <summary>
     /// Resolves the Mongo connection string from the MONGO_CONNECTION_STRING value. Fails fast when it is
     /// missing: silently falling back to a hard-coded host would point a misconfigured deployment at a
@@ -293,12 +305,7 @@ public class Startup
             KnownProxies = { IPAddress.Parse("212.60.5.180") } // Russia gateway
         });
         app.UseRouting();
-        app.UseCors(builder =>
-            builder
-                .AllowAnyHeader()
-                .AllowAnyMethod()
-                .SetIsOriginAllowed(_ => true)
-                .AllowCredentials());
+        app.UseCors(ConfigureCors);
 
         app.UseEndpoints(endpoints =>
         {
